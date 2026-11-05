@@ -396,7 +396,7 @@ fn shape_child(c: *Ctx, k: Gc<Box>, name: Gc<Str>) -> ?Gc<Box> {
     t.extra[n] = Value.Str(nm);
     t.base = Some(k);
     t.b = k.b;
-    let Int(cap) = k.b else { trap() };
+    let cap = k.b as! Int;
     t.s = if (n as i64) + 1 <= (cap as i64) { (n as i64) + 1 } else { (cap as i64) - 1 };
     if k.dict.is_none() { k.dict = Some(value.new_dict(&c.heap, 2)); }
     value.dict_set_str(&c.heap, k.dict.unwrap(), nm, Value.Obj(t));
@@ -436,14 +436,14 @@ fn inst_set(c: *Ctx, o: Gc<Inst>, name: Gc<Str>, v: Value) -> ?u64 {
                     x.items[0] = o.slots[cap - 1];
                     o.slots[cap - 1] = Value.Tuple(x);
                 } else {
-                    let Tuple(x) = o.slots[cap - 1] else { trap() };
+                    let x = o.slots[cap - 1] as! Tuple;
                     if j >= x.items.len {
                         let y = value.new_tuple(&c.heap, x.items.len * 2);
                         for q in 0..y.items.len { y.items[q] = if q < x.items.len { x.items[q] } else { Value.Undef }; }
                         o.slots[cap - 1] = Value.Tuple(y);
                     }
                 }
-                let Tuple(x) = o.slots[cap - 1] else { trap() };
+                let x = o.slots[cap - 1] as! Tuple;
                 x.items[j] = v;
             } else {
                 o.slots[n] = v;
@@ -470,7 +470,7 @@ fn bound(c: *Ctx, selfv: Value, f: Value) -> Value {
 // ── globals ─────────────────────────────────────────────────────────
 
 pub fn get_global(c: *Ctx, func: Value, s: Gc<Str>, idx: *u32, ver: *u32, builtin: *u32) -> Result<Value, Value> {
-    let Func(f) = func else { trap() };
+    let f = func as! Func;
     let d = f.globals;
     if let Some(e) = value.dict_find_str(d, s) {
         *idx = e as u32;
@@ -619,7 +619,7 @@ pub fn getattr(c: *Ctx, obj: Value, name: Gc<Str>, ic: *u32) -> Result<Value, Va
 
 /// Attributes of builtin values: methods from their type's dict.
 fn builtin_attr(c: *Ctx, obj: Value, name: Gc<Str>) -> Result<Value, Value> uses reenter {
-    let int_like = match obj { Int(_) | Long(_) => true, _ => false };
+    let int_like = obj is Int | Long;
     if int_like {
         if name.data.eq("real") or name.data.eq("numerator") { return Ok(obj); }
         if name.data.eq("imag") { return Ok(Value.Int(0)); }
@@ -962,7 +962,7 @@ pub fn bind_args(c: *Ctx, f: Gc<Func>, win: *Value, n: u64, kw: Value) -> Result
     // Keywords.
     if let Tuple(t) = kw {
         for j in 0..nkw {
-            let Str(name) = t.items[j] else { trap() };
+            let name = t.items[j] as! Str;
             let v = args.at(npos + j);
             var found = false;
             for i in 0..np + nk {
@@ -1017,7 +1017,7 @@ pub fn bind_args(c: *Ctx, f: Gc<Func>, win: *Value, n: u64, kw: Value) -> Result
     for i in 0..nk {
         let pi = np + (if has_var { 1 } else { 0 }) + i;
         if win[pi] == Value.Undef {
-            let Str(pn) = p.pnames[pi] else { trap() };
+            let pn = p.pnames[pi] as! Str;
             if let Some(kd) = f.kwdefaults and let Some(v) = value.dict_get_str(kd, pn) { win[pi] = v; }
             else {
                 var b = text.StrBuf.new();
@@ -1141,12 +1141,12 @@ pub fn call_method_s(c: *Ctx, obj: Value, name: Gc<Str>, args: []Value) -> Resul
 }
 
 pub fn dn(c: *Ctx, i: u64) -> Gc<Str> {
-    let Str(s) = c.dn[i] else { trap() };
+    let s = c.dn[i] as! Str;
     s
 }
 
 pub fn make_func(c: *Ctx, creator: Value, p: *Proto, regs: *Value, dst: u64) -> Result<Value, Value> {
-    let Func(cf) = creator else { trap() };
+    let cf = creator as! Func;
     var defaults: ?Gc<Tuple> = None;
     if p.ndefaults > 0 { defaults = Some(value.tuple_of(&c.heap, (regs + dst + 1).slice(p.ndefaults as u64))); }
     var kwdefaults: ?Gc<Dict> = None;
@@ -1168,7 +1168,7 @@ pub fn make_func(c: *Ctx, creator: Value, p: *Proto, regs: *Value, dst: u64) -> 
 }
 
 pub fn build_class(c: *Ctx, name: Value, bases: Value, ns: Value, hint: u64) -> Result<Value, Value> {
-    let Dict(d) = ns else { trap() };
+    let d = ns as! Dict;
     var base: Gc<Box> = c.types[vm.T_OBJECT].unwrap();
     if let Tuple(t) = bases {
         if t.items.len > 1 { return Err(exc(c, Exc.TypeError, "multiple inheritance is not supported")); }
@@ -1237,7 +1237,7 @@ pub fn super_method(c: *Ctx, kv: Value, selfv: Value, name: Gc<Str>, ccls: *u32,
 }
 
 pub fn make_super(c: *Ctx, func: Value, selfv: Value) -> Result<Value, Value> {
-    let Func(f) = func else { trap() };
+    let f = func as! Func;
     let Some(owner) = f.owner else { return Err(exc(c, Exc.RuntimeError, "super(): no arguments")); };
     let b = value.new_box(&c.heap, K_SUPER, 0);
     b.a = selfv;
@@ -1322,7 +1322,7 @@ pub fn arith(c: *Ctx, op: u32, a: Value, b: Value) -> Result<Value, Value> uses 
     }
     match (a, b) {
         (Str(_), _) => if op == O_ADD and !value.is_kind(b, K_NOTIMPL) {
-            if let Str(_) = b {} else if let Inst(_) = b {} else {
+            if !(b is Str | Inst) {
                 var m = text.StrBuf.new();
                 m.push_str("can only concatenate str (not \"");
                 m.push_str(type_name(c, b));
@@ -1396,7 +1396,7 @@ pub fn arith(c: *Ctx, op: u32, a: Value, b: Value) -> Result<Value, Value> uses 
 /// CPython's messages for `+` and `*` on sequences, else "unsupported
 /// operand type(s)".
 fn arith_type_error(c: *Ctx, op: u32, a: Value, b: Value) -> Value {
-    let seq = |v: Value| -> bool { match v { Str(_) | List(_) | Tuple(_) => true, _ => false } };
+    let seq = |v: Value| -> bool { v is Str | List | Tuple };
     if op == O_ADD and !is_inst(b) {
         let what = match a { List(_) => "list", Tuple(_) => "tuple", _ => "" };
         if what.len > 0 {
@@ -2030,7 +2030,7 @@ pub fn new_set(c: *Ctx, frozen: bool) -> Value {
 }
 
 pub fn set_add(c: *Ctx, s: Value, v: Value) -> Result<(), Value> uses reenter {
-    let Obj(b) = s else { trap() };
+    let b = s as! Obj;
     dict_put(c, b.dict.unwrap(), v, Value.Nil)
 }
 
@@ -2044,7 +2044,7 @@ fn index_error(c: *Ctx, what: str) -> Value {
 /// A normalized index into a sequence of length n.
 fn seq_index(c: *Ctx, key: Value, n: u64, what: str) -> Result<u64, Value> {
     let Some(i) = value.as_i64(key) else {
-        if let Float(_) = key {} else if value.is_int(key) { return Err(index_error(c, what)); }
+        if !(key is Float) and value.is_int(key) { return Err(index_error(c, what)); }
         var m = text.StrBuf.new();
         m.push_str(what);
         m.push_str(" indices must be integers or slices, not ");
@@ -2384,7 +2384,7 @@ fn surely_unequal(e: Value, x: Value) -> bool {
 }
 
 pub fn contains_fast(container: Value, x: Value) -> u32 {
-    let simple = match x { Int(_) => true, Str(_) => true, Nil => true, Bool(_) => true, Float(_) => true, _ => false };
+    let simple = x is Int | Str | Nil | Bool | Float;
     if !simple { return 2; }
     match container {
         Dict(d) => {
@@ -2451,7 +2451,7 @@ pub fn contains(c: *Ctx, container: Value, x: Value) -> Result<bool, Value> uses
                 return Ok((i - b.n) % b.s == 0);
             }
             if b.kind == K_DICTVIEW {
-                let Dict(d) = b.a else { trap() };
+                let d = b.a as! Dict;
                 if b.m == 0 { return Ok(dict_lookup(c, d, x)?.is_some()); }
             }
             iter_contains(c, container, x)
@@ -2478,7 +2478,7 @@ fn iter_contains(c: *Ctx, container: Value, x: Value) -> Result<bool, Value> use
 }
 
 pub fn list_extend(c: *Ctx, l: Value, v: Value) -> Result<(), Value> uses reenter {
-    let List(x) = l else { trap() };
+    let x = l as! List;
     match v {
         List(y) => { for i in 0..y.len { value.list_push(&c.heap, x, y.arr.items[i]); } }
         Tuple(t) => { for i in 0..t.items.len { value.list_push(&c.heap, x, t.items[i]); } }
@@ -2585,7 +2585,7 @@ pub fn getiter(c: *Ctx, v: Value) -> Result<Value, Value> uses reenter {
                 }
                 K_SET | K_FROZENSET => Ok(dict_iter(c, o.dict.unwrap(), 3)),
                 K_DICTVIEW => {
-                    let Dict(d) = o.a else { trap() };
+                    let d = o.a as! Dict;
                     Ok(dict_iter(c, d, o.m))
                 }
                 K_CLASS | K_BOUND | K_SUPER | K_PROPERTY | K_STATICM | K_CLASSM | K_MODULE | K_SLICE | K_NOTIMPL => {
@@ -2650,7 +2650,7 @@ pub fn next(c: *Ctx, it: Value) -> Result<?Value, Value> uses reenter {
                     }
                 }
                 K_DICTIT => {
-                    let Dict(d) = b.a else { trap() };
+                    let d = b.a as! Dict;
                     if b.s != -1 and d.len as i64 != b.s {
                         b.s = -2; // sticky, as in CPython
                         return Err(exc(c, Exc.RuntimeError, if b.m == 3 { "Set changed size during iteration" } else { "dictionary changed size during iteration" }));
@@ -2659,7 +2659,7 @@ pub fn next(c: *Ctx, it: Value) -> Result<?Value, Value> uses reenter {
                     let r = value.dict_next(d, &i);
                     b.n = i as i64;
                     let Some(e) = r else { return Ok(None); };
-                    let Int(left) = b.b else { trap() };
+                    let left = b.b as! Int;
                     if left == 0 and b.s >= 0 {
                         b.s = -1; // exhausted from now on
                         b.n = 0x7fffffffffffffff;
@@ -2683,7 +2683,7 @@ pub fn next(c: *Ctx, it: Value) -> Result<?Value, Value> uses reenter {
                     Ok(Some(Value.Tuple(t)))
                 }
                 K_ZIPIT => {
-                    let Tuple(its) = b.a else { trap() };
+                    let its = b.a as! Tuple;
                     let t = value.new_tuple(&c.heap, its.items.len);
                     for i in 0..its.items.len {
                         let Some(v) = next(c, its.items[i])? else { return Ok(None); };
@@ -2692,7 +2692,7 @@ pub fn next(c: *Ctx, it: Value) -> Result<?Value, Value> uses reenter {
                     Ok(Some(Value.Tuple(t)))
                 }
                 K_MAPIT => {
-                    let Tuple(its) = b.b else { trap() };
+                    let its = b.b as! Tuple;
                     var xs: mem.Vec<Value> = mem.Vec.new();
                     for i in 0..its.items.len {
                         let r = next(c, its.items[i]);

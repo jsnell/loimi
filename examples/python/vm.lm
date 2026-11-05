@@ -297,7 +297,7 @@ pub vm Py {
         let np = p.simple as u64;
         if n < np {
             if !ensure(win + p.nregs as u64) { cold { raise ops.exc(ctx, builtins.Exc.RecursionError, "maximum recursion depth exceeded") } }
-            let Some(d) = f.defaults else { trap() };
+            let d = f.defaults as! Some;
             let nd = d.items.len;
             for i in n..np { win[i] = *(d.items.ptr + (i + nd - np)); }
         }
@@ -443,7 +443,7 @@ pub vm Py {
     fn resume(g: Gc<Box>, slot: *Value, cont: *u32, alt: *u32) -> never {
         if g.m == GEN_DONE { jump alt }
         if g.m == GEN_RUNNING { cold { raise ops.exc(ctx, builtins.Exc.ValueError, "generator already executing") } }
-        let Func(f) = g.a else { trap() };
+        let f = g.a as! Func;
         let p = f.proto;
         let win = regs + fp.proto.nregs as u64;
         if !ensure(win + p.nregs as u64) { cold { raise ops.exc(ctx, builtins.Exc.RecursionError, "maximum recursion depth exceeded") } }
@@ -492,14 +492,14 @@ pub vm Py {
 
     family GETGLOBAL(dst: reg, name: kst) : ABx + GlobalIC {
         generic {
-            let Str(s) = name else { trap() };
+            let s = name as! Str;
             dst = ops.get_global(ctx, fp.func, s, &cache.idx, &cache.ver, &cache.builtin)?;
             if cache.builtin != 0 { become GETGLOBAL_B; next }
             become GETGLOBAL_C;
             next
         }
         GETGLOBAL_C {
-            let Func(f) = fp.func else { trap() };
+            let f = fp.func as! Func;
             let d = f.globals;
             let i = cache.idx as u64;
             if likely(i < d.used) {
@@ -509,7 +509,7 @@ pub vm Py {
             cold { become GETGLOBAL; redo }
         }
         GETGLOBAL_B {
-            let Func(f) = fp.func else { trap() };
+            let f = fp.func as! Func;
             let d = f.globals;
             if (d.version as u32) == cache.ver {
                 let bd = ctx.builtins.unwrap();
@@ -521,7 +521,7 @@ pub vm Py {
     }
     /// The entry number is checked as GETGLOBAL_C checks it.
     op SETGLOBAL(src: reg, name: kst) : ABx + SetGIC {
-        let Func(f) = fp.func else { trap() };
+        let f = fp.func as! Func;
         let d = f.globals;
         let i = cache.idx as u64;
         if likely(i < d.used) {
@@ -533,14 +533,14 @@ pub vm Py {
             }
         }
         cold {
-            let Str(s) = name else { trap() };
+            let s = name as! Str;
             value.dict_set_str(&ctx.heap, d, s, src);
             if let Some(j) = value.dict_find_str(d, s) { cache.idx = j as u32; }
             next
         }
     }
     op DELGLOBAL(z: imm, name: kst) : ABx {
-        let Func(f) = fp.func else { trap() };
+        let f = fp.func as! Func;
         if !value.dict_del(f.globals, name, value.hash_of(name).unwrap()) {
             raise ops.name_error(ctx, name)
         }
@@ -548,16 +548,16 @@ pub vm Py {
     }
     /// Class bodies: names live in the namespace dict R[ns].
     op LOADNAME(dst: reg, ns: reg, name: kst) : ABC {
-        let Str(s) = name else { trap() };
-        let Dict(d) = ns else { trap() };
+        let s = name as! Str;
+        let d = ns as! Dict;
         if let Some(v) = value.dict_get_str(d, s) { dst = v; next }
         var a: u32 = 0; var b: u32 = 0; var c2: u32 = 0;
         dst = ops.get_global(ctx, fp.func, s, &a, &b, &c2)?;
         next
     }
     op STORENAME(src: reg, ns: reg, name: kst) : ABC {
-        let Str(s) = name else { trap() };
-        let Dict(d) = ns else { trap() };
+        let s = name as! Str;
+        let d = ns as! Dict;
         value.dict_set_str(&ctx.heap, d, s, src);
         next
     }
@@ -570,28 +570,28 @@ pub vm Py {
         next
     }
     op LOADCELL(dst: reg, cell: reg) : ABC {
-        let Cell(c) = cell else { trap() };
+        let c = cell as! Cell;
         let v = c.v;
         if v == Undef { raise ops.unbound(ctx) }
         dst = v;
         next
     }
     op STORECELL(cell: reg, src: reg) : ABC {
-        let Cell(c) = cell else { trap() };
+        let c = cell as! Cell;
         c.v = src;
         next
     }
     op LOADFREE(dst: reg, i: imm) : ABC {
-        let Func(f) = fp.func else { trap() };
-        let Cell(c) = f.cells.unwrap().items[i] else { trap() };
+        let f = fp.func as! Func;
+        let c = f.cells.unwrap().items[i] as! Cell;
         let v = c.v;
         if v == Undef { raise ops.unbound(ctx) }
         dst = v;
         next
     }
     op STOREFREE(src: reg, i: imm) : ABC {
-        let Func(f) = fp.func else { trap() };
-        let Cell(c) = f.cells.unwrap().items[i] else { trap() };
+        let f = fp.func as! Func;
+        let c = f.cells.unwrap().items[i] as! Cell;
         c.v = src;
         next
     }
@@ -624,7 +624,7 @@ pub vm Py {
         }
         cold {
             if let Inst(o) = obj and let Some(v) = ops.inst_cached(o, name, cache.idx) { dst = v; next }
-            let Str(s) = name else { trap() };
+            let s = name as! Str;
             let old = cache.idx;
             dst = ops.getattr(ctx, obj, s, &cache.idx)?;
             if cache.idx != old { cache.idx2 = old; }
@@ -661,13 +661,13 @@ pub vm Py {
                 next
             }
             gc_point();
-            let Str(s) = name else { trap() };
+            let s = name as! Str;
             ops.setattr(ctx, obj, s, src, &cache.idx)?;
             next
         }
     }
     op DELATTR(obj: reg, name: kst) : ABC {
-        let Str(s) = name else { trap() };
+        let s = name as! Str;
         ops.delattr(ctx, obj, s)?;
         next
     }
@@ -718,7 +718,7 @@ pub vm Py {
             next
         }
         cold {
-            let Str(s) = name else { trap() };
+            let s = name as! Str;
             // The previous entries move down one.
             let (pc_, pe, pf) = (cache.cls, cache.epoch, cache.fnv);
             var m = Value.Nil;
@@ -766,7 +766,7 @@ pub vm Py {
         }
         cold {
             gc_point();
-            let Str(s) = name else { trap() };
+            let s = name as! Str;
             var f = cache.fnv;
             let (m, sv) = ops.super_method(ctx, kv, regs[base.raw + 1], s, &cache.cls, &cache.epoch, &f)?;
             cache.fnv = f;
@@ -1009,7 +1009,7 @@ pub vm Py {
         // A float to a float or int power with a finite result (no error
         // to raise: not 0.0 to a negative power, not a complex result).
         let fy = match b { Float(y) => y, Int(y) => y as f64, _ => 0.5 };
-        if let Float(x) = a and x != 0.0 and (match b { Float(_) => true, Int(_) => true, _ => false }) {
+        if let Float(x) = a and x != 0.0 and (b is Float | Int) {
             let r = builtins.pow_f(x, fy);
             if r - r == 0.0 { dst = Float(r); next }
         }
@@ -1243,7 +1243,7 @@ pub vm Py {
         next
     }
     op LISTAPPEND(l: reg, v: reg) : ABC {
-        let List(x) = l else { trap() };
+        let x = l as! List;
         if x.len < x.arr.items.len {
             *(x.arr.items.ptr + x.len) = v;
             x.len += 1;
@@ -1265,13 +1265,13 @@ pub vm Py {
     op SETADD(s: reg, v: reg) : ABC { gc_point(); ops.set_add(ctx, s, v)?; next }
     op DICTSET(d: reg, key: reg, v: reg) : ABC {
         if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
-        let Dict(x) = d else { trap() };
+        let x = d as! Dict;
         ops.dict_put(ctx, x, key, v)?;
         next
     }
     op TOTUPLE(dst: reg, src: reg) : ABC {
         if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
-        let List(l) = src else { trap() };
+        let l = src as! List;
         dst = Tuple(value.tuple_of(&ctx.heap, l.arr.items[0..l.len]));
         next
     }
@@ -1424,8 +1424,8 @@ pub vm Py {
     /// R[dst] = (yield R[val]): suspend the generator.
     op YIELD(dst: reg, val: reg) : ABC {
         let v = val;
-        let Obj(g) = fp.gen else { trap() };
-        let Func(f) = fp.func else { trap() };
+        let g = fp.gen as! Obj;
+        let f = fp.func as! Func;
         let p = f.proto;
         let saved = g.extra.ptr;
         for i in 0..p.nregs as u64 { saved[i] = regs[i]; }
@@ -1606,7 +1606,7 @@ fn gen_resume(c: *Ctx, g: Gc<Box>, send: Value, throw: Value) -> Result<?Value, 
     if caller + 2 >= c.frames_end or c.vm_depth > 180 or ops.stack_low(c) {
         return Err(ops.exc(c, builtins.Exc.RecursionError, "maximum recursion depth exceeded"));
     }
-    let Func(f) = g.a else { trap() };
+    let f = g.a as! Func;
     let p = f.proto;
     let win = caller.base + caller.proto.nregs as u64;
     let need = win + p.nregs as u64 + 1;

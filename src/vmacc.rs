@@ -113,7 +113,13 @@ fn walk(e: &mut Expr, f: &mut dyn FnMut(&mut Expr) -> bool) {
         | ExprKind::Unit
         | ExprKind::Continue
         | ExprKind::SizeOf(_) => {}
-        ExprKind::Field(a, _) | ExprKind::Unary(_, a) | ExprKind::Cast(a, _) | ExprKind::Try(a) | ExprKind::TypeArgs(a, _) => walk(a, f),
+        ExprKind::Field(a, _)
+        | ExprKind::Unary(_, a)
+        | ExprKind::Cast(a, _)
+        | ExprKind::Is(a, _)
+        | ExprKind::AsVariant(a, _)
+        | ExprKind::Try(a)
+        | ExprKind::TypeArgs(a, _) => walk(a, f),
         ExprKind::Call(c, args) => {
             walk(c, f);
             for a in args {

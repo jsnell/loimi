@@ -1478,7 +1478,7 @@ fn call_method_builtin(c: *Ctx, b: B, args: *Value, n: u64, kw: Value) -> Result
         }
         LExtend => { ops.list_extend(c, selfv, args[1])?; Ok(Value.Nil) }
         LPop => {
-            let List(l) = selfv else { trap() };
+            let l = selfv as! List;
             if np > 2 { var m = text.StrBuf.new(); m.fmt("pop expected at most 1 argument, got {}", np - 1); return Err(exc_buf(c, Exc.TypeError, &m)); }
             if l.len == 0 { return Err(exc(c, Exc.IndexError, "pop from empty list")); }
             var i = l.len as i64 - 1;
@@ -1492,7 +1492,7 @@ fn call_method_builtin(c: *Ctx, b: B, args: *Value, n: u64, kw: Value) -> Result
             Ok(v)
         }
         LInsert => {
-            let List(l) = selfv else { trap() };
+            let l = selfv as! List;
             if np != 3 { var m = text.StrBuf.new(); m.fmt("insert expected 2 arguments, got {}", np - 1); return Err(exc_buf(c, Exc.TypeError, &m)); }
             var i = want_int(c, args[1])?;
             if i < 0 { i += l.len as i64; if i < 0 { i = 0; } }
@@ -1504,7 +1504,7 @@ fn call_method_builtin(c: *Ctx, b: B, args: *Value, n: u64, kw: Value) -> Result
             Ok(Value.Nil)
         }
         LRemove => {
-            let List(l) = selfv else { trap() };
+            let l = selfv as! List;
             for i in 0..l.len {
                 if ops.equal(c, l.arr.items[i], args[1])? {
                     for k in i..l.len - 1 { l.arr.items[k] = l.arr.items[k + 1]; }
@@ -1524,7 +1524,7 @@ fn call_method_builtin(c: *Ctx, b: B, args: *Value, n: u64, kw: Value) -> Result
                 if ops.equal(c, x, args[1])? { return Ok(value.int_val(&c.heap, i as i64)); }
             }
             if b == B.TIndex { return Err(exc(c, Exc.ValueError, "tuple.index(x): x not in tuple")); }
-            let Str(r) = fmt.repr(c, args[1])? else { trap() };
+            let r = fmt.repr(c, args[1])? as! Str;
             var m = text.StrBuf.new();
             m.push_str(r.data);
             m.push_str(" is not in list");
@@ -1540,14 +1540,14 @@ fn call_method_builtin(c: *Ctx, b: B, args: *Value, n: u64, kw: Value) -> Result
             Ok(value.int_val(&c.heap, k))
         }
         LSort => {
-            let List(l) = selfv else { trap() };
+            let l = selfv as! List;
             let key = kwarg(kw, args, n, "key") ?? Value.Nil;
             let rev = kwarg(kw, args, n, "reverse") ?? Value.Bool(false);
             sort_list(c, l, key, ops.truthy(c, rev)?)?;
             Ok(Value.Nil)
         }
         LReverse => {
-            let List(l) = selfv else { trap() };
+            let l = selfv as! List;
             if l.len > 1 {
                 var i: u64 = 0;
                 var j = l.len - 1;
@@ -1555,16 +1555,16 @@ fn call_method_builtin(c: *Ctx, b: B, args: *Value, n: u64, kw: Value) -> Result
             }
             Ok(Value.Nil)
         }
-        LCopy => { let List(l) = selfv else { trap() }; Ok(Value.List(value.list_of(&c.heap, l.arr.items[0..l.len]))) }
+        LCopy => { let l = selfv as! List; Ok(Value.List(value.list_of(&c.heap, l.arr.items[0..l.len]))) }
         LClear => {
-            let List(l) = selfv else { trap() };
+            let l = selfv as! List;
             for i in 0..l.len { l.arr.items[i] = Value.Nil; }
             l.len = 0;
             Ok(Value.Nil)
         }
         // ── dict
         DGet => {
-            let Dict(d) = selfv else { trap() };
+            let d = selfv as! Dict;
             if let Some(v) = ops.dict_lookup(c, d, args[1])? { return Ok(v); }
             Ok(if np > 2 { args[2] } else { Value.Nil })
         }
@@ -1575,7 +1575,7 @@ fn call_method_builtin(c: *Ctx, b: B, args: *Value, n: u64, kw: Value) -> Result
             Ok(Value.Obj(v))
         }
         DPop => {
-            let Dict(d) = selfv else { trap() };
+            let d = selfv as! Dict;
             if let Some(v) = ops.dict_lookup(c, d, args[1])? {
                 let hv = ops.hash_key(c, args[1])?;
                 value.dict_del(d, args[1], hv);
@@ -1585,22 +1585,22 @@ fn call_method_builtin(c: *Ctx, b: B, args: *Value, n: u64, kw: Value) -> Result
             Err(ops.key_error(c, args[1]))
         }
         DSetdefault => {
-            let Dict(d) = selfv else { trap() };
+            let d = selfv as! Dict;
             if let Some(v) = ops.dict_lookup(c, d, args[1])? { return Ok(v); }
             let dv = if np > 2 { args[2] } else { Value.Nil };
             ops.dict_put(c, d, args[1], dv)?;
             Ok(dv)
         }
         DUpdate => {
-            let Dict(d) = selfv else { trap() };
+            let d = selfv as! Dict;
             if np > 1 { dict_update(c, d, args[1])?; }
             if let Tuple(kt) = kw { for i in 0..kt.items.len { ops.dict_put(c, d, kt.items[i], args[np + i])?; } }
             Ok(Value.Nil)
         }
-        DCopy => { let Dict(d) = selfv else { trap() }; Ok(Value.Dict(value.dict_copy(&c.heap, d))) }
-        DClear => { let Dict(d) = selfv else { trap() }; value.dict_clear(&c.heap, d); Ok(Value.Nil) }
+        DCopy => { let d = selfv as! Dict; Ok(Value.Dict(value.dict_copy(&c.heap, d))) }
+        DClear => { let d = selfv as! Dict; value.dict_clear(&c.heap, d); Ok(Value.Nil) }
         DPopitem => {
-            let Dict(d) = selfv else { trap() };
+            let d = selfv as! Dict;
             if d.len == 0 { return Err(exc(c, Exc.KeyError, "popitem(): dictionary is empty")); }
             let t = value.new_tuple(&c.heap, 2);
             let (k, v) = d.pop_last().unwrap();
@@ -1634,7 +1634,7 @@ fn call_method_builtin(c: *Ctx, b: B, args: *Value, n: u64, kw: Value) -> Result
         }
         StClear => { value.dict_clear(&c.heap, set_dict(selfv).unwrap()); Ok(Value.Nil) }
         StCopy => {
-            let Obj(o) = selfv else { trap() };
+            let o = selfv as! Obj;
             let r = value.new_box(&c.heap, o.kind, 0);
             r.dict = Some(value.dict_copy(&c.heap, o.dict.unwrap()));
             Ok(Value.Obj(r))
@@ -1647,7 +1647,7 @@ fn call_method_builtin(c: *Ctx, b: B, args: *Value, n: u64, kw: Value) -> Result
             Ok(Value.Nil)
         }
         StUnion | StIntersection | StDifference | StSymdiff => {
-            let Obj(o) = selfv else { trap() };
+            let o = selfv as! Obj;
             var acc = selfv;
             if np == 1 {
                 let r = value.new_box(&c.heap, o.kind, 0);
@@ -1662,8 +1662,8 @@ fn call_method_builtin(c: *Ctx, b: B, args: *Value, n: u64, kw: Value) -> Result
                     while let Some(v) = ops.next(c, it)? { ops.set_add(c, s, v)?; }
                     other = s;
                 }
-                let Obj(x) = acc else { trap() };
-                let Obj(y) = other else { trap() };
+                let x = acc as! Obj;
+                let y = other as! Obj;
                 let op = if b == B.StUnion { ops.O_BOR } else if b == B.StIntersection { ops.O_BAND } else if b == B.StDifference { ops.O_SUB } else { ops.O_BXOR };
                 acc = set_op(c, op, x, y)?;
             }
@@ -1697,7 +1697,7 @@ fn call_method_builtin(c: *Ctx, b: B, args: *Value, n: u64, kw: Value) -> Result
         }
         // ── generators
         GSend => {
-            let Obj(g) = selfv else { trap() };
+            let g = selfv as! Obj;
             if g.m == value.GEN_NEW and args[1] != Value.Nil {
                 return Err(exc(c, Exc.TypeError, "can't send non-None value to a just-started generator"));
             }
@@ -1707,7 +1707,7 @@ fn call_method_builtin(c: *Ctx, b: B, args: *Value, n: u64, kw: Value) -> Result
             }
         }
         GClose => {
-            let Obj(g) = selfv else { trap() };
+            let g = selfv as! Obj;
             if g.m != value.GEN_SUSPENDED { g.m = GEN_DONE; return Ok(Value.Nil); }
             let ge = exc_of_empty(c, Exc.GeneratorExit);
             match vm.gen_throw(c, g, ge) {
@@ -1722,7 +1722,7 @@ fn call_method_builtin(c: *Ctx, b: B, args: *Value, n: u64, kw: Value) -> Result
             }
         }
         GThrow => {
-            let Obj(g) = selfv else { trap() };
+            let g = selfv as! Obj;
             let e = ops.make_exc(c, args[1])?;
             match vm.gen_throw(c, g, e)? {
                 Some(v) => Ok(v),
@@ -1730,7 +1730,7 @@ fn call_method_builtin(c: *Ctx, b: B, args: *Value, n: u64, kw: Value) -> Result
             }
         }
         PropSetter | PropGetter => {
-            let Obj(o) = selfv else { trap() };
+            let o = selfv as! Obj;
             let p = value.new_box(&c.heap, K_PROPERTY, 0);
             p.a = if b == B.PropGetter { args[1] } else { o.a };
             p.b = if b == B.PropSetter { args[1] } else { o.b };
@@ -2139,7 +2139,7 @@ pub fn load_prelude(c: *Ctx) -> Result<(), Value> uses reenter {
 const IO_SRC: str = "class StringIO:\n    def __init__(self, initial=''):\n        self._parts = [initial]\n    def write(self, s):\n        self._parts.append(s)\n        return len(s)\n    def getvalue(self):\n        return ''.join(self._parts)\n";
 
 pub fn import_module(c: *Ctx, name: Value) -> Result<Value, Value> uses reenter {
-    let Str(s) = name else { trap() };
+    let s = name as! Str;
     let mods = c.modules.unwrap();
     if let Some(m) = value.dict_get_str(mods, s) { return Ok(m); }
     let m = value.new_box(&c.heap, K_MODULE, 0);

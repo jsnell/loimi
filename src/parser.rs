@@ -1318,6 +1318,15 @@ impl Parser {
             return Ok(lhs);
         }
         loop {
+            // `e is P`, at the precedence of comparisons. `is` is not a
+            // keyword: after an operand it can only be this.
+            if self.is_kw("is") && min <= 4 {
+                self.bump();
+                let pat = self.parse_pat()?;
+                let span = lhs.span.to(pat.span);
+                lhs = Expr { kind: ExprKind::Is(Box::new(lhs), pat), span };
+                continue;
+            }
             let Some((op, prec)) = self.binop() else { break };
             if prec < min {
                 break;
@@ -1381,6 +1390,22 @@ impl Parser {
     fn parse_cast(&mut self) -> Res<Expr> {
         let mut e = self.parse_unary()?;
         while self.eat_kw("as") {
+            // `e as! V`: checked unwrap of a variant.
+            if self.is("!") {
+                self.bump();
+                let mut path = Vec::new();
+                if self.is(".") {
+                    path.push(Ident { name: String::new(), span: self.bump().span });
+                }
+                path.push(self.ident()?);
+                while self.is(".") {
+                    self.bump();
+                    path.push(self.ident()?);
+                }
+                let span = e.span.to(self.prev_span());
+                e = Expr { kind: ExprKind::AsVariant(Box::new(e), path), span };
+                continue;
+            }
             let t = self.parse_cast_type()?;
             let span = e.span.to(t.span);
             e = Expr { kind: ExprKind::Cast(Box::new(e), t), span };

@@ -1,0 +1,76 @@
+// matrix: dispatch
+// `e is P` (a pattern test that binds nothing; a variant with fields may
+// be named alone) and `e as! V` (the fields of variant V, or a trap), in
+// plain functions, on options, `value` types and in a vm handler.
+import std.io;
+import std.gc;
+
+object Cell { v: i64 }
+enum T { Ref(i64), Atom(u32), Pair(i64, i64), Nil }
+value V repr nanbox { Num(f64) unboxed, Int(i32), C(Gc<Cell>), Nul }
+
+fn is_ref(t: T) -> bool { t is Ref }
+fn small(t: T) -> bool { t is Atom | Nil | Pair(0, _) }
+const LIMIT: i64 = 7;
+
+vm M {
+    state { pc: *u32, acc: i64 }
+    encoding fixed(u32) { format A { op: 8, x: 24 } }
+    op ADD(x: imm) : A {
+        let t = if x == 0 { T.Nil } else { T.Ref(x as i64) };
+        if t is Nil { exit -1 }
+        let v = t as! Ref;
+        acc = acc + v;
+        next
+    }
+    op HALT() : A { exit acc }
+    operand imm = it;
+    entry run(code: *u32) -> i64 { acc = 0; jump code }
+}
+
+fn show(b: bool) { io.println(if b { "true" } else { "false" }); }
+
+fn main() -> i32 {
+    var heap = gc.Heap.new();
+    let a = T.Ref(3);
+    let b = T.Pair(1, 2);
+    // expect: true
+    show(is_ref(a));
+    // expect: false
+    show(is_ref(b));
+    // expect: true
+    show(small(T.Atom(1)));
+    // expect: true
+    show(small(T.Pair(0, 5)));
+    // expect: false
+    show(small(b));
+    // expect: true
+    show(b is T.Pair(1, _) and !(a is .Nil));
+    // expect: true
+    show(LIMIT is 7);
+    // expect: false
+    show(3 is 0..=2);
+    let x = a as! Ref;
+    let (p, q) = b as! Pair;
+    let pq = b as! T.Pair;
+    // expect: 12
+    io.print_int(x + p + q + pq.0 + pq.1 + (a as! .Ref)); io.println("");
+    let o: ?i64 = Some(5);
+    // expect: 5
+    io.print_int(o as! Some); io.println("");
+    // expect: false
+    show(o is None);
+    var w = V.C(new(&heap, Cell { v: 41 }));
+    // expect: true
+    show(w is C);
+    // expect: true
+    show(V.Int(2) is Int | Nul);
+    let c = w as! C;
+    // expect: 42
+    io.print_int(c.v + ((V.Int(1) as! Int) as i64)); io.println("");
+    var code: [u32; 3] = [M.ADD(40), M.ADD(2), M.HALT()];
+    // expect: 42
+    io.print_int(M.run(&code[0])); io.println("");
+    w = V.Nul;
+    0
+}

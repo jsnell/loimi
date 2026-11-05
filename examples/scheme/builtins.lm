@@ -736,7 +736,7 @@ pub fn call_native(c: *Ctx, p: Prim, args: *V, n: u64) -> Result<V, V> {
             Ok(acc)
         }
         Prim.ExactP => { num_arg(c, name, a)?; Ok(value.boolean(bignum.is_exact(a))) }
-        Prim.InexactP => { num_arg(c, name, a)?; Ok(value.boolean(match a { Num(_) => true, _ => false })) }
+        Prim.InexactP => { num_arg(c, name, a)?; Ok(value.boolean(a is Num)) }
         Prim.Cons => Ok(value.cons(h, a, b)),
         Prim.Car => Ok(pair_arg(c, name, a)?.car),
         Prim.Cdr => Ok(pair_arg(c, name, a)?.cdr),
@@ -804,14 +804,14 @@ pub fn call_native(c: *Ctx, p: Prim, args: *V, n: u64) -> Result<V, V> {
         Prim.Cdddr => cxr(c, name, "ddd", a),
         Prim.Cadddr => cxr(c, name, "addd", a),
         Prim.NullP => Ok(value.boolean(a == value.nil())),
-        Prim.PairP => Ok(value.boolean(match a { P(_) => true, _ => false })),
+        Prim.PairP => Ok(value.boolean(a is P)),
         Prim.ListP => Ok(value.boolean(list_len(a).is_some())),
         Prim.EqP => Ok(value.boolean(a == b)),
         Prim.EqvP => Ok(value.boolean(value.eqv(a, b))),
         Prim.EqualP => Ok(value.boolean(value.equal(a, b))),
         Prim.Not => Ok(value.boolean(a == value.f())),
-        Prim.SymbolP => Ok(value.boolean(match a { Sym(_) => true, _ => false })),
-        Prim.StringP => Ok(value.boolean(match a { S(_) => true, _ => false })),
+        Prim.SymbolP => Ok(value.boolean(a is Sym)),
+        Prim.StringP => Ok(value.boolean(a is S)),
         Prim.ProcedureP => Ok(value.boolean(value.is_procedure(a))),
         Prim.VectorP => Ok(value.boolean(match a { Vec(x) => x.rtd == value.nil(), _ => false })),
         Prim.BooleanP => Ok(value.boolean(a == value.t() or a == value.f())),

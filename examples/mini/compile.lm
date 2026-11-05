@@ -864,7 +864,7 @@ fn Parser.kindex(p: *Parser, e: E, any: bool) -> ?u32 {
         I(i) => p.constant(V.Int(i)),
         K(k) => {
             let v = p.fs.consts.get(k);
-            let num = match v { Int(_) | Num(_) => true, _ => false };
+            let num = v is Int | Num;
             if !any and !num { return None; }
             k
         }

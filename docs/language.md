@@ -277,6 +277,46 @@ E expansion>`). Scheme's 149 primitives (`examples/scheme/builtins.lm`,
 #### Patterns, literals and `match`
 
 - `match` is exhaustive. `if let`, `let ... else`, and `while let` are supported.
+- **`e is P`** tests a pattern without binding: `t is Ref`, `v is Int |
+  Float`, `x is Pair(0, _)`, `k is 0..=9`. It is a `bool` at the
+  precedence of `==` (so `a is A and b is B` needs no parentheses, and
+  `!(v is Nil)` does). A variant with fields may be named alone, at the
+  top of the pattern or of an alternative: `t is Ref` is `t is
+  Ref(_)`; nested, write the fields (`o is Some(Int(_))`). The pattern
+  may not bind: a name that is not a variant or a constant of the type
+  is an error, so a misspelled variant is not a binding that always
+  matches; so is a pattern that matches every value. `e is A | B` is
+  exactly `match e { A(_) => true, B(_) => true, _ => false }`, one arm
+  per alternative, the code the examples wrote by hand. `is` is not a
+  reserved word: it means this only after an operand.
+- **`e as! V`** unwraps variant `V` of `e`, or traps: `let s = name as!
+  Str;`. It yields the field (several fields: a tuple, `let (a, b) = p
+  as! Pair;`), and `V` is named as in a pattern (`Str`, `Value.Str`,
+  `.Str`; `Some` and `Ok` work on options and results). It binds like
+  `as`, so `x.f as! Str` needs no parentheses. A failed `as!` is
+  `trap()` in a `--release` build, the same code as `let Str(s) = name
+  else { trap() };`, which is what `let p = e as! V;` is checked as; in
+  a debug build it is a panic naming the variant and the place
+  (`main.lm:12:13: as! Str of another variant`), so the failure says
+  where. Use it where the variant is an invariant (a verifier, the
+  compiler or a type check before it guarantees it); a guest-language
+  type error wants `let .. else { raise .. }`. A variant without fields
+  is an error (test it with `is`).
+
+  <!-- snippet: run "true 12" -->
+  ```loimi
+  import std.io;
+  enum Term { Ref(i64), Atom(u32), Pair(i64, i64), Nil }
+  fn is_var(t: Term) -> bool { t is Ref }
+  fn main() {
+      let p = Term.Pair(5, 4);
+      let (a, b) = p as! Pair;
+      let r = Term.Ref(3) as! Ref;
+      io.print(if is_var(Term.Ref(1)) and !(p is Atom | Nil) { "true " } else { "false " });
+      io.print_int(a + b + r);
+      io.println("");
+  }
+  ```
 - **Integer patterns** are literals (`0x45`, `-1`, `'a'`) and inclusive
   ranges (`0x28..=0x3E`, `'a'..='z'`); a pattern outside the
   scrutinee's type is an error. Integers count as covered only by `_`
@@ -1371,8 +1411,8 @@ The compiler chooses tag assignments. You can pin a variant's block
 width (`Int(i32) block 48`, below; **Not built:** pinning the tag
 itself, `Int(i32) = tag 0b001`). In return you get:
 
-- **Constructors and patterns.** `Int(3)`, `match v { Int(x) => ... }`, and
-  `if v is Nil` (**Not built:** `is`; write `if let Nil = v`). No macros.
+- **Constructors and patterns.** `Int(3)`, `match v { Int(x) => ... }`,
+  `if v is Nil` and `v as! Int` (section 1.2). No macros.
 - **Optimal match compilation**, including over tuples of values, which is the
   case interpreters care most about (binary operators). The compiler knows the
   bit-level encoding, so it can merge tests. For example, with NaN-boxing and

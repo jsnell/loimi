@@ -119,9 +119,9 @@ pub vm Wam {
             cold { if unify(ctx, x, y) { next } backtrack() }
         }
     }
-    fn is_var(t: Term) -> bool { match t { Ref(_) => true, _ => false } }
+    fn is_var(t: Term) -> bool { t is Ref }
     /// An atom or a small integer: equal only to the same word.
-    fn is_small_atomic(t: Term) -> bool { match t { Atom(_) => true, Int(_) => true, _ => false } }
+    fn is_small_atomic(t: Term) -> bool { t is Atom | Int }
     /// Dereferenced `x` and `y` (not the same word) cannot unify: neither
     /// is a variable and one is an atom or small integer.
     fn clash(x: Term, y: Term) -> bool {
@@ -639,10 +639,10 @@ pub vm Wam {
             backtrack()
         }
     }
-    fn is_atom(t: Term) -> bool { match t { Atom(_) => true, _ => false } }
-    fn is_int(t: Term) -> bool { match t { Int(_) => true, Big(_) => true, _ => false } }
-    fn is_num(t: Term) -> bool { match t { Int(_) => true, Flt(_) => true, Big(_) => true, _ => false } }
-    fn is_compound(t: Term) -> bool { match t { Str(_) => true, Lst(_) => true, _ => false } }
+    fn is_atom(t: Term) -> bool { t is Atom }
+    fn is_int(t: Term) -> bool { t is Int | Big }
+    fn is_num(t: Term) -> bool { t is Int | Flt | Big }
+    fn is_compound(t: Term) -> bool { t is Str | Lst }
 
     /// arg(N, T, A) with its arguments in registers.
     op ARG(n: xr, t: xr, a: xr) : R3 {

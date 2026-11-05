@@ -140,6 +140,9 @@ pub enum Intr {
     Unlikely,
     Assume,
     Trap,
+    /// The failure of `e as! V`: `trap()` in a release build, a panic
+    /// naming `V` (the `Str` argument, never evaluated) in a debug build.
+    TrapAs,
     AddChecked,
     SubChecked,
     MulChecked,

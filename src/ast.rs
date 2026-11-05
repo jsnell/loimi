@@ -106,6 +106,13 @@ pub enum ExprKind {
     Unary(UnOp, P<Expr>),
     Binary(BinOp, P<Expr>, P<Expr>),
     Cast(P<Expr>, TypeExpr),
+    /// `e is P`: whether `e` matches `P`, a pattern that binds nothing;
+    /// a variant with fields may be named alone (`t is Ref`).
+    Is(P<Expr>, Pat),
+    /// `e as! V`: the fields of variant `V` of `e` (one field: its value;
+    /// several: a tuple), or a trap. The path is a pattern's (`V`,
+    /// `E.V`, `.V`).
+    AsVariant(P<Expr>, Vec<Ident>),
     /// `Type { f: e, .. }`; the span of a trailing `..zero`, if any.
     StructLit(Vec<Ident>, Vec<(Ident, Expr)>, Option<Span>),
     Tuple(Vec<Expr>),

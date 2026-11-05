@@ -41,7 +41,7 @@ fn barg(t: Term) -> Arg {
     match t { Int(i) => Arg.Small(i as i64), Big(b) => Arg.Ref(b), _ => Arg.Small(0) }
 }
 
-fn is_big(t: Term) -> bool { match t { Big(_) => true, _ => false } }
+fn is_big(t: Term) -> bool { t is Big }
 
 /// Binary integer arithmetic where an operand is big (or a small result
 /// overflowed).
@@ -354,7 +354,7 @@ pub fn cmp(x: Term, y: Term) -> i32 {
 }
 
 fn fcmp(a: f64, b: f64) -> i32 { if a < b { -1 } else if a > b { 1 } else { 0 } }
-fn is_flt(t: Term) -> bool { match t { Flt(_) => true, _ => false } }
+fn is_flt(t: Term) -> bool { t is Flt }
 
 const OPNAMES: [str; 15] = ["+", "-", "*", "//", "mod", ">>", "<<", "/\\", "\\/", "div", "rem", "xor", "min", "max", "/"];
 

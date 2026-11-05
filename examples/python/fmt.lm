@@ -230,7 +230,7 @@ fn write_repr_(c: *Ctx, b: *text.StrBuf, v: Value) -> Result<(), Value> uses ree
                 }
                 K_DICTVIEW => {
                     b.push_str(if o.m == 0 { "dict_keys([" } else if o.m == 1 { "dict_values([" } else { "dict_items([" });
-                    let Dict(d) = o.a else { trap() };
+                    let d = o.a as! Dict;
                     var it: u64 = 0;
                     var first = true;
                     while let Some(e) = value.dict_next(d, &it) {
@@ -572,7 +572,7 @@ pub fn format(c: *Ctx, v: Value, spec: str) -> Result<Value, Value> uses reenter
         if sp.sign != 0 { out.free(); return Err(ops.exc(c, Exc.ValueError, "Sign not allowed in string format specifier")); }
         if sp.alt { out.free(); return Err(ops.exc(c, Exc.ValueError, "Alternate form (#) not allowed in string format specifier")); }
         if sp.align == '=' { out.free(); return Err(ops.exc(c, Exc.ValueError, "'=' alignment not allowed in string format specifier")); }
-        let Str(ss) = v else { trap() };
+        let ss = v as! Str;
         let d = ss.data;
         let n = if sp.prec >= 0 and (sp.prec as u64) < d.len { sp.prec as u64 } else { d.len };
         pad(&out, d[0..n], &sp, 0, '<');
@@ -616,7 +616,7 @@ pub fn format(c: *Ctx, v: Value, spec: str) -> Result<Value, Value> uses reenter
         out.free();
         return Err(verr_ch(c, "Unknown format code '", ty, "' for object of type 'float'"));
     }
-    let Some(x0) = num_f64(c, v)? else { trap() };
+    let x0 = num_f64(c, v)? as! Some;
     var x = x0;
     let neg = x < 0.0 or (x == 0.0 and (1.0 / x) < 0.0);
     if neg { x = 0.0 - x; }
@@ -673,7 +673,7 @@ fn percent_(c: *Ctx, fs: Gc<Str>, args: Value, b: *text.StrBuf) -> Result<(), Va
     let nargs = if let Some(t) = tup { t.items.len } else { 1 };
     // Like CPython: a non-tuple, non-str argument with __getitem__ is a mapping
     // (no "not all arguments converted" check).
-    let mapping = match args { Dict(_) => true, List(_) => true, _ => false };
+    let mapping = args is Dict | List;
     var i: u64 = 0;
     while i < f.len {
         let ch = f[i];
@@ -740,7 +740,7 @@ fn percent_(c: *Ctx, fs: Gc<Str>, args: Value, b: *text.StrBuf) -> Result<(), Va
         if !keyed { arg = pct_next(c, &pa)?; }
         if conv == 's' or conv == 'r' or conv == 'a' {
             let svv = if conv == 's' { to_str(c, arg)? } else { repr(c, arg)? };
-            let Str(ss) = svv else { trap() };
+            let ss = svv as! Str;
             let d = ss.data;
             let n = if prec >= 0 and (prec as u64) < d.len { prec as u64 } else { d.len };
             pct_pad(b, d[0..n], width, ljust, false, 0);

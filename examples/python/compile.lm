@@ -1591,7 +1591,7 @@ fn C.inline_genexp(c: *C, f: *Expr, arg: *Expr, dst: u32) -> bool {
 }
 
 fn C.is_global(c: *C, n: str) -> bool {
-    match c.kind(n) { Global => true, _ => false }
+    c.kind(n) is Global
 }
 
 fn C.first_param_name(c: *C) -> str {

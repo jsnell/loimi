@@ -1426,6 +1426,7 @@ impl AstAny<'_> {
             | ExprKind::SizeOf(_) => false,
             ExprKind::Assign(l, r) | ExprKind::CompoundAssign(_, l, r) => go(l) || go(r),
             ExprKind::Field(a, _) | ExprKind::Unary(_, a) | ExprKind::Cast(a, _) | ExprKind::Try(a) | ExprKind::TypeArgs(a, _) => go(a),
+            ExprKind::Is(a, _) | ExprKind::AsVariant(a, _) => go(a),
             ExprKind::Call(f, args) => go(f) || args.iter().any(go),
             ExprKind::Index(a, b) | ExprKind::Binary(_, a, b) | ExprKind::Coalesce(a, b) | ExprKind::ArrayRepeat(a, b) => go(a) || go(b),
             ExprKind::SliceRange(a, lo, hi) => go(a) || lo.as_ref().is_some_and(|e| go(e)) || hi.as_ref().is_some_and(|e| go(e)),

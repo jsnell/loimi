@@ -1635,6 +1635,34 @@ impl<'a> Checker<'a> {
                     let e = self.expr(cx, e, None)?;
                     stmts.push(TStmt::Defer(e));
                 }
+                // `let p = e as! V;` is `let V(p) = e else { trap() };`,
+                // so the two compile to the same code; `let (a, b) = e
+                // as! V;` is `let V(a, b) = ..` for two fields.
+                Stmt::Let { pat, mutable, ty: None, init: Some(Expr { kind: ExprKind::AsVariant(inner, path), span: aspan }), els: None, .. } => {
+                    let init = self.expr(cx, inner, None)?;
+                    if init.ty == Ty::Never {
+                        *diverges = true;
+                    }
+                    let n = self.variant_index(&init.ty, &path.last().unwrap().name).map_or(0, |i| self.variant_fields(&init.ty, i).len());
+                    let subs = match &pat.kind {
+                        _ if n <= 1 => Some(vec![pat.clone()]),
+                        PatKind::Tuple(ps) if ps.len() == n => Some(ps.clone()),
+                        PatKind::Wild => Some(vec![pat.clone(); n]),
+                        _ => None,
+                    };
+                    match subs {
+                        Some(subs) => {
+                            let (vpat, els) = self.as_variant_pat(path, &init.ty, Some(subs), *aspan)?;
+                            let p = self.pat(cx, &vpat, &init.ty, *mutable)?;
+                            stmts.push(TStmt::LetPat(p, init, Some(els)));
+                        }
+                        None => {
+                            let v = self.as_variant_of(cx, init, path, *aspan)?;
+                            let p = self.pat(cx, pat, &v.ty, *mutable)?;
+                            stmts.push(TStmt::LetPat(p, v, None));
+                        }
+                    }
+                }
                 Stmt::Let { pat, mutable, ty, init, els, span } => {
                     let decl_ty = match (ty, init) {
                         // `let a: [T; _] = [x, y, z];`: the length from the literal.
@@ -2194,6 +2222,8 @@ impl<'a> Checker<'a> {
                 };
                 Ok(mk(Ty::Slice(Box::new(elem)), TK::SliceRange(Box::new(b), lo, hi), span))
             }
+            ExprKind::Is(inner, pat) => self.is_expr(cx, inner, pat, span),
+            ExprKind::AsVariant(inner, path) => self.as_variant(cx, inner, path, span),
             ExprKind::Unary(op, inner) => self.unary(cx, *op, inner, exp, span),
             ExprKind::Binary(op, l, r) => self.binary(cx, *op, l, r, exp, span),
             ExprKind::Cast(inner, t) => {
@@ -3043,6 +3073,119 @@ impl<'a> Checker<'a> {
             a.body = self.coerce(body, &ty)?;
         }
         Ok(mk(ty, TK::Match(Box::new(s), tarms), span))
+    }
+
+    /// `e is P`: `match e { P => true, _ => false }`, where `P` binds
+    /// nothing, and a variant with fields may be named alone.
+    fn is_expr(&mut self, cx: &mut FnCx, scrut: &Expr, pat: &Pat, span: Span) -> Res<TExpr> {
+        let s = self.expr(cx, scrut, None)?;
+        let pat = self.fill_variant_fields(pat, &s.ty);
+        cx.scopes.push(vec![]);
+        let before = cx.locals.len();
+        let p = self.pat(cx, &pat, &s.ty, false);
+        cx.scopes.pop();
+        let p = p?;
+        if let Some(l) = cx.locals.get(before) {
+            return Err(Diag::new(
+                pat.span,
+                format!(
+                    "`is` patterns cannot bind names, and `{}` is not a variant or constant of `{}` (use `if let` to bind it)",
+                    l.name,
+                    self.ty_name(&s.ty)
+                ),
+            ));
+        }
+        if irrefutable(&p) {
+            return Err(Diag::new(pat.span, "this pattern matches every value, so the `is` test is always true"));
+        }
+        let t = |b| mk(Ty::Bool, TK::Bool(b), span);
+        // `e is A | B` is `match e { A => true, B => true, _ => false }`,
+        // one arm per alternative.
+        let alts = match p.kind {
+            TPK::Or(alts) => alts,
+            _ => vec![p],
+        };
+        let mut arms: Vec<TArm> = alts.into_iter().map(|p| TArm { pat: p, guard: None, body: t(true) }).collect();
+        arms.push(TArm { pat: TPat { ty: s.ty.clone(), kind: TPK::Wild }, guard: None, body: t(false) });
+        Ok(mk(Ty::Bool, TK::Match(Box::new(s), arms), span))
+    }
+
+    /// `V` alone, for a variant with fields, as `V(_, ..)` (`e is V`),
+    /// also among the alternatives of `|`.
+    fn fill_variant_fields(&self, p: &Pat, ty: &Ty) -> Pat {
+        let (path, name) = match &p.kind {
+            PatKind::Ident(n, false) => (vec![Ident { name: n.clone(), span: p.span }], n),
+            PatKind::Variant(path, None) => (path.clone(), &path.last().unwrap().name),
+            PatKind::Or(ps) => {
+                let ps = ps.iter().map(|q| self.fill_variant_fields(q, ty)).collect();
+                return Pat { kind: PatKind::Or(ps), span: p.span };
+            }
+            _ => return p.clone(),
+        };
+        match self.variant_index(ty, name).map(|i| self.variant_fields(ty, i).len()) {
+            Some(n) if n > 0 => {
+                let wild = Pat { kind: PatKind::Wild, span: p.span };
+                Pat { kind: PatKind::Variant(path, Some(vec![wild; n])), span: p.span }
+            }
+            _ => p.clone(),
+        }
+    }
+
+    /// The pattern `V(a, b, ..)` of `e as! V` with the fields' patterns
+    /// given (`subs`), or fresh bindings; and the else block, the trap.
+    /// Errors if `V` is not a variant with fields of `ty`.
+    fn as_variant_pat(&self, path: &[Ident], ty: &Ty, subs: Option<Vec<Pat>>, span: Span) -> Res<(Pat, TExpr)> {
+        let name = &path.last().unwrap().name;
+        let Some(i) = self.variant_index(ty, name) else {
+            return Err(Diag::new(span, format!("`as! {}`: `{}` has no variant `{}`", name, self.ty_name(ty), name)));
+        };
+        let n = self.variant_fields(ty, i).len();
+        if n == 0 {
+            return Err(Diag::new(span, format!("`as! {}`: the variant has no fields to unwrap; test it with `is {}`", name, name)));
+        }
+        let subs = subs.unwrap_or_else(|| {
+            (0..n).map(|k| Pat { kind: PatKind::Ident(format!("as!{}", k), false), span }).collect()
+        });
+        let pat = Pat { kind: PatKind::Variant(path.to_vec(), Some(subs)), span };
+        let msg = format!("as! {} of another variant", name);
+        let trap = mk(Ty::Never, TK::Intrinsic(Intr::TrapAs, vec![mk(Ty::str(), TK::Str(msg.into_bytes()), span)]), span);
+        let els = mk(Ty::Never, TK::Block(vec![], Some(Box::new(trap))), span);
+        Ok((pat, els))
+    }
+
+    /// `e as! V` as an expression: `match e { V(x) => x, _ => trap() }`
+    /// (a tuple for several fields). `let p = e as! V;` is checked as
+    /// `let V(p) = e else { trap() };` instead (`Checker::block`).
+    fn as_variant(&mut self, cx: &mut FnCx, scrut: &Expr, path: &[Ident], span: Span) -> Res<TExpr> {
+        let s = self.expr(cx, scrut, None)?;
+        self.as_variant_of(cx, s, path, span)
+    }
+
+    fn as_variant_of(&mut self, cx: &mut FnCx, s: TExpr, path: &[Ident], span: Span) -> Res<TExpr> {
+        let (pat, els) = self.as_variant_pat(path, &s.ty, None, span)?;
+        cx.scopes.push(vec![]);
+        let p = self.pat(cx, &pat, &s.ty, false);
+        cx.scopes.pop();
+        let p = p?;
+        let TPK::Variant(_, fs) = &p.kind else { unreachable!() };
+        let mut vals: Vec<TExpr> = fs
+            .iter()
+            .map(|f| {
+                let TPK::Bind(id) = f.kind else { unreachable!() };
+                mk(f.ty.clone(), TK::Local(id), span)
+            })
+            .collect();
+        let body = if vals.len() == 1 {
+            vals.pop().unwrap()
+        } else {
+            mk(Ty::Tuple(vals.iter().map(|v| v.ty.clone()).collect()), TK::Tuple(vals), span)
+        };
+        let ty = body.ty.clone();
+        let arms = vec![
+            TArm { pat: p, guard: None, body },
+            TArm { pat: TPat { ty: s.ty.clone(), kind: TPK::Wild }, guard: None, body: els },
+        ];
+        Ok(mk(ty, TK::Match(Box::new(s), arms), span))
     }
 
     /// Warn about a `match` arm in vm code whose body is a lone `if` (no

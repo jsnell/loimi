@@ -378,8 +378,8 @@ pub fn Ctx.to_str(c: *Ctx, v: V) -> Gc<Str> {
 pub fn Ctx.concat(c: *Ctx, a0: V, b0: V) -> V {
     var a = a0;
     var b = b0;
-    let sa = match a { S(_) | R(_) => true, _ => false };
-    let sb = match b { S(_) | R(_) => true, _ => false };
+    let sa = a is S | R;
+    let sb = b is S | R;
     if !sa { a = V.S(c.to_str(a)); }
     if !sb { b = V.S(c.to_str(b)); }
     let la = value.str_len(a);

@@ -579,18 +579,18 @@ pub fn call(m: *Machine, id: u64) -> Result<bool, Term> {
             if let Atom(a) = o {
                 let s = m.db.name(a);
                 if !(s.eq("<") or s.eq(">") or s.eq("=")) { return Err(domain_error(m, "order", o)); }
-            } else if let Ref(_) = o {} else { return Err(type_error(m, "atom", o)); }
+            } else if !(o is Ref) { return Err(type_error(m, "atom", o)); }
             let c = compare(m, m.x[1], m.x[2]);
             Ok(unify(m, m.x[0], Term.Atom(m.order[(c + 1) as u64])))
         }
-        IsVar => Ok(match x(m, 0) { Ref(_) => true, _ => false }),
+        IsVar => Ok(x(m, 0) is Ref),
         NonVar => Ok(match x(m, 0) { Ref(_) => false, _ => true }),
-        IsAtom => Ok(match x(m, 0) { Atom(_) => true, _ => false }),
-        IsNumber => Ok(match x(m, 0) { Int(_) => true, Flt(_) => true, Big(_) => true, _ => false }),
-        IsInteger => Ok(match x(m, 0) { Int(_) => true, Big(_) => true, _ => false }),
-        IsFloat => Ok(match x(m, 0) { Flt(_) => true, _ => false }),
+        IsAtom => Ok(x(m, 0) is Atom),
+        IsNumber => Ok(x(m, 0) is Int | Flt | Big),
+        IsInteger => Ok(x(m, 0) is Int | Big),
+        IsFloat => Ok(x(m, 0) is Flt),
         IsAtomic => Ok(term.is_atomic(x(m, 0))),
-        IsCompound => Ok(match x(m, 0) { Str(_) => true, Lst(_) => true, _ => false }),
+        IsCompound => Ok(x(m, 0) is Str | Lst),
         IsCallable => Ok(term.is_callable(x(m, 0))),
         IsList => {
             var t = x(m, 0);

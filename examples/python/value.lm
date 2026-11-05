@@ -457,7 +457,7 @@ pub fn inst_dictmode(o: Gc<Inst>) -> ?Gc<Dict> {
 pub fn inst_at(o: Gc<Inst>, i: u64) -> Value {
     let cap = o.slots.len;
     if i + 1 < cap or o.keys.extra.len <= cap { return o.slots[i]; }
-    let Tuple(t) = o.slots[cap - 1] else { trap() };
+    let t = o.slots[cap - 1] as! Tuple;
     t.items[i - (cap - 1)]
 }
 
@@ -466,7 +466,7 @@ pub fn inst_at(o: Gc<Inst>, i: u64) -> Value {
 pub fn inst_set_at(o: Gc<Inst>, i: u64, v: Value) {
     let cap = o.slots.len;
     if i + 1 < cap or o.keys.extra.len <= cap { o.slots[i] = v; return; }
-    let Tuple(t) = o.slots[cap - 1] else { trap() };
+    let t = o.slots[cap - 1] as! Tuple;
     t.items[i - (cap - 1)] = v;
 }
 
@@ -481,7 +481,7 @@ pub fn inst_attrs_dict(h: *gc.Heap, o: Gc<Inst>) -> Gc<Dict> {
     let n = o.keys.extra.len;
     let r: Gc<Dict> = Dict.new(h, n);
     for i in 0..n {
-        let Str(k) = o.keys.extra[i] else { trap() };
+        let k = o.keys.extra[i] as! Str;
         r.insert_new(h, str_hash(k), Value.Str(k), inst_at(o, i));
     }
     r

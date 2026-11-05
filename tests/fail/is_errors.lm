@@ -1,0 +1,13 @@
+// errors: 5
+enum T { Ref(i64), Atom(u32), Nil }
+fn f(t: T) -> bool { t is _ }
+fn g(t: T) -> i64 { t as! Nil }
+fn h(n: i64) -> i64 { n as! Some }
+fn k(t: T) -> bool { t is Some(x) }
+fn l(t: T) -> i64 { let (a, b) = t as! Ref; a }
+fn main() {}
+// error: this pattern matches every value, so the `is` test is always true
+// error: `as! Nil`: the variant has no fields to unwrap; test it with `is Nil`
+// error: `as! Some`: `i64` has no variant `Some`
+// error: no variant `Some` in type `T`
+// error: tuple pattern for a value of type `i64`
