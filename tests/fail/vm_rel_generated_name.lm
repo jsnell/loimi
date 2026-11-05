@@ -1,0 +1,15 @@
+// error: a `rel` or `data` cannot be named like a generated vm item
+vm V {
+    state { pc: *u32, regs: *i64 }
+    operand reg = regs[it];
+    operand imm = it;
+    accumulator acc: i64 for reg;
+    encoding fixed(u32) { format ABC { op: 8, a: 8, b: 8, c: 8 } }
+    #[accumulate] op ADD(d: reg, a: reg, b: reg) : ABC { d = a + b; next }
+    op SUB(d: reg, a: reg, b: reg) : ABC { d = a - b; next }
+    op ADDK(d: reg, a: reg, k: imm) : ABC { d = a + (k as i64); next }
+    op RET(a: reg) : ABC { exit a }
+    rel op_name(ADD) = SUB;
+    entry run(code: *u32, r: *i64) -> i64 { regs = r; jump code }
+}
+fn main() { V.op_name(0); }

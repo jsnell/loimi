@@ -1,0 +1,184 @@
+// matrix: dispatch
+// `rel NAME(A) = B;` and `data NAME: T = D;` / `data NAME(A) = V;` in a vm
+// (also in `inline for` rows): host lookups by opcode, `V.NAME(op)`.
+// `_` for an op declares nothing. Op selectors in `accumulate` and
+// `wraps` (`A..B`, globs, `with KIND`), a wrapped op wrapping the supers
+// that contain it, and `supers { .. }` groups with derived names: the
+// same ops, in the same order, as vm W, which lists them by hand.
+import std.io;
+import std.hash;
+
+struct Ctx { steps: i64 }
+
+vm V {
+    context ctx: *Ctx;
+    state { pc: *u64, regs: *u64 }
+    operand ri = *((regs + it) as *i32);
+    operand imm = it;
+    operand label = pc + it verify is_insn_boundary(pc + it);
+    accumulator iacc: u64 for ri;
+    encoding fixed(u64) {
+        format RRR { op: 16, a: 16, b: 16, c: 16 }
+        format RRK { op: 16, a: 16, b: 16, k: s16 }
+        format RI { op: 16, a: 16, imm: s32 }
+    }
+
+    data commutative: bool = false;
+    data cost: u32 = 1;
+    inline for (name, cm, expr, kexpr, neg) in [
+        ("ADD", true, a +% b, a +% (k as i32), _), ("SUB", false, a -% b, a -% (k as i32), _),
+        ("MUL", true, a *% b, a *% (k as i32), _),
+        ("EQ", true, (if a == b { 1 } else { 0 }), (if a == (k as i32) { 1 } else { 0 }), NE),
+        ("NE", true, (if a != b { 1 } else { 0 }), (if a != (k as i32) { 1 } else { 0 }), EQ),
+    ] {
+        op #name(d: ri, a: ri, b: ri) : RRR { d = expr; next }
+        op #(name ++ "K")(d: ri, a: ri, k: imm) : RRK { d = kexpr; next }
+        rel kform(#name) = #(name ++ "K");
+        rel negate(#name) = #neg;
+        data commutative(#name) = cm;
+    }
+    data cost(MUL) = 3;
+    data cost(MULK) = 1 + 2;
+    op LOADI(d: ri, v: imm) : RI { d = v as i32; next }
+    op JNZ(a: ri, t: label) : RI { if a != 0 { jump t } next }
+    op JMP(t: label) : RI { jump t }
+    op RET(a: ri) : RRR { exit a as i64 }
+
+    accumulate ADD..MULK, *K, with label;
+
+    #[forward] supers {
+        LOADI, ADD;
+        SUBK, JNZ;
+        LM = LOADI, MUL;
+    }
+
+    variant budget wraps [JNZ, JMP] {
+        before { ctx.steps += 1; }
+    }
+
+    entry run_budget(c: *Ctx, code: Verified<V>, r: *u64) -> i64 {
+        ctx = c;
+        use_variant budget;
+        regs = r;
+        jump code
+    }
+}
+
+vm W {
+    context ctx: *Ctx;
+    state { pc: *u64, regs: *u64 }
+    operand ri = *((regs + it) as *i32);
+    operand imm = it;
+    operand label = pc + it verify is_insn_boundary(pc + it);
+    accumulator iacc: u64 for ri;
+    encoding fixed(u64) {
+        format RRR { op: 16, a: 16, b: 16, c: 16 }
+        format RRK { op: 16, a: 16, b: 16, k: s16 }
+        format RI { op: 16, a: 16, imm: s32 }
+    }
+    inline for (name, expr, kexpr) in [
+        ("ADD", a +% b, a +% (k as i32)), ("SUB", a -% b, a -% (k as i32)), ("MUL", a *% b, a *% (k as i32)),
+        ("EQ", (if a == b { 1 } else { 0 }), (if a == (k as i32) { 1 } else { 0 })),
+        ("NE", (if a != b { 1 } else { 0 }), (if a != (k as i32) { 1 } else { 0 })),
+    ] {
+        op #name(d: ri, a: ri, b: ri) : RRR { d = expr; next }
+        op #(name ++ "K")(d: ri, a: ri, k: imm) : RRK { d = kexpr; next }
+    }
+    op LOADI(d: ri, v: imm) : RI { d = v as i32; next }
+    op JNZ(a: ri, t: label) : RI { if a != 0 { jump t } next }
+    op JMP(t: label) : RI { jump t }
+    op RET(a: ri) : RRR { exit a as i64 }
+    accumulate ADD, ADDK, SUB, SUBK, MUL, MULK, EQK, NEK, JNZ, JMP;
+    #[forward] super LOADI_ADD = LOADI; ADD;
+    #[forward] super SUBK_JNZ = SUBK; JNZ;
+    #[forward] super LM = LOADI; MUL;
+    variant budget wraps [JNZ, JMP, SUBK_JNZ] {
+        before { ctx.steps += 1; }
+    }
+    entry run_budget(c: *Ctx, code: Verified<W>, r: *u64) -> i64 {
+        ctx = c;
+        use_variant budget;
+        regs = r;
+        jump code
+    }
+}
+
+fn show(op: ?u64) {
+    match op { Some(o) => io.print(V.op_name(o)), None => io.print("-") }
+}
+
+fn main() {
+    // expect: ADD ADDK true 1
+    // expect: SUB SUBK false 1
+    // expect: MUL MULK true 3
+    // expect: EQ EQK true 1
+    // expect: NE NEK true 1
+    // expect: MULK - false 3
+    for op in [V.OP_ADD, V.OP_SUB, V.OP_MUL, V.OP_EQ, V.OP_NE, V.OP_MULK] {
+        io.print(V.op_name(op));
+        io.print(" ");
+        show(V.kform(op));
+        io.print(" ");
+        io.print_bool(V.commutative(op));
+        io.print(" ");
+        io.print_int(V.cost(op) as i64);
+        io.println("");
+    }
+    // expect: - - NE EQ
+    show(V.negate(V.OP_ADD));
+    io.print(" ");
+    show(V.negate(V.OP_SUB));
+    io.print(" ");
+    show(V.negate(V.OP_EQ));
+    io.print(" ");
+    show(V.negate(V.OP_NE));
+    io.println("");
+    // expect: LOADI_ADD SUBK_JNZ LM
+    io.print(V.op_name(V.OP_LOADI_ADD));
+    io.print(" ");
+    io.print(V.op_name(V.OP_SUBK_JNZ));
+    io.print(" ");
+    io.println(V.op_name(V.OP_LM));
+    // The selectors give W's ops, accumulator variants and supers.
+    var same = V.NUM_OPS == W.NUM_OPS;
+    for i in 0..V.NUM_OPS {
+        if !V.op_name(i).eq(W.op_name(i)) { same = false; }
+    }
+    // expect: true 55
+    io.print_bool(same);
+    io.print(" ");
+    io.print_int(V.NUM_OPS as i64);
+    io.println("");
+
+    // r1 = 3; loop: r1 = r1 - 1; jnz r1 loop; ret r1. The super SUBK_JNZ
+    // has a wrapped part (JNZ), so the budget variant counts it (and the
+    // forwarding variant of SUBK_JNZ, which is what runs here). W names
+    // the super, which wraps its forwarding variant too.
+    // expect: 0 3
+    // expect: 0 3
+    var regs: [u64; 4] = [0, 0, 0, 0];
+    var words: [u64; 4] = [V.LOADI(1, 3), V.SUBK(1, 1, 1), V.JNZ(1, -1), V.RET(1)];
+    match V.verify(words[0..4]) {
+        Ok(v) => {
+            var c = Ctx { steps: 0 };
+            let r = V.run_budget(&c, V.optimize(v), &regs[0] as *u64);
+            io.print_int(r);
+            io.print(" ");
+            io.print_int(c.steps);
+            io.println("");
+        }
+        Err(_) => io.println("verify failed"),
+    }
+    var wwords: [u64; 4] = [W.LOADI(1, 3), W.SUBK(1, 1, 1), W.JNZ(1, -1), W.RET(1)];
+    match W.verify(wwords[0..4]) {
+        Ok(v) => {
+            var c = Ctx { steps: 0 };
+            let r = W.run_budget(&c, W.optimize(v), &regs[0] as *u64);
+            io.print_int(r);
+            io.print(" ");
+            io.print_int(c.steps);
+            io.println("");
+        }
+        Err(_) => io.println("verify failed"),
+    }
+}

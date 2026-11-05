@@ -933,6 +933,13 @@ fn check_variants(c: &mut Checker, d: &VmDecl, i: usize, prefix: &str, cc: CallC
                         .ok_or_else(|| Diag::new(o.span, format!("unknown op `{}`", o.name)))?;
                     v.push(k);
                 }
+                // A `#[forward]` super's forwarding variants run in its
+                // place: wrapped with it.
+                let ops = &c.vms[i].ops;
+                let fwd: Vec<usize> = (0..ops.len())
+                    .filter(|&j| !ops[j].fwd.is_empty() && v.iter().any(|&k| ops[k].fwd.is_empty() && !ops[k].parts.is_empty() && ops[k].parts == ops[j].parts))
+                    .collect();
+                v.extend(fwd);
                 v
             }
         };
