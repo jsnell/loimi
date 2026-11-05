@@ -231,6 +231,7 @@ pub fn clock_native(args: *Value) -> Value {
 }
 
 #[require_verified]
+#[profile("lox.vmprofile")]
 pub vm Lox {
     context ctx: *Machine;
     state { pc: *u32, regs: *Value, k: *Value, fp: *Frame }

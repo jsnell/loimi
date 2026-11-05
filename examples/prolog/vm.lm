@@ -25,6 +25,7 @@ pub const EXIT_THROW: i32 = 2;
 pub const EXIT_HALT: i32 = 3;
 
 #[require_verified]
+#[profile("prolog.vmprofile")]
 pub vm Wam {
     context ctx: *Machine;
     state { pc: *u32, e: *Frame, s: *Term, wm: bool }

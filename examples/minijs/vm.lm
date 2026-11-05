@@ -372,6 +372,7 @@ fn find_handler(p: Gc<Proto>, at: *u32) -> ?(u64, u64) {
 }
 
 #[require_verified]
+#[profile("minijs.vmprofile")]
 pub vm JS {
     context ctx: *Ctx;
     state { pc: *u32, regs: *V, k: *V, fp: *Frame }

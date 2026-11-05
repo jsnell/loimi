@@ -485,6 +485,7 @@ pub fn grow(c: *Ctx, fp: *Frame, need: *V) -> Result<*Frame, V> {
 }
 
 #[require_verified]
+#[profile("mini.vmprofile")]
 pub vm Mini {
     context ctx: *Ctx;
     state { pc: *u32, regs: *V, k: *V, fp: *Frame }

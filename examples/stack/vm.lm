@@ -141,6 +141,7 @@ fn stringify(m: *Machine, a: Value, b: Value, two: bool) -> Result<Value, str> u
 }
 
 #[require_verified]
+#[profile("stack.vmprofile")]
 pub vm Stak {
     context ctx: *Machine;
     // The top of the stack lives in `tos`; `sp` points at the value below

@@ -1,0 +1,41 @@
+// --vm-stats over bench/lox's 10 benchmarks (as bench/run_all.py runs them), 2026-11-05
+// Each op: its share of a run's dispatches, summed over the runs, in millionths
+// of one run (docs/lowering.md section 12, "Handler order").
+
+== vm stats: Lox ==
+        167573   16.8%  GETGLOBAL_C
+        124786   12.5%  INVOKE_P
+         79225    7.9%  GETPROP_IN_RET
+         76565    7.7%  RET
+         61801    6.2%  CALL
+         58445    5.8%  ADD
+         47045    4.7%  LOADK
+         43868    4.4%  GETPROP_IN
+         37295    3.7%  JNLTK
+         31250    3.1%  RETNIL
+         27829    2.8%  GETGLOBAL_C_SUBK
+         21909    2.2%  SETPROP_ADD
+         21591    2.2%  EQK
+         20046    2.0%  SETGLOBAL_C
+         19982    2.0%  JNEQK
+         19078    1.9%  LOADNIL
+         17045    1.7%  LOADBOOL
+         15772    1.6%  JMP
+         15415    1.5%  ADD_RET
+         14577    1.5%  GETPROP_POLY
+         14577    1.5%  INVOKE_POLY
+         13516    1.4%  ADDK
+          9361    0.9%  MOVE
+          7752    0.8%  GETPROP_OUT
+          5550    0.6%  JNGTK
+          5168    0.5%  NOT
+          5168    0.5%  SETPROP_IN
+          5168    0.5%  SETPROP_OUT
+          3876    0.4%  JNGE
+          2684    0.3%  SUB
+          2684    0.3%  SUBK
+          1292    0.1%  GETUPV
+          1292    0.1%  SUPERINVOKE
+           775    0.1%  JNLT
+            19    0.0%  JNLE
+            19    0.0%  NEG

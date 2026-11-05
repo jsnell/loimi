@@ -203,6 +203,7 @@ pub fn line_of(p: *Proto, pc: *u32) -> u32 {
     if off < p.lines.len { p.lines[off] } else { 0 }
 }
 
+#[profile("python.vmprofile")]
 pub vm Py {
     context ctx: *Ctx;
     state { pc: *u32, regs: *Value, k: *Value, fp: *Frame }

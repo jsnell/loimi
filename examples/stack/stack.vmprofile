@@ -1,0 +1,40 @@
+// --vm-stats over examples/stack/bench's 5 programs (as bench/run_all.py runs them), 2026-11-05
+// Each op: its share of a run's dispatches, summed over the runs, in millionths
+// of one run (docs/lowering.md section 12, "Handler order").
+
+== vm stats: Stak ==
+         96382    9.6%  LOOP
+         88123    8.8%  ADD
+         80332    8.0%  LGET
+         64153    6.4%  LGET_LGET
+         51854    5.2%  CALL
+         51854    5.2%  RET
+         44444    4.4%  DUP_PUSHI_LT_JZ
+         40899    4.1%  PUSHI_AT
+         39636    4.0%  LGET_PUSHI_ADD
+         39141    3.9%  LSET
+         32107    3.2%  PUSHBOOL
+         32107    3.2%  LGET_LGET_STORE
+         28478    2.8%  PUSHI_MOD
+         27319    2.7%  PUSHI
+         27315    2.7%  PUSHK_MUL
+         26084    2.6%  MKARRAY
+         26084    2.6%  PUSHI_ADD
+         22222    2.2%  DUP_PUSHI_SUB
+         22222    2.2%  SWAP_PUSHI_SUB
+         22203    2.2%  LE_JZ
+         21152    2.1%  JMP
+         21152    2.1%  LGET_LGET_ADD_LSET
+         14815    1.5%  STORE
+         12500    1.2%  DUP
+         12500    1.2%  DROP
+         12500    1.2%  PUSHK_ADD
+         12500    1.2%  GT_JZ
+         10955    1.1%  JZ
+         10955    1.1%  LGET_LGET_AT
+          3478    0.3%  CONCAT
+          3478    0.3%  TOSTR
+          1051    0.1%  MUL
+             2    0.0%  DO
+             2    0.0%  PUSHK
+             2    0.0%  LEN

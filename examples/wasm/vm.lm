@@ -222,6 +222,7 @@ fn q15mulr(a: i16x8, b: i16x8) -> i16x8 {
 }
 
 /// `cache` used as a 64-bit immediate after CONST64.
+#[profile("wasm.vmprofile")]
 pub vm W {
     context ctx: *Machine;
     state { pc: *u64, regs: *u64, fp: *Frame, mem: *u8, msize: u64 }
