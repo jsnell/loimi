@@ -697,8 +697,15 @@ fn sanitize(ir: &str, library: bool, attr: &str) -> String {
     for line in ir.lines() {
         match line.strip_suffix('{') {
             Some(head) if line.starts_with("define ") => {
-                out.push_str(head);
+                // Function attributes go before a `section`/`align` clause
+                // (hot-handler ordering puts handlers in a section).
+                let at = head.find(" section \"").unwrap_or(head.len());
+                out.push_str(&head[..at]);
+                if !out.ends_with(' ') {
+                    out.push(' ');
+                }
                 out.push_str(attr);
+                out.push_str(&head[at..]);
                 out.push_str(" {");
             }
             _ => out.push_str(line),
