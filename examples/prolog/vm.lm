@@ -609,7 +609,10 @@ pub vm Wam {
         match builtins.call(ctx, id) {
             Ok(true) => next,
             Ok(false) => backtrack(),
-            Err(ball) => raise ball,
+            // A guest `throw/1` (and errors of builtins) raise here: control
+            // flow in Prolog, kept inline. (Cold, the switch build measured
+            // 3% slower: the dispatch loop placed otherwise.)
+            Err(ball) => { #[hot] raise ball }
         }
     }
 
@@ -834,7 +837,7 @@ pub vm Wam {
     #[poll(gc)] op METACALL(n: imm) : A {
         match compile.prepare_call(ctx, n) {
             Ok(code) => jump code,
-            Err(ball) => raise ball,
+            Err(ball) => { #[hot] raise ball }   // as in CALLB
         }
     }
 

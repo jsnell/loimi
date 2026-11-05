@@ -395,7 +395,7 @@ Notes:
   the call (a `push`, a `mov`), and one whose cold branch needed nothing
   else went through a `mov %eax, %esi; jmp cold` trampoline instead of
   branching to the cold function directly. Measured on the examples
-  (`docs/design/ergonomics-audit.md`, item 6): only shorter handlers.
+  (`docs/design/ergonomics-audit.md`, item 6): 365 functions shorter in the examples, none longer on a hot path.
 - Each handler is a separate symbol (`Mini.op.ADD`), so `perf` and other
   profilers attribute time per opcode without any extra tooling.
 - **Loops in tail-call vm code** (handlers, cold blocks, vm functions)

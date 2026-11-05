@@ -18,8 +18,8 @@ implementation; `git log` has the details.
   examples lost 138 `cold { }` wrappers with the same code. Raises and
   outlined cold blocks no longer pass the instruction word when nothing
   reads it, so handlers whose cold branch follows a call keep no
-  register for it, and others branch straight to the cold function: 300
-  or so handlers in Lox, Scheme, Python, Wasm, Prolog, Mini and Stack
+  register for it, and others branch straight to the cold function: 365
+  functions (tail-call dispatch) in Lox, Scheme, Python, Wasm, Prolog, Mini and Stack
   are shorter ([lowering.md §3](docs/lowering.md#3-handlers-in-tailcall-mode);
   [design/ergonomics-audit.md](docs/design/ergonomics-audit.md), item 6).
 - **Cache layouts from structs**: `cache PropIC = obj.Site;` takes a

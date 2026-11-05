@@ -24,7 +24,7 @@ against master at 627c1ca.
   ([language.md §4](../language.md#4-slow-paths-cold-blocks)); 138
   wrappers removed in eight interpreters. Raises and outlined cold blocks
   no longer pass the instruction word where nothing reads it, which
-  made 300-odd handlers shorter (see the item).
+  made 365 tail-call functions shorter (see the item).
 - **Item 7** (every error of a build): built; see its row below and section 2.
 - **Item 9** (derived root scanning, typed `add_scanner`): built as
   `#[trace] struct` and `add_scanner<T>`; Python and Prolog are ported
@@ -808,9 +808,14 @@ Refinements of the proposal:
   branch's location) and the debugger see the hand-written form.
   `LOIMI_COLD_AUDIT=1` lists the branches made cold.
 - **`#[hot]` is on the control word** (`Err(ball) => { #[hot] raise ball
-  }`), and an unused one is an error. No example needed it: Prolog's
-  `throw/1` raises through CALLB, where cold costs the throw one more
-  jump and the hot path nothing (below).
+  }`), and an unused one is an error. Prolog uses it on the two arms
+  through which a guest `throw/1` raises (CALLB, METACALL): in tail-call
+  mode cold cost the throw one jump and the hot path nothing, but in
+  switch mode the dispatch loop, one function, came out placed
+  differently and measured 3.1% slower (7 programs, min of 9
+  interleaved, where the build against itself gave 0.992); with
+  `#[hot]` Prolog's goto and switch code is the base compiler's, and the
+  switch build measures 1.001.
 - **A codegen change the measurement asked for.** Making Prolog's CALLB
   raise cold first cost its hot path an instruction: an outlined cold
   block is passed the handler's instruction word, so the word had to
@@ -821,6 +826,71 @@ Refinements of the proposal:
   (`vmgen::reads_insn`, `on_raise_reads_insn`; lowering.md §3). That is
   the change behind most of the differences below, in hand-written cold
   blocks as much as in new ones.
+
+**Ports, and what `ir-diff` showed** (`--release --asm`, tail-call,
+goto and switch dispatch).
+- **The ports** (the sources before against those without the wrappers,
+  both built by the new compiler): 138 wrappers removed, 114 `cold {
+  raise/fail .. }` and 24 `cold { become ..; redo }`: Lox 36, Wasm 30,
+  Python 17, Scheme 16, MiniJS 15, Stack 12, Mini 10, Prolog 2. Every
+  function the same in all three modes for all eight, and for Mini with
+  `--cfg debug`, `--cfg gil` and `--jit-stencils`, Prolog with
+  `--jit-stencils`, Python with `--cfg debug` and Regex (unchanged; its
+  one `fail` is in a variant's `before` block, which the rule does not
+  cover). Left hand-written: unconditional raises (MiniJS THROW and
+  THROWREF, Prolog UNDEF), one wrapper inside a larger cold block
+  (Python), the budget variant's `fail` (Regex), and two tails where the
+  rule would also have moved type tests into the cold block, so the
+  code would not have been the same (Mini's CALL after its native and
+  wrapped-coroutine cases, MiniJS's string-method member after the rope
+  cases: there the hot path was 4 instructions shorter and the native
+  path one test longer).
+- **The compiler on unchanged sources** (the base compiler against the
+  new one, the sources before the ports): the sites the hand had not
+  written cold (`LOIMI_COLD_AUDIT=1`: 42, in Scheme's `call_slow` and
+  `callcc`, MiniJS's and Python's and Wasm's `call_slow`, Wasm's ten
+  table and bulk-memory ops, Python's DELGLOBAL, LOADCELL, LOADFREE,
+  Prolog's CALLB and METACALL, Regex's `grow_stack`), and the word no
+  longer passed. In tail-call mode 365 functions are shorter (Lox 83,
+  Scheme 118, Wasm 98, Python 39, Prolog 14, Mini 8, Stack 4, MiniJS 1;
+  e.g. Lox SUB 30 → 27 lines: `ja cold` instead of `ja .L0; .L0: movl
+  %eax, %esi; jmp cold`; Python LOADCELL 77 → 31: its unbound-variable
+  error is outlined; Scheme CALLCC 208 → 124), 20 the same length, and
+  seven longer, none on a hot path: a `.section` directive after Prolog's
+  CALLB (the same instructions on its fast path, `pushq %rax`/`popq
+  %rax`; the throw path one jump longer) and Wasm's TABLE_INIT and
+  MEM_INIT (their trap path is a jump to the cold function), Prolog's
+  METACALL.cold#0, Wasm's `call_slow` and Regex's `grow_stack` (slow
+  paths), Python's GETATTR_GETATTR_MUL.resume1 (a super's resume
+  function, reached from slow paths only). New functions are the
+  outlined blocks (Python 19, Wasm 10, Scheme 6, Prolog 3; Prolog's go
+  away with its `#[hot]`, which leaves 14 functions shorter and none
+  else different). In goto and switch mode Lox, Mini, Stack and (with
+  `#[hot]`) Prolog are the same; in MiniJS, Scheme, Python, Wasm and
+  Regex the one function holding the handlers
+  differs: its front-end IR differs only by the `cold` marker on the new
+  cold blocks (in MiniJS, 15 `call void @llvm.sideeffect() cold` lines in
+  inlined copies of `call_slow`), and the rest is LLVM's block placement
+  and register allocation of a function of 10,000 to 30,000 lines.
+  Python's `--cfg debug` build has three functions longer (CALLKW +31
+  lines of spills in a handler with a 256-byte frame), which is the
+  debugger build.
+- **Timing** (the base compiler against the new one on the unported
+  sources, `--align-functions=64`, user+sys, minimum of 5 interleaved
+  runs, geometric mean of new/base over each suite's programs; the
+  machine was also running the test suite, so single programs moved by
+  up to ±8% both ways, and the build against itself gave 0.99 to 1.01):
+
+  | | tail-call | goto | switch |
+  |---|---:|---:|---:|
+  | Lox (10) | 1.000 | same code | same code |
+  | MiniJS (14) | 1.002 | 1.001 | 1.005 |
+  | Python (11) | 0.965 | 0.998 | 0.991 |
+  | Scheme (r7rs) | 1.002 | 1.002 | 1.008 |
+  | Mini (14) | 0.998 | same code | same code |
+  | Prolog (30) | 0.994 | 0.995 | 1.036; with `#[hot]` same code (1.001) |
+  | Wasm (7) | 1.005; 0.988 again (3, min of 9) | 0.995 (min of 7) | 0.986 (min of 7) |
+  | Stack (5) | 1.028; 0.991 again (min of 9; itself 1.007) | same code | same code |
 
 ### 7. Report more than one error per build
 
