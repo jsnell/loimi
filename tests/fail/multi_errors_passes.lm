@@ -1,0 +1,27 @@
+// Effects are checked with the bodies, so their errors are reported with
+// the type errors; a generic instance reports its first error only, and
+// once for all instances that hit it.
+import std.gc;
+
+fn helper(h: *gc.Heap) { gc.collect(h); }
+
+fn twice<T>(x: T) -> T {
+    let y = x.nothing;
+    y
+}
+
+fn other(h: *gc.Heap) -> i64 {
+    gc.collect(h);
+    let n: i64 = 1;
+    n + false
+}
+
+fn main() {
+    twice(1);
+    twice(true);
+}
+// errors: 4
+// error: `collect` uses gc, but `helper` does not declare it
+// error: `collect` uses gc, but `other` does not declare it
+// error: multi_errors_passes.lm:9:15
+// error: multi_errors_passes.lm:16:9

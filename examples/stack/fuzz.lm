@@ -118,7 +118,7 @@ fn run_one(seed: u64, src: str, stress: bool, stack: *Value, lstack: *Value, fra
     m.nglobals = prog.nglobals;
     for i in 0..prog.nglobals as u64 { m.globals[i] = Value.Nil; }
     m.fp.word = prog.main;
-    m.heap.add_scanner(&m as *u8, vm.scan_roots);
+    m.heap.add_scanner(&m, vm.scan_roots);
     if stress { m.heap.set_stress(true); }
 
     let n = 1 + r.below(3);

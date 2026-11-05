@@ -122,6 +122,26 @@ implementation; `git log` has the details.
 
 ### Core language
 
+- **`e is P` and `e as! V`**: a pattern test that binds nothing (`t is
+  Ref`, `v is Int | Float`, `!(o is Nil)`; a misspelled variant is an
+  error, not a binding), and a checked unwrap of a variant (`let s =
+  name as! Str;`, `let (a, b) = p as! Pair;`) that is `trap()` in
+  release builds, the same code as the `let Str(s) = name else { trap()
+  };` it replaces, and a panic naming the variant and place in debug
+  builds ([language.md §1.2](docs/language.md#patterns-literals-and-match)).
+  Python's 78 such unwraps and 36 `=> true, _ => false` predicates
+  (Prolog, MiniJS, Python, Scheme, Mini) use them; the release code is
+  unchanged (`loimi ir-diff`).
+- **Names and constant data on enum variants**: `#[name("car")]` and
+  `#[names]` generate `E.name(k)` and `E.from_name(s)`; `#[data(min: i32
+  = 1, max: i32 = -1)]` on the enum and `#[data(2, 2)]` on its variants
+  generate one accessor per key (`p.min()`). Compiled only where
+  called; the lookups are `match`es LLVM turns into tables
+  ([language.md §1.2](docs/language.md#variant-names-and-data)).
+  Scheme's 149 primitives (five parallel copies: `prim_info`, `P_*`
+  ids, raw-number arms in `call_native`, `inline_prim`'s name chain)
+  and Python's exception kinds (`E_*`, `enames`, `eparents`) now use
+  them.
 - **Pointer stability** (prototype; `docs/design/lifetimes.md`): in
   `#![safe]` and `#![lifetimes]` modules, a pointer or slice into a
   container used after a call that may move or free it (`push`,
@@ -247,6 +267,16 @@ implementation; `git log` has the details.
 
 ### GC
 
+- **`#[trace] struct`**: generates `S.trace(s, heap)`, which marks the
+  GC references in a context struct's fields (inline, in fixed arrays,
+  in `mem.Vec` and `map.HashMap`, in nested structs), for a root scanner
+  to call before marking the stacks; `#[untraced]` leaves a field to the
+  scanner, and a field it cannot reach is an error rather than a missing
+  root. `heap.add_scanner(ctx, scan)` is typed (`scan: fn(*Heap, *T)`),
+  as is `add_sweeper`, so scanners no longer cast through `*u8`
+  ([language.md §8](docs/language.md#8-gc-integration)). Python's and
+  Prolog's scanners lost 25 hand-copied lines; every example's
+  scanner and sweeper takes its own type.
 - **No sweep** ([stdlib/gc.md](docs/stdlib/gc.md#heap-layout)): marking
   sets a bit per 16-byte granule in each chunk's mark bitmap, and each
   size class bump-allocates through the runs of clear bits (found
@@ -385,6 +415,21 @@ implementation; `git log` has the details.
 
 ### Tooling
 
+- **`loimi ir-diff A B`** compares the optimized IR (and with `--asm`
+  the assembly) of two builds function by function, ignoring panic
+  locations, constant and local names, metadata numbering and function
+  order, so a refactor that moves lines can be shown to be zero-cost
+  ([status.md](docs/status.md#comparing-builds-loimi-ir-diff)).
+- **Every error of a build, not just the first**: function bodies, vm
+  handlers and the statements of a body are checked past an error, with
+  bindings of a failed statement poisoned so that one mistake gives one
+  error; errors print in source order, at most `--max-errors N`
+  (default 20). Imports, types and signatures still stop at their first
+  error ([status.md](docs/status.md), Compiler row;
+  [design/ergonomics-audit.md](docs/design/ergonomics-audit.md) item 7).
+- An `if`, `match` or block whose results are all literals is typed
+  from the other operand, as a literal is: `(if c { 1 } else { 0 }) == y`
+  with `y: i32` ([language.md §1.2](docs/language.md#12-basics)).
 - **`--vm-stats`** counts entries into each `cold` block, per op, with
   its source location ([status.md](docs/status.md), Instrumentation row).
 - **Doc-snippet test**: every `loimi` code block in the README and

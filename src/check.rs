@@ -64,6 +64,19 @@ pub struct FnCx {
     pub block_use: bool,
     /// Inside a closure body: the closure's type (for messages).
     pub closure_ty: Option<Ty>,
+    /// Error recovery (`Checker::errors`): a block records the error of a
+    /// statement and goes on with the next one. Off in speculative
+    /// checks (probes, and checks retried on error), whose errors are
+    /// part of their result.
+    pub recover: bool,
+    /// Locals bound by a statement that failed (or that read one): they
+    /// have type `never`, and an error in a statement that reads one is
+    /// not reported, since it may follow from the first.
+    pub poison: Vec<LocalId>,
+    /// Set by `lookup` when it finds a poisoned local, and by a block
+    /// that recorded an error: the statement being checked depends on an
+    /// error already reported. Shared with probes.
+    pub tainted: std::rc::Rc<std::cell::Cell<bool>>,
 }
 
 impl FnCx {
@@ -81,6 +94,9 @@ impl FnCx {
             unsafe_depth: 0,
             block_use: false,
             closure_ty: None,
+            recover: false,
+            poison: vec![],
+            tainted: Default::default(),
         }
     }
     pub fn declare(&mut self, name: &str, ty: Ty, mutable: bool) -> LocalId {
@@ -104,6 +120,9 @@ impl FnCx {
             unsafe_depth: self.unsafe_depth,
             block_use: false,
             closure_ty: self.closure_ty.clone(),
+            recover: false,
+            poison: self.poison.clone(),
+            tainted: self.tainted.clone(),
         }
     }
     /// A local not visible by name.
@@ -116,6 +135,9 @@ impl FnCx {
         for s in self.scopes.iter().rev() {
             for (n, id) in s.iter().rev() {
                 if n == name {
+                    if !self.poison.is_empty() && self.poison.contains(id) {
+                        self.tainted.set(true);
+                    }
                     return Some(*id);
                 }
             }
@@ -154,6 +176,13 @@ pub struct Checker<'a> {
     /// Warnings, in the order found (deduplicated by span: handler
     /// bodies can be checked more than once).
     pub warnings: Vec<Diag>,
+    /// Errors recorded so that checking can go on (function bodies,
+    /// handlers, statements: `run_all`). Errors of the passes that later
+    /// ones depend on (names, types, signatures) are returned instead.
+    pub errors: Vec<Diag>,
+    /// Inside an `if`/`match` checked again, with recovery, after an
+    /// error (`branches_inferred`).
+    pub rechecking: u32,
     /// Declaring a signature-only function (an instance over opaque type
     /// parameters, or a trait method without a default): no body needed.
     pub sig_only: bool,
@@ -256,6 +285,19 @@ fn is_literal_expr(e: &Expr) -> bool {
     }
 }
 
+/// A literal-only expression (`is_literal_expr`), or an `if`, `match` or
+/// block whose every result is one: `(if c { 1 } else { 0 }) == y` types
+/// its left operand from `y`, as `1 == y` does.
+fn literal_valued(e: &Expr) -> bool {
+    let tail = |b: &Block| matches!(b.stmts.last(), Some(Stmt::Expr { expr, semi: false }) if literal_valued(expr));
+    match &e.kind {
+        ExprKind::If(_, then, Some(els)) => tail(then) && literal_valued(els),
+        ExprKind::Block(b) => tail(b),
+        ExprKind::Match(_, arms) => !arms.is_empty() && arms.iter().all(|a| literal_valued(&a.body)),
+        _ => is_literal_expr(e),
+    }
+}
+
 impl<'a> Checker<'a> {
     pub fn new(modules: &'a [Module]) -> Checker<'a> {
         Checker {
@@ -277,6 +319,8 @@ impl<'a> Checker<'a> {
             object_count: 0,
             aliases: vec![],
             warnings: vec![],
+            errors: vec![],
+            rechecking: 0,
             sig_only: false,
             closure_count: 0,
             unsafe_fns: Default::default(),
@@ -332,6 +376,21 @@ impl<'a> Checker<'a> {
     /// The value (function, const, global) named `name` in module `m`.
     pub fn value_def(&self, m: usize, name: &str) -> Option<(Def, bool)> {
         self.values[m].get(name).cloned()
+    }
+
+    /// Check the program, going on past errors where later checks do not
+    /// depend on what failed: every function body and every vm handler
+    /// is checked, and inside a body every statement. All errors found,
+    /// or none.
+    pub fn run_all(&mut self) -> Result<(), Vec<Diag>> {
+        if let Err(d) = self.run() {
+            self.errors.push(d);
+        }
+        if self.errors.is_empty() {
+            Ok(())
+        } else {
+            Err(std::mem::take(&mut self.errors))
+        }
     }
 
     pub fn run(&mut self) -> Res<()> {
@@ -606,9 +665,28 @@ impl<'a> Checker<'a> {
         for (id, m, f) in fn_decls {
             self.pending.push((id, m, f, vec![]));
         }
+        // Bodies are independent of each other: an error in one is
+        // recorded and the next is checked.
         while let Some((id, m, f, env)) = self.pending.pop() {
-            self.check_against_bounds(id).map_err(|d| self.instance_note(d, id))?;
-            self.with_tenv(env, |c| c.check_fn_body(id, m, &f, None)).map_err(|d| self.instance_note(d, id))?;
+            let before = self.errors.len();
+            let r = self.check_against_bounds(id).and_then(|_| self.with_tenv(env, |c| c.check_fn_body(id, m, &f, None)));
+            if let Err(d) = r {
+                self.errors.push(d);
+            }
+            if self.errors.len() > before {
+                // An instance of a generic function: its first error only
+                // (the others may follow from the type arguments).
+                if self.generics.fn_site.contains_key(&id) {
+                    self.errors.truncate(before + 1);
+                }
+                for i in before..self.errors.len() {
+                    let d = std::mem::replace(&mut self.errors[i], Diag::new(Span::default(), ""));
+                    self.errors[i] = self.instance_note(d, id);
+                }
+            }
+        }
+        if !self.errors.is_empty() {
+            return Ok(());
         }
         // `export "C" const`s, for the header.
         for id in 0..self.consts.len() {
@@ -915,6 +993,7 @@ impl<'a> Checker<'a> {
             params.push(cx.declare(&p.name.name, t.clone(), true));
         }
         let ret = def.ret.clone();
+        cx.recover = true;
         let b = self.block(&mut cx, body, Some(&ret))?;
         let b = self.coerce(b, &ret)?;
         let fd = &mut self.prog.fns[id as usize];
@@ -1463,23 +1542,126 @@ impl<'a> Checker<'a> {
         let mut stmts = Vec::new();
         let mut tail = None;
         let mut diverges = false;
+        // With recovery: a statement's error was recorded (or follows
+        // from one already reported).
+        let mut failed = false;
+        let outer_taint = cx.recover && cx.tainted.replace(false);
         let n = b.stmts.len();
         for (i, s) in b.stmts.iter().enumerate() {
+            if !cx.recover {
+                self.stmt(cx, s, i + 1 == n, exp, &mut stmts, &mut tail, &mut diverges)?;
+                continue;
+            }
+            let mark = CxMark::new(cx);
+            let taint = cx.tainted.replace(false);
+            let r = self.stmt(cx, s, i + 1 == n, exp, &mut stmts, &mut tail, &mut diverges);
+            let tainted = cx.tainted.get();
+            match r {
+                Ok(()) => {
+                    // A binding computed from a poisoned local is poisoned.
+                    if tainted {
+                        if let (Stmt::Let { .. }, Some(TStmt::Let(..) | TStmt::LetPat(..))) = (s, stmts.last()) {
+                            let to = cx.locals.len() as LocalId;
+                            cx.poison.extend(mark.locals..to);
+                        }
+                    }
+                }
+                Err(d) => {
+                    mark.restore(cx);
+                    if !tainted {
+                        self.errors.push(d);
+                    }
+                    failed = true;
+                    // What the statement binds is poisoned: declared (so
+                    // that it still shadows) with type `never`.
+                    if let Stmt::Let { pat, ty, .. } = s {
+                        let annotated = match (&pat.kind, ty) {
+                            (PatKind::Ident(..), Some(t)) => self.resolve_type(cx.module, t).ok(),
+                            _ => None,
+                        };
+                        let mut names = Vec::new();
+                        pat_names(pat, &mut names);
+                        for name in names {
+                            match &annotated {
+                                Some(t) => {
+                                    cx.declare(&name, t.clone(), true);
+                                }
+                                None => {
+                                    let id = cx.declare(&name, Ty::Never, true);
+                                    cx.poison.push(id);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            cx.tainted.set(taint || tainted);
+        }
+        if cx.recover {
+            let t = cx.tainted.get() || failed;
+            cx.tainted.set(outer_taint || t);
+            if failed {
+                // Its type is unknown: `never` fits any context, so the
+                // enclosing code is checked without errors that follow
+                // from this one.
+                return Ok(mk(Ty::Never, TK::Block(stmts, None), b.span));
+            }
+        }
+        let ty = match &tail {
+            Some(t) => t.ty.clone(),
+            None if diverges => Ty::Never,
+            None => Ty::Unit,
+        };
+        Ok(mk(ty, TK::Block(stmts, tail), b.span))
+    }
+
+    /// One statement of a block (`last`: the block's last).
+    #[allow(clippy::too_many_arguments)]
+    fn stmt(&mut self, cx: &mut FnCx, s: &Stmt, last: bool, exp: Option<&Ty>, stmts: &mut Vec<TStmt>, tail: &mut Option<Box<TExpr>>, diverges: &mut bool) -> Res<()> {
+        {
             match s {
-                Stmt::Expr { expr, semi: false } if i == n - 1 => {
+                Stmt::Expr { expr, semi: false } if last => {
                     let e = self.expr(cx, expr, exp)?;
-                    tail = Some(Box::new(e));
+                    *tail = Some(Box::new(e));
                 }
                 Stmt::Expr { expr, .. } => {
                     let e = self.expr(cx, expr, None)?;
                     if e.ty == Ty::Never {
-                        diverges = true;
+                        *diverges = true;
                     }
                     stmts.push(TStmt::Expr(e));
                 }
                 Stmt::Defer(e) => {
                     let e = self.expr(cx, e, None)?;
                     stmts.push(TStmt::Defer(e));
+                }
+                // `let p = e as! V;` is `let V(p) = e else { trap() };`,
+                // so the two compile to the same code; `let (a, b) = e
+                // as! V;` is `let V(a, b) = ..` for two fields.
+                Stmt::Let { pat, mutable, ty: None, init: Some(Expr { kind: ExprKind::AsVariant(inner, path), span: aspan }), els: None, .. } => {
+                    let init = self.expr(cx, inner, None)?;
+                    if init.ty == Ty::Never {
+                        *diverges = true;
+                    }
+                    let n = self.variant_index(&init.ty, &path.last().unwrap().name).map_or(0, |i| self.variant_fields(&init.ty, i).len());
+                    let subs = match &pat.kind {
+                        _ if n <= 1 => Some(vec![pat.clone()]),
+                        PatKind::Tuple(ps) if ps.len() == n => Some(ps.clone()),
+                        PatKind::Wild => Some(vec![pat.clone(); n]),
+                        _ => None,
+                    };
+                    match subs {
+                        Some(subs) => {
+                            let (vpat, els) = self.as_variant_pat(path, &init.ty, Some(subs), *aspan)?;
+                            let p = self.pat(cx, &vpat, &init.ty, *mutable)?;
+                            stmts.push(TStmt::LetPat(p, init, Some(els)));
+                        }
+                        None => {
+                            let v = self.as_variant_of(cx, init, path, *aspan)?;
+                            let p = self.pat(cx, pat, &v.ty, *mutable)?;
+                            stmts.push(TStmt::LetPat(p, v, None));
+                        }
+                    }
                 }
                 Stmt::Let { pat, mutable, ty, init, els, span } => {
                     let decl_ty = match (ty, init) {
@@ -1508,7 +1690,11 @@ impl<'a> Checker<'a> {
                             // the enclosing function's.
                             let want = |eff| Ty::Block(vec![Ty::Param(HOLE); ps.len()], Box::new(Ty::Param(HOLE)), eff);
                             let (nscopes, nloops) = (cx.scopes.len(), cx.loops.len());
-                            match self.block_arg(cx, e, &want(0)) {
+                            // Speculative: its error is the reason to retry.
+                            let recover = std::mem::replace(&mut cx.recover, false);
+                            let first = self.block_arg(cx, e, &want(0));
+                            cx.recover = recover;
+                            match first {
                                 Ok(v) => Some(v),
                                 Err(_) if cx.effects != 0 => {
                                     cx.scopes.truncate(nscopes);
@@ -1529,7 +1715,7 @@ impl<'a> Checker<'a> {
                     };
                     if let Some(init) = &init {
                         if init.ty == Ty::Never {
-                            diverges = true;
+                            *diverges = true;
                         }
                     }
                     let simple = matches!(&pat.kind, PatKind::Ident(name, _) if !self.names_unit_variant(name, init.as_ref().map(|e| &e.ty).or(decl_ty.as_ref())));
@@ -1574,12 +1760,7 @@ impl<'a> Checker<'a> {
                 }
             }
         }
-        let ty = match &tail {
-            Some(t) => t.ty.clone(),
-            None if diverges => Ty::Never,
-            None => Ty::Unit,
-        };
-        Ok(mk(ty, TK::Block(stmts, tail), b.span))
+        Ok(())
     }
 
     fn names_unit_variant(&self, name: &str, ty: Option<&Ty>) -> bool {
@@ -2041,6 +2222,8 @@ impl<'a> Checker<'a> {
                 };
                 Ok(mk(Ty::Slice(Box::new(elem)), TK::SliceRange(Box::new(b), lo, hi), span))
             }
+            ExprKind::Is(inner, pat) => self.is_expr(cx, inner, pat, span),
+            ExprKind::AsVariant(inner, path) => self.as_variant(cx, inner, path, span),
             ExprKind::Unary(op, inner) => self.unary(cx, *op, inner, exp, span),
             ExprKind::Binary(op, l, r) => self.binary(cx, *op, l, r, exp, span),
             ExprKind::Cast(inner, t) => {
@@ -2063,6 +2246,33 @@ impl<'a> Checker<'a> {
                                 self.ty_name(&v.ty),
                                 self.ty_name(&to),
                                 self.ty_name(&to).trim_start_matches("Gc<").trim_end_matches('>')
+                            ),
+                        ));
+                    }
+                    return Ok(mk(to, TK::Cast(Box::new(v)), span));
+                }
+                // `f as fn(*Heap, *u8)` from `fn(*Heap, *T)`: the same
+                // function called with other pointer types (a callback
+                // registered with untyped data; `gc.Heap.add_scanner<T>`).
+                if let (Ty::Fn(ps, r, e), Ty::Fn(qs, r2, e2)) = (&v.ty, &to) {
+                    let same = |a: &Ty, b: &Ty| a == b || matches!((a, b), (Ty::Ptr(_), Ty::Ptr(_)));
+                    if ps.len() != qs.len() || !same(r, r2) || e2 < e || !ps.iter().zip(qs).all(|(a, b)| same(a, b)) {
+                        return Err(Diag::new(
+                            span,
+                            format!(
+                                "cannot cast `{}` to `{}`: a function type converts only to one that differs in the types of raw pointers (and has at least its effects)",
+                                self.ty_name(&v.ty),
+                                self.ty_name(&to)
+                            ),
+                        ));
+                    }
+                    if cx.unsafe_depth == 0 {
+                        return Err(Diag::new(
+                            span,
+                            format!(
+                                "casting `{}` to `{}` is unsafe: the function must only be called with pointers to what it expects; wrap the cast in `unsafe {{ }}`",
+                                self.ty_name(&v.ty),
+                                self.ty_name(&to)
                             ),
                         ));
                     }
@@ -2240,7 +2450,11 @@ impl<'a> Checker<'a> {
                 let id = self.push_loop(cx, false);
                 cx.scopes.push(vec![]);
                 let r = (|| -> Res<TExpr> {
-                    let tconds = self.conds(cx, conds)?;
+                    let tconds = match self.conds(cx, conds) {
+                        Ok(t) => t,
+                        Err(d) if cx.recover => return Ok(self.salvage(cx, d, vec![(conds_pats(conds), None, Branch::Block(body))], span)),
+                        Err(d) => return Err(d),
+                    };
                     let b = self.block(cx, body, Some(&Ty::Unit))?;
                     let b = if b.ty == Ty::Never { b } else { self.coerce(b, &Ty::Unit)? };
                     let brk = mk(Ty::Never, TK::Break(id, None), span);
@@ -2353,21 +2567,27 @@ impl<'a> Checker<'a> {
                 let id = self.push_loop(cx, false);
                 cx.scopes.push(vec![]);
                 let user = cx.declare(&var.name, ity.clone(), false);
+                // A range of literals is i64: say so where a mismatch may
+                // come from it (also on the errors the body recorded).
+                let literal_range = ann.is_none() && is_literal_expr(lo) && is_literal_expr(hi);
+                let before = self.errors.len();
                 let b = self.block(cx, body, Some(&Ty::Unit));
                 cx.scopes.pop();
                 cx.loops.pop();
                 cx.scopes.pop();
-                // A range of literals is i64: say so where a mismatch may
-                // come from it.
-                let literal_range = ann.is_none() && is_literal_expr(lo) && is_literal_expr(hi);
-                let b = b.map_err(|d| {
-                    if literal_range && d.msg.starts_with("mismatched types") && d.msg.contains(&format!("`{}`", self.ty_name(&ity))) {
-                        let t = self.ty_name(&ity);
+                let note = |c: &Self, d: Diag| {
+                    if literal_range && d.msg.starts_with("mismatched types") && d.msg.contains(&format!("`{}`", c.ty_name(&ity))) {
+                        let t = c.ty_name(&ity);
                         d.note(lo.span.to(hi.span), format!("`{}` is `{}`: its range has only literals; write `for {}: T in ..` for another type", var.name, t, var.name))
                     } else {
                         d
                     }
-                })?;
+                };
+                for i in before..self.errors.len() {
+                    let d = std::mem::replace(&mut self.errors[i], Diag::new(Span::default(), ""));
+                    self.errors[i] = note(self, d);
+                }
+                let b = b.map_err(|d| note(self, d))?;
                 let local = |id| mk(ity.clone(), TK::Local(id), span);
                 let cond = mk(Ty::Bool, TK::Binary(BinOp::Lt, Box::new(local(ctr)), Box::new(local(end))), span);
                 let inner = mk(
@@ -2518,6 +2738,55 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// With recovery, after error `d` in the condition of an `if` or a
+    /// `while` or in the scrutinee of a `match`: check the branches
+    /// anyway, for their own errors, with what the condition or pattern
+    /// binds poisoned. The result has type `never`, and the statement is
+    /// marked as following from an error.
+    fn salvage(&mut self, cx: &mut FnCx, d: Diag, branches: Vec<(Vec<&Pat>, Option<&Expr>, Branch)>, span: Span) -> TExpr {
+        if !cx.tainted.get() {
+            self.errors.push(d);
+        }
+        let after_d = self.errors.len();
+        for (pats, guard, body) in branches {
+            let mark = CxMark::new(cx);
+            cx.scopes.push(vec![]);
+            let mut names = Vec::new();
+            for p in pats {
+                pat_names(p, &mut names);
+            }
+            for n in names {
+                let id = cx.declare(&n, Ty::Never, true);
+                cx.poison.push(id);
+            }
+            for e in guard.map(Branch::Expr).into_iter().chain(std::iter::once(body)) {
+                cx.tainted.set(false);
+                let r = match e {
+                    Branch::Block(b) => self.block(cx, b, None),
+                    Branch::Expr(x) => self.expr(cx, x, None),
+                };
+                if let Err(e) = r {
+                    if !cx.tainted.get() {
+                        self.errors.push(e);
+                    }
+                }
+            }
+            mark.restore(cx);
+        }
+        // A branch checked without the type the context expects may not
+        // be typed alone (`Ok(x)`): that is not the user's error.
+        let mut i = after_d;
+        while i < self.errors.len() {
+            if self.errors[i].msg.starts_with("cannot infer") {
+                self.errors.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+        cx.tainted.set(true);
+        mk(Ty::Never, TK::Block(vec![], None), span)
+    }
+
     /// `if`/`match` without an expected type. When a branch cannot be
     /// typed on its own (`Ok(e)`, `None`), guess the type from all branches
     /// together and check again with that as the expected type, so
@@ -2529,25 +2798,97 @@ impl<'a> Checker<'a> {
             ExprKind::Match(scrut, arms) => c.match_expr(cx, scrut, arms, exp, e.span),
             _ => unreachable!(),
         };
-        let err = match check(self, cx, None) {
-            Ok(v) => return Ok(v),
-            Err(d) => d,
-        };
-        if !err.msg.starts_with("cannot infer") {
-            return Err(err);
+        let infer = |d: &Diag| d.msg.starts_with("cannot infer");
+        if !cx.recover {
+            let err = match check(self, cx, None) {
+                Ok(v) => return Ok(v),
+                Err(d) => d,
+            };
+            if !infer(&err) {
+                return Err(err);
+            }
+            cx.scopes.truncate(nscopes);
+            cx.loops.truncate(nloops);
+            let guess = self.guess_ty(cx, e);
+            if has_hole(&guess) {
+                return Err(err);
+            }
+            return match check(self, cx, Some(&guess)) {
+                Ok(v) => Ok(v),
+                Err(_) => {
+                    cx.scopes.truncate(nscopes);
+                    cx.loops.truncate(nloops);
+                    Err(err)
+                }
+            };
         }
+        if self.rechecking == 0 {
+            // A program that compiles is checked as without recovery (the
+            // same locals, so the same code): first without it. Only after
+            // an error is it checked again with recovery, for the rest.
+            cx.recover = false;
+            let r = self.branches_inferred(cx, e);
+            cx.recover = true;
+            let err = match r {
+                Ok(v) => return Ok(v),
+                Err(d) => d,
+            };
+            cx.scopes.truncate(nscopes);
+            cx.loops.truncate(nloops);
+            let before = self.errors.len();
+            self.rechecking += 1;
+            let r = self.branches_inferred(cx, e);
+            self.rechecking -= 1;
+            // One "cannot infer" for the whole `if`/`match`: the others
+            // are the same missing annotation.
+            let mut seen = false;
+            let mut i = before;
+            while i < self.errors.len() {
+                if infer(&self.errors[i]) && std::mem::replace(&mut seen, true) {
+                    self.errors.remove(i);
+                } else {
+                    i += 1;
+                }
+            }
+            return match r {
+                Ok(_) if self.errors.len() == before => Err(err),
+                Err(d) if seen && infer(&d) => {
+                    // Reported already; the result's type is unknown.
+                    cx.tainted.set(true);
+                    Ok(mk(Ty::Never, TK::Block(vec![], None), e.span))
+                }
+                r => r,
+            };
+        }
+        // Checking again after an error (so nested `if`s are not checked
+        // twice each): a branch's error is recorded rather than returned,
+        // and a recorded "cannot infer" is a reason to check again too.
+        // The errors of the first check are dropped if the second succeeds.
+        let before = self.errors.len();
+        let taint = cx.tainted.get();
+        let first = check(self, cx, None);
+        if !(matches!(&first, Err(d) if infer(d)) || self.errors[before..].iter().any(infer)) {
+            return first;
+        }
+        let errs: Vec<Diag> = self.errors.drain(before..).collect();
+        let first_taint = cx.tainted.replace(taint);
         cx.scopes.truncate(nscopes);
         cx.loops.truncate(nloops);
         let guess = self.guess_ty(cx, e);
         if has_hole(&guess) {
-            return Err(err);
+            self.errors.extend(errs);
+            cx.tainted.set(first_taint);
+            return first;
         }
         match check(self, cx, Some(&guess)) {
             Ok(v) => Ok(v),
             Err(_) => {
+                self.errors.truncate(before);
+                self.errors.extend(errs);
+                cx.tainted.set(first_taint);
                 cx.scopes.truncate(nscopes);
                 cx.loops.truncate(nloops);
-                Err(err)
+                first
             }
         }
     }
@@ -2655,7 +2996,16 @@ impl<'a> Checker<'a> {
         }
         let exp = if hint.is_some() { hint.as_ref() } else { exp };
         cx.scopes.push(vec![]);
-        let tconds = self.conds(cx, conds)?;
+        let tconds = match self.conds(cx, conds) {
+            Ok(t) => t,
+            Err(d) if cx.recover => {
+                cx.scopes.pop();
+                let mut branches = vec![(conds_pats(conds), None, Branch::Block(then))];
+                branches.extend(els.map(|e| (vec![], None, Branch::Expr(e))));
+                return Ok(self.salvage(cx, d, branches, span));
+            }
+            Err(d) => return Err(d),
+        };
         let then_exp = if els.is_none() { Some(&Ty::Unit) } else { exp };
         let t = self.block(cx, then, then_exp);
         cx.scopes.pop();
@@ -2680,7 +3030,19 @@ impl<'a> Checker<'a> {
     }
 
     fn match_expr(&mut self, cx: &mut FnCx, scrut: &Expr, arms: &[Arm], exp: Option<&Ty>, span: Span) -> Res<TExpr> {
-        let s = self.expr(cx, scrut, None)?;
+        let s = match self.expr(cx, scrut, None) {
+            Ok(s) => s,
+            Err(d) if cx.recover => {
+                let branches = arms.iter().map(|a| (vec![&a.pat], a.guard.as_ref(), Branch::Expr(&a.body))).collect();
+                return Ok(self.salvage(cx, d, branches, span));
+            }
+            Err(d) => return Err(d),
+        };
+        if cx.recover && s.ty == Ty::Never && cx.tainted.get() {
+            // A poisoned scrutinee: no pattern fits `never`.
+            let branches = arms.iter().map(|a| (vec![&a.pat], a.guard.as_ref(), Branch::Expr(&a.body))).collect();
+            return Ok(self.salvage(cx, Diag::new(span, ""), branches, span));
+        }
         // An arm `P1 | P2 => body` whose alternatives bind names is one
         // arm per alternative, with the same guard and body (the body is
         // compiled once per alternative).
@@ -2738,6 +3100,292 @@ impl<'a> Checker<'a> {
             a.body = self.coerce(body, &ty)?;
         }
         Ok(mk(ty, TK::Match(Box::new(s), tarms), span))
+    }
+
+    /// The body of a `#[trace] struct`'s generated `S.trace(s, h)`
+    /// (src/parser.rs `trace_method`), `__gc_trace_fields(h, s)`: what a
+    /// hand-written root scanner writes for each field, in declaration
+    /// order, checked as source (`Checker::trace_place`). Fields marked
+    /// `#[untraced]` are skipped.
+    fn trace_fields(&mut self, cx: &mut FnCx, h: &Expr, s: &Expr, span: Span) -> Res<TExpr> {
+        let sv = self.expr(cx, s, None)?;
+        let Ty::Ptr(st) = &sv.ty else { return Err(Diag::new(span, "`__gc_trace_fields` takes a heap and a pointer to a struct")) };
+        let Ty::Struct(sid) = **st else { return Err(Diag::new(span, "`__gc_trace_fields` takes a heap and a pointer to a struct")) };
+        let decl = self.modules[cx.module].items.iter().find_map(|it| match it {
+            Item::Struct(d) if d.derive_trace.is_some() && matches!(self.scopes[cx.module].get(&d.name.name), Some((Def::Struct(i), _)) if *i == sid) => Some(d),
+            _ => None,
+        });
+        let Some(decl) = decl else { return Err(Diag::new(span, "`__gc_trace_fields` is for the generated `trace` of a `#[trace] struct`")) };
+        let fields = self.prog.structs[sid as usize].fields.clone();
+        let sname = decl.name.name.clone();
+        let mut stmts = Vec::new();
+        let mut marked: Vec<String> = Vec::new();
+        for (fname, fty) in &fields {
+            if decl.untraced.iter().any(|u| u.name == *fname) {
+                continue;
+            }
+            let fspan = decl.fields.iter().find(|(f, _)| f.name == *fname).map_or(span, |(f, _)| f.span);
+            let place = Expr { kind: ExprKind::Field(Box::new(s.clone()), Ident { name: fname.clone(), span }), span };
+            if let Err(why) = self.trace_place(h, place, fname, fty, span, &mut stmts, &mut marked) {
+                return Err(Diag::new(
+                    fspan,
+                    format!(
+                        "`#[trace] struct {}`: field `{}` holds GC references that `#[trace]` cannot reach ({}; it traces `Gc`, options, `value` types, structs, tuples, enums and fixed arrays of them, and `mem.Vec` and `map.HashMap`); mark them in a root scanner, and the field `#[untraced]`",
+                        sname, fname, why
+                    ),
+                ));
+            }
+        }
+        if std::env::var_os("LOIMI_DUMP_VM_EXPANSION").is_some() {
+            eprintln!("// <#[trace] struct {}>: {}.trace marks {}", sname, sname, if marked.is_empty() { "nothing".into() } else { marked.join(", ") });
+        }
+        // The generated code reads `Vec.ptr`: it is not the user's raw
+        // pointer operation.
+        let body = Expr { kind: ExprKind::Unsafe(Block { stmts, span }), span };
+        self.expr(cx, &body, Some(&Ty::Unit))
+    }
+
+    /// The statements marking the GC references in `place` (named `name`
+    /// in `marked`), of type `ty`, as a hand-written scanner does:
+    /// - a type that holds them inline (`Gc`, an option, a `value` type,
+    ///   a struct, tuple or enum holding one): `gc_mark(h, place);`
+    /// - a fixed array of those: `for i: u64 in 0..N { gc_mark(h, place[i]); }`
+    /// - `mem.Vec<T>`: `for i in 0..place.len { gc_mark(h, place.ptr[i]); }`
+    /// - `map.HashMap<K, V>`: each entry's key and value that hold them;
+    /// - another struct: its fields, in turn (a struct holding a `Vec`).
+    /// Raw pointers are not followed (a scanner marks what they point to
+    /// by hand, as for any object). Any other type holding references
+    /// behind a pointer (a container this does not know, an array of
+    /// `Vec`s) is an error, saying why: no field is left unscanned
+    /// silently.
+    #[allow(clippy::too_many_arguments)]
+    fn trace_place(&self, h: &Expr, place: Expr, name: &str, ty: &Ty, span: Span, stmts: &mut Vec<Stmt>, marked: &mut Vec<String>) -> Result<(), String> {
+        let ex = |kind| Expr { kind, span };
+        let id = |n: &str| ex(ExprKind::Ident(n.into()));
+        let field = |e: Expr, n: &str| ex(ExprKind::Field(Box::new(e), Ident { name: n.into(), span }));
+        let mark = |v: Expr| Stmt::Expr { expr: ex(ExprKind::Call(Box::new(id("gc_mark")), vec![h.clone(), v])), semi: true };
+        let block = |stmts: Vec<Stmt>| Block { stmts, span };
+        let u64t = TypeExpr { kind: TypeKind::Named(vec![Ident { name: "u64".into(), span }], vec![]), span };
+        let traced = |t: &Ty| crate::gcgen::is_traced(&self.prog, t);
+        let lp = |var: &str, ty: Option<TypeExpr>, hi: Expr, body: Stmt| Stmt::Expr {
+            expr: ex(ExprKind::For(Ident { name: var.into(), span }, ty, Box::new(ex(ExprKind::Int(0))), Some(Box::new(hi)), block(vec![body]))),
+            semi: false,
+        };
+        // A fresh loop variable per nesting level (`s.a.v` in `s.a`'s loop).
+        let var = format!("i{}", name.matches('.').count());
+        if let Ty::Array(et, n) = ty {
+            if traced(et) {
+                stmts.push(lp(&var, Some(u64t), ex(ExprKind::Int(*n as i64 as _)), mark(ex(ExprKind::Index(Box::new(place), Box::new(id(&var)))))));
+                marked.push(format!("{}[0..{}]", name, n));
+                return Ok(());
+            }
+        }
+        if traced(ty) {
+            stmts.push(mark(place));
+            marked.push(name.to_string());
+            return Ok(());
+        }
+        let inst = self.generics.inst_of.get(ty).map(|(g, args)| {
+            let gt = &self.generics.types[*g as usize];
+            (self.modules[gt.module].path.join("."), gt.name.clone(), args.clone())
+        });
+        match (&inst, ty) {
+            (Some((m, n, args)), _) if m == "std.mem" && n == "Vec" => {
+                if traced(&args[0]) {
+                    let elem = ex(ExprKind::Index(Box::new(field(place.clone(), "ptr")), Box::new(id(&var))));
+                    stmts.push(lp(&var, None, field(place, "len"), mark(elem)));
+                    marked.push(format!("{} (Vec)", name));
+                } else if self.holds_gc(&args[0], 0) {
+                    return Err(format!("a `Vec` of `{}`", self.ty_name(&args[0])));
+                }
+            }
+            (Some((m, n, args)), _) if m == "std.map" && n == "HashMap" => {
+                let (tk, tv) = (traced(&args[0]), traced(&args[1]));
+                for (t, ok) in [(&args[0], tk), (&args[1], tv)] {
+                    if !ok && self.holds_gc(t, 0) {
+                        return Err(format!("a `HashMap` of `{}`", self.ty_name(t)));
+                    }
+                }
+                if tk || tv {
+                    // { var it: u64 = 0; while let Some(e) = place.next(&it) { gc_mark(h, e.key); .. } }
+                    let it = Stmt::Let {
+                        pat: Pat { kind: PatKind::Ident("it".into(), false), span },
+                        mutable: true,
+                        ty: Some(u64t),
+                        init: Some(ex(ExprKind::Int(0))),
+                        els: None,
+                        span,
+                    };
+                    let next = ex(ExprKind::Call(Box::new(field(place, "next")), vec![ex(ExprKind::Unary(UnOp::AddrOf, Box::new(id("it"))))]));
+                    let mut body = Vec::new();
+                    if tk {
+                        body.push(mark(field(id("e"), "key")));
+                    }
+                    if tv {
+                        body.push(mark(field(id("e"), "value")));
+                    }
+                    let pat = Pat { kind: PatKind::Variant(vec![Ident { name: "Some".into(), span }], Some(vec![Pat { kind: PatKind::Ident("e".into(), false), span }])), span };
+                    let w = ex(ExprKind::While(vec![Cond::Let(pat, next)], block(body)));
+                    stmts.push(Stmt::Expr { expr: ex(ExprKind::Block(block(vec![it, Stmt::Expr { expr: w, semi: false }]))), semi: false });
+                    marked.push(format!("{} (HashMap {})", name, if tk && tv { "keys and values" } else if tk { "keys" } else { "values" }));
+                }
+            }
+            (_, Ty::Struct(sid)) if self.prog.structs[*sid as usize].object.is_none() => {
+                for (f, ft) in self.prog.structs[*sid as usize].fields.clone() {
+                    self.trace_place(h, field(place.clone(), &f), &format!("{}.{}", name, f), &ft, span, stmts, marked)?;
+                }
+            }
+            // A raw pointer of the context itself delimits memory the
+            // scanner walks (a stack); one inside a field's struct is a
+            // container this does not know.
+            (_, Ty::Ptr(inner)) if name.contains('.') && self.holds_gc(inner, 0) => {
+                return Err(format!("`{}` points to `{}`", name, self.ty_name(inner)))
+            }
+            _ if self.holds_gc(ty, 0) => return Err(format!("its type is `{}`", self.ty_name(ty))),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Whether a value of `t` holds GC references, inline or in the
+    /// memory of a std container (a `Vec<Value>` in a struct): where
+    /// `#[trace]` must look.
+    fn holds_gc(&self, t: &Ty, depth: u32) -> bool {
+        if depth > 8 {
+            return false;
+        }
+        if crate::gcgen::is_traced(&self.prog, t) {
+            return true;
+        }
+        if let Some((_, args)) = self.generics.inst_of.get(t) {
+            if args.iter().any(|a| self.holds_gc(a, depth + 1)) {
+                return true;
+            }
+        }
+        match t {
+            Ty::Option(i) | Ty::Array(i, _) => self.holds_gc(i, depth + 1),
+            Ty::Tuple(ts) => ts.iter().any(|x| self.holds_gc(x, depth + 1)),
+            Ty::Result(a, b) => self.holds_gc(a, depth + 1) || self.holds_gc(b, depth + 1),
+            Ty::Enum(i) => self.prog.enums[*i as usize].variants.iter().any(|v| v.fields.iter().any(|x| self.holds_gc(x, depth + 1))),
+            Ty::Struct(i) => {
+                let sd = &self.prog.structs[*i as usize];
+                sd.object.is_none() && sd.fields.iter().any(|(_, x)| self.holds_gc(x, depth + 1))
+            }
+            _ => false,
+        }
+    }
+
+    /// `e is P`: `match e { P => true, _ => false }`, where `P` binds
+    /// nothing, and a variant with fields may be named alone.
+    fn is_expr(&mut self, cx: &mut FnCx, scrut: &Expr, pat: &Pat, span: Span) -> Res<TExpr> {
+        let s = self.expr(cx, scrut, None)?;
+        let pat = self.fill_variant_fields(pat, &s.ty);
+        cx.scopes.push(vec![]);
+        let before = cx.locals.len();
+        let p = self.pat(cx, &pat, &s.ty, false);
+        cx.scopes.pop();
+        let p = p?;
+        if let Some(l) = cx.locals.get(before) {
+            return Err(Diag::new(
+                pat.span,
+                format!(
+                    "`is` patterns cannot bind names, and `{}` is not a variant or constant of `{}` (use `if let` to bind it)",
+                    l.name,
+                    self.ty_name(&s.ty)
+                ),
+            ));
+        }
+        if irrefutable(&p) {
+            return Err(Diag::new(pat.span, "this pattern matches every value, so the `is` test is always true"));
+        }
+        let t = |b| mk(Ty::Bool, TK::Bool(b), span);
+        // `e is A | B` is `match e { A => true, B => true, _ => false }`,
+        // one arm per alternative.
+        let alts = match p.kind {
+            TPK::Or(alts) => alts,
+            _ => vec![p],
+        };
+        let mut arms: Vec<TArm> = alts.into_iter().map(|p| TArm { pat: p, guard: None, body: t(true) }).collect();
+        arms.push(TArm { pat: TPat { ty: s.ty.clone(), kind: TPK::Wild }, guard: None, body: t(false) });
+        Ok(mk(Ty::Bool, TK::Match(Box::new(s), arms), span))
+    }
+
+    /// `V` alone, for a variant with fields, as `V(_, ..)` (`e is V`),
+    /// also among the alternatives of `|`.
+    fn fill_variant_fields(&self, p: &Pat, ty: &Ty) -> Pat {
+        let (path, name) = match &p.kind {
+            PatKind::Ident(n, false) => (vec![Ident { name: n.clone(), span: p.span }], n),
+            PatKind::Variant(path, None) => (path.clone(), &path.last().unwrap().name),
+            PatKind::Or(ps) => {
+                let ps = ps.iter().map(|q| self.fill_variant_fields(q, ty)).collect();
+                return Pat { kind: PatKind::Or(ps), span: p.span };
+            }
+            _ => return p.clone(),
+        };
+        match self.variant_index(ty, name).map(|i| self.variant_fields(ty, i).len()) {
+            Some(n) if n > 0 => {
+                let wild = Pat { kind: PatKind::Wild, span: p.span };
+                Pat { kind: PatKind::Variant(path, Some(vec![wild; n])), span: p.span }
+            }
+            _ => p.clone(),
+        }
+    }
+
+    /// The pattern `V(a, b, ..)` of `e as! V` with the fields' patterns
+    /// given (`subs`), or fresh bindings; and the else block, the trap.
+    /// Errors if `V` is not a variant with fields of `ty`.
+    fn as_variant_pat(&self, path: &[Ident], ty: &Ty, subs: Option<Vec<Pat>>, span: Span) -> Res<(Pat, TExpr)> {
+        let name = &path.last().unwrap().name;
+        let Some(i) = self.variant_index(ty, name) else {
+            return Err(Diag::new(span, format!("`as! {}`: `{}` has no variant `{}`", name, self.ty_name(ty), name)));
+        };
+        let n = self.variant_fields(ty, i).len();
+        if n == 0 {
+            return Err(Diag::new(span, format!("`as! {}`: the variant has no fields to unwrap; test it with `is {}`", name, name)));
+        }
+        let subs = subs.unwrap_or_else(|| {
+            (0..n).map(|k| Pat { kind: PatKind::Ident(format!("as!{}", k), false), span }).collect()
+        });
+        let pat = Pat { kind: PatKind::Variant(path.to_vec(), Some(subs)), span };
+        let msg = format!("as! {} of another variant", name);
+        let trap = mk(Ty::Never, TK::Intrinsic(Intr::TrapAs, vec![mk(Ty::str(), TK::Str(msg.into_bytes()), span)]), span);
+        let els = mk(Ty::Never, TK::Block(vec![], Some(Box::new(trap))), span);
+        Ok((pat, els))
+    }
+
+    /// `e as! V` as an expression: `match e { V(x) => x, _ => trap() }`
+    /// (a tuple for several fields). `let p = e as! V;` is checked as
+    /// `let V(p) = e else { trap() };` instead (`Checker::block`).
+    fn as_variant(&mut self, cx: &mut FnCx, scrut: &Expr, path: &[Ident], span: Span) -> Res<TExpr> {
+        let s = self.expr(cx, scrut, None)?;
+        self.as_variant_of(cx, s, path, span)
+    }
+
+    fn as_variant_of(&mut self, cx: &mut FnCx, s: TExpr, path: &[Ident], span: Span) -> Res<TExpr> {
+        let (pat, els) = self.as_variant_pat(path, &s.ty, None, span)?;
+        cx.scopes.push(vec![]);
+        let p = self.pat(cx, &pat, &s.ty, false);
+        cx.scopes.pop();
+        let p = p?;
+        let TPK::Variant(_, fs) = &p.kind else { unreachable!() };
+        let mut vals: Vec<TExpr> = fs
+            .iter()
+            .map(|f| {
+                let TPK::Bind(id) = f.kind else { unreachable!() };
+                mk(f.ty.clone(), TK::Local(id), span)
+            })
+            .collect();
+        let body = if vals.len() == 1 {
+            vals.pop().unwrap()
+        } else {
+            mk(Ty::Tuple(vals.iter().map(|v| v.ty.clone()).collect()), TK::Tuple(vals), span)
+        };
+        let ty = body.ty.clone();
+        let arms = vec![
+            TArm { pat: p, guard: None, body },
+            TArm { pat: TPat { ty: s.ty.clone(), kind: TPK::Wild }, guard: None, body: els },
+        ];
+        Ok(mk(ty, TK::Match(Box::new(s), arms), span))
     }
 
     /// Warn about a `match` arm in vm code whose body is a lone `if` (no
@@ -4383,6 +5031,9 @@ impl<'a> Checker<'a> {
             let m = self.expr(cx, &args[0], None)?;
             return Ok(Some(mk(Ty::Never, TK::Intrinsic(Intr::Panic, vec![m]), span)));
         }
+        if name == "__gc_trace_fields" && args.len() == 2 {
+            return Ok(Some(self.trace_fields(cx, &args[0], &args[1], span)?));
+        }
         if name == "gc_mark" {
             if args.len() != 2 {
                 return Err(Diag::new(span, "`gc_mark` takes a heap and a value"));
@@ -4488,6 +5139,13 @@ impl<'a> Checker<'a> {
             let b = self.expr_coerce(cx, r, &Ty::Bool)?;
             return Ok(mk(Ty::Bool, TK::Binary(op, Box::new(a), Box::new(b)), span));
         }
+        let operand_exp = if op.is_cmp() { None } else { exp };
+        if !matches!(op, Shl | Shr) {
+            if let Some(ab) = self.literal_branches(cx, l, r, operand_exp) {
+                let (a, b) = ab?;
+                return self.binary_typed(op, a, b, span);
+            }
+        }
         if matches!(op, Add | Sub) {
             // Pointer arithmetic: `p + n`, `p - n` (in elements).
             let a = self.expr(cx, l, exp)?;
@@ -4503,7 +5161,7 @@ impl<'a> Checker<'a> {
                 return Ok(mk(t, TK::Intrinsic(Intr::PtrOffset, vec![a, n]), span));
             }
             let operand_exp = exp;
-            let (a, b) = if is_literal_expr(l) && !is_literal_expr(r) {
+            let (a, b) = if literal_valued(l) && !literal_valued(r) {
                 let b = self.expr(cx, r, operand_exp)?;
                 let a = self.expr_coerce(cx, l, &b.ty.clone())?;
                 (a, b)
@@ -4519,7 +5177,6 @@ impl<'a> Checker<'a> {
             let t = a.ty.clone();
             return Ok(mk(t, TK::Binary(op, Box::new(a), Box::new(b)), span));
         }
-        let operand_exp = if op.is_cmp() { None } else { exp };
         let (a, b) = if matches!(op, Shl | Shr) {
             // The result has the left operand's type (a literal takes it
             // from the context, or is i64); the amount may be any integer.
@@ -4536,7 +5193,7 @@ impl<'a> Checker<'a> {
                 return Err(Diag::new(r.span, format!("shift amount must be an integer, found `{}`", self.ty_name(&b.ty))));
             }
             (a, b)
-        } else if is_literal_expr(l) && !is_literal_expr(r) {
+        } else if literal_valued(l) && !literal_valued(r) {
             let b = self.expr(cx, r, operand_exp)?;
             let a = self.expr_coerce(cx, l, &b.ty.clone())?;
             (a, b)
@@ -4547,6 +5204,49 @@ impl<'a> Checker<'a> {
             let b = if a.ty == Ty::Never { b } else { self.coerce(b, &at)? };
             (a, b)
         };
+        self.binary_typed(op, a, b, span)
+    }
+
+    /// `(if c { 1 } else { 0 }) == y`: the left operand's results are all
+    /// literals, the right's are not, so the left is typed from the
+    /// right as a plain literal is (`literal_valued`). The right is
+    /// checked first, expecting what the left would be alone (the
+    /// context's type, or the literals' default), so a program that
+    /// compiled without this is typed as before. None: not that case.
+    fn literal_branches(&mut self, cx: &mut FnCx, l: &Expr, r: &Expr, operand_exp: Option<&Ty>) -> Option<Res<(TExpr, TExpr)>> {
+        if is_literal_expr(l) || !literal_valued(l) || literal_valued(r) {
+            return None;
+        }
+        fn leaf(e: &Expr) -> Option<Ty> {
+            match &e.kind {
+                ExprKind::Int(_) => Some(Ty::i64()),
+                ExprKind::Float(_) => Some(Ty::F64),
+                ExprKind::Unary(UnOp::Neg, x) => leaf(x),
+                ExprKind::Binary(_, a, b) => leaf(a).or_else(|| leaf(b)),
+                ExprKind::If(_, then, Some(els)) => match then.stmts.last() {
+                    Some(Stmt::Expr { expr, .. }) => leaf(expr).or_else(|| leaf(els)),
+                    _ => None,
+                },
+                ExprKind::Block(b) => match b.stmts.last() {
+                    Some(Stmt::Expr { expr, .. }) => leaf(expr),
+                    _ => None,
+                },
+                ExprKind::Match(_, arms) => arms.iter().find_map(|a| leaf(&a.body)),
+                _ => None,
+            }
+        }
+        let alone = operand_exp.cloned().or_else(|| leaf(l))?;
+        Some((|| {
+            let b = self.expr(cx, r, Some(&alone))?;
+            let want = if b.ty == Ty::Never { alone.clone() } else { b.ty.clone() };
+            let a = self.expr_coerce(cx, l, &want)?;
+            Ok((a, b))
+        })())
+    }
+
+    /// A binary operator's result, its operands checked.
+    fn binary_typed(&mut self, op: BinOp, a: TExpr, b: TExpr, span: Span) -> Res<TExpr> {
+        use BinOp::*;
         let t = a.ty.clone();
         if let Ty::Vector(l, n) = &t {
             // Lane-wise; comparisons give a mask of signed integers of the
@@ -5000,4 +5700,74 @@ pub fn wrap_int(v: i128, it: IntTy) -> i128 {
     let mask: i128 = if bits >= 128 { -1 } else { (1i128 << bits) - 1 };
     let u = v & mask;
     if it.signed && u > it.max() { u - (1i128 << bits) } else { u }
+}
+
+/// What a statement that fails may leave changed in a `FnCx`, to undo
+/// when checking goes on after it.
+struct CxMark {
+    locals: LocalId,
+    scopes: usize,
+    last_scope: usize,
+    loops: usize,
+    unsafe_depth: u32,
+    ret: Ty,
+    effects: u8,
+    closure_ty: Option<Ty>,
+    vm: Option<crate::vmcheck::HandlerCx>,
+}
+
+impl CxMark {
+    fn new(cx: &FnCx) -> CxMark {
+        CxMark {
+            locals: cx.locals.len() as LocalId,
+            scopes: cx.scopes.len(),
+            last_scope: cx.scopes.last().map_or(0, |s| s.len()),
+            loops: cx.loops.len(),
+            unsafe_depth: cx.unsafe_depth,
+            ret: cx.ret.clone(),
+            effects: cx.effects,
+            closure_ty: cx.closure_ty.clone(),
+            vm: cx.vm.clone(),
+        }
+    }
+    fn restore(self, cx: &mut FnCx) {
+        cx.scopes.truncate(self.scopes);
+        if let Some(s) = cx.scopes.last_mut() {
+            s.truncate(self.last_scope);
+        }
+        cx.loops.truncate(self.loops);
+        cx.unsafe_depth = self.unsafe_depth;
+        cx.ret = self.ret;
+        cx.effects = self.effects;
+        cx.closure_ty = self.closure_ty;
+        cx.vm = self.vm;
+        cx.block_use = false;
+    }
+}
+
+/// The names a `let` pattern binds (by the convention that variants are
+/// capitalized, so that a poisoned binding does not shadow `None`).
+fn pat_names(p: &Pat, out: &mut Vec<String>) {
+    match &p.kind {
+        PatKind::Ident(n, _) if n.starts_with(|c: char| c.is_lowercase() || c == '_') => out.push(n.clone()),
+        PatKind::Variant(_, Some(ps)) | PatKind::Tuple(ps) => ps.iter().for_each(|q| pat_names(q, out)),
+        PatKind::Or(ps) => {
+            if let Some(q) = ps.first() {
+                pat_names(q, out)
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A branch of an `if`, `while` or `match` (`Checker::salvage`).
+#[derive(Clone, Copy)]
+enum Branch<'e> {
+    Block(&'e Block),
+    Expr(&'e Expr),
+}
+
+/// The patterns of `if let`/`while let` conditions.
+fn conds_pats(conds: &[Cond]) -> Vec<&Pat> {
+    conds.iter().filter_map(|c| if let Cond::Let(p, _) = c { Some(p) } else { None }).collect()
 }

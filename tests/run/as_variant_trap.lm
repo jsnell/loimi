@@ -1,0 +1,13 @@
+// args: --release
+// A failed `as!` in a release build is `trap()`: no message.
+// expect-exit: 134
+// expect-no-stderr: as!
+enum T { Ref(i64), Nil }
+
+#[inline(never)]
+fn get(k: i64) -> T { if k > 0 { T.Ref(k) } else { T.Nil } }
+
+fn main() -> i32 {
+    let v = get(0) as! Ref;
+    v as i32
+}

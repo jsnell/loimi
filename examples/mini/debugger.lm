@@ -237,15 +237,14 @@ pub fn attach(c: *Ctx, front: StopFn, data: *u8) -> *Dbg {
         d.builtins.push(kv[0]);
         i = value.table_iter(c.globals, i, &kv[0]);
     }
-    c.heap.add_scanner(d as *u8, scan_dbg);
+    c.heap.add_scanner(d, scan_dbg);
     c.dbg = Some(d);
     d
 }
 
 /// GC roots: the chunks (whose code the breakpoints patch), and the
 /// values handed out or held.
-fn scan_dbg(h: *gc.Heap, data: *u8) {
-    let d = data as *Dbg;
+fn scan_dbg(h: *gc.Heap, d: *Dbg) {
     for i in 0..d.chunks.len { gc_mark(h, d.chunks.at(i).main); }
     let rs = d.refs.items();
     for i in 0..rs.len { gc_mark(h, rs[i].v); }

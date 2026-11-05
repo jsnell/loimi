@@ -411,7 +411,7 @@ fn main() -> i32 uses gc {
     }, ret0[..]) else { unreachable };
     ctx.frames.cl = value.new_closure(&ctx.heap, idle);
     park(&ctx);
-    ctx.heap.add_scanner(&ctx as *u8, vm.scan_roots);
+    ctx.heap.add_scanner(&ctx, vm.scan_roots);
     var line = text.StrBuf.new();
     var verified: u64 = 0;
     for i in 0..count {

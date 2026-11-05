@@ -151,7 +151,7 @@ fn Pike.add(p: *Pike, code: []u32, l: *List, pc0: u64, input: *u8, sp: u64, end:
 }
 
 fn target(w: u32, pc: u64) -> u32 {
-    let Some(off) = Rx.label(w) else { trap() };
+    let off = Rx.label(w) as! Some;
     (pc as i64 + off) as u32
 }
 

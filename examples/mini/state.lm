@@ -62,7 +62,7 @@ pub fn new_ctx(host: fn(*Ctx, i32, *V, u64) -> Result<V, V> uses reenter) -> Ctx
 /// `--cfg gil`, also give the state its lock (threads.lm), held by the
 /// calling thread.
 pub fn attach(c: *Ctx) {
-    c.heap.add_scanner(c as *u8, vm.scan_roots);
+    c.heap.add_scanner(c, vm.scan_roots);
     #[cfg(gil)]
     threads.init(c);
 }

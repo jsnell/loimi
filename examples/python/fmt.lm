@@ -11,7 +11,7 @@ import vm;
 import vm.{Ctx};
 import ops;
 import builtins;
-import builtins.{E_TYPE, E_VALUE, E_OVERFLOW};
+import builtins.{Exc};
 
 extern "C" fn snprintf(buf: *u8, n: u64, fmt: *u8, ...) -> i32;
 
@@ -44,16 +44,16 @@ pub fn write_str(c: *Ctx, b: *text.StrBuf, v: Value) -> Result<(), Value> uses r
             if let Some(m) = ops.class_lookup(i.cls, vm.intern(c, "__str__")) {
                 let args = [v];
                 let r = vm.invoke(c, m, args[..])?;
-                let Str(s) = r else { return Err(ops.exc(c, E_TYPE, "__str__ returned non-string")); };
+                let Str(s) = r else { return Err(ops.exc(c, Exc.TypeError, "__str__ returned non-string")); };
                 b.push_str(s.data);
                 return Ok(());
             }
-            if ops.subclass(i.cls, c.excs[builtins.E_BASE].unwrap()) and ops.class_lookup(i.cls, vm.intern(c, "__repr__")).is_none() {
+            if ops.subclass(i.cls, c.excs[builtins.Exc.BaseException as u64].unwrap()) and ops.class_lookup(i.cls, vm.intern(c, "__repr__")).is_none() {
                 let args = value.inst_get(i, vm.intern(c, "args")) ?? Value.Nil;
                 if let Tuple(t) = args {
                     if t.items.len == 0 { return Ok(()); }
                     if t.items.len == 1 {
-                        if ops.subclass(i.cls, c.excs[builtins.E_KEY].unwrap()) { return write_repr(c, b, t.items[0]); }
+                        if ops.subclass(i.cls, c.excs[builtins.Exc.KeyError as u64].unwrap()) { return write_repr(c, b, t.items[0]); }
                         return write_str(c, b, t.items[0]);
                     }
                 }
@@ -175,11 +175,11 @@ fn write_repr_(c: *Ctx, b: *text.StrBuf, v: Value) -> Result<(), Value> uses ree
             if let Some(m) = ops.class_lookup(i.cls, vm.intern(c, "__repr__")) {
                 let args = [v];
                 let r = vm.invoke(c, m, args[..])?;
-                let Str(s) = r else { return Err(ops.exc(c, E_TYPE, "__repr__ returned non-string")); };
+                let Str(s) = r else { return Err(ops.exc(c, Exc.TypeError, "__repr__ returned non-string")); };
                 b.push_str(s.data);
                 return Ok(());
             }
-            if ops.subclass(i.cls, c.excs[builtins.E_BASE].unwrap()) {
+            if ops.subclass(i.cls, c.excs[builtins.Exc.BaseException as u64].unwrap()) {
                 b.push_str(ops.class_name(i.cls));
                 let args = value.inst_get(i, vm.intern(c, "args")) ?? Value.Nil;
                 if let Tuple(t) = args and t.items.len == 1 {
@@ -230,7 +230,7 @@ fn write_repr_(c: *Ctx, b: *text.StrBuf, v: Value) -> Result<(), Value> uses ree
                 }
                 K_DICTVIEW => {
                     b.push_str(if o.m == 0 { "dict_keys([" } else if o.m == 1 { "dict_values([" } else { "dict_items([" });
-                    let Dict(d) = o.a else { trap() };
+                    let d = o.a as! Dict;
                     var it: u64 = 0;
                     var first = true;
                     while let Some(e) = value.dict_next(d, &it) {
@@ -453,7 +453,7 @@ fn pad(b: *text.StrBuf, body: str, sp: *Spec, lead: u64, default_align: u8) {
     }
 }
 
-fn verr(c: *Ctx, kind: u64, a: str, mid: str, z: str) -> Value {
+fn verr(c: *Ctx, kind: Exc, a: str, mid: str, z: str) -> Value {
     var m = text.StrBuf.new();
     m.push_str(a);
     m.push_str(mid);
@@ -466,14 +466,14 @@ fn verr_ch(c: *Ctx, a: str, ch: u8, z: str) -> Value {
     m.push_str(a);
     m.push(ch);
     m.push_str(z);
-    ops.exc_buf(c, E_VALUE, &m)
+    ops.exc_buf(c, Exc.ValueError, &m)
 }
 
 /// A number as a float for float conversions; OverflowError for huge ints.
 fn num_f64(c: *Ctx, v: Value) -> Result<?f64, Value> {
     let Some(x) = value.to_f64(v) else { return Ok(None); };
     if let Float(_) = v { return Ok(Some(x)); }
-    if x == 1.0 / 0.0 or x == -1.0 / 0.0 { return Err(ops.exc(c, E_OVERFLOW, "int too large to convert to float")); }
+    if x == 1.0 / 0.0 or x == -1.0 / 0.0 { return Err(ops.exc(c, Exc.OverflowError, "int too large to convert to float")); }
     Ok(Some(x))
 }
 
@@ -531,7 +531,7 @@ pub fn format(c: *Ctx, v: Value, spec: str) -> Result<Value, Value> uses reenter
     let isnum = value.is_num(v);
     let isstr = if let Str(_) = v { true } else { false };
     if !isnum and !isstr {
-        return Err(verr(c, E_TYPE, "unsupported format string passed to ", ops.type_name(c, v), ".__format__"));
+        return Err(verr(c, Exc.TypeError, "unsupported format string passed to ", ops.type_name(c, v), ".__format__"));
     }
     var sp = Spec { fill: ' ', fill_set: false, align: 0, sign: 0, alt: false, width: 0, comma: 0, prec: -1, ty: 0 };
     let perr = parse_spec(spec, isnum, &sp);
@@ -542,10 +542,10 @@ pub fn format(c: *Ctx, v: Value, spec: str) -> Result<Value, Value> uses reenter
         m.push_str("' for object of type '");
         m.push_str(ops.type_name(c, v));
         m.push('\'');
-        return Err(ops.exc_buf(c, E_VALUE, &m));
+        return Err(ops.exc_buf(c, Exc.ValueError, &m));
     }
-    if perr == 2 { return Err(ops.exc(c, E_VALUE, "Format specifier missing precision")); }
-    if perr == 3 { return Err(ops.exc(c, E_VALUE, "Cannot specify both ',' and '_'.")); }
+    if perr == 2 { return Err(ops.exc(c, Exc.ValueError, "Format specifier missing precision")); }
+    if perr == 3 { return Err(ops.exc(c, Exc.ValueError, "Cannot specify both ',' and '_'.")); }
     let isfloat = if let Float(_) = v { true } else { false };
     var ty = sp.ty;
     if ty == 0 and !isfloat { ty = if isstr { 's' } else { 'd' }; }
@@ -559,7 +559,7 @@ pub fn format(c: *Ctx, v: Value, spec: str) -> Result<Value, Value> uses reenter
             m.push_str("' with '");
             m.push(ty);
             m.push_str("'.");
-            return Err(ops.exc_buf(c, E_VALUE, &m));
+            return Err(ops.exc_buf(c, Exc.ValueError, &m));
         }
     }
     var out = text.StrBuf.new();
@@ -568,11 +568,11 @@ pub fn format(c: *Ctx, v: Value, spec: str) -> Result<Value, Value> uses reenter
             out.free();
             return Err(verr_ch(c, "Unknown format code '", ty, "' for object of type 'str'"));
         }
-        if sp.sign == ' ' { out.free(); return Err(ops.exc(c, E_VALUE, "Space not allowed in string format specifier")); }
-        if sp.sign != 0 { out.free(); return Err(ops.exc(c, E_VALUE, "Sign not allowed in string format specifier")); }
-        if sp.alt { out.free(); return Err(ops.exc(c, E_VALUE, "Alternate form (#) not allowed in string format specifier")); }
-        if sp.align == '=' { out.free(); return Err(ops.exc(c, E_VALUE, "'=' alignment not allowed in string format specifier")); }
-        let Str(ss) = v else { trap() };
+        if sp.sign == ' ' { out.free(); return Err(ops.exc(c, Exc.ValueError, "Space not allowed in string format specifier")); }
+        if sp.sign != 0 { out.free(); return Err(ops.exc(c, Exc.ValueError, "Sign not allowed in string format specifier")); }
+        if sp.alt { out.free(); return Err(ops.exc(c, Exc.ValueError, "Alternate form (#) not allowed in string format specifier")); }
+        if sp.align == '=' { out.free(); return Err(ops.exc(c, Exc.ValueError, "'=' alignment not allowed in string format specifier")); }
+        let ss = v as! Str;
         let d = ss.data;
         let n = if sp.prec >= 0 and (sp.prec as u64) < d.len { sp.prec as u64 } else { d.len };
         pad(&out, d[0..n], &sp, 0, '<');
@@ -585,12 +585,12 @@ pub fn format(c: *Ctx, v: Value, spec: str) -> Result<Value, Value> uses reenter
             out.free();
             return Err(verr_ch(c, "Unknown format code '", ty, "' for object of type 'int'"));
         }
-        if sp.prec >= 0 { out.free(); return Err(ops.exc(c, E_VALUE, "Precision not allowed in integer format specifier")); }
+        if sp.prec >= 0 { out.free(); return Err(ops.exc(c, Exc.ValueError, "Precision not allowed in integer format specifier")); }
         if ty == 'c' {
-            if sp.sign != 0 { out.free(); return Err(ops.exc(c, E_VALUE, "Sign not allowed with integer format specifier 'c'")); }
-            if sp.alt { out.free(); return Err(ops.exc(c, E_VALUE, "Alternate form (#) not allowed with integer format specifier 'c'")); }
+            if sp.sign != 0 { out.free(); return Err(ops.exc(c, Exc.ValueError, "Sign not allowed with integer format specifier 'c'")); }
+            if sp.alt { out.free(); return Err(ops.exc(c, Exc.ValueError, "Alternate form (#) not allowed with integer format specifier 'c'")); }
             let cv = value.as_i64(v) ?? -1;
-            if cv < 0 or cv >= 0x110000 { out.free(); return Err(ops.exc(c, E_OVERFLOW, "%c arg not in range(0x110000)")); }
+            if cv < 0 or cv >= 0x110000 { out.free(); return Err(ops.exc(c, Exc.OverflowError, "%c arg not in range(0x110000)")); }
             var ch: [u8; 1] = [(cv & 255) as u8];
             emit_number(&out, &sp, 0, "", "", ch[0..1], 0, 3);
             return Ok(mkstr(c, &out));
@@ -616,7 +616,7 @@ pub fn format(c: *Ctx, v: Value, spec: str) -> Result<Value, Value> uses reenter
         out.free();
         return Err(verr_ch(c, "Unknown format code '", ty, "' for object of type 'float'"));
     }
-    let Some(x0) = num_f64(c, v)? else { trap() };
+    let x0 = num_f64(c, v)? as! Some;
     var x = x0;
     let neg = x < 0.0 or (x == 0.0 and (1.0 / x) < 0.0);
     if neg { x = 0.0 - x; }
@@ -643,7 +643,7 @@ fn pct_next(c: *Ctx, a: *PctArgs) -> Result<Value, Value> {
         a.ai = 1;
         return Ok(a.args);
     }
-    Err(ops.exc(c, E_TYPE, "not enough arguments for format string"))
+    Err(ops.exc(c, Exc.TypeError, "not enough arguments for format string"))
 }
 
 /// Append body padded to width (spaces; or zeros after the first `lead`
@@ -673,13 +673,13 @@ fn percent_(c: *Ctx, fs: Gc<Str>, args: Value, b: *text.StrBuf) -> Result<(), Va
     let nargs = if let Some(t) = tup { t.items.len } else { 1 };
     // Like CPython: a non-tuple, non-str argument with __getitem__ is a mapping
     // (no "not all arguments converted" check).
-    let mapping = match args { Dict(_) => true, List(_) => true, _ => false };
+    let mapping = args is Dict | List;
     var i: u64 = 0;
     while i < f.len {
         let ch = f[i];
         if ch != '%' { b.push(ch); i += 1; continue; }
         i += 1;
-        if i >= f.len { return Err(ops.exc(c, E_VALUE, "incomplete format")); }
+        if i >= f.len { return Err(ops.exc(c, Exc.ValueError, "incomplete format")); }
         if f[i] == '%' { b.push('%'); i += 1; continue; }
         var arg: Value = Value.Nil;
         var keyed = false;
@@ -691,8 +691,8 @@ fn percent_(c: *Ctx, fs: Gc<Str>, args: Value, b: *text.StrBuf) -> Result<(), Va
                 if f[i] == '(' { depth += 1; } else if f[i] == ')' { depth -= 1; }
                 i += 1;
             }
-            if depth > 0 { return Err(ops.exc(c, E_VALUE, "incomplete format key")); }
-            let Dict(d) = args else { return Err(ops.exc(c, E_TYPE, "format requires a mapping")); };
+            if depth > 0 { return Err(ops.exc(c, Exc.ValueError, "incomplete format key")); }
+            let Dict(d) = args else { return Err(ops.exc(c, Exc.TypeError, "format requires a mapping")); };
             let key = value.new_str(&c.heap, f[ks..i - 1]);
             let Some(kv) = value.dict_get_str(d, key) else { return Err(ops.key_error(c, Value.Str(key))); };
             arg = kv;
@@ -714,7 +714,7 @@ fn percent_(c: *Ctx, fs: Gc<Str>, args: Value, b: *text.StrBuf) -> Result<(), Va
         if i < f.len and f[i] == '*' {
             i += 1;
             let wv = pct_next(c, &pa)?;
-            let Some(w) = value.as_i64(wv) else { return Err(ops.exc(c, E_TYPE, "* wants int")); };
+            let Some(w) = value.as_i64(wv) else { return Err(ops.exc(c, Exc.TypeError, "* wants int")); };
             if w < 0 { ljust = true; width = (0 - w) as u64; } else { width = w as u64; }
         } else {
             while i < f.len and text.is_digit(f[i]) { width = width * 10 + (f[i] - '0') as u64; i += 1; }
@@ -726,21 +726,21 @@ fn percent_(c: *Ctx, fs: Gc<Str>, args: Value, b: *text.StrBuf) -> Result<(), Va
             if i < f.len and f[i] == '*' {
                 i += 1;
                 let pv = pct_next(c, &pa)?;
-                let Some(p) = value.as_i64(pv) else { return Err(ops.exc(c, E_TYPE, "* wants int")); };
+                let Some(p) = value.as_i64(pv) else { return Err(ops.exc(c, Exc.TypeError, "* wants int")); };
                 prec = if p < 0 { 0 } else { p };
             } else {
                 while i < f.len and text.is_digit(f[i]) { prec = prec * 10 + (f[i] - '0') as i64; i += 1; }
             }
         }
         while i < f.len and (f[i] == 'h' or f[i] == 'l' or f[i] == 'L') { i += 1; }
-        if i >= f.len { return Err(ops.exc(c, E_VALUE, "incomplete format")); }
+        if i >= f.len { return Err(ops.exc(c, Exc.ValueError, "incomplete format")); }
         let conv = f[i];
         let conv_at = i;
         i += 1;
         if !keyed { arg = pct_next(c, &pa)?; }
         if conv == 's' or conv == 'r' or conv == 'a' {
             let svv = if conv == 's' { to_str(c, arg)? } else { repr(c, arg)? };
-            let Str(ss) = svv else { trap() };
+            let ss = svv as! Str;
             let d = ss.data;
             let n = if prec >= 0 and (prec as u64) < d.len { prec as u64 } else { d.len };
             pct_pad(b, d[0..n], width, ljust, false, 0);
@@ -761,12 +761,12 @@ fn percent_(c: *Ctx, fs: Gc<Str>, args: Value, b: *text.StrBuf) -> Result<(), Va
                     m.push(conv);
                     m.push_str(if conv == 'x' or conv == 'X' or conv == 'o' { " format: an integer is required, not " } else { " format: a real number is required, not " });
                     m.push_str(ops.type_name(c, arg));
-                    return Err(ops.exc_buf(c, E_TYPE, &m));
+                    return Err(ops.exc_buf(c, Exc.TypeError, &m));
                 }
             }
         } else if conv == 'f' or conv == 'F' or conv == 'e' or conv == 'E' or conv == 'g' or conv == 'G' {
             let Some(x0) = num_f64(c, arg)? else {
-                return Err(verr(c, E_TYPE, "must be real number, not ", ops.type_name(c, arg), ""));
+                return Err(verr(c, Exc.TypeError, "must be real number, not ", ops.type_name(c, arg), ""));
             };
             fx = x0;
         }
@@ -776,11 +776,11 @@ fn percent_(c: *Ctx, fs: Gc<Str>, args: Value, b: *text.StrBuf) -> Result<(), Va
                 body.push(ss.data[0]);
             } else if value.is_int(arg) {
                 let cv = value.as_i64(arg) ?? -1;
-                if cv < 0 or cv >= 0x110000 { body.free(); return Err(ops.exc(c, E_OVERFLOW, "%c arg not in range(0x110000)")); }
+                if cv < 0 or cv >= 0x110000 { body.free(); return Err(ops.exc(c, Exc.OverflowError, "%c arg not in range(0x110000)")); }
                 body.push((cv & 255) as u8);
             } else {
                 body.free();
-                return Err(ops.exc(c, E_TYPE, "%c requires int or char"));
+                return Err(ops.exc(c, Exc.TypeError, "%c requires int or char"));
             }
             pct_pad(b, body.as_str(), width, ljust, false, 0);
         } else if conv == 'd' or conv == 'i' or conv == 'u' or conv == 'x' or conv == 'X' or conv == 'o' {
@@ -815,12 +815,12 @@ fn percent_(c: *Ctx, fs: Gc<Str>, args: Value, b: *text.StrBuf) -> Result<(), Va
             m.push(hexdigit(conv & 15));
             m.push_str(") at index ");
             m.push_u64(conv_at);
-            return Err(ops.exc_buf(c, E_VALUE, &m));
+            return Err(ops.exc_buf(c, Exc.ValueError, &m));
         }
         body.free();
     }
     if !mapping and pa.ai < nargs {
-        return Err(ops.exc(c, E_TYPE, "not all arguments converted during string formatting"));
+        return Err(ops.exc(c, Exc.TypeError, "not all arguments converted during string formatting"));
     }
     Ok(())
 }

@@ -13,4 +13,4 @@ fn main() {
     var h = gc.Heap.new();
     register(&h);
 }
-// error: passes the address of local `keep` to `Heap.add_scanner`, which may keep it beyond the call
+// error: passes the address of local `keep` to `Heap.add_scanner<u8>`, which may keep it beyond the call

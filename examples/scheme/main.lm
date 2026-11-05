@@ -64,8 +64,8 @@ fn main() -> i32 uses gc {
             ctx.heap.set_verify(true);
         }
     }
-    for id in 0..builtins.NPRIMS {
-        let (name, _, _) = builtins.prim_info(id);
+    for id: i32 in 0..builtins.Prim.COUNT {
+        let name = (id as builtins.Prim).name();
         let s = ctx.syms.intern(&ctx.heap, name);
         let g = ctx.global(s);
         ctx.gvals.set(g as u64, value.prim(id));
@@ -76,7 +76,7 @@ fn main() -> i32 uses gc {
         return 0;
     }
     let main_closure = value.new_closure(&ctx.heap, proto);
-    ctx.heap.add_scanner(&ctx as *u8, rt.scan_roots);
+    ctx.heap.add_scanner(&ctx, rt.scan_roots);
     Scheme.run(&ctx, main_closure);
     ctx.flush();
     if ctx.error != value.unspec() {

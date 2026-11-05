@@ -1,0 +1,5 @@
+// Names and data on enum variants: enum data unknown key.
+// error: `P` has no data key `mx` (keys: min, max)
+#[data(min: i32, max: i32 = 0)]
+enum P { #[data(min = 1, mx = 2)] A }
+fn main() {}

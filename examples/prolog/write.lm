@@ -312,7 +312,7 @@ fn term_prec(m: *Machine, t: Term) -> u32 {
 }
 
 fn is_number(t: Term) -> bool {
-    match t { Int(_) => true, Flt(_) => true, Big(_) => true, _ => false }
+    t is Int | Flt | Big
 }
 
 pub fn write_term(m: *Machine, b: *text.StrBuf, t: Term, o: WOpts) {

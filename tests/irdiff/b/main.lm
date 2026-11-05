@@ -1,0 +1,27 @@
+// `loimi ir-diff` fixture: ../a/main.lm with moved lines, a renamed table and a
+// renamed helper. Same code.
+import std.io;
+import std.os;
+
+
+// The names, now under another name.
+var TABLE: [str; 3] = ["zero", "one", "two"];
+
+
+
+fn name_of(i: u64) -> str {
+    TABLE[i]
+}
+
+fn half(x: i64) -> i64 {
+    // The divisor is the same expression, a few lines further down, so
+    // the panics of `/` carry other line numbers.
+    x / (os.arg_count() as i64 - 7)
+}
+
+fn main() {
+    let n = os.arg_count() as u64;
+    io.println(name_of(n));
+    io.print_int(half(n as i64 * 10));
+    io.println("");
+}

@@ -1,0 +1,5 @@
+// Names and data on enum variants: enum data missing.
+// error: `P.B` gives no `min` and the key has no default
+#[data(min: i32)]
+enum P { #[data(1)] A, B }
+fn main() {}

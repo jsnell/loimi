@@ -615,7 +615,7 @@ fn show(b: *text.StrBuf, v: Value, depth: u32) {
         Inst(i) => {
             let cls = ops.class_name(i.cls);
             // An exception as its class and arguments.
-            if let Some(d) = DBG and let Some(base) = d.ctx.excs[builtins.E_BASE] and ops.subclass(i.cls, base) {
+            if let Some(d) = DBG and let Some(base) = d.ctx.excs[builtins.Exc.BaseException as u64] and ops.subclass(i.cls, base) {
                 let args = value.inst_get(i, vm.intern(d.ctx, "args")) ?? Value.Nil;
                 if let Tuple(t) = args {
                     b.push_str(cls);

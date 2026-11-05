@@ -1,0 +1,13 @@
+// A failed `as!` in a debug build is a panic that names the variant and
+// the place (in a release build it is `trap()`, as_variant_trap.lm).
+// expect-exit: 134
+// expect-stderr: as_variant_panic.lm:11:13: as! Ref of another variant
+enum T { Ref(i64), Nil }
+
+#[inline(never)]
+fn get(k: i64) -> T { if k > 0 { T.Ref(k) } else { T.Nil } }
+
+fn main() -> i32 {
+    let v = get(0) as! Ref;
+    v as i32
+}

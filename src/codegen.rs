@@ -2461,6 +2461,14 @@ impl<'a, 'p> FnGen<'a, 'p> {
     }
 
     fn intrinsic(&mut self, e: &TExpr, i: Intr, args: &[TExpr]) -> String {
+        if i == Intr::TrapAs {
+            if self.cg.opts.overflow_checks {
+                let TK::Str(m) = &args[0].kind else { unreachable!() };
+                self.panic(&String::from_utf8_lossy(m), e.span);
+                return "zeroinitializer".into();
+            }
+            return self.intrinsic(e, Intr::Trap, &[]);
+        }
         let vals: Vec<String> = args.iter().map(|a| self.val(a)).collect();
         let decl = |cg: &mut Codegen, s: &str| {
             cg.decls.insert(s.to_string());
@@ -2517,6 +2525,7 @@ impl<'a, 'p> FnGen<'a, 'p> {
                 self.panic("trap", e.span);
                 "zeroinitializer".into()
             }
+            Intr::TrapAs => unreachable!(),
             Intr::Trap => {
                 decl(self.cg, "declare void @llvm.trap() noreturn");
                 self.emit("call void @llvm.trap()");

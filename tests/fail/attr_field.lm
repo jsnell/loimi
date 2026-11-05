@@ -1,4 +1,4 @@
-// error: unknown attribute `verfied` on a field (here: `allow`)
+// error: unknown attribute `verfied` on a field (here: `allow`, `untraced`)
 struct S {
     #[verfied]
     x: i64,

@@ -1,0 +1,6 @@
+// Names and data on enum variants: enum data not const.
+// error: a data value is a constant: a function call is not
+fn f() -> i32 { 1 }
+#[data(min: i32)]
+enum P { #[data(f())] A }
+fn main() {}

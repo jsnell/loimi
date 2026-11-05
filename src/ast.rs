@@ -106,6 +106,13 @@ pub enum ExprKind {
     Unary(UnOp, P<Expr>),
     Binary(BinOp, P<Expr>, P<Expr>),
     Cast(P<Expr>, TypeExpr),
+    /// `e is P`: whether `e` matches `P`, a pattern that binds nothing;
+    /// a variant with fields may be named alone (`t is Ref`).
+    Is(P<Expr>, Pat),
+    /// `e as! V`: the fields of variant `V` of `e` (one field: its value;
+    /// several: a tuple), or a trap. The path is a pattern's (`V`,
+    /// `E.V`, `.V`).
+    AsVariant(P<Expr>, Vec<Ident>),
     /// `Type { f: e, .. }`; the span of a trailing `..zero`, if any.
     StructLit(Vec<Ident>, Vec<(Ident, Expr)>, Option<Span>),
     Tuple(Vec<Expr>),
@@ -210,6 +217,18 @@ pub enum Stmt {
 #[derive(Clone, Debug, Default)]
 pub struct Attrs {
     pub list: Vec<(String, Vec<String>, Span)>,
+    /// The entries of `#[data(..)]` (enums and their variants; src/enumgen.rs).
+    pub data: Vec<DataArg>,
+}
+
+/// An entry of `#[data(..)]`: `key: Type`, `key: Type = default` (on an
+/// enum), `key = value` or a positional `value` (on a variant).
+#[derive(Clone, Debug)]
+pub struct DataArg {
+    pub key: Option<Ident>,
+    pub ty: Option<TypeExpr>,
+    pub value: Option<Expr>,
+    pub span: Span,
 }
 
 impl Attrs {
@@ -307,6 +326,11 @@ pub struct StructDecl {
     /// `#[trace(f)]` on an `object`: a function of the same module that
     /// traces the trailing array and any memory the object owns.
     pub trace: Option<Ident>,
+    /// `#[trace]` on a plain struct: `S.trace(s, heap)` is generated,
+    /// marking its fields (src/parser.rs `trace_method`), except those
+    /// marked `#[untraced]` (listed here).
+    pub derive_trace: Option<Span>,
+    pub untraced: Vec<Ident>,
 }
 
 #[derive(Clone, Debug)]
@@ -314,6 +338,8 @@ pub struct Variant {
     pub name: Ident,
     pub fields: Vec<TypeExpr>,
     pub discr: Option<i128>,
+    /// `#[name("..")]`, `#[data(..)]` (src/enumgen.rs).
+    pub attrs: Attrs,
 }
 
 #[derive(Clone, Debug)]
@@ -326,6 +352,8 @@ pub struct EnumDecl {
     pub is_pub: bool,
     /// `#[c_name("..")]`: its name in a C header.
     pub c_name: Option<String>,
+    /// `#[names]`, `#[data(..)]` (src/enumgen.rs).
+    pub attrs: Attrs,
 }
 
 #[derive(Clone, Debug)]

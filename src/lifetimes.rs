@@ -67,7 +67,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
-use crate::diag::{Diag, Res, Span};
+use crate::diag::{Diag, Span};
 use crate::tir::*;
 
 /// Longest path kept; longer ones are cut and marked `trunc` (anything
@@ -2185,7 +2185,8 @@ struct Report {
 
 /// Summarize every function (a least fixpoint over the call graph), then
 /// check the functions of checked modules.
-pub fn check(p: &Program, cx: &Ctx, sm: &crate::diag::SourceMap) -> Res<()> {
+/// All errors found: a function's first, for each function.
+pub fn check(p: &Program, cx: &Ctx, sm: &crate::diag::SourceMap) -> Result<(), Vec<Diag>> {
     let mode = std::env::var("LOIMI_LIFETIMES").unwrap_or_default();
     if mode == "off" {
         return Ok(());
@@ -2318,6 +2319,7 @@ pub fn check(p: &Program, cx: &Ctx, sm: &crate::diag::SourceMap) -> Res<()> {
     if stats {
         eprintln!("lifetimes: {} growable fields", grown.len());
     }
+    let mut all = Vec::new();
     for &i in &checked {
         let Some(r) = reports.remove(&i) else { continue };
         let mut lines = r.lines;
@@ -2351,11 +2353,14 @@ pub fn check(p: &Program, cx: &Ctx, sm: &crate::diag::SourceMap) -> Res<()> {
         for l in lines {
             eprintln!("{}", l);
         }
-        if let Some(d) = errs.into_iter().next() {
-            return Err(d);
-        }
+        // A function's first error: the others may follow from it.
+        all.extend(errs.into_iter().next());
     }
-    Ok(())
+    if all.is_empty() {
+        Ok(())
+    } else {
+        Err(all)
+    }
 }
 
 

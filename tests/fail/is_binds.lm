@@ -1,0 +1,4 @@
+enum T { Ref(i64), Nil }
+fn f(t: T) -> bool { t is Reff }
+fn main() {}
+// error: `is` patterns cannot bind names, and `Reff` is not a variant or constant of `T` (use `if let` to bind it)

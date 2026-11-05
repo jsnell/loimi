@@ -56,8 +56,7 @@ pub const MAX_LEN: i32 = 1 << 24;
 /// GC roots: the data stack up to `sp` (the top value, `tos`, is rooted
 /// by the compiler), the locals of every active frame,
 /// the globals and the constants.
-pub fn scan_roots(h: *gc.Heap, data: *u8) {
-    let m = data as *Machine;
+pub fn scan_roots(h: *gc.Heap, m: *Machine) {
     var p = m.stack;
     while p <= m.sp { gc_mark(h, *p); p = p + 1; }
     let ltop = m.lp + m.fp.word.nlocals as u64;

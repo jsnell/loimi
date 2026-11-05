@@ -1,0 +1,8 @@
+import std.gc;
+object Box { v: i64 }
+struct Stack<T> { p: *T, n: u64 }
+#[trace]
+struct Ctx { heap: gc.Heap, s: Stack<Gc<Box>> }
+fn scan(h: *gc.Heap, c: *Ctx) { c.trace(h); }
+fn main() { var c = Ctx { heap: gc.Heap.new(), s: Stack { p: 0 as *Gc<Box>, n: 0 } }; c.heap.add_scanner(&c, scan); }
+// error: `#[trace] struct Ctx`: field `s` holds GC references that `#[trace]` cannot reach (`s.p` points to `Gc<Box>`

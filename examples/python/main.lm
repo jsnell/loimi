@@ -77,7 +77,7 @@ fn main() -> i32 uses reenter {
     c.stack_low = stack_floor((&probe) as u64);
     c.hw = c.stack;
     c.frames_end = c.frames + FRAMES - 4;
-    c.heap.add_scanner(c as *u8, vm.scan_roots);
+    c.heap.add_scanner(c, vm.scan_roots);
     // The bottom frame, below the module's: a prototype with no registers.
     let dummy: *Proto = mem.alloc(1);
     *dummy = Proto { name: "<host>", nparams: 0, nkwonly: 0, flags: 0, nregs: 0, simple: 0, pnames: [], freesrc: [],
@@ -135,7 +135,7 @@ fn main() -> i32 uses reenter {
 }
 
 fn report(c: *Ctx, e: Value) -> i32 uses reenter {
-    if let Inst(i) = e and ops.subclass(i.cls, c.excs[builtins.E_SYSEXIT].unwrap()) { return 0; }
+    if let Inst(i) = e and ops.subclass(i.cls, c.excs[builtins.Exc.SystemExit as u64].unwrap()) { return 0; }
     var b = text.StrBuf.new();
     b.push_str("Traceback (most recent call last):\n  line ");
     b.push_int(c.err_line as i64);

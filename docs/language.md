@@ -168,7 +168,9 @@ enum Token { Num(f64), Ident(Symbol), Punct(u8), Eof }
   error says so.
 - **Literal arithmetic** takes its type from the other operand: in
   `(16 + 8 + 8 * n) >> 4` with `n: u64`, `16 + 8` is `u64` (without
-  another operand or an annotation it is `i64`).
+  another operand or an annotation it is `i64`). So does an `if`,
+  `match` or block whose every result is a literal:
+  `(if c { 1 } else { 0 }) == y` with `y: i32` compares `i32`s.
 - **Array lengths from the literal.** `let t: [(str, u32); _] = [..];`
   takes the length from the array literal, so a table's annotation need
   not count its rows.
@@ -207,9 +209,114 @@ enum Token { Num(f64), Ident(Symbol), Punct(u8), Eof }
   and their parameters take no bounds: the bounds of the aliased type
   are checked where it is instantiated. Aliases are imported like other
   items (`import m.{Name}`, `m.Name`).
+
+#### Variant names and data
+
+An interpreter's builtins, exception kinds and operators are enums
+with tables beside them: name to variant for registration, variant to
+message, arity or base class. The tables can live on the variants
+instead, and the compiler generates the lookups:
+
+<!-- snippet: run "car 1 1" "+ 0 -1" "Some" -->
+```loimi
+import std.io;
+
+/// Builtins by the id a value holds: the Scheme name, the argument
+/// counts (-1: any) and whether the compiler inlines it.
+#[data(min: i32 = 1, max: i32 = 1, inline: bool = false)]
+enum Prim: i32 {
+    #[name("+"), data(0, -1, inline = true)] Add,
+    #[name("car"), data(inline = true)] Car,
+    #[name("vector-ref"), data(2, 2)] VectorRef,
+    #[name("display"), data(max = 2)] Display,
+}
+
+fn main() {
+    for id: i32 in 0..Prim.COUNT {
+        let p = id as Prim;
+        io.print(p.name()); io.print(" ");
+        io.print_int(p.min() as i64); io.print(" ");
+        io.print_int(p.max() as i64); io.println("");
+    }
+    io.println(match Prim.from_name("car") { Some(_) => "Some", None => "None" });
+}
+```
+
+- **Names.** `#[name("..")]` on a variant, or `#[names]` on the enum,
+  generates `E.name(k) -> str` and, for an enum without payloads,
+  `E.from_name(s: str) -> ?E`. A variant without `#[name]` is named as
+  written (`#[names] enum Exc { TypeError, ValueError }` names them
+  `"TypeError"` and `"ValueError"`). Two variants may not have the same
+  name.
+- **Data.** `#[data(key: Type, key: Type = default, ..)]` on the enum
+  declares keys; `#[data(..)]` on a variant gives its values, by
+  position (in the keys' order), then as `key = value`. A key without a
+  default must be given by every variant. Each key generates an
+  accessor `E.key(k) -> Type` (`p.min()`). Values are constants:
+  literals, names of constants and variants, and constructors, tuples
+  and arrays of them (`Some(Op.Ge)`, `(4, true)`); a value of the wrong
+  type is reported at the value. `name`, `from_name` and `COUNT` cannot
+  be keys, a hand-written `fn E.name` (or `E.key`) is an error, and
+  generic enums take neither names nor data.
+- **Cost.** The functions are generated as source in the enum's module
+  and compiled only if something calls them: an enum with names and
+  data that nobody looks up compiles to the same IR as one without.
+  `name` and the accessors are `#[inline]` `match`es that return
+  constants, so LLVM turns a lookup of an unknown variant into a
+  constant-table load (or merges it into a `switch` already on the
+  same value) and folds it for a known one (`Prim.Car.min()` is `1`).
+  `from_name` is a string `match`: a `switch` on the length, then
+  word-sized compares.
+
+`LOIMI_DUMP_VM_EXPANSION=1` prints the generated functions (as `<enum
+E expansion>`). Scheme's 149 primitives (`examples/scheme/builtins.lm`,
+`enum Prim`, with the op that inlines a primitive as the data `op:
+?PO`) and Python's exception classes (`examples/python/builtins.lm`,
+`enum Exc`, with `parent: ?Exc`) are written this way.
+
 #### Patterns, literals and `match`
 
 - `match` is exhaustive. `if let`, `let ... else`, and `while let` are supported.
+- **`e is P`** tests a pattern without binding: `t is Ref`, `v is Int |
+  Float`, `x is Pair(0, _)`, `k is 0..=9`. It is a `bool` at the
+  precedence of `==` (so `a is A and b is B` needs no parentheses, and
+  `!(v is Nil)` does). A variant with fields may be named alone, at the
+  top of the pattern or of an alternative: `t is Ref` is `t is
+  Ref(_)`; nested, write the fields (`o is Some(Int(_))`). The pattern
+  may not bind: a name that is not a variant or a constant of the type
+  is an error, so a misspelled variant is not a binding that always
+  matches; so is a pattern that matches every value. `e is A | B` is
+  exactly `match e { A(_) => true, B(_) => true, _ => false }`, one arm
+  per alternative, the code the examples wrote by hand. `is` is not a
+  reserved word: it means this only after an operand.
+- **`e as! V`** unwraps variant `V` of `e`, or traps: `let s = name as!
+  Str;`. It yields the field (several fields: a tuple, `let (a, b) = p
+  as! Pair;`), and `V` is named as in a pattern (`Str`, `Value.Str`,
+  `.Str`; `Some` and `Ok` work on options and results). It binds like
+  `as`, so `x.f as! Str` needs no parentheses. A failed `as!` is
+  `trap()` in a `--release` build, the same code as `let Str(s) = name
+  else { trap() };`, which is what `let p = e as! V;` is checked as; in
+  a debug build it is a panic naming the variant and the place
+  (`main.lm:12:13: as! Str of another variant`), so the failure says
+  where. Use it where the variant is an invariant (a verifier, the
+  compiler or a type check before it guarantees it); a guest-language
+  type error wants `let .. else { raise .. }`. A variant without fields
+  is an error (test it with `is`).
+
+  <!-- snippet: run "true 12" -->
+  ```loimi
+  import std.io;
+  enum Term { Ref(i64), Atom(u32), Pair(i64, i64), Nil }
+  fn is_var(t: Term) -> bool { t is Ref }
+  fn main() {
+      let p = Term.Pair(5, 4);
+      let (a, b) = p as! Pair;
+      let r = Term.Ref(3) as! Ref;
+      io.print(if is_var(Term.Ref(1)) and !(p is Atom | Nil) { "true " } else { "false " });
+      io.print_int(a + b + r);
+      io.println("");
+  }
+  ```
 - **Integer patterns** are literals (`0x45`, `-1`, `'a'`) and inclusive
   ranges (`0x28..=0x3E`, `'a'..='z'`); a pattern outside the
   scrutinee's type is an error. Integers count as covered only by `_`
@@ -304,6 +411,25 @@ enum Token { Num(f64), Ident(Symbol), Punct(u8), Eof }
   falling out of the `match` is then the same as trying the rest.
 #### Warnings, attributes and tests
 
+- **Errors.** A build reports every independent error it finds, in
+  source order, at most `--max-errors N` (default 20, `0` for all).
+  Checking goes on past an error in a function body, a vm handler or a
+  statement; a binding whose initializer failed is not reported again
+  where it is used. Errors in imports, types and signatures stop the
+  build, since what follows depends on them ([status.md](status.md),
+  Compiler row). This program gets two errors, `p.z` and the `str`
+  assigned to `n`, and none for `a`, which is poisoned:
+
+<!-- snippet: fail "error: 2 errors" -->
+```loimi
+struct P { x: i64 }
+fn f(p: P) -> i64 {
+    let a = p.z;
+    let n: i64 = "one";
+    a + n
+}
+fn main() {}
+```
 - **Warnings** are named (`warning[match_fallout]: ..`). `#[allow(name)]`
   silences one on a match arm, an item (function, `vm`, ...) or a vm item
   (`op`, `family`, vm function, entry), covering everything inside it;
@@ -333,7 +459,8 @@ enum Token { Num(f64), Ident(Symbol), Punct(u8), Eof }
   `#[unsafe]`, `#[raw]` (section 1.3), `#[test]` and `#[track_caller]` (below); `export "C"`
   functions take `#[catch_panic]` and `#[c_const(..)]`, and structs and
   enums named in a C header `#[c_name("..")]` (section 10.1); an
-  `object` takes `#[trace(f)]` (section 8); a `vm`
+  `object` takes `#[trace(f)]` and a plain struct `#[trace]`, with
+  `#[untraced]` on its fields (section 8); a `vm`
   takes `#[require_verified]`, `#[dispatch(mode)]` and
   `#[profile("file")]` (section 3.7); a module-level
   `var` takes `#[thread_local]`; a `super` takes `#[forward]`.
@@ -1286,8 +1413,8 @@ The compiler chooses tag assignments. You can pin a variant's block
 width (`Int(i32) block 48`, below; **Not built:** pinning the tag
 itself, `Int(i32) = tag 0b001`). In return you get:
 
-- **Constructors and patterns.** `Int(3)`, `match v { Int(x) => ... }`, and
-  `if v is Nil` (**Not built:** `is`; write `if let Nil = v`). No macros.
+- **Constructors and patterns.** `Int(3)`, `match v { Int(x) => ... }`,
+  `if v is Nil` and `v as! Int` (section 1.2). No macros.
 - **Optimal match compilation**, including over tuples of values, which is the
   case interpreters care most about (binary operators). The compiler knows the
   bit-level encoding, so it can merge tests. For example, with NaN-boxing and
@@ -2410,7 +2537,7 @@ struct Hooks {
 - Callbacks that run while the runtime is in a fragile state have no
   effects in their type, which makes the restriction checked: the GC's
   root scanners run during a collection, so `Heap.add_scanner` takes a
-  `fn(*Heap, *u8)` and rejects a `uses gc` function.
+  `fn(*Heap, *T)` and rejects a `uses gc` function.
 
 Because allocation fast paths are inlined (`std.gc` bump allocation) and only
 their refill path carries `uses gc`, allocating a value in a handler costs
@@ -3278,6 +3405,65 @@ enough to make it precise and cheap:
   `Gc<gc.Weak<T>>` that reads None once `x` died, and
   `gc.Ephemerons<K, V>` maps objects to values that only the key keeps
   alive. There is no `weak` field qualifier.
+- **Root scanners and `#[trace] struct`.** What the compiler does not
+  root (an interpreter's context: its globals, interned names, tables of
+  values; the VM stacks in memory) a root scanner marks:
+  `heap.add_scanner(ctx, scan)` registers `scan: fn(*gc.Heap, *Ctx)`
+  (no effects: it runs inside a collection), called with `ctx` at every
+  collection. `add_scanner<T>` takes any `*T` and a function of that
+  type (`add_sweeper` likewise), so neither side casts through `*u8`.
+  `#[trace]` on a plain struct generates `S.trace(s: *S, h: *gc.Heap)`,
+  which marks every GC reference in the fields, in declaration order,
+  with the code a scanner would write by hand: `gc_mark(h, s.f)` for a
+  field that holds them inline (`Gc`, options, `value` types, structs,
+  tuples, enums); a loop over a fixed array of those; a loop over the
+  elements of a `mem.Vec` and over the keys and values of a
+  `map.HashMap` that hold them; and the fields of a nested struct, in
+  turn. Raw pointers are not followed (the scanner marks the stack
+  ranges they delimit), and `#[untraced]` on a field leaves it to the
+  scanner. A field that holds GC references `#[trace]` cannot reach (any
+  other container, an array of `Vec`s, a raw pointer inside a nested
+  struct) is an error naming the field,
+  so a context field cannot be left unscanned silently. The method is
+  compiled only if called; `LOIMI_DUMP_VM_EXPANSION=1` lists what it
+  marks (`Ctx.trace marks globals, types[0..24], strs (HashMap
+  values), ..`). Python's `Ctx` and Prolog's `Machine` are written this
+  way.
+
+  <!-- snippet: run "3" -->
+  ```loimi
+  import std.io;
+  import std.gc;
+  import std.mem;
+  object Box { v: i64 }
+  #[trace]
+  struct Ctx {
+      heap: gc.Heap,
+      top: ?Gc<Box>,
+      consts: mem.Vec<Gc<Box>>,
+      stack: *Gc<Box>,
+      sp: u64,
+  }
+  fn scan(h: *gc.Heap, c: *Ctx) {
+      c.trace(h);                                     // top, consts
+      for i in 0..c.sp { gc_mark(h, c.stack[i]); }    // the live stack
+  }
+  fn main() uses gc {
+      var c = Ctx { heap: gc.Heap.new(), consts: mem.Vec.new(), ..zero };
+      c.heap.add_scanner(&c, scan);
+      c.top = Some(new(&c.heap, Box { v: 1 }));
+      c.consts.push(new(&c.heap, Box { v: 2 }));
+      gc.collect(&c.heap);
+      io.print_int(c.top.unwrap().v + c.consts.at(0).v);
+      io.println("");
+  }
+  ```
+
+  A function value converts to a function type that differs only in
+  the types of raw pointers (`scan as fn(*gc.Heap, *u8)`) inside
+  `unsafe { }`: the callback is then called with pointers of the types
+  it was written for only if its caller says so, as `add_scanner<T>`
+  does.
 - **Roots.** These come from three places: the VM stacks (described by the
   `state` kinds and the `ctx.sync` area), compiler-managed temporary roots at
   effectful calls (section 5), and explicit `Root<T>` handles for host data

@@ -763,7 +763,7 @@ fn C.put_arg(c: *C, t0: Term, a: u8) {
     }
 }
 
-fn is_compound(t: Term) -> bool { match t { Str(_) => true, Lst(_) => true, _ => false } }
+fn is_compound(t: Term) -> bool { t is Str | Lst }
 
 /// One argument of a structure being built: a variable or a constant
 /// (compound arguments are built into a register first).

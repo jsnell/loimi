@@ -30,16 +30,12 @@ import rt.{Ctx};
 import read;
 import read.{fail, Reader};
 import builtins;
+import builtins.{Prim, PO};
 import vm.{Scheme};
 
 // ── AST ─────────────────────────────────────────────────────────────
 
 enum K { Const, Ref, GRef, Set, GSet, GDef, If, Lambda, Seq, Call, Prim, Let, Letrec, And, Or, GChk }
-
-/// Ops for builtins compiled inline.
-enum PO { Add, Sub, Mul, Div, Quo, Rem, Mod, NumEq, Lt, Gt, Le, Ge, Eq, Eqv, Cons, Vref, ZeroP, Not, NullP, PairP, Car, Cdr, SetCar, SetCdr, Vset,
-    SymP, NumP, FixP, StrP, VecP, Vector, Record, Memq, Assq, RRef, RSet, RecP,
-    Length, OddP, EvenP, PosP, NegP, VLen, Reverse, Append, SRef }
 
 struct Var {
     name: Gc<Sym>,
@@ -250,52 +246,6 @@ fn Comp.is_form(c: *Comp, x: V, name: str) -> bool {
     false
 }
 
-/// Builtins compiled inline: (op, number of arguments).
-fn inline_prim(name: str) -> ?(PO, i64) {
-    if name.eq("+") { return Some((PO.Add, 2)); }
-    if name.eq("-") { return Some((PO.Sub, 2)); }
-    if name.eq("*") { return Some((PO.Mul, 2)); }
-    if name.eq("/") { return Some((PO.Div, 2)); }
-    if name.eq("quotient") { return Some((PO.Quo, 2)); }
-    if name.eq("remainder") { return Some((PO.Rem, 2)); }
-    if name.eq("modulo") { return Some((PO.Mod, 2)); }
-    if name.eq("=") { return Some((PO.NumEq, 2)); }
-    if name.eq("<") { return Some((PO.Lt, 2)); }
-    if name.eq(">") { return Some((PO.Gt, 2)); }
-    if name.eq("<=") { return Some((PO.Le, 2)); }
-    if name.eq(">=") { return Some((PO.Ge, 2)); }
-    if name.eq("eq?") { return Some((PO.Eq, 2)); }
-    if name.eq("eqv?") { return Some((PO.Eqv, 2)); }
-    if name.eq("cons") { return Some((PO.Cons, 2)); }
-    if name.eq("vector-ref") { return Some((PO.Vref, 2)); }
-    if name.eq("zero?") { return Some((PO.ZeroP, 1)); }
-    if name.eq("not") { return Some((PO.Not, 1)); }
-    if name.eq("null?") { return Some((PO.NullP, 1)); }
-    if name.eq("pair?") { return Some((PO.PairP, 1)); }
-    if name.eq("car") { return Some((PO.Car, 1)); }
-    if name.eq("cdr") { return Some((PO.Cdr, 1)); }
-    if name.eq("set-car!") { return Some((PO.SetCar, 2)); }
-    if name.eq("set-cdr!") { return Some((PO.SetCdr, 2)); }
-    if name.eq("vector-set!") { return Some((PO.Vset, 3)); }
-    if name.eq("symbol?") { return Some((PO.SymP, 1)); }
-    if name.eq("number?") { return Some((PO.NumP, 1)); }
-    if name.eq("exact-integer?") { return Some((PO.FixP, 1)); }
-    if name.eq("string?") { return Some((PO.StrP, 1)); }
-    if name.eq("vector?") { return Some((PO.VecP, 1)); }
-    if name.eq("memq") { return Some((PO.Memq, 2)); }
-    if name.eq("assq") { return Some((PO.Assq, 2)); }
-    if name.eq("length") { return Some((PO.Length, 1)); }
-    if name.eq("odd?") { return Some((PO.OddP, 1)); }
-    if name.eq("even?") { return Some((PO.EvenP, 1)); }
-    if name.eq("positive?") { return Some((PO.PosP, 1)); }
-    if name.eq("negative?") { return Some((PO.NegP, 1)); }
-    if name.eq("vector-length") { return Some((PO.VLen, 1)); }
-    if name.eq("reverse") { return Some((PO.Reverse, 1)); }
-    if name.eq("append") { return Some((PO.Append, 2)); }
-    if name.eq("string-ref") { return Some((PO.SRef, 2)); }
-    None
-}
-
 fn Comp.prim(c: *Comp, po: PO, args: mem.Vec<*Node>) -> *Node {
     let n = c.node(K.Prim);
     n.po = po;
@@ -361,7 +311,7 @@ fn Comp.build_inner(c: *Comp, x: V) -> *Node {
             // A builtin that the program never redefines is called directly.
             if n.a.kind == K.GRef and let Sym(s) = p.car and !c.redefined.contains(s as u64)
                 and let Some(id) = value.prim_of(c.ctx.gvals.at(n.a.g as u64))
-                and id != builtins.P_APPLY {
+                and id != Prim.Apply as i32 {
                 n.a = c.konst(value.prim(id));
             }
             var cur = p.cdr;
@@ -436,8 +386,9 @@ fn Comp.inline_call(c: *Comp, name: str, args: V, argc: i64) -> ?*Node {
         }
         l.free();
     }
-    let Some((po, want)) = inline_prim(name) else { return None; };
-    if argc == want { return Some(c.prim(po, c.args(args))); }
+    let Some(prim) = Prim.from_name(name) else { return None; };
+    let Some(po) = prim.op() else { return None; };
+    if argc == po.arity() { return Some(c.prim(po, c.args(args))); }
     // Left-fold + and * over more operands; (- x) is (- 0 x).
     if (po == PO.Add or po == PO.Mul or po == PO.Sub) and argc > 2 {
         let l = c.args(args);
@@ -1418,7 +1369,7 @@ fn may_call(n: *Node) -> bool {
         let f = n.a;
         if f.kind != K.Const { return true; }
         let Some(id) = value.prim_of(f.v) else { return true; };
-        if id == builtins.P_APPLY or id == builtins.P_CALLCC { return true; }
+        if id == Prim.Apply as i32 or id == Prim.CallCc as i32 { return true; }
     }
     if may_call(n.a) or may_call(n.b) or may_call(n.c) { return true; }
     for i in 0..n.list.len {
@@ -1455,8 +1406,7 @@ fn Comp.inl(c: *Comp, n: *Node, depth: u32) -> *Node {
     }
     // A builtin substituted for a parameter, as in (map car l): an op.
     if n.a.kind == K.Const and let Some(id) = value.prim_of(n.a.v) {
-        let (name, _, _) = builtins.prim_info(id);
-        if let Some((po, want)) = inline_prim(name) and want as u64 == n.list.len {
+        if let Some(po) = (id as Prim).op() and po.arity() as u64 == n.list.len {
             n.kind = K.Prim;
             n.po = po;
             n.a = null_node();
@@ -2396,7 +2346,7 @@ fn Gen.call(g: *Gen, n: *Node, dst: u32, tail: bool) {
         if base != dst { g.emit(Scheme.MOVE(dst as u8, base as u8)); }
         return;
     }
-    if f.kind == K.Const and value.prim_of(f.v) == Some(builtins.P_CALLCC) and nargs == 1 {
+    if f.kind == K.Const and value.prim_of(f.v) == Some(Prim.CallCc as i32) and nargs == 1 {
         let r = g.alloc();
         g.to(n.list.at(0), r);
         g.emit(Scheme.CALLCC(base as u8, if tail { 1 } else { 0 }));
@@ -2405,7 +2355,7 @@ fn Gen.call(g: *Gen, n: *Node, dst: u32, tail: bool) {
         return;
     }
     if f.kind == K.Const and let Some(id) = value.prim_of(f.v)
-        and id != builtins.P_APPLY and id != builtins.P_CALLCC {
+        and id != Prim.Apply as i32 and id != Prim.CallCc as i32 {
         for i in 0..nargs {
             let r = g.alloc();
             g.to(n.list.at(i), r);
@@ -2531,7 +2481,7 @@ fn Gen.prim(g: *Gen, n: *Node, dst: u32) {
         // Too many constants for the operand: the native, with the
         // constant split back into its arguments.
         var ns: mem.Vec<*Node> = mem.Vec.new();
-        let id = if po == PO.RRef { builtins.P_RECORD_REF } else if po == PO.RecP { builtins.P_RECORDP } else { builtins.P_RECORD_SET };
+        let id = if po == PO.RRef { Prim.RecordRef as i32 } else if po == PO.RecP { Prim.RecordP as i32 } else { Prim.RecordSet as i32 };
         if po == PO.RecP {
             ns.push(g.konst_node(n.v));
             ns.push(args.at(0));
@@ -2887,7 +2837,7 @@ pub fn compile(ctx: *Ctx, prelude: str, src: str) -> Gc<Proto> {
             c.galias.insert(gk, id);
         } else if let Some(id) = value.prim_of(c.ctx.gvals.at(h))
             and !c.redefined.contains(c.ctx.gsyms.at(h) as u64)
-            and id != builtins.P_APPLY {
+            and id != Prim.Apply as i32 {
             c.galias.insert(gk, id);
         } else if let Some((l, _, _)) = c.known(n.a) {
             c.glams.insert(gk, l);

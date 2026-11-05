@@ -128,11 +128,11 @@ pub fn deref(t: Term) -> Term {
 }
 
 pub fn is_callable(t: Term) -> bool {
-    match t { Atom(_) => true, Str(_) => true, Lst(_) => true, _ => false }
+    t is Atom | Str | Lst
 }
 
 pub fn is_atomic(t: Term) -> bool {
-    match t { Atom(_) => true, Int(_) => true, Flt(_) => true, Big(_) => true, _ => false }
+    t is Atom | Int | Flt | Big
 }
 
 /// A term's name and arity (lists are '[|]'/2), if it is callable or atomic.

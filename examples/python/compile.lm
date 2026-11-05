@@ -1591,7 +1591,7 @@ fn C.inline_genexp(c: *C, f: *Expr, arg: *Expr, dst: u32) -> bool {
 }
 
 fn C.is_global(c: *C, n: str) -> bool {
-    match c.kind(n) { Global => true, _ => false }
+    c.kind(n) is Global
 }
 
 fn C.first_param_name(c: *C) -> str {
@@ -1945,8 +1945,8 @@ pub fn run_module_source(c: *Ctx, src: str, d: Gc<Dict>) -> Result<(), Value> us
     let arena: *mem.Arena = mem.alloc(1);
     *arena = mem.Arena.new();
     let r = compile_source(c, src, arena);
-    let Ok(idx) = r else { return Err(ops.exc(c, builtins.E_RUNTIME, "cannot compile builtin module")); };
-    if let Err(_) = verify_from(c, first) { return Err(ops.exc(c, builtins.E_RUNTIME, "builtin module failed verification")); }
+    let Ok(idx) = r else { return Err(ops.exc(c, builtins.Exc.RuntimeError, "cannot compile builtin module")); };
+    if let Err(_) = verify_from(c, first) { return Err(ops.exc(c, builtins.Exc.RuntimeError, "builtin module failed verification")); }
     let p = c.protos.at(idx as u64);
     let f = new(&c.heap, Func { proto: p, defaults: None, kwdefaults: None, cells: None, globals: d, owner: None });
     vm.invoke(c, Value.Func(f), [])?;

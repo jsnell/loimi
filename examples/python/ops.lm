@@ -14,7 +14,7 @@ import big;
 import vm;
 import vm.{Ctx, Proto, Frame, Py, P_VARARGS, P_VARKW, P_GEN};
 import builtins;
-import builtins.{E_TYPE, E_VALUE, E_INDEX, E_KEY, E_ATTRIBUTE, E_NAME, E_ZERODIV, E_STOPITER, E_UNBOUND, E_OVERFLOW, E_RUNTIME, E_NOTIMPL};
+import builtins.{Exc};
 import fmt;
 
 pub const O_ADD: u32 = 0;
@@ -152,8 +152,8 @@ pub const C_NE: u32 = 5;
 // ── errors ──────────────────────────────────────────────────────────
 
 /// A new exception instance of builtin exception `kind` with message `msg`.
-pub fn exc(c: *Ctx, kind: u64, msg: str) -> Value {
-    let cls = c.excs[kind].unwrap();
+pub fn exc(c: *Ctx, kind: Exc, msg: str) -> Value {
+    let cls = c.excs[kind as u64].unwrap();
     exc_of(c, cls, Value.Str(value.new_str(&c.heap, msg)))
 }
 
@@ -165,7 +165,7 @@ pub fn exc_of(c: *Ctx, cls: Gc<Box>, arg: Value) -> Value {
     Value.Inst(inst)
 }
 
-pub fn exc_buf(c: *Ctx, kind: u64, b: *text.StrBuf) -> Value {
+pub fn exc_buf(c: *Ctx, kind: Exc, b: *text.StrBuf) -> Value {
     let e = exc(c, kind, b.as_str());
     b.free();
     e
@@ -176,7 +176,7 @@ pub fn type_error(c: *Ctx, msg: str, v: Value) -> Value {
     b.push_str(type_name(c, v));
     b.push_str("() ");
     b.push_str(msg);
-    exc_buf(c, E_TYPE, &b)
+    exc_buf(c, Exc.TypeError, &b)
 }
 
 pub fn not_callable(c: *Ctx, v: Value) -> Value {
@@ -184,7 +184,7 @@ pub fn not_callable(c: *Ctx, v: Value) -> Value {
     b.push('\'');
     b.push_str(type_name(c, v));
     b.push_str("' object is not callable");
-    exc_buf(c, E_TYPE, &b)
+    exc_buf(c, Exc.TypeError, &b)
 }
 
 pub fn name_error(c: *Ctx, name: Value) -> Value {
@@ -192,11 +192,11 @@ pub fn name_error(c: *Ctx, name: Value) -> Value {
     b.push_str("name '");
     if let Str(s) = name { b.push_str(s.data); }
     b.push_str("' is not defined");
-    exc_buf(c, E_NAME, &b)
+    exc_buf(c, Exc.NameError, &b)
 }
 
 pub fn unbound(c: *Ctx) -> Value {
-    exc(c, E_UNBOUND, "cannot access free variable or local variable before assignment")
+    exc(c, Exc.UnboundLocalError, "cannot access free variable or local variable before assignment")
 }
 
 pub fn attr_error(c: *Ctx, v: Value, name: Gc<Str>) -> Value {
@@ -216,7 +216,7 @@ pub fn attr_error(c: *Ctx, v: Value, name: Gc<Str>) -> Value {
     }
     b.push_str(name.data);
     b.push('\'');
-    exc_buf(c, E_ATTRIBUTE, &b)
+    exc_buf(c, Exc.AttributeError, &b)
 }
 
 pub fn unsupported(c: *Ctx, op: str, a: Value, b: Value) -> Value {
@@ -228,7 +228,7 @@ pub fn unsupported(c: *Ctx, op: str, a: Value, b: Value) -> Value {
     m.push_str("' and '");
     m.push_str(type_name(c, b));
     m.push('\'');
-    exc_buf(c, E_TYPE, &m)
+    exc_buf(c, Exc.TypeError, &m)
 }
 
 // ── types ───────────────────────────────────────────────────────────
@@ -396,7 +396,7 @@ fn shape_child(c: *Ctx, k: Gc<Box>, name: Gc<Str>) -> ?Gc<Box> {
     t.extra[n] = Value.Str(nm);
     t.base = Some(k);
     t.b = k.b;
-    let Int(cap) = k.b else { trap() };
+    let cap = k.b as! Int;
     t.s = if (n as i64) + 1 <= (cap as i64) { (n as i64) + 1 } else { (cap as i64) - 1 };
     if k.dict.is_none() { k.dict = Some(value.new_dict(&c.heap, 2)); }
     value.dict_set_str(&c.heap, k.dict.unwrap(), nm, Value.Obj(t));
@@ -436,14 +436,14 @@ fn inst_set(c: *Ctx, o: Gc<Inst>, name: Gc<Str>, v: Value) -> ?u64 {
                     x.items[0] = o.slots[cap - 1];
                     o.slots[cap - 1] = Value.Tuple(x);
                 } else {
-                    let Tuple(x) = o.slots[cap - 1] else { trap() };
+                    let x = o.slots[cap - 1] as! Tuple;
                     if j >= x.items.len {
                         let y = value.new_tuple(&c.heap, x.items.len * 2);
                         for q in 0..y.items.len { y.items[q] = if q < x.items.len { x.items[q] } else { Value.Undef }; }
                         o.slots[cap - 1] = Value.Tuple(y);
                     }
                 }
-                let Tuple(x) = o.slots[cap - 1] else { trap() };
+                let x = o.slots[cap - 1] as! Tuple;
                 x.items[j] = v;
             } else {
                 o.slots[n] = v;
@@ -470,7 +470,7 @@ fn bound(c: *Ctx, selfv: Value, f: Value) -> Value {
 // ── globals ─────────────────────────────────────────────────────────
 
 pub fn get_global(c: *Ctx, func: Value, s: Gc<Str>, idx: *u32, ver: *u32, builtin: *u32) -> Result<Value, Value> {
-    let Func(f) = func else { trap() };
+    let f = func as! Func;
     let d = f.globals;
     if let Some(e) = value.dict_find_str(d, s) {
         *idx = e as u32;
@@ -496,7 +496,7 @@ fn bind_attr(c: *Ctx, selfv: Value, v: Value) -> Result<Value, Value> uses reent
         Builtin(_) => Ok(bound(c, selfv, v)),
         Obj(b) => {
             if b.kind == K_PROPERTY {
-                if b.a == Value.Nil { return Err(exc(c, E_ATTRIBUTE, "property has no getter")); }
+                if b.a == Value.Nil { return Err(exc(c, Exc.AttributeError, "property has no getter")); }
                 let args = [selfv];
                 return vm.invoke(c, b.a, args[..]);
             }
@@ -619,7 +619,7 @@ pub fn getattr(c: *Ctx, obj: Value, name: Gc<Str>, ic: *u32) -> Result<Value, Va
 
 /// Attributes of builtin values: methods from their type's dict.
 fn builtin_attr(c: *Ctx, obj: Value, name: Gc<Str>) -> Result<Value, Value> uses reenter {
-    let int_like = match obj { Int(_) | Long(_) => true, _ => false };
+    let int_like = obj is Int | Long;
     if int_like {
         if name.data.eq("real") or name.data.eq("numerator") { return Ok(obj); }
         if name.data.eq("imag") { return Ok(Value.Int(0)); }
@@ -682,7 +682,7 @@ pub fn setattr(c: *Ctx, obj: Value, name: Gc<Str>, v: Value, ic: *u32) -> Result
         Inst(o) => {
             let cv = class_lookup(o.cls, name);
             if let Some(Obj(b)) = cv and b.kind == K_PROPERTY {
-                if b.b == Value.Nil { return Err(exc(c, E_ATTRIBUTE, "property has no setter")); }
+                if b.b == Value.Nil { return Err(exc(c, Exc.AttributeError, "property has no setter")); }
                 let args = [obj, v];
                 vm.invoke(c, b.b, args[..])?;
                 return Ok(());
@@ -693,7 +693,7 @@ pub fn setattr(c: *Ctx, obj: Value, name: Gc<Str>, v: Value, ic: *u32) -> Result
                 return Ok(());
             }
             if name.data.eq("__dict__") {
-                let Dict(nd) = v else { return Err(exc(c, E_TYPE, "__dict__ must be set to a dictionary")); };
+                let Dict(nd) = v else { return Err(exc(c, Exc.TypeError, "__dict__ must be set to a dictionary")); };
                 inst_dict(c, o);
                 o.slots[0] = Value.Dict(nd);
                 return Ok(());
@@ -859,7 +859,7 @@ fn arg_error(c: *Ctx, f: Gc<Func>, msg: str) -> Value {
     b.push_str(f.proto.name);
     b.push_str("() ");
     b.push_str(msg);
-    exc_buf(c, E_TYPE, &b)
+    exc_buf(c, Exc.TypeError, &b)
 }
 
 /// Rearrange the arguments at `win` (n values; the last ones named by the
@@ -950,7 +950,7 @@ pub fn bind_args(c: *Ctx, f: Gc<Func>, win: *Value, n: u64, kw: Value) -> Result
         b.fmt(" but {} ", npos);
         b.push_str(if npos == 1 { "was given" } else { "were given" });
         args.free();
-        return Err(exc_buf(c, E_TYPE, &b));
+        return Err(exc_buf(c, Exc.TypeError, &b));
     }
     let kwslot = slot + nk;
     var kwd: ?Gc<Dict> = None;
@@ -962,7 +962,7 @@ pub fn bind_args(c: *Ctx, f: Gc<Func>, win: *Value, n: u64, kw: Value) -> Result
     // Keywords.
     if let Tuple(t) = kw {
         for j in 0..nkw {
-            let Str(name) = t.items[j] else { trap() };
+            let name = t.items[j] as! Str;
             let v = args.at(npos + j);
             var found = false;
             for i in 0..np + nk {
@@ -976,7 +976,7 @@ pub fn bind_args(c: *Ctx, f: Gc<Func>, win: *Value, n: u64, kw: Value) -> Result
                         b.push_str("() got multiple values for argument '");
                         b.push_str(name.data);
                         b.push('\'');
-                        return Err(exc_buf(c, E_TYPE, &b));
+                        return Err(exc_buf(c, Exc.TypeError, &b));
                     }
                     win[pi] = v;
                     found = true;
@@ -992,7 +992,7 @@ pub fn bind_args(c: *Ctx, f: Gc<Func>, win: *Value, n: u64, kw: Value) -> Result
                     b.push_str("() got an unexpected keyword argument '");
                     b.push_str(name.data);
                     b.push('\'');
-                    return Err(exc_buf(c, E_TYPE, &b));
+                    return Err(exc_buf(c, Exc.TypeError, &b));
                 }
             }
         }
@@ -1010,14 +1010,14 @@ pub fn bind_args(c: *Ctx, f: Gc<Func>, win: *Value, n: u64, kw: Value) -> Result
                 b.push_str("() missing 1 required positional argument: '");
                 if let Str(pn) = p.pnames[i] { b.push_str(pn.data); }
                 b.push('\'');
-                return Err(exc_buf(c, E_TYPE, &b));
+                return Err(exc_buf(c, Exc.TypeError, &b));
             }
         }
     }
     for i in 0..nk {
         let pi = np + (if has_var { 1 } else { 0 }) + i;
         if win[pi] == Value.Undef {
-            let Str(pn) = p.pnames[pi] else { trap() };
+            let pn = p.pnames[pi] as! Str;
             if let Some(kd) = f.kwdefaults and let Some(v) = value.dict_get_str(kd, pn) { win[pi] = v; }
             else {
                 var b = text.StrBuf.new();
@@ -1025,7 +1025,7 @@ pub fn bind_args(c: *Ctx, f: Gc<Func>, win: *Value, n: u64, kw: Value) -> Result
                 b.push_str("() missing required keyword-only argument: '");
                 b.push_str(pn.data);
                 b.push('\'');
-                return Err(exc_buf(c, E_TYPE, &b));
+                return Err(exc_buf(c, Exc.TypeError, &b));
             }
         }
     }
@@ -1068,7 +1068,7 @@ pub fn spread_args(c: *Ctx, at: *Value) -> Result<(u64, Value), Value> uses reen
     }
     let n = xs.len;
     let need = at + n + 1;
-    if need > c.stack_end { xs.free(); names.free(); return Err(exc(c, builtins.E_RECURSION, "too many arguments")); }
+    if need > c.stack_end { xs.free(); names.free(); return Err(exc(c, builtins.Exc.RecursionError, "too many arguments")); }
     if need > c.hw { c.hw = need; }
     for i in 0..n { at[i] = xs.at(i); }
     let kw = if names.len > 0 { Value.Tuple(value.tuple_of(&c.heap, names.items())) } else { Value.Nil };
@@ -1084,7 +1084,7 @@ pub fn call_generic(c: *Ctx, top: *Value, n: u64, kw: Value) -> Result<Value, Va
         Obj(o) => {
             if o.kind == K_BOUND {
                 let need = top + n + 3;
-                if need > c.stack_end { return Err(exc(c, builtins.E_RECURSION, "maximum recursion depth exceeded")); }
+                if need > c.stack_end { return Err(exc(c, builtins.Exc.RecursionError, "maximum recursion depth exceeded")); }
                 if need > c.hw { c.hw = need; }
                 var i = n;
                 while i > 0 { top[i + 1] = top[i]; i -= 1; }
@@ -1100,7 +1100,7 @@ pub fn call_generic(c: *Ctx, top: *Value, n: u64, kw: Value) -> Result<Value, Va
                     return Ok(inst);
                 };
                 let need = top + n + 3;
-                if need > c.stack_end { return Err(exc(c, builtins.E_RECURSION, "maximum recursion depth exceeded")); }
+                if need > c.stack_end { return Err(exc(c, builtins.Exc.RecursionError, "maximum recursion depth exceeded")); }
                 if need > c.hw { c.hw = need; }
                 var i = n;
                 while i > 0 { top[i + 1] = top[i]; i -= 1; }
@@ -1141,12 +1141,12 @@ pub fn call_method_s(c: *Ctx, obj: Value, name: Gc<Str>, args: []Value) -> Resul
 }
 
 pub fn dn(c: *Ctx, i: u64) -> Gc<Str> {
-    let Str(s) = c.dn[i] else { trap() };
+    let s = c.dn[i] as! Str;
     s
 }
 
 pub fn make_func(c: *Ctx, creator: Value, p: *Proto, regs: *Value, dst: u64) -> Result<Value, Value> {
-    let Func(cf) = creator else { trap() };
+    let cf = creator as! Func;
     var defaults: ?Gc<Tuple> = None;
     if p.ndefaults > 0 { defaults = Some(value.tuple_of(&c.heap, (regs + dst + 1).slice(p.ndefaults as u64))); }
     var kwdefaults: ?Gc<Dict> = None;
@@ -1168,13 +1168,13 @@ pub fn make_func(c: *Ctx, creator: Value, p: *Proto, regs: *Value, dst: u64) -> 
 }
 
 pub fn build_class(c: *Ctx, name: Value, bases: Value, ns: Value, hint: u64) -> Result<Value, Value> {
-    let Dict(d) = ns else { trap() };
+    let d = ns as! Dict;
     var base: Gc<Box> = c.types[vm.T_OBJECT].unwrap();
     if let Tuple(t) = bases {
-        if t.items.len > 1 { return Err(exc(c, E_TYPE, "multiple inheritance is not supported")); }
+        if t.items.len > 1 { return Err(exc(c, Exc.TypeError, "multiple inheritance is not supported")); }
         if t.items.len == 1 {
-            let Obj(b) = t.items[0] else { return Err(exc(c, E_TYPE, "bases must be types")); };
-            if b.kind != K_CLASS { return Err(exc(c, E_TYPE, "bases must be types")); }
+            let Obj(b) = t.items[0] else { return Err(exc(c, Exc.TypeError, "bases must be types")); };
+            if b.kind != K_CLASS { return Err(exc(c, Exc.TypeError, "bases must be types")); }
             base = b;
         }
     }
@@ -1213,8 +1213,8 @@ pub fn build_class(c: *Ctx, name: Value, bases: Value, ns: Value, hint: u64) -> 
 /// Nil for a zero-argument super() outside a method.
 pub fn super_method(c: *Ctx, kv: Value, selfv: Value, name: Gc<Str>, ccls: *u32, cepoch: *u32, cfn: *u64)
     -> Result<(Value, Value), Value> uses reenter {
-    if kv == Value.Nil { return Err(exc(c, E_RUNTIME, "super(): no arguments")); }
-    let Obj(k) = kv else { return Err(exc(c, E_TYPE, "super() argument 1 must be a type")); };
+    if kv == Value.Nil { return Err(exc(c, Exc.RuntimeError, "super(): no arguments")); }
+    let Obj(k) = kv else { return Err(exc(c, Exc.TypeError, "super() argument 1 must be a type")); };
     if k.kind == K_CLASS and let Some(cls) = k.base and let Some(v) = class_lookup(cls, name) {
         var plain = false;
         if let Func(_) = v { plain = true; }
@@ -1237,8 +1237,8 @@ pub fn super_method(c: *Ctx, kv: Value, selfv: Value, name: Gc<Str>, ccls: *u32,
 }
 
 pub fn make_super(c: *Ctx, func: Value, selfv: Value) -> Result<Value, Value> {
-    let Func(f) = func else { trap() };
-    let Some(owner) = f.owner else { return Err(exc(c, E_RUNTIME, "super(): no arguments")); };
+    let f = func as! Func;
+    let Some(owner) = f.owner else { return Err(exc(c, Exc.RuntimeError, "super(): no arguments")); };
     let b = value.new_box(&c.heap, K_SUPER, 0);
     b.a = selfv;
     b.base = Some(owner);
@@ -1246,34 +1246,34 @@ pub fn make_super(c: *Ctx, func: Value, selfv: Value) -> Result<Value, Value> {
 }
 
 pub fn is_exc_class(c: *Ctx, v: Value) -> bool {
-    if let Obj(b) = v and b.kind == K_CLASS { return subclass(b, c.excs[builtins.E_BASE].unwrap()); }
+    if let Obj(b) = v and b.kind == K_CLASS { return subclass(b, c.excs[builtins.Exc.BaseException as u64].unwrap()); }
     false
 }
 
 /// The exception a `raise` of `v` raises: instances as they are, classes
 /// instantiated.
 pub fn make_exc(c: *Ctx, v: Value) -> Result<Value, Value> uses reenter {
-    if let Inst(i) = v and subclass(i.cls, c.excs[builtins.E_BASE].unwrap()) { return Ok(v); }
+    if let Inst(i) = v and subclass(i.cls, c.excs[builtins.Exc.BaseException as u64].unwrap()) { return Ok(v); }
     if is_exc_class(c, v) {
         let top = c.fp.base + c.fp.proto.nregs as u64;
         if top + 2 > c.hw { c.hw = top + 2; }
         top[0] = v;
         return call_generic(c, top, 0, Value.Nil);
     }
-    Err(exc(c, E_TYPE, "exceptions must derive from BaseException"))
+    Err(exc(c, Exc.TypeError, "exceptions must derive from BaseException"))
 }
 
 pub fn exc_match(c: *Ctx, e: Value, cls: Value) -> Result<bool, Value> {
     match cls {
         Obj(b) => {
-            if b.kind != K_CLASS { return Err(exc(c, E_TYPE, "catching classes that do not inherit from BaseException is not allowed")); }
+            if b.kind != K_CLASS { return Err(exc(c, Exc.TypeError, "catching classes that do not inherit from BaseException is not allowed")); }
             Ok(isinstance(c, e, b))
         }
         Tuple(t) => {
             for i in 0..t.items.len { if exc_match(c, e, t.items[i])? { return Ok(true); } }
             Ok(false)
         }
-        _ => Err(exc(c, E_TYPE, "catching classes that do not inherit from BaseException is not allowed")),
+        _ => Err(exc(c, Exc.TypeError, "catching classes that do not inherit from BaseException is not allowed")),
     }
 }
 
@@ -1322,12 +1322,12 @@ pub fn arith(c: *Ctx, op: u32, a: Value, b: Value) -> Result<Value, Value> uses 
     }
     match (a, b) {
         (Str(_), _) => if op == O_ADD and !value.is_kind(b, K_NOTIMPL) {
-            if let Str(_) = b {} else if let Inst(_) = b {} else {
+            if !(b is Str | Inst) {
                 var m = text.StrBuf.new();
                 m.push_str("can only concatenate str (not \"");
                 m.push_str(type_name(c, b));
                 m.push_str("\") to str");
-                return Err(exc_buf(c, E_TYPE, &m));
+                return Err(exc_buf(c, Exc.TypeError, &m));
             }
         } else {},
         _ => {}
@@ -1396,7 +1396,7 @@ pub fn arith(c: *Ctx, op: u32, a: Value, b: Value) -> Result<Value, Value> uses 
 /// CPython's messages for `+` and `*` on sequences, else "unsupported
 /// operand type(s)".
 fn arith_type_error(c: *Ctx, op: u32, a: Value, b: Value) -> Value {
-    let seq = |v: Value| -> bool { match v { Str(_) | List(_) | Tuple(_) => true, _ => false } };
+    let seq = |v: Value| -> bool { v is Str | List | Tuple };
     if op == O_ADD and !is_inst(b) {
         let what = match a { List(_) => "list", Tuple(_) => "tuple", _ => "" };
         if what.len > 0 {
@@ -1407,7 +1407,7 @@ fn arith_type_error(c: *Ctx, op: u32, a: Value, b: Value) -> Value {
             m.push_str(type_name(c, b));
             m.push_str("\") to ");
             m.push_str(what);
-            return exc_buf(c, E_TYPE, &m);
+            return exc_buf(c, Exc.TypeError, &m);
         }
     }
     if op == O_MUL and (seq(a) or seq(b)) and !is_inst(a) and !is_inst(b) {
@@ -1415,14 +1415,14 @@ fn arith_type_error(c: *Ctx, op: u32, a: Value, b: Value) -> Value {
         m.push_str("can't multiply sequence by non-int of type '");
         m.push_str(type_name(c, if seq(a) { b } else { a }));
         m.push('\'');
-        return exc_buf(c, E_TYPE, &m);
+        return exc_buf(c, Exc.TypeError, &m);
     }
     unsupported(c, op_sym(op), a, b)
 }
 
 /// Sequence repetition `seq * n`.
-fn exc_of_empty_kind(c: *Ctx, kind: u64) -> Value {
-    let e = exc_of(c, c.excs[kind].unwrap(), Value.Nil);
+fn exc_of_empty_kind(c: *Ctx, kind: Exc) -> Value {
+    let e = exc_of(c, c.excs[kind as u64].unwrap(), Value.Nil);
     if let Inst(i) = e { inst_put(c, i, vm.intern(c, "args"), Value.Tuple(value.new_tuple(&c.heap, 0))); }
     e
 }
@@ -1432,7 +1432,7 @@ fn repeat(c: *Ctx, seq: Value, n: Value) -> Result<?Value, Value> {
     if let Float(_) = n { return Ok(None); }
     let k = if k0 < 0 { 0 } else { k0 as u64 };
     let len = match seq { Str(s) => s.data.len, _ => value.seq_len(seq) };
-    if len > 0 and k > (1 << 27) / len { return Err(exc_of_empty_kind(c, builtins.E_MEMORY)); }
+    if len > 0 and k > (1 << 27) / len { return Err(exc_of_empty_kind(c, builtins.Exc.MemoryError)); }
     match seq {
         Str(s) => {
             let r = new_uninit(&c.heap, Str { hash: 0 }, s.data.len * k);
@@ -1455,7 +1455,7 @@ fn repeat(c: *Ctx, seq: Value, n: Value) -> Result<?Value, Value> {
     }
 }
 
-fn zero_div(c: *Ctx, what: str) -> Value { exc(c, E_ZERODIV, what) }
+fn zero_div(c: *Ctx, what: str) -> Value { exc(c, Exc.ZeroDivisionError, what) }
 
 pub fn int_arith(c: *Ctx, op: u32, a: Value, b: Value) -> Result<Value, Value> {
     let h = &c.heap;
@@ -1482,11 +1482,11 @@ pub fn int_arith(c: *Ctx, op: u32, a: Value, b: Value) -> Result<Value, Value> {
             O_BOR => return Ok(value.int_val(h, x | y)),
             O_BXOR => return Ok(value.int_val(h, x ^ y)),
             O_LSHIFT => {
-                if y < 0 { return Err(exc(c, E_VALUE, "negative shift count")); }
+                if y < 0 { return Err(exc(c, Exc.ValueError, "negative shift count")); }
                 if y < 63 and (x << y) >> y == x { return Ok(value.int_val(h, x << y)); }
             }
             O_RSHIFT => {
-                if y < 0 { return Err(exc(c, E_VALUE, "negative shift count")); }
+                if y < 0 { return Err(exc(c, Exc.ValueError, "negative shift count")); }
                 return Ok(value.int_val(h, if y > 63 { if x < 0 { -1 } else { 0 } } else { x >> y }));
             }
             _ => {}
@@ -1518,16 +1518,16 @@ pub fn int_arith(c: *Ctx, op: u32, a: Value, b: Value) -> Result<Value, Value> {
                 if x == 0.0 { return Err(zero_div(c, "0.0 cannot be raised to a negative power")); }
                 return Ok(float_pow(c, x, y)?);
             }
-            let Some(e) = value.as_i64(b) else { return Err(exc(c, E_OVERFLOW, "exponent too large")); };
+            let Some(e) = value.as_i64(b) else { return Err(exc(c, Exc.OverflowError, "exponent too large")); };
             Ok(big.pow(h, a, e as u64))
         }
         O_LSHIFT => {
-            if big.is_neg(b) { return Err(exc(c, E_VALUE, "negative shift count")); }
-            let Some(e) = value.as_i64(b) else { return Err(exc(c, E_OVERFLOW, "shift count too large")); };
+            if big.is_neg(b) { return Err(exc(c, Exc.ValueError, "negative shift count")); }
+            let Some(e) = value.as_i64(b) else { return Err(exc(c, Exc.OverflowError, "shift count too large")); };
             Ok(big.shl(h, a, e as u64))
         }
         O_RSHIFT => {
-            if big.is_neg(b) { return Err(exc(c, E_VALUE, "negative shift count")); }
+            if big.is_neg(b) { return Err(exc(c, Exc.ValueError, "negative shift count")); }
             let e = value.as_i64(b) ?? 1000000;
             Ok(big.shr(h, a, e as u64))
         }
@@ -1551,7 +1551,7 @@ fn small(v: Value) -> ?i64 {
 fn float_pow(c: *Ctx, x: f64, y: f64) -> Result<Value, Value> {
     let r = builtins.pow_f(x, y);
     if r - r != 0.0 and r == r and x - x == 0.0 and y - y == 0.0 {
-        let e = exc_of(c, c.excs[E_OVERFLOW].unwrap(), Value.Int(34));
+        let e = exc_of(c, c.excs[Exc.OverflowError as u64].unwrap(), Value.Int(34));
         if let Inst(i) = e {
             let t = value.new_tuple(&c.heap, 2);
             t.items[0] = Value.Int(34);
@@ -1580,10 +1580,10 @@ fn int_true_div(c: *Ctx, a: Value, b: Value) -> Result<Value, Value> {
     let Some((q0, r)) = big.divmod(h, n, d) else { return Err(zero_div(c, "division by zero")); };
     var q = q0;
     if big.bit_length(r) != 0 { q = big.bitop(h, q, Value.Int(1), 1); }
-    if k > 2000 { return Err(exc(c, E_OVERFLOW, "integer division result too large for a float")); }
+    if k > 2000 { return Err(exc(c, Exc.OverflowError, "integer division result too large for a float")); }
     let e = if k < -2000 { -2000 } else { k };
     let f = ldexp(value.to_f64(q).unwrap(), e as i32);
-    if f - f != 0.0 { return Err(exc(c, E_OVERFLOW, "integer division result too large for a float")); }
+    if f - f != 0.0 { return Err(exc(c, Exc.OverflowError, "integer division result too large for a float")); }
     Ok(Value.Float(if neg { -f } else { f }))
 }
 
@@ -1670,7 +1670,7 @@ pub fn unary(c: *Ctx, op: u32, a: Value) -> Result<Value, Value> uses reenter {
     m.push_str(": '");
     m.push_str(type_name(c, a));
     m.push('\'');
-    Err(exc_buf(c, E_TYPE, &m))
+    Err(exc_buf(c, Exc.TypeError, &m))
 }
 
 /// An int (not a bool) that fits an i64: Int or a medium Long.
@@ -1749,7 +1749,7 @@ pub fn recursion_error(c: *Ctx, what: str) -> Value {
     var m = text.StrBuf.new();
     m.push_str("maximum recursion depth exceeded");
     m.push_str(what);
-    exc_buf(c, builtins.E_RECURSION, &m)
+    exc_buf(c, builtins.Exc.RecursionError, &m)
 }
 
 /// The C stack is nearly used up (vm.Ctx.stack_low).
@@ -1844,7 +1844,7 @@ fn cmp_type_error(c: *Ctx, op: u32, a: Value, b: Value) -> Value {
     m.push_str("' and '");
     m.push_str(type_name(c, b));
     m.push('\'');
-    exc_buf(c, E_TYPE, &m)
+    exc_buf(c, Exc.TypeError, &m)
 }
 
 /// Python ==, calling __eq__ on instances (with the identity shortcut
@@ -1965,7 +1965,7 @@ pub fn hash_key(c: *Ctx, v: Value) -> Result<u64, Value> uses reenter {
     if let Inst(i) = v {
         if !class_has_hash(c, i.cls) { return Ok(hash.mix(v as u64)); }
         if let Some(r) = call_method_s(c, v, dn(c, DN_HASH), [])? {
-            let Some(i) = value.as_i64(r) else { return Err(exc(c, E_TYPE, "__hash__ method should return an integer")); };
+            let Some(i) = value.as_i64(r) else { return Err(exc(c, Exc.TypeError, "__hash__ method should return an integer")); };
             return Ok(i as u64);
         }
         return Ok(hash.mix(v as u64));
@@ -1977,7 +1977,7 @@ pub fn hash_key(c: *Ctx, v: Value) -> Result<u64, Value> uses reenter {
         m.push_str("unhashable type: '");
         m.push_str(type_name(c, bad));
         m.push('\'');
-        return Err(exc_buf(c, E_TYPE, &m));
+        return Err(exc_buf(c, Exc.TypeError, &m));
     };
     Ok(hv)
 }
@@ -2019,7 +2019,7 @@ pub fn dict_lookup(c: *Ctx, d: Gc<Dict>, k: Value) -> Result<?Value, Value> uses
 }
 
 pub fn key_error(c: *Ctx, k: Value) -> Value {
-    let cls = c.excs[E_KEY].unwrap();
+    let cls = c.excs[Exc.KeyError as u64].unwrap();
     exc_of(c, cls, k)
 }
 
@@ -2030,7 +2030,7 @@ pub fn new_set(c: *Ctx, frozen: bool) -> Value {
 }
 
 pub fn set_add(c: *Ctx, s: Value, v: Value) -> Result<(), Value> uses reenter {
-    let Obj(b) = s else { trap() };
+    let b = s as! Obj;
     dict_put(c, b.dict.unwrap(), v, Value.Nil)
 }
 
@@ -2038,18 +2038,18 @@ fn index_error(c: *Ctx, what: str) -> Value {
     var m = text.StrBuf.new();
     m.push_str(what);
     m.push_str(" index out of range");
-    exc_buf(c, E_INDEX, &m)
+    exc_buf(c, Exc.IndexError, &m)
 }
 
 /// A normalized index into a sequence of length n.
 fn seq_index(c: *Ctx, key: Value, n: u64, what: str) -> Result<u64, Value> {
     let Some(i) = value.as_i64(key) else {
-        if let Float(_) = key {} else if value.is_int(key) { return Err(index_error(c, what)); }
+        if !(key is Float) and value.is_int(key) { return Err(index_error(c, what)); }
         var m = text.StrBuf.new();
         m.push_str(what);
         m.push_str(" indices must be integers or slices, not ");
         m.push_str(type_name(c, key));
-        return Err(exc_buf(c, E_TYPE, &m));
+        return Err(exc_buf(c, Exc.TypeError, &m));
     };
     let j = if i < 0 { i + n as i64 } else { i };
     if j < 0 or j >= n as i64 { return Err(index_error(c, what)); }
@@ -2065,7 +2065,7 @@ pub fn index_of(c: *Ctx, v: Value) -> Result<Value, Value> uses reenter {
                 m.push_str("__index__ returned non-int (type ");
                 m.push_str(type_name(c, r));
                 m.push(')');
-                return Err(exc_buf(c, E_TYPE, &m));
+                return Err(exc_buf(c, Exc.TypeError, &m));
             }
             return Ok(r);
         }
@@ -2111,7 +2111,7 @@ fn not_subscriptable(c: *Ctx, obj: Value) -> Value {
     m.push('\'');
     m.push_str(type_name(c, obj));
     m.push_str("' object is not subscriptable");
-    exc_buf(c, E_TYPE, &m)
+    exc_buf(c, Exc.TypeError, &m)
 }
 
 pub fn setindex(c: *Ctx, obj: Value, key0: Value, v: Value) -> Result<(), Value> uses reenter {
@@ -2128,14 +2128,14 @@ pub fn setindex(c: *Ctx, obj: Value, key0: Value, v: Value) -> Result<(), Value>
         Inst(_) => {
             let args = [key, v];
             if call_method(c, obj, "__setitem__", args[..])?.is_some() { return Ok(()); }
-            Err(exc(c, E_TYPE, "object does not support item assignment"))
+            Err(exc(c, Exc.TypeError, "object does not support item assignment"))
         }
         _ => {
             var m = text.StrBuf.new();
             m.push('\'');
             m.push_str(type_name(c, obj));
             m.push_str("' object does not support item assignment");
-            Err(exc_buf(c, E_TYPE, &m))
+            Err(exc_buf(c, Exc.TypeError, &m))
         }
     }
 }
@@ -2173,9 +2173,9 @@ pub fn delindex(c: *Ctx, obj: Value, key0: Value) -> Result<(), Value> uses reen
         Inst(_) => {
             let args = [key];
             if call_method(c, obj, "__delitem__", args[..])?.is_some() { return Ok(()); }
-            Err(exc(c, E_TYPE, "object does not support item deletion"))
+            Err(exc(c, Exc.TypeError, "object does not support item deletion"))
         }
-        _ => Err(exc(c, E_TYPE, "object does not support item deletion")),
+        _ => Err(exc(c, Exc.TypeError, "object does not support item deletion")),
     }
 }
 
@@ -2183,8 +2183,8 @@ pub fn delindex(c: *Ctx, obj: Value, key0: Value) -> Result<(), Value> uses reen
 pub fn slice_indices(c: *Ctx, lo: Value, hi: Value, st: Value, n: u64) -> Result<(i64, i64, i64, u64), Value> {
     var step: i64 = 1;
     if st != Value.Nil {
-        let Some(s) = value.as_i64(st) else { return Err(exc(c, E_TYPE, "slice indices must be integers or None or have an __index__ method")); };
-        if s == 0 { return Err(exc(c, E_VALUE, "slice step cannot be zero")); }
+        let Some(s) = value.as_i64(st) else { return Err(exc(c, Exc.TypeError, "slice indices must be integers or None or have an __index__ method")); };
+        if s == 0 { return Err(exc(c, Exc.ValueError, "slice step cannot be zero")); }
         step = s;
     }
     let len = n as i64;
@@ -2196,13 +2196,13 @@ pub fn slice_indices(c: *Ctx, lo: Value, hi: Value, st: Value, n: u64) -> Result
         start = len - 1; stop = -1;
     }
     if lo != Value.Nil {
-        let Some(x) = value.as_i64(lo) else { return Err(exc(c, E_TYPE, "slice indices must be integers or None or have an __index__ method")); };
+        let Some(x) = value.as_i64(lo) else { return Err(exc(c, Exc.TypeError, "slice indices must be integers or None or have an __index__ method")); };
         start = if x < 0 { x + len } else { x };
         if step > 0 { if start < 0 { start = 0; } if start > len { start = len; } }
         else { if start < -1 { start = -1; } if start >= len { start = len - 1; } }
     }
     if hi != Value.Nil {
-        let Some(x) = value.as_i64(hi) else { return Err(exc(c, E_TYPE, "slice indices must be integers or None or have an __index__ method")); };
+        let Some(x) = value.as_i64(hi) else { return Err(exc(c, Exc.TypeError, "slice indices must be integers or None or have an __index__ method")); };
         stop = if x < 0 { x + len } else { x };
         if step > 0 { if stop < 0 { stop = 0; } if stop > len { stop = len; } }
         else { if stop < -1 { stop = -1; } if stop >= len { stop = len - 1; } }
@@ -2302,7 +2302,7 @@ pub fn getslice(c: *Ctx, obj: Value, lo: Value, hi: Value, st: Value) -> Result<
 }
 
 pub fn setslice(c: *Ctx, obj: Value, lo: Value, hi: Value, st: Value, v: Value) -> Result<(), Value> uses reenter {
-    let List(l) = obj else { return Err(exc(c, E_TYPE, "object does not support slice assignment")); };
+    let List(l) = obj else { return Err(exc(c, Exc.TypeError, "object does not support slice assignment")); };
     // l[a:b] = another list, step 1: raw moves, one barrier.
     if let List(src) = v and (src as u64) != (l as u64) and st == Value.Nil and let Some((start, _st, cnt)) = slice_fast(lo, hi, st, l.len) {
         let a0 = start as u64;
@@ -2336,7 +2336,7 @@ pub fn setslice(c: *Ctx, obj: Value, lo: Value, hi: Value, st: Value, v: Value) 
             m.push_int(src.len as i64);
             m.push_str(" to extended slice of size ");
             m.push_int(n as i64);
-            return Err(exc_buf(c, E_VALUE, &m));
+            return Err(exc_buf(c, Exc.ValueError, &m));
         }
         var j = start;
         for i in 0..n { l.arr.items[j as u64] = src.arr.items[i]; j += step; }
@@ -2384,7 +2384,7 @@ fn surely_unequal(e: Value, x: Value) -> bool {
 }
 
 pub fn contains_fast(container: Value, x: Value) -> u32 {
-    let simple = match x { Int(_) => true, Str(_) => true, Nil => true, Bool(_) => true, Float(_) => true, _ => false };
+    let simple = x is Int | Str | Nil | Bool | Float;
     if !simple { return 2; }
     match container {
         Dict(d) => {
@@ -2439,7 +2439,7 @@ pub fn contains(c: *Ctx, container: Value, x: Value) -> Result<bool, Value> uses
         }
         Dict(d) => Ok(dict_lookup(c, d, x)?.is_some()),
         Str(s) => {
-            let Str(n) = x else { return Err(exc(c, E_TYPE, "'in <string>' requires string as left operand")); };
+            let Str(n) = x else { return Err(exc(c, Exc.TypeError, "'in <string>' requires string as left operand")); };
             Ok(mem.find_bytes(s.data, n.data).is_some())
         }
         Obj(b) => {
@@ -2451,7 +2451,7 @@ pub fn contains(c: *Ctx, container: Value, x: Value) -> Result<bool, Value> uses
                 return Ok((i - b.n) % b.s == 0);
             }
             if b.kind == K_DICTVIEW {
-                let Dict(d) = b.a else { trap() };
+                let d = b.a as! Dict;
                 if b.m == 0 { return Ok(dict_lookup(c, d, x)?.is_some()); }
             }
             iter_contains(c, container, x)
@@ -2466,7 +2466,7 @@ pub fn contains(c: *Ctx, container: Value, x: Value) -> Result<bool, Value> uses
             m.push_str("argument of type '");
             m.push_str(type_name(c, container));
             m.push_str("' is not iterable");
-            Err(exc_buf(c, E_TYPE, &m))
+            Err(exc_buf(c, Exc.TypeError, &m))
         }
     }
 }
@@ -2478,7 +2478,7 @@ fn iter_contains(c: *Ctx, container: Value, x: Value) -> Result<bool, Value> use
 }
 
 pub fn list_extend(c: *Ctx, l: Value, v: Value) -> Result<(), Value> uses reenter {
-    let List(x) = l else { trap() };
+    let x = l as! List;
     match v {
         List(y) => { for i in 0..y.len { value.list_push(&c.heap, x, y.arr.items[i]); } }
         Tuple(t) => { for i in 0..t.items.len { value.list_push(&c.heap, x, t.items[i]); } }
@@ -2506,7 +2506,7 @@ pub fn unpack2(c: *Ctx, src: Value) -> Result<(Value, Value), Value> uses reente
         var m = text.StrBuf.new();
         if l.len > 2 { m.fmt("too many values to unpack (expected {})", 2); }
         else { m.fmt2("not enough values to unpack (expected {}, got {})", 2, l.len); }
-        return Err(exc_buf(c, E_VALUE, &m));
+        return Err(exc_buf(c, Exc.ValueError, &m));
     }
     Ok((l.arr.items[0], l.arr.items[1]))
 }
@@ -2519,7 +2519,7 @@ fn unpack_list(c: *Ctx, src: Value) -> Result<Gc<List>, Value> uses reenter {
             m.push_str("cannot unpack non-iterable ");
             m.push_str(type_name(c, src));
             m.push_str(" object");
-            Err(exc_buf(c, E_TYPE, &m))
+            Err(exc_buf(c, Exc.TypeError, &m))
         }
         _ => to_list(c, src),
     }
@@ -2532,7 +2532,7 @@ pub fn unpack(c: *Ctx, src: Value, dst: *Value, before: u64, after: u64) -> Resu
             var m = text.StrBuf.new();
             if l.len > before { m.fmt("too many values to unpack (expected {})", before); }
             else { m.fmt2("not enough values to unpack (expected {}, got {})", before, l.len); }
-            return Err(exc_buf(c, E_VALUE, &m));
+            return Err(exc_buf(c, Exc.ValueError, &m));
         }
         for i in 0..before { dst[i] = l.arr.items[i]; }
         return Ok(());
@@ -2540,7 +2540,7 @@ pub fn unpack(c: *Ctx, src: Value, dst: *Value, before: u64, after: u64) -> Resu
     if l.len < before + after {
         var m = text.StrBuf.new();
         m.fmt2("not enough values to unpack (expected at least {}, got {})", before + after, l.len);
-        return Err(exc_buf(c, E_VALUE, &m));
+        return Err(exc_buf(c, Exc.ValueError, &m));
     }
     for i in 0..before { dst[i] = l.arr.items[i]; }
     let mid = l.len - before - after;
@@ -2585,7 +2585,7 @@ pub fn getiter(c: *Ctx, v: Value) -> Result<Value, Value> uses reenter {
                 }
                 K_SET | K_FROZENSET => Ok(dict_iter(c, o.dict.unwrap(), 3)),
                 K_DICTVIEW => {
-                    let Dict(d) = o.a else { trap() };
+                    let d = o.a as! Dict;
                     Ok(dict_iter(c, d, o.m))
                 }
                 K_CLASS | K_BOUND | K_SUPER | K_PROPERTY | K_STATICM | K_CLASSM | K_MODULE | K_SLICE | K_NOTIMPL => {
@@ -2613,7 +2613,7 @@ fn not_iterable(c: *Ctx, v: Value) -> Value {
     m.push('\'');
     m.push_str(type_name(c, v));
     m.push_str("' object is not iterable");
-    exc_buf(c, E_TYPE, &m)
+    exc_buf(c, Exc.TypeError, &m)
 }
 
 /// The next item of an iterator, or None when it is exhausted.
@@ -2641,7 +2641,7 @@ pub fn next(c: *Ctx, it: Value) -> Result<?Value, Value> uses reenter {
                             match vm.invoke(c, m, xs[..]) {
                                 Ok(v) => { b.n += 1; Ok(Some(v)) }
                                 Err(e) => {
-                                    if isinstance(c, e, c.excs[E_INDEX].unwrap()) or isinstance(c, e, c.excs[E_STOPITER].unwrap()) { return Ok(None); }
+                                    if isinstance(c, e, c.excs[Exc.IndexError as u64].unwrap()) or isinstance(c, e, c.excs[Exc.StopIteration as u64].unwrap()) { return Ok(None); }
                                     Err(e)
                                 }
                             }
@@ -2650,20 +2650,20 @@ pub fn next(c: *Ctx, it: Value) -> Result<?Value, Value> uses reenter {
                     }
                 }
                 K_DICTIT => {
-                    let Dict(d) = b.a else { trap() };
+                    let d = b.a as! Dict;
                     if b.s != -1 and d.len as i64 != b.s {
                         b.s = -2; // sticky, as in CPython
-                        return Err(exc(c, E_RUNTIME, if b.m == 3 { "Set changed size during iteration" } else { "dictionary changed size during iteration" }));
+                        return Err(exc(c, Exc.RuntimeError, if b.m == 3 { "Set changed size during iteration" } else { "dictionary changed size during iteration" }));
                     }
                     var i = b.n as u64;
                     let r = value.dict_next(d, &i);
                     b.n = i as i64;
                     let Some(e) = r else { return Ok(None); };
-                    let Int(left) = b.b else { trap() };
+                    let left = b.b as! Int;
                     if left == 0 and b.s >= 0 {
                         b.s = -1; // exhausted from now on
                         b.n = 0x7fffffffffffffff;
-                        return Err(exc(c, E_RUNTIME, if b.m == 3 { "Set changed size during iteration" } else { "dictionary keys changed during iteration" }));
+                        return Err(exc(c, Exc.RuntimeError, if b.m == 3 { "Set changed size during iteration" } else { "dictionary keys changed during iteration" }));
                     }
                     b.b = Value.Int(left - 1);
                     if b.m == 0 or b.m == 3 { return Ok(Some(value.dict_key(d, e))); }
@@ -2683,7 +2683,7 @@ pub fn next(c: *Ctx, it: Value) -> Result<?Value, Value> uses reenter {
                     Ok(Some(Value.Tuple(t)))
                 }
                 K_ZIPIT => {
-                    let Tuple(its) = b.a else { trap() };
+                    let its = b.a as! Tuple;
                     let t = value.new_tuple(&c.heap, its.items.len);
                     for i in 0..its.items.len {
                         let Some(v) = next(c, its.items[i])? else { return Ok(None); };
@@ -2692,7 +2692,7 @@ pub fn next(c: *Ctx, it: Value) -> Result<?Value, Value> uses reenter {
                     Ok(Some(Value.Tuple(t)))
                 }
                 K_MAPIT => {
-                    let Tuple(its) = b.b else { trap() };
+                    let its = b.b as! Tuple;
                     var xs: mem.Vec<Value> = mem.Vec.new();
                     for i in 0..its.items.len {
                         let r = next(c, its.items[i]);
@@ -2737,7 +2737,7 @@ pub fn next(c: *Ctx, it: Value) -> Result<?Value, Value> uses reenter {
                 Ok(Some(v)) => Ok(Some(v)),
                 Ok(None) => Err(not_iterator(c, it)),
                 Err(e) => {
-                    if isinstance(c, e, c.excs[E_STOPITER].unwrap()) { return Ok(None); }
+                    if isinstance(c, e, c.excs[Exc.StopIteration as u64].unwrap()) { return Ok(None); }
                     Err(e)
                 }
             }
@@ -2751,7 +2751,7 @@ fn not_iterator(c: *Ctx, v: Value) -> Value {
     m.push('\'');
     m.push_str(type_name(c, v));
     m.push_str("' object is not an iterator");
-    exc_buf(c, E_TYPE, &m)
+    exc_buf(c, Exc.TypeError, &m)
 }
 
 // ── strings ─────────────────────────────────────────────────────────

@@ -16,6 +16,9 @@
 //!   // matrix: check-roots     run as is and built with --gc-check-roots
 //!   // env: K=V ...            environment of the program (e.g. LOIMI_JIT=1)
 //!   // error: <text>           (tests/fail) substring of the compile error
+//!   // errors: <n>             (tests/fail) exactly n errors are reported
+//!                              (checking goes on past errors; none may be
+//!                              a cascade of another)
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -196,6 +199,19 @@ fn run_programs_with(xenv: &[(String, String)], select: impl Fn(&str, &str) -> b
     }
 }
 
+/// The errors in a compiler's output: `error: ..` and `error[lint]: ..`
+/// lines, but not the closing count (`error: 3 errors`).
+fn error_count(stderr: &str) -> usize {
+    stderr
+        .lines()
+        .filter(|l| l.starts_with("error:") || l.starts_with("error["))
+        .filter(|l| {
+            let r = l.trim_start_matches("error: ");
+            !(r.ends_with(" errors") && r.trim_end_matches(" errors").parse::<usize>().is_ok()) && !r.contains("are shown (--max-errors")
+        })
+        .count()
+}
+
 #[test]
 fn compile_errors() {
     let mut failures = Vec::new();
@@ -218,10 +234,49 @@ fn compile_errors() {
                 failures.push(format!("{}: error lacks `{}`:\n{}", name, w, stderr));
             }
         }
+        if let Some(n) = directives(&text, "errors").first() {
+            let n: usize = n.trim().parse().expect("`// errors:` takes a number");
+            let got = error_count(&stderr);
+            if got != n {
+                failures.push(format!("{}: {} errors reported, expected {}:\n{}", name, got, n, stderr));
+            }
+        }
     }
     if !failures.is_empty() {
         panic!("{} failure(s):\n\n{}", failures.len(), failures.join("\n\n"));
     }
+}
+
+/// `loimi ir-diff`: tests/irdiff/b is tests/irdiff/a with lines moved
+/// and a table and a function renamed (the same code: exit 0); c changes
+/// one constant (exit 1, naming the function and the line).
+#[test]
+fn ir_diff() {
+    if cross() {
+        return;
+    }
+    let run = |b: &str, extra: &[&str]| {
+        let out = loimi().arg("ir-diff").arg("tests/irdiff/a/main.lm").arg(format!("tests/irdiff/{}/main.lm", b)).args(extra).output().unwrap();
+        (out.status.code(), String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr))
+    };
+    for flags in [&["--release", "--asm"][..], &[]] {
+        let (code, text) = run("b", flags);
+        assert_eq!(code, Some(0), "ir-diff a b {:?}:\n{}", flags, text);
+        assert!(text.contains("result: same code"), "{}", text);
+    }
+    let (code, text) = run("c", &["--release", "--asm"]);
+    assert_eq!(code, Some(1), "ir-diff a c:\n{}", text);
+    assert!(text.contains("differs: main ") && text.contains("+  %v15 = add nsw i64 %v14, -9") && text.contains("+\taddq\t$-9"), "{}", text);
+    // `.ll` inputs (from `build --emit-llvm`) compare the same way.
+    let dir = std::env::temp_dir().join(format!("loimi-irdiff-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for x in ["a", "b"] {
+        let st = loimi().args(["build", &format!("tests/irdiff/{}/main.lm", x), "--release", "--emit-llvm", "-o"]).arg(dir.join(format!("{}.ll", x))).status().unwrap();
+        assert!(st.success());
+    }
+    let out = loimi().arg("ir-diff").arg(dir.join("a.ll")).arg(dir.join("b.ll")).arg("--release").output().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stdout));
 }
 
 /// `loimi test` (std.test): run each tests/test/NAME.lm from its

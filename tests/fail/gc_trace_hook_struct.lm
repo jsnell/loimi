@@ -1,5 +1,6 @@
-// `#[trace(f)]` applies to objects only.
-// error: `trace`
+// `#[trace(f)]` (a trace hook) applies to objects only; on a struct, `#[trace]`
+// derives `S.trace` and takes no function.
+// error: `#[trace]` on a struct takes no function
 #[trace(tr)]
 struct S { n: u64 }
 

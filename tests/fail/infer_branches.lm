@@ -3,3 +3,4 @@ fn main() {
     let r = if c { Ok(1) } else { Ok(2) };
 }
 // error: cannot infer the type of `Ok`
+// errors: 1

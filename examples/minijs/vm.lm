@@ -29,8 +29,8 @@ fn arith(c: *Ctx, op: i64, a: V, b: V) -> Result<V, V> {
         let an = value.is_number(a);
         let bn = value.is_number(b);
         if !(an and bn) {
-            let sa = match a { S(_) | R(_) | O(_) | A(_) | F(_) => true, _ => false };
-            let sb = match b { S(_) | R(_) | O(_) | A(_) | F(_) => true, _ => false };
+            let sa = a is S | R | O | A | F;
+            let sb = b is S | R | O | A | F;
             if sa or sb { return Ok(c.concat(a, b)); }
         }
     }
@@ -107,7 +107,7 @@ fn eq_slow(a: V, b: V) -> bool {
 
 #[inline(always)]
 fn is_str(v: V) -> bool {
-    match v { S(_) | R(_) => true, _ => false }
+    v is S | R
 }
 
 #[inline(always)]
@@ -185,8 +185,8 @@ fn read_miss(c: *Ctx, o: Gc<Obj>, kv: V, site: *obj.Site, st: obj.IcState) -> (V
 /// array (or string) prototype member.
 fn prim_get(c: *Ctx, v: V, kv: V, shape_w: *u32, slot_w: *u32) -> Result<(V, bool), V> {
     let key = key_of_const(c, kv);
-    let is_arr = match v { A(_) => true, _ => false };
-    let is_str = match v { S(_) => true, _ => false };
+    let is_arr = v is A;
+    let is_str = v is S;
     if (is_arr or is_str) and key != c.k_length {
         let p = if is_arr { c.arr_proto() } else { c.str_proto() };
         if c.key_index(key) < 0 and p.dict.is_none() {
