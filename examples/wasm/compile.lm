@@ -779,9 +779,47 @@ fn kmems() -> [(u64, u64); 23] {
     ]
 }
 
+/// Whether `op` is a load that also writes its address to a second slot
+/// (R4 format, the load's result in field a).
 fn is_tk(op: u64) -> bool {
     for row in tkloads() { let (_, tk) = row; if tk == op { return true; } }
+    for row in rloads() { let (_, _, tr) = row; if tr == op { return true; } }
     false
+}
+
+/// (load, its _R form (address a + b), its _TR form (also t = a + b))
+fn rloads() -> [(u64, u64, u64); 8] {
+    [
+        (W.OP_I32_LOAD, W.OP_I32_LOAD_R, W.OP_I32_LOAD_TR), (W.OP_I64_LOAD, W.OP_I64_LOAD_R, W.OP_I64_LOAD_TR),
+        (W.OP_F32_LOAD, W.OP_F32_LOAD_R, W.OP_F32_LOAD_TR), (W.OP_F64_LOAD, W.OP_F64_LOAD_R, W.OP_F64_LOAD_TR),
+        (W.OP_I32_LOAD8_U, W.OP_I32_LOAD8_U_R, W.OP_I32_LOAD8_U_TR), (W.OP_I32_LOAD8_S, W.OP_I32_LOAD8_S_R, W.OP_I32_LOAD8_S_TR),
+        (W.OP_I32_LOAD16_U, W.OP_I32_LOAD16_U_R, W.OP_I32_LOAD16_U_TR), (W.OP_I32_LOAD16_S, W.OP_I32_LOAD16_S_R, W.OP_I32_LOAD16_S_TR),
+    ]
+}
+
+/// A load at offset 0 from the sum of two slots that the last op computed
+/// (`I32_ADD h, x, y`): into the home `h` it read from (the address was
+/// a stack temporary), or into a local (`local.tee`'d address, then
+/// also written by the fused op). The I32_ADD is replaced, and the word
+/// of the fused op (writing `d`) returned.
+fn T.add_load(t: *T, vop: u64, a: Val, offset: u64, p: u64, d: u64) -> ?u64 {
+    if offset != 0 { return None; }
+    let Some(last) = t.code.last() else { return None; };
+    let w = t.code.at(last);
+    if W.opcode(w) != W.OP_I32_ADD { return None; }
+    let (s, x, y) = (W.RRR_a(w), W.RRR_b(w), W.RRR_c(w));
+    let home = a.loc == Loc.Home and t.has_def and last == t.last_def_pc and s == t.home(p);
+    let tee = a.loc == Loc.Local and s == a.x;
+    if !home and !tee { return None; }
+    if tee and (d >= 4096 or s >= 4096 or x >= 4096 or y >= 4096) { return None; }
+    for row in rloads() {
+        let (o, r, tr) = row;
+        if o != vop { continue; }
+        t.code.truncate(last);
+        if home { return Some(rrr(r, d, x, y)); }
+        return Some(W.encode.R4(tr, d as u16, s as u16, x as u16, y as u16));
+    }
+    None
 }
 
 /// (load, its _TK form)
@@ -1108,8 +1146,10 @@ fn T.instr(t: *T) -> Result<bool, str> {
                 }
                 let ra = t.reg(a);
                 let rv = t.reg(v);
-                if offset < 65536 {
-                    t.emit(rrr(vop, ra, rv, offset));
+                // The field holds the end of the access (vm.lm).
+                let end = offset + (1 << (natural as u64));
+                if end < 65536 {
+                    t.emit(rrr(vop, ra, rv, end));
                 } else {
                     let h = t.home(p);
                     let pc = t.emit(W.ADDR(h as u16, ra as u16));
@@ -1132,10 +1172,16 @@ fn T.instr(t: *T) -> Result<bool, str> {
                     t.push_home(ty);
                     return Ok(true);
                 }
+                if let Some(w) = t.add_load(vop, a, offset, p, t.home(p)) {
+                    t.emit_def(w, t.home(p));
+                    t.push_home(ty);
+                    return Ok(true);
+                }
                 let ra = t.reg(a);
                 let h = t.home(p);
-                if offset < 65536 {
-                    t.emit_def(rrr(vop, h, ra, offset), h);
+                let end = offset + (1 << (natural as u64));
+                if end < 65536 {
+                    t.emit_def(rrr(vop, h, ra, end), h);
                 } else {
                     let pc = t.emit(W.ADDR(h as u16, ra as u16));
                     t.code.set(pc + 1, offset);

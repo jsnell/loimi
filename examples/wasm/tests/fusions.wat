@@ -41,6 +41,23 @@
       (br_if 0 (local.get 0)))
     (local.get 1))
 
+  ;; Loads from the sum of two locals, as a temporary (I32_LOAD_R) and
+  ;; tee'd into the first one (I32_LOAD_TR, which also writes it); the
+  ;; sum wraps at 32 bits (-4 + 8 is address 4, not 2^32 + 4).
+  (func $rload (param i32 i32) (result i32)
+    (i32.load (i32.add (local.get 0) (local.get 1))))
+  (func $rtee (param i32 i32) (result i32)
+    (i32.add
+      (i32.load8_u (local.tee 0 (i32.add (local.get 0) (local.get 1))))
+      (i32.mul (local.get 0) (i32.const 1000))))
+
+  ;; Offsets near the end of the 16-bit field, which holds offset + size:
+  ;; 65530 + 4 fits, 65532 + 4 does not (ADDR and I32_LOAD_X).
+  (func $far (result i32)
+    (i32.store offset=65530 (i32.const 0) (i32.const 11))
+    (i32.store offset=65532 (i32.const 0) (i32.const 22))
+    (i32.add (i32.load16_u offset=65530 (i32.const 0)) (i32.load offset=65532 (i32.const 0))))
+
   (func (export "main") (result i32)
     (call $pi (call $tee (i32.const 0)))
     (call $pi (i32.load (i32.const 0)))
@@ -53,6 +70,10 @@
     (call $pf (call $fmin (f64.const nan) (f64.const 2.5)))
     (call $pf (call $fmin (f64.const 2.5) (f64.const nan)))
     (call $pi (call $rem (i32.const 20)))
+    (call $pi (call $rload (i32.const -4) (i32.const 8)))
+    (call $pi (call $rload (i32.const 8) (i32.const 4)))
+    (call $pi (call $rtee (i32.const 2) (i32.const 2)))
+    (call $pi (call $far))
     (global.set $g (i32.add (global.get $g) (i32.const 5)))
     (call $pi (global.get $g))
     (i32.const 0)))

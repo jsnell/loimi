@@ -257,6 +257,15 @@ pub vm W {
     operand l8 = it verify it < 8;
     operand l4 = it verify it < 4;
     operand l2 = it verify it < 2;
+    // The end of an access of 1..16 bytes: its offset plus its size
+    // (compile.lm), so the bounds check is one compare and the address
+    // a displacement (`mem + top - size`); at least the size, so the
+    // access starts at or after `mem`.
+    operand e1 = it verify it >= 1;
+    operand e2 = it verify it >= 2;
+    operand e4 = it verify it >= 4;
+    operand e8 = it verify it >= 8;
+    operand e16 = it verify it >= 16;
     // wasm3's r0 and fp0: a value that one op computes and the next alone
     // consumes stays in a register (the `accumulate` ops, `W.accumulate`
     // in compile.lm).
@@ -285,7 +294,10 @@ pub vm W {
         BR_F64_LT, BR_F64_LE, BR_F64_GT, BR_F64_GE,
         BR_I32_EQK, BR_I32_NEK, BR_I32_LT_SK, BR_I32_LT_UK, BR_I32_GT_SK, BR_I32_GT_UK,
         BR_I32_LE_SK, BR_I32_LE_UK, BR_I32_GE_SK, BR_I32_GE_UK,
-        BRZ, BRNZ;
+        BRZ, BRNZ,
+        I32_LOAD_TK, I64_LOAD_TK, F64_LOAD_TK, I32_LOAD8_U_TK, I32_LOAD16_U_TK,
+        I32_LOAD_R, I64_LOAD_R, F64_LOAD_R, I32_LOAD8_U_R, I32_LOAD16_U_R,
+        I32_LOAD_TR, I64_LOAD_TR, F64_LOAD_TR, I32_LOAD8_U_TR, I32_LOAD16_U_TR;
     operand label = pc + it verify is_insn_boundary(pc + it);
     // The base of a callee's window: anywhere in the frame.
     operand base = it verify it <= (f.nslots as u64) display "r{}";
@@ -461,37 +473,38 @@ pub vm W {
     }
 
     // ── memory ────────────────────────────────────────────────────────
-    // d = load(a + off): the effective address is computed in 64 bits,
-    // so it cannot wrap, and checked against the memory's size. Guest
-    // addresses need not be aligned: `read_unaligned` (LLVM `align 1`).
-    inline for (name, dk, ty, conv, size) in [
-        ("I32_LOAD", ri, i32, x, 4), ("I64_LOAD", rl, i64, x, 8),
-        ("F32_LOAD", rf, f32, x, 4), ("F64_LOAD", rd, f64, x, 8),
-        ("I32_LOAD8_S", ri, i8, x as i32, 1), ("I32_LOAD8_U", ri, u8, x as i32, 1),
-        ("I32_LOAD16_S", ri, i16, x as i32, 2), ("I32_LOAD16_U", ri, u16, x as i32, 2),
-        ("I64_LOAD8_S", rl, i8, x as i64, 1), ("I64_LOAD8_U", rl, u8, x as i64, 1),
-        ("I64_LOAD16_S", rl, i16, x as i64, 2), ("I64_LOAD16_U", rl, u16, x as i64, 2),
-        ("I64_LOAD32_S", rl, i32, x as i64, 4), ("I64_LOAD32_U", rl, u32, x as i64, 4),
+    // d = load(a + offset): the end of the access (`end`: offset plus size,
+    // in the code) is computed in 64 bits, so it cannot wrap, and checked
+    // against the memory's size. Guest addresses need not be aligned:
+    // `read_unaligned` (LLVM `align 1`).
+    inline for (name, dk, ty, conv, size, ek) in [
+        ("I32_LOAD", ri, i32, x, 4, e4), ("I64_LOAD", rl, i64, x, 8, e8),
+        ("F32_LOAD", rf, f32, x, 4, e4), ("F64_LOAD", rd, f64, x, 8, e8),
+        ("I32_LOAD8_S", ri, i8, x as i32, 1, e1), ("I32_LOAD8_U", ri, u8, x as i32, 1, e1),
+        ("I32_LOAD16_S", ri, i16, x as i32, 2, e2), ("I32_LOAD16_U", ri, u16, x as i32, 2, e2),
+        ("I64_LOAD8_S", rl, i8, x as i64, 1, e1), ("I64_LOAD8_U", rl, u8, x as i64, 1, e1),
+        ("I64_LOAD16_S", rl, i16, x as i64, 2, e2), ("I64_LOAD16_U", rl, u16, x as i64, 2, e2),
+        ("I64_LOAD32_S", rl, i32, x as i64, 4, e4), ("I64_LOAD32_U", rl, u32, x as i64, 4, e4),
     ] {
-        op #name(d: dk, a: ru, off: imm) : RRR {
-            let ea = (a as u64) + off;
-            if ea + size > msize { cold { raise Trap.MemOOB } }
-            let x = ((mem + ea) as *ty).read_unaligned();
+        op #name(d: dk, a: ru, end: ek) : RRR {
+            let top = (a as u64) + end;
+            if top > msize { cold { raise Trap.MemOOB } }
+            let x = ((mem + top - size) as *ty).read_unaligned();
             d = conv;
             next
         }
     }
-    inline for (name, vk, ty, conv, size) in [
-        ("I32_STORE", ri, i32, v, 4), ("I64_STORE", rl, i64, v, 8),
-        ("F32_STORE", ru, u32, v, 4), ("F64_STORE", rd, f64, v, 8),
-        ("I32_STORE8", ri, u8, v as u8, 1), ("I32_STORE16", ri, u16, v as u16, 2),
-        ("I64_STORE8", rl, u8, v as u8, 1), ("I64_STORE16", rl, u16, v as u16, 2),
-        ("I64_STORE32", rl, u32, v as u32, 4),
+    inline for (name, vk, ty, conv, size, ek) in [
+        ("I32_STORE", ri, i32, v, 4, e4), ("I64_STORE", rl, i64, v, 8, e8),
+        ("F32_STORE", ru, u32, v, 4, e4), ("F64_STORE", rd, f64, v, 8, e8),
+        ("I32_STORE8", ri, u8, v as u8, 1, e1), ("I32_STORE16", ri, u16, v as u16, 2, e2),
+        ("I64_STORE8", rl, u8, v as u8, 1, e1), ("I64_STORE16", rl, u16, v as u16, 2, e2),
+        ("I64_STORE32", rl, u32, v as u32, 4, e4),
     ] {
-        op #name(a: ru, v: vk, off: imm) : RRR {
-            let ea = (a as u64) + off;
-            if ea + size > msize { cold { raise Trap.MemOOB } }
-            ((mem + ea) as *ty).write_unaligned(conv);
+        op #name(a: ru, v: vk, end: ek) : RRR {
+            let top = (a as u64) + end;
+            if top > msize { cold { raise Trap.MemOOB } }
+            ((mem + top - size) as *ty).write_unaligned(conv);
             next
         }
     }
@@ -916,25 +929,25 @@ pub vm W {
     }
 
     // Memory: as the scalar loads (`_X`: a 64-bit address from ADDR).
-    inline for (name, dk, ty, conv, size) in [
-        ("V128_LOAD", vul, u64x2, x, 16),
-        ("V128_LOAD8X8_S", vh, u64, i8x16.from_bits(u64x2.new(x, 0)).widen_low(), 8),
-        ("V128_LOAD8X8_U", vuh, u64, u8x16.from_bits(u64x2.new(x, 0)).widen_low(), 8),
-        ("V128_LOAD16X4_S", vi, u64, i16x8.from_bits(u64x2.new(x, 0)).widen_low(), 8),
-        ("V128_LOAD16X4_U", vui, u64, u16x8.from_bits(u64x2.new(x, 0)).widen_low(), 8),
-        ("V128_LOAD32X2_S", vl, u64, i32x4.from_bits(u64x2.new(x, 0)).widen_low(), 8),
-        ("V128_LOAD32X2_U", vul, u64, u32x4.from_bits(u64x2.new(x, 0)).widen_low(), 8),
-        ("V128_LOAD8_SPLAT", vb, i8, i8x16.splat(x), 1),
-        ("V128_LOAD16_SPLAT", vh, i16, i16x8.splat(x), 2),
-        ("V128_LOAD32_SPLAT", vi, i32, i32x4.splat(x), 4),
-        ("V128_LOAD64_SPLAT", vl, i64, i64x2.splat(x), 8),
-        ("V128_LOAD32_ZERO", vui, u32, u32x4.new(x, 0, 0, 0), 4),
-        ("V128_LOAD64_ZERO", vul, u64, u64x2.new(x, 0), 8),
+    inline for (name, dk, ty, conv, size, ek) in [
+        ("V128_LOAD", vul, u64x2, x, 16, e16),
+        ("V128_LOAD8X8_S", vh, u64, i8x16.from_bits(u64x2.new(x, 0)).widen_low(), 8, e8),
+        ("V128_LOAD8X8_U", vuh, u64, u8x16.from_bits(u64x2.new(x, 0)).widen_low(), 8, e8),
+        ("V128_LOAD16X4_S", vi, u64, i16x8.from_bits(u64x2.new(x, 0)).widen_low(), 8, e8),
+        ("V128_LOAD16X4_U", vui, u64, u16x8.from_bits(u64x2.new(x, 0)).widen_low(), 8, e8),
+        ("V128_LOAD32X2_S", vl, u64, i32x4.from_bits(u64x2.new(x, 0)).widen_low(), 8, e8),
+        ("V128_LOAD32X2_U", vul, u64, u32x4.from_bits(u64x2.new(x, 0)).widen_low(), 8, e8),
+        ("V128_LOAD8_SPLAT", vb, i8, i8x16.splat(x), 1, e1),
+        ("V128_LOAD16_SPLAT", vh, i16, i16x8.splat(x), 2, e2),
+        ("V128_LOAD32_SPLAT", vi, i32, i32x4.splat(x), 4, e4),
+        ("V128_LOAD64_SPLAT", vl, i64, i64x2.splat(x), 8, e8),
+        ("V128_LOAD32_ZERO", vui, u32, u32x4.new(x, 0, 0, 0), 4, e4),
+        ("V128_LOAD64_ZERO", vul, u64, u64x2.new(x, 0), 8, e8),
     ] {
-        op #name(d: dk, a: ru, off: imm) : RRR {
-            let ea = (a as u64) + off;
-            if ea + size > msize { cold { raise Trap.MemOOB } }
-            let x = ((mem + ea) as *ty).read_unaligned();
+        op #name(d: dk, a: ru, end: ek) : RRR {
+            let top = (a as u64) + end;
+            if top > msize { cold { raise Trap.MemOOB } }
+            let x = ((mem + top - size) as *ty).read_unaligned();
             d = conv;
             next
         }
@@ -946,10 +959,10 @@ pub vm W {
             next
         }
     }
-    op V128_STORE(a: ru, v: vul, off: imm) : RRR {
-        let ea = (a as u64) + off;
-        if ea + 16 > msize { cold { raise Trap.MemOOB } }
-        ((mem + ea) as *u64x2).write_unaligned(v);
+    op V128_STORE(a: ru, v: vul, end: e16) : RRR {
+        let top = (a as u64) + end;
+        if top > msize { cold { raise Trap.MemOOB } }
+        ((mem + top - 16) as *u64x2).write_unaligned(v);
         next
     }
     op V128_STORE_X(a: rq, v: vul) : RRR {
@@ -1058,6 +1071,34 @@ pub vm W {
         }
     }
 
+    // `local.get p; local.get i; i32.add; f64.load` (an array element at a
+    // base plus a scaled index): the add (wrapping, as i32.add) and the
+    // load at offset 0 in one op; `_TR` also writes the sum to t
+    // (`local.tee`, 12-bit fields). compile.lm.
+    inline for (name, tname, dk, ty, conv, size) in [
+        ("I32_LOAD_R", "I32_LOAD_TR", ri, i32, x, 4), ("I64_LOAD_R", "I64_LOAD_TR", rl, i64, x, 8),
+        ("F32_LOAD_R", "F32_LOAD_TR", rf, f32, x, 4), ("F64_LOAD_R", "F64_LOAD_TR", rd, f64, x, 8),
+        ("I32_LOAD8_U_R", "I32_LOAD8_U_TR", ri, u8, x as i32, 1), ("I32_LOAD8_S_R", "I32_LOAD8_S_TR", ri, i8, x as i32, 1),
+        ("I32_LOAD16_U_R", "I32_LOAD16_U_TR", ri, u16, x as i32, 2), ("I32_LOAD16_S_R", "I32_LOAD16_S_TR", ri, i16, x as i32, 2),
+    ] {
+        op #name(d: dk, a: ru, b: ru) : RRR {
+            let ea = (a +% b) as u64;
+            if ea + size > msize { cold { raise Trap.MemOOB } }
+            let x = ((mem + ea) as *ty).read_unaligned();
+            d = conv;
+            next
+        }
+        op #tname(d: dk, t: ru, a: ru, b: ru) : R4 {
+            let v = a +% b;
+            t = v;
+            let ea = v as u64;
+            if ea + size > msize { cold { raise Trap.MemOOB } }
+            let x = ((mem + ea) as *ty).read_unaligned();
+            d = conv;
+            next
+        }
+    }
+
     // ── more compare-and-branch ──────────────────────────────────────
     // A bit test (`x & k; br_if`) and a test of a loaded word against
     // zero (`p->next != 0`, `i32.load; local.tee; br_if`), which also
@@ -1071,10 +1112,10 @@ pub vm W {
         jump pc + 2
     }
     inline for (name, nz) in [("BR_I32_LOAD_NZ", true), ("BR_I32_LOAD_Z", false)] {
-        op #name(d: ri, a: ru, off: imm) : RRR then JMP {
-            let ea = (a as u64) + off;
-            if ea + 4 > msize { cold { raise Trap.MemOOB } }
-            let x = ((mem + ea) as *i32).read_unaligned();
+        op #name(d: ri, a: ru, end: e4) : RRR then JMP {
+            let top = (a as u64) + end;
+            if top > msize { cold { raise Trap.MemOOB } }
+            let x = ((mem + top - 4) as *i32).read_unaligned();
             d = x;
             if (x != 0) == nz { jump then.t }
             jump pc + 2
