@@ -43,34 +43,19 @@ extern "C" fn clock_gettime(id: i32, ts: *i64) -> i32;
 
 pub fn pow_f(x: f64, y: f64) -> f64 { pow(x, y) }
 
-// Exception kinds (index into Ctx.excs).
-pub const E_BASE: u64 = 0;
-pub const E_EXC: u64 = 1;
-pub const E_TYPE: u64 = 2;
-pub const E_VALUE: u64 = 3;
-pub const E_INDEX: u64 = 4;
-pub const E_KEY: u64 = 5;
-pub const E_ATTRIBUTE: u64 = 6;
-pub const E_NAME: u64 = 7;
-pub const E_ZERODIV: u64 = 8;
-pub const E_STOPITER: u64 = 9;
-pub const E_UNBOUND: u64 = 10;
-pub const E_OVERFLOW: u64 = 11;
-pub const E_RUNTIME: u64 = 12;
-pub const E_NOTIMPL: u64 = 13;
-pub const E_RECURSION: u64 = 14;
-pub const E_ARITH: u64 = 15;
-pub const E_LOOKUP: u64 = 16;
-pub const E_ASSERT: u64 = 17;
-pub const E_GENEXIT: u64 = 18;
-pub const E_KBINT: u64 = 19;
-pub const E_SYSEXIT: u64 = 20;
-pub const E_IMPORT: u64 = 21;
-pub const E_MEMORY: u64 = 22;
-pub const E_OS: u64 = 23;
-pub const E_EOF: u64 = 24;
-pub const E_UNICODE: u64 = 25;
-pub const E_MODNOTFOUND: u64 = 26;
+// Exception kinds (index into Ctx.excs), each with its base class.
+#[names, data(parent: ?Exc = Some(Exc.Exception))]
+pub enum Exc: u64 {
+    #[data(None)] BaseException, #[data(Some(Exc.BaseException))] Exception, TypeError, ValueError,
+    #[data(Some(Exc.LookupError))] IndexError, #[data(Some(Exc.LookupError))] KeyError, AttributeError,
+    NameError, #[data(Some(Exc.ArithmeticError))] ZeroDivisionError, StopIteration,
+    #[data(Some(Exc.NameError))] UnboundLocalError, #[data(Some(Exc.ArithmeticError))] OverflowError,
+    RuntimeError, #[data(Some(Exc.RuntimeError))] NotImplementedError,
+    #[data(Some(Exc.RuntimeError))] RecursionError, ArithmeticError, LookupError, AssertionError,
+    #[data(Some(Exc.BaseException))] GeneratorExit, #[data(Some(Exc.BaseException))] KeyboardInterrupt,
+    #[data(Some(Exc.BaseException))] SystemExit, ImportError, MemoryError, OSError, EOFError,
+    #[data(Some(Exc.ValueError))] UnicodeError, #[data(Some(Exc.ImportError))] ModuleNotFoundError,
+}
 
 /// Builtin functions and methods. Their number is the Builtin(id) payload.
 pub enum B {
@@ -167,27 +152,26 @@ pub fn setup(c: *Ctx) {
     let bd = value.new_dict(&c.heap, 128);
     c.builtins = Some(bd);
     // Exceptions.
-    let enames = ["BaseException", "Exception", "TypeError", "ValueError", "IndexError", "KeyError",
-                  "AttributeError", "NameError", "ZeroDivisionError", "StopIteration", "UnboundLocalError",
-                  "OverflowError", "RuntimeError", "NotImplementedError", "RecursionError", "ArithmeticError",
-                  "LookupError", "AssertionError", "GeneratorExit", "KeyboardInterrupt", "SystemExit",
-                  "ImportError", "MemoryError", "OSError", "EOFError", "UnicodeError", "ModuleNotFoundError"];
-    let eparents = [99, 0, 1, 1, 16, 16, 1, 1, 15, 1, 7, 15, 1, 12, 12, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 3, 21];
     // Parents first: repeat until every class exists.
     var made: u64 = 0;
-    while made < enames.len {
-        for i in 0..enames.len {
+    while made < Exc.COUNT {
+        for i: u64 in 0..Exc.COUNT {
             if c.excs[i].is_some() { continue; }
-            let p = eparents[i];
-            if p != 99 and c.excs[p as u64].is_none() { continue; }
-            let base = if p == 99 { obj } else { c.excs[p as u64].unwrap() };
-            let e = new_class(c, enames[i], Some(base), 0);
+            let k = i as Exc;
+            let base = match k.parent() {
+                None => obj,
+                Some(p) => {
+                    let Some(b) = c.excs[p as u64] else { continue; };
+                    b
+                }
+            };
+            let e = new_class(c, k.name(), Some(base), 0);
             c.excs[i] = Some(e);
-            put(c, bd, enames[i], Value.Obj(e));
+            put(c, bd, k.name(), Value.Obj(e));
             made += 1;
         }
     }
-    put(c, c.excs[E_BASE].unwrap().dict.unwrap(), "__init__", bv(B.ExcInit));
+    put(c, c.excs[Exc.BaseException as u64].unwrap().dict.unwrap(), "__init__", bv(B.ExcInit));
     put(c, obj.dict.unwrap(), "__init__", bv(B.ObjInit));
     // Builtin types visible by name.
     let visible = [("int", T_INT), ("float", T_FLOAT), ("str", T_STR), ("bool", T_BOOL), ("list", T_LIST),
@@ -279,7 +263,7 @@ fn nargs_error(c: *Ctx, name: str, want: str, got: u64) -> Value {
     b.push_str(" arguments (");
     b.push_int(got as i64);
     b.push_str(" given)");
-    exc_buf(c, E_TYPE, &b)
+    exc_buf(c, Exc.TypeError, &b)
 }
 
 /// The value of keyword argument `name`, if given.
@@ -302,7 +286,7 @@ fn want_int(c: *Ctx, v: Value) -> Result<i64, Value> {
     b.push('\'');
     b.push_str(type_name(c, v));
     b.push_str("' object cannot be interpreted as an integer");
-    Err(exc_buf(c, E_TYPE, &b))
+    Err(exc_buf(c, Exc.TypeError, &b))
 }
 
 fn want_f64(c: *Ctx, v: Value) -> Result<f64, Value> {
@@ -310,7 +294,7 @@ fn want_f64(c: *Ctx, v: Value) -> Result<f64, Value> {
     var b = text.StrBuf.new();
     b.push_str("must be real number, not ");
     b.push_str(type_name(c, v));
-    Err(exc_buf(c, E_TYPE, &b))
+    Err(exc_buf(c, Exc.TypeError, &b))
 }
 
 fn want_str(c: *Ctx, v: Value) -> Result<Gc<Str>, Value> {
@@ -318,7 +302,7 @@ fn want_str(c: *Ctx, v: Value) -> Result<Gc<Str>, Value> {
     var b = text.StrBuf.new();
     b.push_str("must be str, not ");
     b.push_str(type_name(c, v));
-    Err(exc_buf(c, E_TYPE, &b))
+    Err(exc_buf(c, Exc.TypeError, &b))
 }
 
 pub fn range_len(b: Gc<Box>) -> u64 {
@@ -352,13 +336,13 @@ fn no_len(c: *Ctx, v: Value) -> Value {
     b.push_str("object of type '");
     b.push_str(type_name(c, v));
     b.push_str("' has no len()");
-    exc_buf(c, E_TYPE, &b)
+    exc_buf(c, Exc.TypeError, &b)
 }
 
 pub fn float_to_int(c: *Ctx, x: f64) -> Result<Value, Value> {
     match big.from_f64(&c.heap, x) {
         Some(v) => Ok(v),
-        None => Err(exc(c, if x != x { E_VALUE } else { E_OVERFLOW },
+        None => Err(exc(c, if x != x { Exc.ValueError } else { Exc.OverflowError },
                         if x != x { "cannot convert float NaN to integer" } else { "cannot convert float infinity to integer" })),
     }
 }
@@ -503,7 +487,7 @@ pub fn sort_list(c: *Ctx, l: Gc<List>, key: Value, reverse: bool) -> Result<(), 
     keys.free();
     vals.free();
     r?;
-    if modified { return Err(exc(c, E_VALUE, "list modified during sort")); }
+    if modified { return Err(exc(c, Exc.ValueError, "list modified during sort")); }
     Ok(())
 }
 
@@ -516,7 +500,7 @@ fn minmax(c: *Ctx, args: *Value, n: u64, kw: Value, is_max: bool) -> Result<Valu
     let l = if np == 1 { items_of(c, args[0])? } else { value.list_of(&c.heap, args.slice(np)) };
     if l.len == 0 {
         if let Some(d) = dflt { return Ok(d); }
-        return Err(exc(c, E_VALUE, if is_max { "max() iterable argument is empty" } else { "min() iterable argument is empty" }));
+        return Err(exc(c, Exc.ValueError, if is_max { "max() iterable argument is empty" } else { "min() iterable argument is empty" }));
     }
     var best = l.arr.items[0];
     var bestk = best;
@@ -604,14 +588,14 @@ pub fn call(c: *Ctx, id: u32, args: *Value, n: u64, kw: Value) -> Result<Value, 
             Ok(Value.Bool(isinst(c, args[0], args[1])?))
         }
         IsSubclass => {
-            let Obj(x) = args[0] else { return Err(exc(c, E_TYPE, "issubclass() arg 1 must be a class")); };
+            let Obj(x) = args[0] else { return Err(exc(c, Exc.TypeError, "issubclass() arg 1 must be a class")); };
             match args[1] {
                 Obj(y) => Ok(Value.Bool(ops.subclass(x, y))),
                 Tuple(t) => {
                     for i in 0..t.items.len { if let Obj(y) = t.items[i] and ops.subclass(x, y) { return Ok(Value.Bool(true)); } }
                     Ok(Value.Bool(false))
                 }
-                _ => Err(exc(c, E_TYPE, "issubclass() arg 2 must be a class")),
+                _ => Err(exc(c, Exc.TypeError, "issubclass() arg 2 must be a class")),
             }
         }
         Repr => fmt.repr(c, args[0]),
@@ -623,9 +607,9 @@ pub fn call(c: *Ctx, id: u32, args: *Value, n: u64, kw: Value) -> Result<Value, 
                 Long(_) => Ok(big.abs(&c.heap, args[0])),
                 Inst(_) => {
                     if let Some(r) = ops.call_method(c, args[0], "__abs__", [])? { return Ok(r); }
-                    Err(exc(c, E_TYPE, "bad operand type for abs()"))
+                    Err(exc(c, Exc.TypeError, "bad operand type for abs()"))
                 }
-                _ => Err(exc(c, E_TYPE, "bad operand type for abs()")),
+                _ => Err(exc(c, Exc.TypeError, "bad operand type for abs()")),
             }
         }
         Min => minmax(c, args, n, kw, false),
@@ -728,7 +712,7 @@ pub fn call(c: *Ctx, id: u32, args: *Value, n: u64, kw: Value) -> Result<Value, 
         Id => Ok(value.int_val(&c.heap, ((args[0] as u64) & 0xffffffffffff) as i64)),
         Ord => {
             let s = want_str(c, args[0])?;
-            if s.data.len == 0 { return Err(exc(c, E_TYPE, "ord() expected a character, but string of length 0 found")); }
+            if s.data.len == 0 { return Err(exc(c, Exc.TypeError, "ord() expected a character, but string of length 0 found")); }
             // decode one UTF-8 character
             let b0 = s.data[0] as i64;
             if b0 < 0x80 { return Ok(Value.Int(b0 as i48)); }
@@ -749,7 +733,7 @@ pub fn call(c: *Ctx, id: u32, args: *Value, n: u64, kw: Value) -> Result<Value, 
             let (a, d) = (args[0], args[1]);
             if value.is_num(a) and value.is_num(d) and !(value.is_int(a) and value.is_int(d)) {
                 let y = value.to_f64(d).unwrap();
-                if y == 0.0 { return Err(exc(c, E_ZERODIV, "float divmod()")); }
+                if y == 0.0 { return Err(exc(c, Exc.ZeroDivisionError, "float divmod()")); }
                 let (q, r) = ops.float_divmod(value.to_f64(a).unwrap(), y);
                 let t = value.new_tuple(&c.heap, 2);
                 t.items[0] = Value.Float(q);
@@ -771,9 +755,9 @@ pub fn call(c: *Ctx, id: u32, args: *Value, n: u64, kw: Value) -> Result<Value, 
                 // modular exponentiation
                 let m = args[2];
                 if !value.is_int(args[0]) or !value.is_int(args[1]) or !value.is_int(m) {
-                    return Err(exc(c, E_TYPE, "pow() 3rd argument not allowed unless all arguments are integers"));
+                    return Err(exc(c, Exc.TypeError, "pow() 3rd argument not allowed unless all arguments are integers"));
                 }
-                if m == Value.Int(0) { return Err(exc(c, E_VALUE, "pow() 3rd argument cannot be 0")); }
+                if m == Value.Int(0) { return Err(exc(c, Exc.ValueError, "pow() 3rd argument cannot be 0")); }
                 var base = ops.arith(c, ops.O_MOD, args[0], m)?;
                 var e = args[1];
                 if big.is_neg(e) {
@@ -826,7 +810,7 @@ pub fn call(c: *Ctx, id: u32, args: *Value, n: u64, kw: Value) -> Result<Value, 
             match ops.getattr(c, args[0], s, &ic) {
                 Ok(v) => Ok(v),
                 Err(e) => {
-                    if np > 2 and ops.isinstance(c, e, c.excs[E_ATTRIBUTE].unwrap()) { return Ok(args[2]); }
+                    if np > 2 and ops.isinstance(c, e, c.excs[Exc.AttributeError as u64].unwrap()) { return Ok(args[2]); }
                     Err(e)
                 }
             }
@@ -843,7 +827,7 @@ pub fn call(c: *Ctx, id: u32, args: *Value, n: u64, kw: Value) -> Result<Value, 
             match ops.getattr(c, args[0], s, &ic) {
                 Ok(_) => Ok(Value.Bool(true)),
                 Err(e) => {
-                    if ops.isinstance(c, e, c.excs[E_ATTRIBUTE].unwrap()) { return Ok(Value.Bool(false)); }
+                    if ops.isinstance(c, e, c.excs[Exc.AttributeError as u64].unwrap()) { return Ok(Value.Bool(false)); }
                     Err(e)
                 }
             }
@@ -866,7 +850,7 @@ pub fn call(c: *Ctx, id: u32, args: *Value, n: u64, kw: Value) -> Result<Value, 
         }
         Hex | Oct | Bin => {
             let x = ops.index_of(c, args[0])?;
-            if !value.is_int(x) { return Err(exc(c, E_TYPE, "an integer is required")); }
+            if !value.is_int(x) { return Err(exc(c, Exc.TypeError, "an integer is required")); }
             var buf = text.StrBuf.new();
             if big.is_neg(x) { buf.push('-'); }
             buf.push_str(if b == B.Hex { "0x" } else if b == B.Oct { "0o" } else { "0b" });
@@ -880,16 +864,16 @@ pub fn call(c: *Ctx, id: u32, args: *Value, n: u64, kw: Value) -> Result<Value, 
         Globals => Ok(Value.Dict(c.globals.unwrap())),
         Vars => {
             if let Inst(i) = args[0] { return Ok(Value.Dict(ops.inst_dict(c, i))); }
-            Err(exc(c, E_TYPE, "vars() argument must have __dict__ attribute"))
+            Err(exc(c, Exc.TypeError, "vars() argument must have __dict__ attribute"))
         }
-        Input => Err(exc(c, E_EOF, "EOF when reading a line")),
+        Input => Err(exc(c, Exc.EOFError, "EOF when reading a line")),
         ObjInit => {
             if n > 1 {
                 if let Inst(i) = args[0] {
                     var m = text.StrBuf.new();
                     m.push_str(ops.class_name(i.cls));
                     m.push_str("() takes no arguments");
-                    return Err(exc_buf(c, E_TYPE, &m));
+                    return Err(exc_buf(c, Exc.TypeError, &m));
                 }
             }
             Ok(Value.Nil)
@@ -925,7 +909,7 @@ fn mod_inverse(c: *Ctx, a: Value, m: Value) -> Result<Value, Value> uses reenter
         x0 = x1;
         x1 = x2;
     }
-    if r0 != Value.Int(1) { return Err(exc(c, E_VALUE, "base is not invertible for the given modulus")); }
+    if r0 != Value.Int(1) { return Err(exc(c, Exc.ValueError, "base is not invertible for the given modulus")); }
     ops.arith(c, ops.O_MOD, x0, m)
 }
 
@@ -972,15 +956,15 @@ fn stop_iteration(c: *Ctx, it: Value) -> Value {
     if let Obj(g) = it and g.kind == K_GEN and g.b != Value.Nil {
         let v = g.b;
         g.b = Value.Nil;
-        let e = ops.exc_of(c, c.excs[E_STOPITER].unwrap(), v);
+        let e = ops.exc_of(c, c.excs[Exc.StopIteration as u64].unwrap(), v);
         if let Inst(i) = e { ops.inst_put(c, i, vm.intern(c, "value"), v); }
         return e;
     }
-    exc_of_empty(c, E_STOPITER)
+    exc_of_empty(c, Exc.StopIteration)
 }
 
-fn exc_of_empty(c: *Ctx, kind: u64) -> Value {
-    let cls = c.excs[kind].unwrap();
+fn exc_of_empty(c: *Ctx, kind: Exc) -> Value {
+    let cls = c.excs[kind as u64].unwrap();
     let inst = ops.new_inst(c, cls);
     ops.inst_put(c, inst, vm.intern(c, "args"), Value.Tuple(value.new_tuple(&c.heap, 0)));
     Value.Inst(inst)
@@ -989,14 +973,14 @@ fn exc_of_empty(c: *Ctx, kind: u64) -> Value {
 pub fn isinst(c: *Ctx, v: Value, cls: Value) -> Result<bool, Value> {
     match cls {
         Obj(k) => {
-            if k.kind != K_CLASS { return Err(exc(c, E_TYPE, "isinstance() arg 2 must be a type or tuple of types")); }
+            if k.kind != K_CLASS { return Err(exc(c, Exc.TypeError, "isinstance() arg 2 must be a type or tuple of types")); }
             Ok(ops.isinstance(c, v, k))
         }
         Tuple(t) => {
             for i in 0..t.items.len { if isinst(c, v, t.items[i])? { return Ok(true); } }
             Ok(false)
         }
-        _ => Err(exc(c, E_TYPE, "isinstance() arg 2 must be a type or tuple of types")),
+        _ => Err(exc(c, Exc.TypeError, "isinstance() arg 2 must be a type or tuple of types")),
     }
 }
 
@@ -1077,17 +1061,17 @@ pub fn construct(c: *Ctx, cls: Gc<Box>, args: *Value, n: u64, kw: Value) -> Resu
             r.s = 1;
             if np == 1 { r.m = want_int(c, ops.index_of(c, args[0])?)?; }
             else if np >= 2 { r.n = want_int(c, ops.index_of(c, args[0])?)?; r.m = want_int(c, ops.index_of(c, args[1])?)?; }
-            else { return Err(exc(c, E_TYPE, "range expected at least 1 argument, got 0")); }
+            else { return Err(exc(c, Exc.TypeError, "range expected at least 1 argument, got 0")); }
             if np >= 3 {
                 r.s = want_int(c, args[2])?;
-                if r.s == 0 { return Err(exc(c, E_VALUE, "range() arg 3 must not be zero")); }
+                if r.s == 0 { return Err(exc(c, Exc.ValueError, "range() arg 3 must not be zero")); }
             }
             Ok(Value.Obj(r))
         }
         T_OBJECT => Ok(ops.new_instance(c, cls)),
         T_TYPE => {
             if np == 1 { return Ok(Value.Obj(ops.class_of(c, args[0]))); }
-            Err(exc(c, E_TYPE, "type() with 3 arguments is not supported"))
+            Err(exc(c, Exc.TypeError, "type() with 3 arguments is not supported"))
         }
         T_PROPERTY => {
             let p = value.new_box(&c.heap, K_PROPERTY, 0);
@@ -1096,8 +1080,8 @@ pub fn construct(c: *Ctx, cls: Gc<Box>, args: *Value, n: u64, kw: Value) -> Resu
             Ok(Value.Obj(p))
         }
         T_SUPER => {
-            if np != 2 { return Err(exc(c, E_RUNTIME, "super(): only the two-argument form is a call")); }
-            let Obj(k) = args[0] else { return Err(exc(c, E_TYPE, "super() argument 1 must be a type")); };
+            if np != 2 { return Err(exc(c, Exc.RuntimeError, "super(): only the two-argument form is a call")); }
+            let Obj(k) = args[0] else { return Err(exc(c, Exc.TypeError, "super() argument 1 must be a type")); };
             let s = value.new_box(&c.heap, K_SUPER, 0);
             s.a = args[1];
             s.base = Some(k);
@@ -1118,7 +1102,7 @@ fn int_arg_error(c: *Ctx, x: Value) -> Value {
     b.push_str("int() argument must be a string, a bytes-like object or a real number, not '");
     b.push_str(type_name(c, x));
     b.push('\'');
-    exc_buf(c, E_TYPE, &b)
+    exc_buf(c, Exc.TypeError, &b)
 }
 
 fn trim_ws(s: str) -> str {
@@ -1145,7 +1129,7 @@ fn parse_int(c: *Ctx, s0: str, base0: i64) -> Result<Value, Value> {
     b.push_int(base0);
     b.push_str(": ");
     fmt.write_str_repr(&b, s0);
-    Err(exc_buf(c, E_VALUE, &b))
+    Err(exc_buf(c, Exc.ValueError, &b))
 }
 
 fn parse_float(c: *Ctx, s0: str) -> Result<Value, Value> {
@@ -1163,7 +1147,7 @@ fn parse_float(c: *Ctx, s0: str) -> Result<Value, Value> {
     var b = text.StrBuf.new();
     b.push_str("could not convert string to float: ");
     fmt.write_str_repr(&b, s0);
-    Err(exc_buf(c, E_VALUE, &b))
+    Err(exc_buf(c, Exc.ValueError, &b))
 }
 
 fn dict_update(c: *Ctx, d: Gc<Dict>, src: Value) -> Result<(), Value> uses reenter {
@@ -1175,7 +1159,7 @@ fn dict_update(c: *Ctx, d: Gc<Dict>, src: Value) -> Result<(), Value> uses reent
     let it = ops.getiter(c, src)?;
     while let Some(p) = ops.next(c, it)? {
         let l = items_of(c, p)?;
-        if l.len != 2 { return Err(exc(c, E_VALUE, "dictionary update sequence element has wrong length")); }
+        if l.len != 2 { return Err(exc(c, Exc.ValueError, "dictionary update sequence element has wrong length")); }
         ops.dict_put(c, d, l.arr.items[0], l.arr.items[1])?;
     }
     Ok(())
@@ -1263,7 +1247,7 @@ fn split_str(c: *Ctx, s: str, sep: Value, maxsplit: i64, from_right: bool) -> Re
         return Ok(Value.List(l));
     }
     let sp = want_str(c, sep)?.data;
-    if sp.len == 0 { return Err(exc(c, E_VALUE, "empty separator")); }
+    if sp.len == 0 { return Err(exc(c, Exc.ValueError, "empty separator")); }
     if from_right and maxsplit >= 0 {
         var pieces: mem.Vec<(u64, u64)> = mem.Vec.new();
         var end = s.len;
@@ -1310,7 +1294,7 @@ fn call_method_builtin(c: *Ctx, b: B, args: *Value, n: u64, kw: Value) -> Result
                     m.fmt("sequence item {}: expected str instance, ", i);
                     m.push_str(type_name(c, l.arr.items[i]));
                     m.push_str(" found");
-                    return Err(exc_buf(c, E_TYPE, &m));
+                    return Err(exc_buf(c, Exc.TypeError, &m));
                 };
                 out.push_str(x.data);
             }
@@ -1348,7 +1332,7 @@ fn call_method_builtin(c: *Ctx, b: B, args: *Value, n: u64, kw: Value) -> Result
             let r = if b == B.SFind or b == B.SIndex { find_sub(s, sub, a, z) } else { rfind_sub(s, sub, a, z) };
             match r {
                 Some(i) => Ok(value.int_val(&c.heap, i as i64)),
-                None => if b == B.SFind or b == B.SRfind { Ok(Value.Int(-1)) } else { Err(exc(c, E_VALUE, "substring not found")) },
+                None => if b == B.SFind or b == B.SRfind { Ok(Value.Int(-1)) } else { Err(exc(c, Exc.ValueError, "substring not found")) },
             }
         }
         SCount => {
@@ -1488,18 +1472,18 @@ fn call_method_builtin(c: *Ctx, b: B, args: *Value, n: u64, kw: Value) -> Result
         SFormat => str_format(c, want_str(c, selfv)?, args + 1, np - 1, kw, n - np),
         // ── list
         LAppend => {
-            let List(l) = selfv else { return Err(exc(c, E_TYPE, "descriptor 'append' requires a 'list' object")); };
+            let List(l) = selfv else { return Err(exc(c, Exc.TypeError, "descriptor 'append' requires a 'list' object")); };
             value.list_push(&c.heap, l, args[1]);
             Ok(Value.Nil)
         }
         LExtend => { ops.list_extend(c, selfv, args[1])?; Ok(Value.Nil) }
         LPop => {
             let List(l) = selfv else { trap() };
-            if np > 2 { var m = text.StrBuf.new(); m.fmt("pop expected at most 1 argument, got {}", np - 1); return Err(exc_buf(c, E_TYPE, &m)); }
-            if l.len == 0 { return Err(exc(c, E_INDEX, "pop from empty list")); }
+            if np > 2 { var m = text.StrBuf.new(); m.fmt("pop expected at most 1 argument, got {}", np - 1); return Err(exc_buf(c, Exc.TypeError, &m)); }
+            if l.len == 0 { return Err(exc(c, Exc.IndexError, "pop from empty list")); }
             var i = l.len as i64 - 1;
             if np > 1 { i = want_int(c, args[1])?; if i < 0 { i += l.len as i64; } }
-            if i < 0 or i >= l.len as i64 { return Err(exc(c, E_INDEX, "pop index out of range")); }
+            if i < 0 or i >= l.len as i64 { return Err(exc(c, Exc.IndexError, "pop index out of range")); }
             let j = i as u64;
             let v = l.arr.items[j];
             for k in j..l.len - 1 { l.arr.items[k] = l.arr.items[k + 1]; }
@@ -1509,7 +1493,7 @@ fn call_method_builtin(c: *Ctx, b: B, args: *Value, n: u64, kw: Value) -> Result
         }
         LInsert => {
             let List(l) = selfv else { trap() };
-            if np != 3 { var m = text.StrBuf.new(); m.fmt("insert expected 2 arguments, got {}", np - 1); return Err(exc_buf(c, E_TYPE, &m)); }
+            if np != 3 { var m = text.StrBuf.new(); m.fmt("insert expected 2 arguments, got {}", np - 1); return Err(exc_buf(c, Exc.TypeError, &m)); }
             var i = want_int(c, args[1])?;
             if i < 0 { i += l.len as i64; if i < 0 { i = 0; } }
             if i > l.len as i64 { i = l.len as i64; }
@@ -1529,7 +1513,7 @@ fn call_method_builtin(c: *Ctx, b: B, args: *Value, n: u64, kw: Value) -> Result
                     return Ok(Value.Nil);
                 }
             }
-            Err(exc(c, E_VALUE, "list.remove(x): x not in list"))
+            Err(exc(c, Exc.ValueError, "list.remove(x): x not in list"))
         }
         LIndex | TIndex => {
             // `__eq__` may change the list: each step reads its current
@@ -1539,12 +1523,12 @@ fn call_method_builtin(c: *Ctx, b: B, args: *Value, n: u64, kw: Value) -> Result
                 let Some(x) = value.seq_at(selfv, i) else { break; };
                 if ops.equal(c, x, args[1])? { return Ok(value.int_val(&c.heap, i as i64)); }
             }
-            if b == B.TIndex { return Err(exc(c, E_VALUE, "tuple.index(x): x not in tuple")); }
+            if b == B.TIndex { return Err(exc(c, Exc.ValueError, "tuple.index(x): x not in tuple")); }
             let Str(r) = fmt.repr(c, args[1])? else { trap() };
             var m = text.StrBuf.new();
             m.push_str(r.data);
             m.push_str(" is not in list");
-            Err(exc_buf(c, E_VALUE, &m))
+            Err(exc_buf(c, Exc.ValueError, &m))
         }
         LCount | TCount => {
             var k: i64 = 0;
@@ -1617,7 +1601,7 @@ fn call_method_builtin(c: *Ctx, b: B, args: *Value, n: u64, kw: Value) -> Result
         DClear => { let Dict(d) = selfv else { trap() }; value.dict_clear(&c.heap, d); Ok(Value.Nil) }
         DPopitem => {
             let Dict(d) = selfv else { trap() };
-            if d.len == 0 { return Err(exc(c, E_KEY, "popitem(): dictionary is empty")); }
+            if d.len == 0 { return Err(exc(c, Exc.KeyError, "popitem(): dictionary is empty")); }
             let t = value.new_tuple(&c.heap, 2);
             let (k, v) = d.pop_last().unwrap();
             t.items[0] = k;
@@ -1643,7 +1627,7 @@ fn call_method_builtin(c: *Ctx, b: B, args: *Value, n: u64, kw: Value) -> Result
         StPop => {
             let d = set_dict(selfv).unwrap();
             var it: u64 = 0;
-            let Some(e) = value.dict_next(d, &it) else { return Err(exc(c, E_KEY, "pop from an empty set")); };
+            let Some(e) = value.dict_next(d, &it) else { return Err(exc(c, Exc.KeyError, "pop from an empty set")); };
             let k = value.dict_key(d, e);
             value.dict_del(d, k, ops.hash_key(c, k)?);
             Ok(k)
@@ -1715,7 +1699,7 @@ fn call_method_builtin(c: *Ctx, b: B, args: *Value, n: u64, kw: Value) -> Result
         GSend => {
             let Obj(g) = selfv else { trap() };
             if g.m == value.GEN_NEW and args[1] != Value.Nil {
-                return Err(exc(c, E_TYPE, "can't send non-None value to a just-started generator"));
+                return Err(exc(c, Exc.TypeError, "can't send non-None value to a just-started generator"));
             }
             match vm.gen_next(c, g, args[1])? {
                 Some(v) => Ok(v),
@@ -1725,12 +1709,12 @@ fn call_method_builtin(c: *Ctx, b: B, args: *Value, n: u64, kw: Value) -> Result
         GClose => {
             let Obj(g) = selfv else { trap() };
             if g.m != value.GEN_SUSPENDED { g.m = GEN_DONE; return Ok(Value.Nil); }
-            let ge = exc_of_empty(c, E_GENEXIT);
+            let ge = exc_of_empty(c, Exc.GeneratorExit);
             match vm.gen_throw(c, g, ge) {
-                Ok(Some(_)) => Err(exc(c, E_RUNTIME, "generator ignored GeneratorExit")),
+                Ok(Some(_)) => Err(exc(c, Exc.RuntimeError, "generator ignored GeneratorExit")),
                 Ok(None) => Ok(Value.Nil),
                 Err(e) => {
-                    if ops.exc_match(c, e, Value.Obj(c.excs[E_GENEXIT].unwrap()))? or ops.exc_match(c, e, Value.Obj(c.excs[E_STOPITER].unwrap()))? {
+                    if ops.exc_match(c, e, Value.Obj(c.excs[Exc.GeneratorExit as u64].unwrap()))? or ops.exc_match(c, e, Value.Obj(c.excs[Exc.StopIteration as u64].unwrap()))? {
                         return Ok(Value.Nil);
                     }
                     Err(e)
@@ -1783,12 +1767,12 @@ fn str_format(c: *Ctx, fs: Gc<Str>, args: *Value, np: u64, kw: Value, nkw: u64) 
         i += 1;
         var v: Value = Value.Nil;
         if field.len == 0 {
-            if auto >= np { out.free(); return Err(exc(c, E_INDEX, "Replacement index out of range for positional args tuple")); }
+            if auto >= np { out.free(); return Err(exc(c, Exc.IndexError, "Replacement index out of range for positional args tuple")); }
             v = args[auto];
             auto += 1;
         } else if text.is_digit(field[0]) {
             let k = (text.parse_int(field) ?? 0) as u64;
-            if k >= np { out.free(); return Err(exc(c, E_INDEX, "Replacement index out of range for positional args tuple")); }
+            if k >= np { out.free(); return Err(exc(c, Exc.IndexError, "Replacement index out of range for positional args tuple")); }
             v = args[k];
         } else {
             // keyword, possibly with .attr
@@ -1891,7 +1875,7 @@ fn getrandbits(c: *Ctx, k: u64) -> Value {
 }
 
 fn randbelow(c: *Ctx, n: Value) -> Result<Value, Value> {
-    if !value.is_int(n) or big.is_neg(n) or n == Value.Int(0) { return Err(exc(c, E_VALUE, "empty range for randrange()")); }
+    if !value.is_int(n) or big.is_neg(n) or n == Value.Int(0) { return Err(exc(c, Exc.ValueError, "empty range for randrange()")); }
     let k = big.bit_length(n);
     loop {
         let r = getrandbits(c, k);
@@ -1967,7 +1951,7 @@ fn module_call(c: *Ctx, b: B, args: *Value, n: u64, kw: Value) -> Result<Value, 
     match b {
         MSqrt => {
             let x = want_f64(c, args[0])?;
-            if x < 0.0 { return Err(exc(c, E_VALUE, "math domain error")); }
+            if x < 0.0 { return Err(exc(c, Exc.ValueError, "math domain error")); }
             Ok(Value.Float(x.sqrt()))
         }
         MSin => Ok(Value.Float(sin(want_f64(c, args[0])?))),
@@ -1983,7 +1967,7 @@ fn module_call(c: *Ctx, b: B, args: *Value, n: u64, kw: Value) -> Result<Value, 
         MTanh => Ok(Value.Float(tanh(want_f64(c, args[0])?))),
         MLog => {
             let x = want_f64(c, args[0])?;
-            if x <= 0.0 { return Err(exc(c, E_VALUE, "math domain error")); }
+            if x <= 0.0 { return Err(exc(c, Exc.ValueError, "math domain error")); }
             if np > 1 { return Ok(Value.Float(log(x) / log(want_f64(c, args[1])?))); }
             Ok(Value.Float(log(x)))
         }
@@ -2017,14 +2001,14 @@ fn module_call(c: *Ctx, b: B, args: *Value, n: u64, kw: Value) -> Result<Value, 
         }
         MFactorial => {
             let k = want_int(c, args[0])?;
-            if k < 0 { return Err(exc(c, E_VALUE, "factorial() not defined for negative values")); }
+            if k < 0 { return Err(exc(c, Exc.ValueError, "factorial() not defined for negative values")); }
             var r = Value.Int(1);
             for i in 2..k + 1 { r = big.mul(&c.heap, r, value.int_val(&c.heap, i)); }
             Ok(r)
         }
         MIsqrt => {
             let x = args[0];
-            if big.is_neg(x) { return Err(exc(c, E_VALUE, "isqrt() argument must be nonnegative")); }
+            if big.is_neg(x) { return Err(exc(c, Exc.ValueError, "isqrt() argument must be nonnegative")); }
             // Newton's method on ints
             if x == Value.Int(0) { return Ok(x); }
             var r = x;
@@ -2093,12 +2077,12 @@ fn module_call(c: *Ctx, b: B, args: *Value, n: u64, kw: Value) -> Result<Value, 
         }
         RChoice => {
             let k = len_of(c, args[0])?;
-            if k == 0 { return Err(exc(c, E_INDEX, "Cannot choose from an empty sequence")); }
+            if k == 0 { return Err(exc(c, Exc.IndexError, "Cannot choose from an empty sequence")); }
             let i = randbelow(c, value.int_val(&c.heap, k as i64))?;
             ops.getindex(c, args[0], i)
         }
         RShuffle => {
-            let List(l) = args[0] else { return Err(exc(c, E_TYPE, "shuffle needs a list")); };
+            let List(l) = args[0] else { return Err(exc(c, Exc.TypeError, "shuffle needs a list")); };
             var i = l.len;
             while i > 1 {
                 i -= 1;
@@ -2134,8 +2118,8 @@ fn module_call(c: *Ctx, b: B, args: *Value, n: u64, kw: Value) -> Result<Value, 
         }
         SysSetrecursionlimit => Ok(Value.Nil),
         SysGetrecursionlimit => Ok(Value.Int(1000)),
-        SysExit => Err(exc(c, E_SYSEXIT, "")),
-        _ => Err(exc(c, E_TYPE, "unsupported builtin")),
+        SysExit => Err(exc(c, Exc.SystemExit, "")),
+        _ => Err(exc(c, Exc.TypeError, "unsupported builtin")),
     }
 }
 
@@ -2198,7 +2182,7 @@ pub fn import_module(c: *Ctx, name: Value) -> Result<Value, Value> uses reenter 
         b.push_str("No module named '");
         b.push_str(nm);
         b.push('\'');
-        return Err(exc_buf(c, E_MODNOTFOUND, &b));
+        return Err(exc_buf(c, Exc.ModuleNotFoundError, &b));
     }
     value.dict_set_str(&c.heap, mods, s, Value.Obj(m));
     Ok(Value.Obj(m))

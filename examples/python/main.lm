@@ -135,7 +135,7 @@ fn main() -> i32 uses reenter {
 }
 
 fn report(c: *Ctx, e: Value) -> i32 uses reenter {
-    if let Inst(i) = e and ops.subclass(i.cls, c.excs[builtins.E_SYSEXIT].unwrap()) { return 0; }
+    if let Inst(i) = e and ops.subclass(i.cls, c.excs[builtins.Exc.SystemExit as u64].unwrap()) { return 0; }
     var b = text.StrBuf.new();
     b.push_str("Traceback (most recent call last):\n  line ");
     b.push_int(c.err_line as i64);

@@ -13,6 +13,7 @@ import value.{V, Pair, Vect, Proto, Closure, Lines, Protos, Descs};
 import rt.{Ctx, Frame};
 import rt;
 import builtins;
+import builtins.{Prim};
 
 fn arity_err(c: *Ctx, cl: Gc<Closure>, n: u64) -> V {
     c.tmp.clear();
@@ -522,42 +523,42 @@ pub vm Scheme {
             dst = Int(n);
             next
         }
-        cold { dst = builtins.call_native(ctx, builtins.P_LENGTH, regs + a as u64, 1)?; next }
+        cold { dst = builtins.call_native(ctx, Prim.Length, regs + a as u64, 1)?; next }
     }
     op ODDP(dst: reg, a: callbase) : ABC {
         if let Int(x) = regs[a as u64] {
             dst = value.boolean((x & 1) != 0);
             next
         }
-        cold { dst = builtins.call_native(ctx, builtins.P_ODDP, regs + a as u64, 1)?; next }
+        cold { dst = builtins.call_native(ctx, Prim.OddP, regs + a as u64, 1)?; next }
     }
     op EVENP(dst: reg, a: callbase) : ABC {
         if let Int(x) = regs[a as u64] {
             dst = value.boolean((x & 1) == 0);
             next
         }
-        cold { dst = builtins.call_native(ctx, builtins.P_EVENP, regs + a as u64, 1)?; next }
+        cold { dst = builtins.call_native(ctx, Prim.EvenP, regs + a as u64, 1)?; next }
     }
     op POSP(dst: reg, a: callbase) : ABC {
         if let Int(x) = regs[a as u64] {
             dst = value.boolean(x > 0);
             next
         }
-        cold { dst = builtins.call_native(ctx, builtins.P_POSP, regs + a as u64, 1)?; next }
+        cold { dst = builtins.call_native(ctx, Prim.PositiveP, regs + a as u64, 1)?; next }
     }
     op NEGP(dst: reg, a: callbase) : ABC {
         if let Int(x) = regs[a as u64] {
             dst = value.boolean(x < 0);
             next
         }
-        cold { dst = builtins.call_native(ctx, builtins.P_NEGP, regs + a as u64, 1)?; next }
+        cold { dst = builtins.call_native(ctx, Prim.NegativeP, regs + a as u64, 1)?; next }
     }
     op VLEN(dst: reg, a: callbase) : ABC {
         if let Vec(v) = regs[a as u64] {
             dst = Int(v.data.len as i32);
             next
         }
-        cold { dst = builtins.call_native(ctx, builtins.P_VLEN, regs + a as u64, 1)?; next }
+        cold { dst = builtins.call_native(ctx, Prim.VectorLength, regs + a as u64, 1)?; next }
     }
 
     // (reverse l) and (append l m), allocating from the allocator's
@@ -570,13 +571,13 @@ pub vm Scheme {
         var cur = regs[a as u64];
         while let P(p) = cur {
             let Some(c) = try_new(&ctx.heap, Pair { car: p.car, cdr: r }) else cold {
-                dst = builtins.call_native(ctx, builtins.P_REVERSE, regs + a as u64, 1)?;
+                dst = builtins.call_native(ctx, Prim.Reverse, regs + a as u64, 1)?;
                 next
             };
             r = P(c);
             cur = p.cdr;
         }
-        if cur != V.Imm(value.IMM_NIL) { cold { dst = builtins.call_native(ctx, builtins.P_REVERSE, regs + a as u64, 1)?; next } }
+        if cur != V.Imm(value.IMM_NIL) { cold { dst = builtins.call_native(ctx, Prim.Reverse, regs + a as u64, 1)?; next } }
         dst = r;
         next
     }
@@ -593,7 +594,7 @@ pub vm Scheme {
             var cur = p0.cdr;
             while let P(p) = cur {
                 let Some(c) = try_new(&ctx.heap, Pair { car: p.car, cdr: V.Imm(value.IMM_NIL) }) else cold {
-                    dst = builtins.call_native(ctx, builtins.P_APPEND, regs + base as u64, 2)?;
+                    dst = builtins.call_native(ctx, Prim.Append, regs + base as u64, 2)?;
                     next
                 };
                 last.cdr = P(c);
@@ -606,7 +607,7 @@ pub vm Scheme {
                 next
             }
         }
-        cold { dst = builtins.call_native(ctx, builtins.P_APPEND, regs + base as u64, 2)?; next }
+        cold { dst = builtins.call_native(ctx, Prim.Append, regs + base as u64, 2)?; next }
     }
 
     /// (string-ref R[base] R[base+1]).
@@ -615,7 +616,7 @@ pub vm Scheme {
             dst = value.chr(st.data.ptr[i as u64] as i32);
             next
         }
-        cold { dst = builtins.call_native(ctx, builtins.P_SREF, regs + base as u64, 2)?; next }
+        cold { dst = builtins.call_native(ctx, Prim.StringRef, regs + base as u64, 2)?; next }
     }
 
     /// Records (define-record-type): `f` is the constant (rtd . i) of
@@ -680,7 +681,7 @@ pub vm Scheme {
     fn call_slow(base: u64, nargs: u64, tail: bool) -> never {
         var n = nargs;
         var f = regs[base];
-        while value.prim_of(f) == Some(builtins.P_APPLY) {
+        while value.prim_of(f) == Some(Prim.Apply as i32) {
             // (apply proc arg ... list): spread the list into registers.
             if n < 2 { raise rt.err_msg(ctx, "apply: wrong number of arguments") }
             let lst = regs[base + n];
@@ -696,7 +697,7 @@ pub vm Scheme {
             if cur != V.Imm(value.IMM_NIL) { raise rt.type_err(ctx, "apply", "list", lst) }
             f = regs[base];
         }
-        if value.prim_of(f) == Some(builtins.P_CALLCC) {
+        if value.prim_of(f) == Some(Prim.CallCc as i32) {
             if n != 1 { raise rt.err_msg(ctx, "call-with-current-continuation: wrong number of arguments") }
             // (Inline: a call of another vm function here would make
             // CALL/TAILCALL look as if they could continue.)
@@ -777,7 +778,7 @@ pub vm Scheme {
             jump p.code
         }
         if let Some(id) = value.prim_of(f) {
-            let v = builtins.call_native(ctx, id, regs + base + 1, n)?;
+            let v = builtins.call_native(ctx, id as Prim, regs + base + 1, n)?;
             if !tail {
                 regs[base] = v;
                 next
@@ -795,7 +796,7 @@ pub vm Scheme {
     /// builtin the program never redefines (not apply or call/cc).
     op PRIMCALL(base: callbase, nargs: imm, id: imm) : ABC {
         if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
-        regs[base] = builtins.call_native(ctx, id as i32, regs + base + 1, nargs as u64)?;
+        regs[base] = builtins.call_native(ctx, id as Prim, regs + base + 1, nargs as u64)?;
         next
     }
 
