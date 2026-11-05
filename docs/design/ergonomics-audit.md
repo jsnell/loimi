@@ -593,6 +593,42 @@ word table (names to encoders), and Python's and Scheme's AST-to-op maps,
 which are maps from a compiler enum (item 2's `#[data]` on that enum is
 the tool).
 
+**What `ir-diff` showed** (items 3 and 11 together; `loimi ir-diff
+A.ll B.ll --release --asm`, tail-call, goto and switch dispatch, and
+`--jit-stencils` for Mini and Prolog):
+- **The compiler on unchanged sources** (the base compiler at 078b358
+  against the new one): the `--emit-llvm` output of all nine examples is
+  byte-identical in every mode.
+- **The ports** (the sources at 078b358 against the ported ones, both
+  built by the new compiler): Lox, MiniJS, Regex and Scheme (supers only)
+  give byte-identical `.ll` files; Stack (supers, `wraps`) and Prolog
+  (supers untouched, `jump_form`) every function the same. Every vm
+  handler, super, resume function and outlined cold block is the same in
+  all nine. What differs is translator code, which now calls the
+  generated lookups: Python's `C.jump_if_false` (843 → 712 IR lines);
+  Mini's `Parser.jump_if` (+8 assembly lines: an `unwrap` of
+  `Mini.negate` where `negate_jump` returned 0) and, with stencils,
+  `Parser.cond` (−8), plus the out-of-line `Mini.negate`; Wasm's
+  `T.binop` (705 → 366 assembly lines), `T.cond_jump` (821 → 346),
+  `T.min_max`, `T.add_load`, `T.tee_load`, `kmem` and `T.instr`, which
+  materialized the tables on the stack and searched them, plus the
+  out-of-line `W.sel`, `W.sel_swapped`, `W.xform` and `fusion`.
+- **The op set** (`LOIMI_DUMP_VM_EXPANSION=1`, the base sources with the
+  base compiler against the ported ones with the new): every line of the
+  old expansion is in the new one, in order, for all nine (Mini also
+  with `--cfg debug` and `--cfg gil`, Python with `--cfg debug`): the
+  same opcodes, names, supers, forwarding and accumulator variants,
+  encoders and disassembler. The new lines are the lookups (Wasm 331,
+  Mini 28, Python 16, Prolog 8) and Stack's dumped `wraps` list. So the
+  checked-in `.vmprofile` files need no change.
+- **Behaviour**: Wasm's spec suite (52,800 commands, every dispatch
+  mode) and the 30 PolyBench kernels (`polybench.sh --check`) pass.
+- **Timing** (the translators differ; `--align-functions=64`, user+sys,
+  min of 5 interleaved, the machine otherwise loaded 2 to 3): Wasm's
+  seven programs geomean new/base 1.001 (coremark 1.017, then 1.000 in
+  a min of 9), Mini's seven 1.001; translation is a negligible part of
+  any run.
+
 ### 4. Panic locations out of the IR identity check, then `extend vm`
 
 **Pattern.** Panic messages carry `file:line:col`, so moving code by
@@ -1382,6 +1418,8 @@ Refinements of the proposal:
   names and the checked-in `.vmprofile` files are unchanged.
 - **Stack's budget** is `wraps [JMP, JZ, LOOP, CALL]`; the five supers
   are added by the rule, in the same order.
+- **Code:** the same, and the same op set, in all nine (the ports were
+  compared together with item 3's: see "What `ir-diff` showed" there).
 
 ### 12. A typed host-side decoder and checked encoders
 
