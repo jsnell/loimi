@@ -26,17 +26,17 @@ Progress (2026-11-02):
   `examples/scheme` (an R7RS-small subset) and `examples/minijs` (a
   JavaScript subset).
 - **Speed criterion 1 is met.** Mini beats PUC-Lua 5.4 on all 14
-  clean-room benchmarks, taking 0.25–0.76× of Lua's time (0.52× by
+  clean-room benchmarks, taking 0.26–0.71× of Lua's time (0.47× by
   geometric mean). Current numbers for every interpreter:
   [`results.md`](results.md).
 - **The stretch goal is met.** Mini takes less time than LuaJIT's
-  interpreter (`-joff`) on 13 of the 14 (hash_strings 1.04×; 0.82×
-  by geometric mean).
-- MiniJS beats `node --jitless` (0.50× by geometric mean) and QuickJS
-  (0.39×) on all 14 of its clean-room benchmarks.
+  interpreter (`-joff`) on all 14 (hash_strings, the closest, 0.96×;
+  0.75× by geometric mean).
+- MiniJS beats `node --jitless` (0.48× by geometric mean) and QuickJS
+  (0.37×) on all 14 of its clean-room benchmarks.
 - Scheme runs 43 unmodified r7rs-benchmarks programs. By geometric mean
-  it takes 0.25× of Gauche's time and 0.45× of Guile's with Guile's JIT
-  off, and 0.94× of Guile's with its JIT on.
+  it takes 0.22× of Gauche's time and 0.38× of Guile's with Guile's JIT
+  off, and 0.80× of Guile's with its JIT on.
 - Beyond the plan:
   - closures (non-escaping `block fn`, escaping `closure fn`) and traits;
   - C embedding (`--lib`, `--shared`, `--header`) with re-entrant natives;
@@ -282,9 +282,9 @@ quickening on/off.
      all their tests with the JIT forced on, with no change to their
      source. JIT against interpreter, by geometric mean: Mini 0.77,
      MiniJS 0.85, Scheme 0.79 (Scheme with the JIT is 0.80 of Guile 3's
-     time with its JIT). Remeasured 2026-11-04
-     ([`results.md`](results.md)): 0.76, 0.85, 0.82 (Scheme with the
-     JIT 0.76 of Guile's); Prolog, added later, 1.11 (without `sieve`). A JIT build with
+     time with its JIT). Remeasured 2026-11-05
+     ([`results.md`](results.md)): 0.76, 0.83, 0.79 (Scheme with the
+     JIT 0.63 of Guile's); Prolog, added later, 1.00 (1.35 on `sieve`). A JIT build with
      the JIT off now runs the default build's handlers (counting copies are swapped in only with
      `LOIMI_JIT=1`) and is within noise of a default build (was +5%).
      Stencil builds take a third less time.

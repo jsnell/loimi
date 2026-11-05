@@ -11,34 +11,36 @@ This page replaces the ratios quoted elsewhere (README, `status.md`,
 
 | | |
 |---|---|
-| Date | 2026-11-04 |
-| Commit | master 95a227e |
-| CPU | Intel Core i7-6700 @ 3.40 GHz, 4 cores / 8 threads (2.7 GHz in `/proc/cpuinfo` during this run) |
+| Date | 2026-11-05 |
+| Commit | master c7e94ae |
+| CPU | Intel Core i7-6700 @ 3.40 GHz, 4 cores / 8 threads (3.1 GHz in `/proc/cpuinfo` during this run) |
 | Kernel | Linux 6.12.113+deb13-amd64 |
 | Compilers | clang 19.1.7 (Debian), rustc 1.97.1 |
 | Other | Python 3.13.5, node v26.13.0, PCRE2 10.46 (system library) |
 
-No other agent ran, but the host was loaded from outside this machine
-image: the 1-minute load average never fell below 1.0 (each chunk waited
-3 minutes for it, the first 10, then started; 2.96 at the lowest),
-and it was 3.0–5.0 during the runs, median 4.3, our own benchmark
-process included (the previous run's was 0.4–3.4). Every program,
-references included, took about 1.3–1.4× the time of the previous run
-(references 1.28–1.40× by suite geometric mean), so compare ratios, not
-seconds, across runs. The suites ran as six `run_all.py --only`
-invocations into one output directory (mini, mini-coro: 8 minutes;
-minijs, lox: 11; scheme, regex: 8; wasm, wasm-simd, stack: 7; python: 4;
-prolog: 17, over the 15 minutes aimed for, as its slow cases are run
-once already), 55 minutes in all, then the PolyBench set (3 minutes).
-Single benchmarks move by about ±3% between runs from code placement and
-load, more on a loaded host.
+No other agent ran; the host was less loaded from outside than in the
+previous run. Each chunk waited for the 1-minute load average to fall
+below 1.0, at most 3 minutes (90–180 s; it started at 0.94–1.17, the
+PolyBench set at 1.77), and it was 0.9–2.6 during the runs, median 2.0,
+our own benchmark process included (the previous run's was 3.0–5.0).
+Every program, references included, took about 0.75–0.8 of the time of
+the previous run (references 0.75–0.79 by suite geometric mean; the
+clock was 3.1 GHz against 2.7), so compare ratios, not seconds, across
+runs. The suites ran as six `run_all.py --only` invocations into one
+output directory (mini, mini-coro: 6 minutes; minijs, lox: 9; scheme,
+regex: 6; wasm, wasm-simd, stack: 6; python: 3; prolog: 12), 44 minutes
+in all, then the PolyBench set (2 minutes). Single benchmarks move by
+about ±3% between runs from code placement and load.
 
 **Method.**
 
 - Every Loimi interpreter is built with `--release --align-functions=64`
   in each dispatch mode (`--dispatch=tailcall`, `goto`, `switch`).
   Mini, MiniJS, Scheme and Prolog are also built with `--jit-stencils`
-  (tail-call dispatch) and run with `LOIMI_JIT=1` (column *jit*).
+  (tail-call dispatch) and run with `LOIMI_JIT=1` (column *jit*). Since
+  this run's previous one the driver also keeps every x86-64 vm branch
+  off 32-byte boundaries (the JCC erratum, [lowering.md
+  §12](lowering.md#12-driver-settings)), in every build.
 - The suites' own scripts do the timing: `bench/mini/compare.py`,
   `bench/mini/coroutines/run.py`, `bench/minijs/compare.py`,
   `bench/scheme/compare.py`, `bench/lox/compare.py`,
@@ -55,8 +57,8 @@ load, more on a loaded host.
   (`bench.py` does not interleave, so it runs in 3 rounds of one run).
   The regex times are measured inside the process, each the best of 3
   matches over 4 MiB of text, and the minimum over 3 processes, in
-  milliseconds. Prolog's JIT build on `sieve` (58 s a run) ran once
-  (`run.py --slow 10`).
+  milliseconds. Prolog runs over 10 s are not repeated (`run.py --slow
+  10`); none was, this time.
 - Ratios are ours divided by the reference: below 1, ours takes less
   time. Geometric means are over every benchmark of the suite.
 - References: PUC-Lua 5.4.9 and LuaJIT 2.1 (`-joff`, its assembly
@@ -98,47 +100,47 @@ bench/wasm/bench.py -n 1 --dir bench/wasm/polybench-out --interp="wasm3=bench/wa
 
 | interpreter | build | vs tailcall | references (ours / ref) |
 |---|---|---:|---|
-| mini (14) | tailcall | 1 | lua 0.52, luajit-joff 0.82 |
-| mini (14) | goto | 1.00 | lua 0.52, luajit-joff 0.83 |
-| mini (14) | switch | 1.08 | lua 0.57, luajit-joff 0.89 |
-| mini (14) | jit | 0.76 | lua 0.40, luajit-joff 0.62 |
-| mini-coro (3) | tailcall | 1 | lua 0.37, luajit-joff 1.01 |
-| mini-coro (3) | goto | 1.04 | lua 0.39, luajit-joff 1.05 |
-| mini-coro (3) | switch | 1.09 | lua 0.40, luajit-joff 1.09 |
-| mini-coro (3) | jit | 0.84 | lua 0.31, luajit-joff 0.85 |
-| minijs (14) | tailcall | 1 | node-jitless 0.50, qjs 0.39 |
-| minijs (14) | goto | 1.02 | node-jitless 0.51, qjs 0.40 |
-| minijs (14) | switch | 1.12 | node-jitless 0.56, qjs 0.43 |
-| minijs (14) | jit | 0.85 | node-jitless 0.43, qjs 0.33 |
-| scheme (43) | tailcall | 1 | gauche 0.25, guile-nojit 0.45, guile 0.94 |
-| scheme (43) | goto | 1.03 | gauche 0.25, guile-nojit 0.46, guile 0.96 |
-| scheme (43) | switch | 1.07 | gauche 0.26, guile-nojit 0.48, guile 1.01 |
-| scheme (43) | jit | 0.82 | gauche 0.20, guile-nojit 0.36, guile 0.76 |
-| lox (10) | tailcall | 1 | clox 0.44 |
-| lox (10) | goto | 1.08 | clox 0.48 |
-| lox (10) | switch | 1.03 | clox 0.46 |
+| mini (14) | tailcall | 1 | lua 0.47, luajit-joff 0.75 |
+| mini (14) | goto | 1.03 | lua 0.49, luajit-joff 0.77 |
+| mini (14) | switch | 1.09 | lua 0.52, luajit-joff 0.81 |
+| mini (14) | jit | 0.76 | lua 0.36, luajit-joff 0.57 |
+| mini-coro (3) | tailcall | 1 | lua 0.36, luajit-joff 0.98 |
+| mini-coro (3) | goto | 1.02 | lua 0.37, luajit-joff 1.00 |
+| mini-coro (3) | switch | 1.08 | lua 0.39, luajit-joff 1.06 |
+| mini-coro (3) | jit | 0.80 | lua 0.29, luajit-joff 0.78 |
+| minijs (14) | tailcall | 1 | node-jitless 0.48, qjs 0.37 |
+| minijs (14) | goto | 1.04 | node-jitless 0.50, qjs 0.38 |
+| minijs (14) | switch | 1.21 | node-jitless 0.58, qjs 0.45 |
+| minijs (14) | jit | 0.83 | node-jitless 0.40, qjs 0.31 |
+| scheme (43) | tailcall | 1 | gauche 0.22, guile-nojit 0.38, guile 0.80 |
+| scheme (43) | goto | 1.03 | gauche 0.22, guile-nojit 0.39, guile 0.82 |
+| scheme (43) | switch | 1.11 | gauche 0.24, guile-nojit 0.42, guile 0.89 |
+| scheme (43) | jit | 0.79 | gauche 0.17, guile-nojit 0.30, guile 0.63 |
+| lox (10) | tailcall | 1 | clox 0.45 |
+| lox (10) | goto | 1.01 | clox 0.45 |
+| lox (10) | switch | 1.07 | clox 0.48 |
 | regex (9) | tailcall | 1 | pcre2 0.44, python-re 0.41 |
-| regex (9) | goto | 1.01 | pcre2 0.45, python-re 0.42 |
-| regex (9) | switch | 1.07 | pcre2 0.47, python-re 0.44 |
-| wasm (7) | tailcall | 1 | wasm3 0.87 |
-| wasm (7) | goto | 1.05 | wasm3 0.91 |
-| wasm (7) | switch | 1.27 | wasm3 1.10 |
+| regex (9) | goto | 1.03 | pcre2 0.45, python-re 0.42 |
+| regex (9) | switch | 1.11 | pcre2 0.49, python-re 0.46 |
+| wasm (7) | tailcall | 1 | wasm3 0.85 |
+| wasm (7) | goto | 1.05 | wasm3 0.90 |
+| wasm (7) | switch | 1.28 | wasm3 1.09 |
 | wasm-simd (3) | tailcall | 1 | mvp 0.98 |
 | wasm-simd (3) | goto | 1.03 | mvp 1.01 |
-| wasm-simd (3) | switch | 1.30 | mvp 1.28 |
-| wasm-polybench (30) | tailcall | 1 | wasm3 0.90 |
-| wasm-polybench (30) | goto | 1.02 | wasm3 0.92 |
-| wasm-polybench (30) | switch | 1.23 | wasm3 1.11 |
+| wasm-simd (3) | switch | 1.29 | mvp 1.27 |
+| wasm-polybench (30) | tailcall | 1 | wasm3 0.83 |
+| wasm-polybench (30) | goto | 1.05 | wasm3 0.88 |
+| wasm-polybench (30) | switch | 1.25 | wasm3 1.04 |
 | stack (5) | tailcall | 1 | — |
 | stack (5) | goto | 1.03 | — |
-| stack (5) | switch | 1.18 | — |
-| python (11) | tailcall | 1 | cpython 0.37, micropython 0.13 |
-| python (11) | goto | 1.05 | cpython 0.39, micropython 0.14 |
-| python (11) | switch | 1.18 | cpython 0.44, micropython 0.15 |
-| prolog (30) | tailcall | 1 | swipl 0.53, trealla 0.13 |
-| prolog (30) | goto | 1.04 | swipl 0.55, trealla 0.13 |
-| prolog (30) | switch | 1.10 | swipl 0.58, trealla 0.14 |
-| prolog (30) | jit | 1.26 (1.11 without sieve) | swipl 0.66, trealla 0.16 (swipl 0.58, trealla 0.14 over 29, without sieve) |
+| stack (5) | switch | 1.11 | — |
+| python (11) | tailcall | 1 | cpython 0.33, micropython 0.11 |
+| python (11) | goto | 1.10 | cpython 0.36, micropython 0.13 |
+| python (11) | switch | 1.17 | cpython 0.38, micropython 0.13 |
+| prolog (30) | tailcall | 1 | swipl 0.52, trealla 0.13 |
+| prolog (30) | goto | 1.03 | swipl 0.54, trealla 0.13 |
+| prolog (30) | switch | 1.11 | swipl 0.58, trealla 0.14 |
+| prolog (30) | jit | 1.00 (0.99 without sieve) | swipl 0.52, trealla 0.13 (swipl 0.51, trealla 0.12 over 29, without sieve) |
 
 (n) is the number of benchmarks. *vs tailcall* is the geometric mean of
 that build's times over the tail-call build's. Suites: `mini` (Mini, a
@@ -155,83 +157,59 @@ suite).
 
 ## Notes
 
-- Mini (tail-call) takes 0.25–0.76 of PUC-Lua's time and 0.49–1.04 of
-  LuaJIT `-joff`'s: less on 13 of 14 (hash_strings 1.04; string_build,
-  1.09 in the previous run, 0.94). With the JIT: 0.56–0.99 of the
-  interpreter's time.
+- Mini (tail-call) takes 0.26–0.71 of PUC-Lua's time and 0.47–0.96 of
+  LuaJIT `-joff`'s: less on all 14 (hash_strings 0.96, 1.04 in the
+  previous run; spectral_norm 0.93, queens 0.92). With the JIT: 0.56–0.97
+  of the interpreter's time.
 - Mini's coroutine benchmarks switch threads inside the dispatch loop
-  (`examples/mini/COROUTINES.md`): 0.34–0.42 of PUC-Lua's time and
-  0.95–1.11 of LuaJIT `-joff`'s (chameneos 1.11); goto and switch take
-  1.02–1.10× tail-call.
-- MiniJS takes 0.22–0.78 of `node --jitless`'s time and 0.20–0.65 of
-  QuickJS's, less on all 14.
-  **2026-11-04, second MiniJS pass** (after this run; tail-call only,
-  `compare.py -n 3 --align 64` with the 573511e build as a column):
-  0.939 of the time before by geometric mean, 0.48 of node --jitless
-  and 0.37 of QuickJS (0.51 and 0.39 for the old build in the same
-  run); bitops 0.83, raytrace 0.90, closures and spectral_norm 0.91,
-  strings 0.92, binary_trees 0.93, others 0.94-0.99. Arithmetic slow
-  paths inline, a DIV family, constant compares, frameless handlers,
-  calls that do not clear registers
-  ([bench/minijs/RESULTS.md](../bench/minijs/RESULTS.md#second-performance-pass-2026-11-04)).
-  Other dispatch modes and the JIT build were not rerun.
-- Scheme takes less time than Guile with its JIT on 14 of 43 programs
-  (geometric mean 0.94); with Loimi's JIT, on 21 (0.76). The bignum
-  programs: pi 1.30× Guile (GMP's subquadratic division and square root
-  against std.bigint's), chudnovsky 1.10×. (After this run, std.bigint's
-  faster division and square root: pi 0.84 and chudnovsky 0.89 of the
-  time; [stdlib.md](stdlib.md#stdbigint).)
-- Lox takes 0.25–0.66 of clox's time. Switch mode is within 3% of
-  tail-call except `equality` (1.17×); goto mode took 1.08× tail-call by
-  geometric mean in this run (1.03 in the previous one; invocation, zoo
-  and method_call 1.12–1.14).
+  (`examples/mini/COROUTINES.md`): 0.34–0.40 of PUC-Lua's time and
+  0.92–1.06 of LuaJIT `-joff`'s (chameneos 1.06); goto and switch take
+  1.01–1.12× tail-call.
+- MiniJS takes 0.23–0.69 of `node --jitless`'s time and 0.19–0.60 of
+  QuickJS's, less on all 14. Switch mode takes 1.21× the tail-call time
+  (1.12× in the previous run; nbody 1.28×, closures 1.34×).
+- Scheme takes less time than Guile with its JIT on 20 of 43 programs
+  (geometric mean 0.80); with Loimi's JIT, on 29 (0.63). The bignum
+  programs, after std.bigint's faster division and square root: pi 1.09×
+  Guile (1.30 in the previous run), chudnovsky 0.94× (1.10).
+- Lox takes 0.23–0.63 of clox's time. goto takes 1.01× tail-call by
+  geometric mean (1.08 in the previous run), switch 1.07× (equality
+  1.22×).
 - Regex: the backtracker takes less time than the PCRE2 interpreter and
-  Python's `re` except on `literal` (1.26 and 1.29) and, against Python,
+  Python's `re` except on `literal` (1.24 and 1.25) and, against Python,
   `dot-star` (1.25). `pathological` is rejected by the required-byte check
-  before matching (0.0 ms; Python 551 ms) and is left out of the
+  before matching (0.0 ms; Python 432 ms) and is left out of the
   geometric means.
 - Wasm takes 0.75–0.94 of wasm3's time on the seven programs, less on
-  all, and 0.75–1.01 on the 30 PolyBench kernels (0.90 by geometric mean;
-  more only on gesummv, 1.01). Switch builds take 1.27× the tail-call
-  time (1.23× on PolyBench). The SIMD build of nbody takes 0.95 of its
-  MVP build's time; fannkuchredux and spectralnorm, whose vectorized code
-  is a few instructions outside the hot loops, 0.98–1.01.
-- Python (tail-call) takes 0.22–0.67 of CPython's time, less on all 11
-  (nqueens 0.67, hexiom 0.54; richards 0.22, float 0.26). MicroPython's
+  all, and 0.66–0.93 on the 30 PolyBench kernels (0.83 by geometric mean;
+  less on all 30). Switch builds take 1.28× the tail-call time (1.25× on
+  PolyBench). goto mode takes 1.42× the tail-call time on gemm, more than
+  switch mode (see "Changes" below). The SIMD build of nbody takes 0.95
+  of its MVP build's time; fannkuchredux and spectralnorm, whose
+  vectorized code is a few instructions outside the hot loops, 1.00.
+- Python (tail-call) takes 0.22–0.43 of CPython's time, less on all 11
+  (hexiom 0.43, nqueens 0.42; richards 0.22, float 0.24). MicroPython's
   output differs on chaos and go (its `random` is another generator) and
   nbody (last float digits); their times are in the table and in the
-  geometric means (`compare.py` leaves them out of its own). Switch takes
-  1.07–1.29× the tail-call time.
-- Prolog takes 0.20–0.93 of SWI-Prolog's time, less on all 30 (tak 0.20;
-  sieve, whose assert/retract compile clauses, 0.93), and 0.05–0.36 of
-  Trealla's. **The JIT build takes 1.11× the interpreter's time** over
-  the 29 programs other than sieve (1.01× in the previous run): 0.92
-  unify to 1.43 meta_qsort (times10 1.35, divide10 1.31, poly_10 1.29;
-  meta_qsort and times10 confirmed in a rerun, best of 5: 1.43 and
-  1.31). Normalized to SWI-Prolog the JIT build still took 0.75 of its
-  previous time, but the interpreter took 0.67: the second and third
-  Prolog rounds (inline head unification, guards, first-argument
-  indexing in CALL, superinstructions) helped the interpreter more than
-  the stencil build. Not investigated further here. On sieve the JIT
-  build takes 48× the interpreter's time: every assert/retract makes code
-  objects that are never freed and the JIT compiles each as it gets hot
-  (`examples/prolog/FRICTION.md`, item 6): that cell is marked † and the
-  summary gives the geometric means with and without it.
-  *Note, 2026-11-04 (after this run):* both were the JIT's. Clauses
-  entered from try chains (`jump` through a `Wam.Resume`) never counted
-  toward compiling, so most clause code stayed interpreted, and the
-  registry of code objects was a sorted array kept by `memmove`, which
-  sieve's 700,000 asserted clauses made quadratic. With both fixed the
-  JIT build takes 0.98 of the interpreter's time over the 29 (1.04 for
-  the old build in the same A/B, CPU time, best of 3; unify and tak
-  0.83, mu and prover 1.16) and 1.30 on sieve (46 for the old build).
-  Not rerun here; see
-  [design/copy-and-patch.md §14](design/copy-and-patch.md#14-prolog-2026-11-04).
+  geometric means (`compare.py` leaves them out of its own). goto takes
+  1.10× the tail-call time (1.05× in the previous run; nbody 1.22×),
+  switch 1.06–1.30×.
+- Prolog takes 0.18–0.99 of SWI-Prolog's time, less on all 30 (tak 0.18;
+  sieve, whose assert/retract compile clauses, 0.99), and 0.05–0.37 of
+  Trealla's. The JIT build takes the interpreter's time (1.00 by
+  geometric mean, 0.99 over the 29 programs other than sieve; 1.11 over
+  the 29 in the previous run): 0.77 tak to 1.15 query, and 1.35 on sieve
+  (48 in the previous run). Clauses entered from try chains now count
+  toward compiling, and the registry of code objects, which sieve's
+  asserted clauses made quadratic, is a treap
+  ([design/copy-and-patch.md §14](design/copy-and-patch.md#14-prolog-2026-11-04)).
+  `run_all.py` still marks the JIT cell of sieve † (its `PATHOLOGICAL`
+  table); the mark is left out here.
 
 ## GC: mark bitmaps instead of sweeping (2026-11-04)
 
-A dated A/B of one change, made before this run; its effect is in the
-tables ("Changes since the previous run"). `std.gc`
+A dated A/B of one change, made before the previous run (95a227e); its
+effect is in that run's "Changes" section. `std.gc`
 stopped sweeping: marking sets a bit per 16-byte granule in each chunk's
 bitmap, and each size class bump-allocates through the runs of clear
 bits ([stdlib/gc.md](stdlib/gc.md#heap-layout)).
@@ -303,78 +281,101 @@ through a FIFO of popped objects without prefetching (no change), and a
 plain load instead of the prefetch (boyer mark 252 ms, slower than
 before).
 
-## Changes since the previous run (a663b98)
+## Changes since the previous run (95a227e)
 
-The previous tables (commit a663b98, 2026-11-03, same machine and
-method) against these, over the benchmarks both runs have. The host ran
-this run's programs about 1.3–1.4× slower (*references' time*, new/old
-geometric mean of every reference of the suite), so the mode columns
-divide that out: each is the geometric mean over benchmarks of (ours /
-first reference) new over old, below 1 when ours gained on the
-reference. *ratio* is the tail-call (or JIT) build over the first
+The previous tables (commit 573511e, a run at 95a227e, 2026-11-04, same
+machine and method) against these, over the benchmarks both runs have.
+The host ran this run's programs in about 0.75–0.8 of the time (*references'
+time*, new/old geometric mean of every reference of the suite), so the
+mode columns divide that out: each is the geometric mean over benchmarks
+of (ours / first reference) new over old, below 1 when ours gained on
+the reference. *ratio* is the tail-call (or JIT) build over the first
 reference, old → new.
 
 | suite | references' time | tailcall | goto | switch | jit | ratio old → new |
 |---|---:|---:|---:|---:|---:|---|
-| mini (14) | 1.38–1.39 | 0.96 | 0.94 | 0.97 | 0.97 | lua 0.54 → 0.52, jit 0.41 → 0.40 |
-| mini-coro (3) | 1.34 | 0.91 | 0.94 | 1.02 | 0.97 | lua 0.41 → 0.37, jit 0.32 → 0.31 |
-| minijs (14) | 1.35–1.36 | 0.97 | 0.97 | 1.00 | 0.96 | node-jitless 0.52 → 0.50, jit 0.44 → 0.43 |
-| scheme (43) | 1.34–1.40 | 0.97 | 0.96 | 0.96 | 0.96 | guile 0.97 → 0.94, jit 0.80 → 0.76 |
-| lox (10) | 1.35 | 0.98 | 1.04 | 0.97 | | clox 0.45 → 0.44 |
-| regex (8) | 1.30 | 1.00 | 1.00 | 0.97 | | pcre2 0.44 → 0.44 |
-| wasm (7) | 1.32 | 0.95 | 0.95 | 0.95 | | wasm3 0.91 → 0.87 |
-| wasm-simd (3) | (mvp) | 0.99 | 0.99 | 1.01 | | mvp 0.99 → 0.98 |
-| stack (5) | | 1.22 | 1.26 | 1.21 | | (own time new/old; no reference) |
-| python (11) | 1.28–1.29 | 0.72 | 0.73 | 0.73 | | cpython 0.52 → 0.37 |
-| prolog (30) | 1.36–1.38 | 0.67 | 0.69 | 0.68 | 0.75 (29) | swipl 0.79 → 0.53, jit (29) 0.77 → 0.58 |
+| mini (14) | 0.78 | 0.91 | 0.93 | 0.91 | 0.91 | lua 0.52 → 0.47, jit 0.40 → 0.36 |
+| mini-coro (3) | 0.77 | 0.98 | 0.96 | 0.97 | 0.92 | lua 0.37 → 0.36, jit 0.31 → 0.29 |
+| minijs (14) | 0.76–0.77 | 0.96 | 0.97 | 1.04 | 0.93 | node-jitless 0.50 → 0.48, jit 0.43 → 0.40 |
+| scheme (43) | 0.75–0.77 | 0.88 | 0.88 | 0.91 | 0.85 | guile 0.94 → 0.80, jit 0.76 → 0.63 |
+| lox (10) | 0.79 | 1.01 | 0.94 | 1.04 | | clox 0.44 → 0.45 |
+| regex (8) | 0.79 | 0.99 | 1.02 | 1.03 | | pcre2 0.44 → 0.44 |
+| wasm (7) | 0.78 | 0.98 | 0.98 | 0.99 | | wasm3 0.87 → 0.85 |
+| wasm-simd (3) | (mvp) | 1.00 | 1.00 | 0.99 | | mvp 0.98 → 0.98 |
+| wasm-polybench (30) | 0.77 | 0.93 | 0.96 | 0.94 | | wasm3 0.90 → 0.83 |
+| stack (5) | | 0.77 | 0.78 | 0.72 | | (own time new/old; no reference) |
+| python (11) | 0.77–0.78 | 0.89 | 0.94 | 0.88 | | cpython 0.37 → 0.33 |
+| prolog (30) | 0.76–0.77 | 0.99 | 0.98 | 1.00 | 0.79 (0.88 over 29) | swipl 0.53 → 0.52, jit 0.66 → 0.52 (29: 0.58 → 0.51) |
 
-New in this run: the PolyBench held-out set (0.90 of wasm3; 0.893 in
-the wasm round-two measurement, `examples/wasm/FRICTION.md`). No suite
-lost more than 4% against its references by geometric mean (Lox's goto
-build, 1.04) and no single benchmark more than 25% (the largest: MiniJS
-switch-mode awfy_micro 1.23, Lox goto-mode invocation 1.16, Mini JIT
-sieve 1.15; the Prolog JIT build's meta_qsort 1.11, see the notes). What
-changed, from `git log a663b98..95a227e`:
+Stak's own times fell with the host's (0.77 against the references'
+0.75–0.79): unchanged. No suite lost more than 4% against its references
+by geometric mean (MiniJS and Lox switch builds, 1.04). The largest
+single-benchmark losses: PolyBench goto-mode gemm 1.29, MiniJS
+switch-mode nbody 1.22, Scheme goto-mode primes 1.18, Lox switch-mode zoo
+1.17, Python goto-mode nbody 1.16, Scheme switch-mode takl 1.16, Lox
+tail-call properties 1.15. What changed, from `git log 95a227e..c7e94ae`:
 
-- **Prolog, second and third optimization rounds** (6187ede, 95a227e;
-  `examples/prolog/FRICTION.md`, "Optimizations, second round" and
-  "third round"): binding and trailing inline in the head ops, nested
-  head structures built in place, CALL/EXECUTE indexing the first
-  argument, guard chains, superinstructions from `--vm-stats`, inline
-  arg/3, functor/3 and compare/3, first-clause commitment on a
-  comparison, a 2 MiB minimum heap. 0.67 of the previous time relative
-  to SWI-Prolog (tak 0.32, queens_8 0.40, query 0.42, sendmore 0.45;
-  the least, qsort 0.86); the JIT build 0.75 (notes).
-- **Python, second round and instance layout** (418a644, e578712;
-  `examples/python/FRICTION.md`): a global method cache, operator-method
-  cache, list and math fast paths, FORITER2, a POW fast path; instance
-  attributes in inline slots behind per-class shapes, LOADMETHOD caching
-  the method. 0.72 relative to CPython (float 0.51, richards 0.59,
-  deltablue 0.64, spectral_norm 0.66; nbody 1.02).
-- **std.gc without sweeping** (41db7df, then prefetching marks and
-  fragmented chunks after the pool, ecb9073; the section above): the
-  GC-heavy programs gained most: Mini binary_trees 0.70 and
-  string_build 0.78 relative to Lua, Scheme ctak and diviter 0.84,
-  deriv 0.92, MiniJS strings 0.90, Lox binary_trees 0.83; part of
-  Prolog's and Python's gains too (boyer 0.47, sieve 0.47).
-- **Wasm translator, rounds one and two** (76772e3, 6187ede:
-  `examples/wasm/FRICTION.md`): zeroing only locals read before
-  written, K-form loads and stores, compare-and-branch fusions, min/max
-  selects, constant slots for operands without a K form, `local.tee`'d
-  addresses: 0.95 relative to wasm3 in every mode.
-- **Mini coroutines**: the 4–6% lost at a0efc73 (the previous run's
-  "Regressions" section: the inline barrier slow path made `coro.enter`
-  and `coro.suspend` too large to inline) is fixed by logging the thread
-  switch's stores with an out-of-line `gc.remember` (e5a9b29):
-  tail-call 0.91 relative to Lua, goto 0.94; switch 1.02.
-- **No speed change intended**: lifetimes checking on by default
-  (80439a2; compile-time only, the examples' IR unchanged apart from 7
-  `unsafe { }` blocks), `#![safe]` modules and `#[raw]` (std.lex,
-  std.parse, std.diag, std.text, std.hash, std.io, std.bc, std.map,
-  std.dict), write barriers for stores through trailing-array slices
-  (5b44eb0), the vm verifier's bitmap fix (9bc3ad8), the Mini and Python
-  debuggers (`--cfg debug` only). Lox, regex, Stak and the switch-mode
-  columns moved within ±4% relative to their references.
+- **Mini, third and fourth passes** (`bench/mini/RESULTS.md`, third and
+  fourth phases): a word-at-a-time `std.hash.bytes`, `%` by
+  multiplication, rotated while loops, frameless table and return
+  handlers, young-only sweeps of the string table, constant locals
+  folded into nested functions, if/elseif chains on one local as a jump
+  table. 0.91 relative to Lua (interp 0.77, sieve 0.72, string_build
+  0.75, oo_methods 0.87, hash_strings 0.88; binary_trees 1.06, nbody
+  1.07); the JIT build 0.91 (sieve 0.63). Coroutines 0.98.
+- **MiniJS, second pass** (`bench/minijs/RESULTS.md`, second
+  performance pass): arithmetic slow paths inline, a DIV family, constant
+  compares, frameless handlers, calls that do not clear registers. 0.96
+  relative to node --jitless (bitops 0.85, strings 0.88, closures 0.91;
+  the pass's own A/B: 0.939), the JIT build 0.93; switch mode 1.04
+  (nbody 1.22, fannkuch 1.10).
+- **Scheme, third and fourth rounds, std.bigint**
+  ([bench/scheme/README.md](../bench/scheme/README.md)): builtins as ops,
+  allocation without a stack frame, no register clearing on calls,
+  aliases, loop-invariant free variables, known calls as `CALLK`, record
+  ops, `call/cc` as an op, strings with `std.gc`'s `new_uninit`; GMP-style
+  division and Newton square roots in `std.bigint`. 0.88 relative to
+  Gauche (gcbench 0.44, deriv 0.61, browse 0.70, paraffins 0.71, conform
+  0.75; pi 0.86, chudnovsky 0.88; the rounds' own A/Bs: 0.894 and 0.941),
+  the JIT build 0.85.
+- **Python, third round**
+  ([examples/python/FRICTION.md](../examples/python/FRICTION.md#optimizations-third-round-calls-generator-expressions-slices-2026-11-04)):
+  class instantiation and default arguments without the generic call
+  path, generator expressions consumed by builtins run inline,
+  `super(..).m(..)` as one op, list slices with raw copies. 0.89 relative
+  to CPython (nqueens 0.63, fannkuch 0.79, hexiom 0.80); goto 0.94 (nbody
+  1.16).
+- **The Prolog JIT** (a5db063, 691e424;
+  [design/copy-and-patch.md §14](design/copy-and-patch.md#14-prolog-2026-11-04)):
+  jumps to resume points count like calls, the code-object registry is a
+  treap. The JIT build 0.88 relative to SWI-Prolog over the 29 programs
+  other than sieve (times10 0.68, divide10 and poly_10 0.70, tak 0.73,
+  meta_qsort 0.75), sieve 58 s → 1.3 s. The interpreter is unchanged
+  (0.99).
+- **Wasm translator, round three** (98074d4, 2e849e0;
+  `examples/wasm/FRICTION.md`, "Round three"): bounds checks against the
+  end of the access, array-element loads as one op, result variants for
+  ops with several only-assigned operands. 0.98 relative to wasm3 on the
+  seven programs, 0.93 on PolyBench (nussinov 0.86, cholesky 0.89; the
+  round's own A/B: 0.838 against 0.932 for the old build, 0.90).
+- **Branch alignment against the JCC erratum** (476f1a7; [lowering.md
+  §12](lowering.md#12-driver-settings)): every x86-64 vm build pads
+  branches, dispatch jumps included, off 32-byte boundaries, so every
+  interpreter's machine code moved. On the build of the wasm round it
+  fixed the 1.4× cholesky, lu and ludcmp took. Over a suite it is a wash:
+  this run's binaries against the same code built with
+  `--no-branch-align` (user+sys CPU time, MiniJS wall-clock, minimum
+  of 2–5 interleaved runs),
+  aligned/unaligned: Scheme tail-call 1.00, MiniJS 1.01, Lox 1.02, wasm
+  tail-call on PolyBench 1.00, goto 1.01. It has two single-benchmark
+  losses of its own, the two above that are not explained by the
+  rounds: Lox `properties` 1.13 (0.210 s against 0.186) and PolyBench
+  goto-mode gemm 1.37 (0.129 s against 0.094). Not investigated
+  further here.
+- **No speed change intended**: `--gc-check-roots` fixes, the GC
+  allocator's documented invariants, `new_uninit` tests, Mini's and
+  Python's `--cfg debug` builds. Regex, Stak, the wasm SIMD builds and
+  the Prolog interpreter moved within ±3% relative to their references.
 
 ## Per suite
 
@@ -382,55 +383,32 @@ changed, from `git log a663b98..95a227e`:
 
 | benchmark | tailcall | goto | switch | jit | lua | luajit-joff | tailcall/lua | tailcall/luajit-joff | jit/lua | jit/luajit-joff |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| binary_trees | 1.034 | 1.085 | 1.209 | 0.871 | 4.204 | 1.927 | 0.25 | 0.54 | 0.21 | 0.45 |
-| closures | 0.596 | 0.668 | 0.683 | 0.497 | 1.596 | 1.226 | 0.37 | 0.49 | 0.31 | 0.41 |
-| fannkuch | 1.593 | 1.358 | 1.619 | 1.192 | 2.185 | 1.798 | 0.73 | 0.89 | 0.55 | 0.66 |
-| fib | 1.243 | 1.334 | 1.555 | 0.852 | 2.034 | 1.435 | 0.61 | 0.87 | 0.42 | 0.59 |
-| hash_strings | 1.409 | 1.338 | 1.456 | 1.038 | 2.081 | 1.352 | 0.68 | 1.04 | 0.50 | 0.77 |
-| interp | 1.228 | 1.201 | 1.324 | 0.919 | 2.615 | 1.417 | 0.47 | 0.87 | 0.35 | 0.65 |
-| mandelbrot | 0.811 | 0.808 | 0.832 | 0.457 | 1.518 | 0.995 | 0.53 | 0.82 | 0.30 | 0.46 |
-| nbody | 0.595 | 0.611 | 0.657 | 0.454 | 1.610 | 0.672 | 0.37 | 0.89 | 0.28 | 0.68 |
-| oo_methods | 0.929 | 1.045 | 1.082 | 0.660 | 1.620 | 1.217 | 0.57 | 0.76 | 0.41 | 0.54 |
-| queens | 1.213 | 1.193 | 1.280 | 0.891 | 1.590 | 1.240 | 0.76 | 0.98 | 0.56 | 0.72 |
-| sieve | 1.073 | 1.020 | 1.111 | 0.970 | 1.794 | 1.309 | 0.60 | 0.82 | 0.54 | 0.74 |
-| sort | 1.148 | 1.072 | 1.135 | 0.835 | 1.563 | 1.195 | 0.73 | 0.96 | 0.53 | 0.70 |
-| spectral_norm | 1.400 | 1.404 | 1.455 | 0.959 | 2.256 | 1.527 | 0.62 | 0.92 | 0.43 | 0.63 |
-| string_build | 1.171 | 1.204 | 1.233 | 1.157 | 3.096 | 1.243 | 0.38 | 0.94 | 0.37 | 0.93 |
-| **geomean** |  |  |  |  |  |  | **0.52** | **0.82** | **0.40** | **0.62** |
+| binary_trees | 0.800 | 0.862 | 0.901 | 0.661 | 3.073 | 1.560 | 0.26 | 0.51 | 0.22 | 0.42 |
+| closures | 0.438 | 0.493 | 0.537 | 0.363 | 1.228 | 0.936 | 0.36 | 0.47 | 0.30 | 0.39 |
+| fannkuch | 1.135 | 1.037 | 1.253 | 0.892 | 1.709 | 1.433 | 0.66 | 0.79 | 0.52 | 0.62 |
+| fib | 0.934 | 1.105 | 1.057 | 0.660 | 1.611 | 1.121 | 0.58 | 0.83 | 0.41 | 0.59 |
+| hash_strings | 0.979 | 0.991 | 1.014 | 0.771 | 1.639 | 1.025 | 0.60 | 0.96 | 0.47 | 0.75 |
+| interp | 0.731 | 0.721 | 0.822 | 0.561 | 2.021 | 1.091 | 0.36 | 0.67 | 0.28 | 0.51 |
+| mandelbrot | 0.644 | 0.647 | 0.682 | 0.360 | 1.203 | 0.782 | 0.54 | 0.82 | 0.30 | 0.46 |
+| nbody | 0.458 | 0.452 | 0.511 | 0.337 | 1.156 | 0.518 | 0.40 | 0.88 | 0.29 | 0.65 |
+| oo_methods | 0.685 | 0.775 | 0.750 | 0.471 | 1.372 | 1.049 | 0.50 | 0.65 | 0.34 | 0.45 |
+| queens | 0.870 | 0.853 | 0.921 | 0.661 | 1.229 | 0.941 | 0.71 | 0.92 | 0.54 | 0.70 |
+| sieve | 0.646 | 0.660 | 0.679 | 0.512 | 1.506 | 1.007 | 0.43 | 0.64 | 0.34 | 0.51 |
+| sort | 0.759 | 0.743 | 0.805 | 0.592 | 1.150 | 0.871 | 0.66 | 0.87 | 0.51 | 0.68 |
+| spectral_norm | 1.078 | 1.091 | 1.139 | 0.741 | 1.740 | 1.163 | 0.62 | 0.93 | 0.43 | 0.64 |
+| string_build | 0.707 | 0.705 | 0.724 | 0.686 | 2.488 | 0.982 | 0.28 | 0.72 | 0.28 | 0.70 |
+| **geomean** |  |  |  |  |  |  | **0.47** | **0.75** | **0.36** | **0.57** |
 
 Times in seconds.
-
-**2026-11-04, third Mini pass** (after this run; tail-call only,
-user+sys CPU time, minimum of 7 interleaved runs with the pass's
-starting build cdb5024 as a column): 0.927 of the time before by
-geometric mean, 0.49 of PUC-Lua's and 0.77 of LuaJIT -joff's (0.83 for
-the old build in the same run); less than -joff on all 14 (closest:
-hash_strings 0.96, queens and spectral_norm 0.94). string_build 0.77,
-sieve 0.83, oo_methods 0.86, sort 0.91, hash_strings 0.92, fannkuch
-0.92, interp 0.94; others 0.96-1.01. Coroutines 0.966 (chameneos 0.89;
-0.97 of -joff). A word-at-a-time `std.hash.bytes`, `%` by
-multiplication, rotated while loops, frameless table and return
-handlers, young-only sweeps of the string table
-([bench/mini/RESULTS.md](../bench/mini/RESULTS.md#third-phase-2026-11-04)).
-Other dispatch modes and the JIT build were not rerun.
-
-**2026-11-05, fourth Mini pass** (same method, 5cb7048 as the column):
-0.984 by geometric mean, 0.47 of PUC-Lua's time and 0.75 of LuaJIT
--joff's (0.76 for the old build in the same run; the references ran
-faster under this run's load). interp 0.82 (constant locals read
-without upvalues, its opcode elseif chain as a `SWITCH` jump table);
-the others' bytecode is unchanged and their times within noise
-(0.94-1.04). Coroutines 1.007 (noise)
-([bench/mini/RESULTS.md](../bench/mini/RESULTS.md#fourth-phase-2026-11-05)).
 
 ### mini-coro
 
 | benchmark | tailcall | goto | switch | jit | lua | luajit-joff | tailcall/lua | tailcall/luajit-joff | jit/lua | jit/luajit-joff |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| chameneos | 0.546 | 0.582 | 0.595 | 0.471 | 1.288 | 0.490 | 0.42 | 1.11 | 0.37 | 0.96 |
-| coroutine_ring | 0.457 | 0.472 | 0.502 | 0.362 | 1.272 | 0.481 | 0.36 | 0.95 | 0.28 | 0.75 |
-| sieve | 0.492 | 0.504 | 0.526 | 0.430 | 1.454 | 0.509 | 0.34 | 0.97 | 0.30 | 0.84 |
-| **geomean** |  |  |  |  |  |  | **0.37** | **1.01** | **0.31** | **0.85** |
+| chameneos | 0.407 | 0.411 | 0.456 | 0.308 | 1.008 | 0.383 | 0.40 | 1.06 | 0.31 | 0.80 |
+| coroutine_ring | 0.346 | 0.363 | 0.379 | 0.284 | 1.003 | 0.377 | 0.34 | 0.92 | 0.28 | 0.75 |
+| sieve | 0.369 | 0.371 | 0.382 | 0.300 | 1.074 | 0.383 | 0.34 | 0.96 | 0.28 | 0.78 |
+| **geomean** |  |  |  |  |  |  | **0.36** | **0.98** | **0.29** | **0.78** |
 
 Times in seconds.
 
@@ -438,21 +416,21 @@ Times in seconds.
 
 | benchmark | tailcall | goto | switch | jit | node-jitless | qjs | tailcall/node-jitless | tailcall/qjs | jit/node-jitless | jit/qjs |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| awfy_micro | 1.003 | 1.003 | 1.366 | 0.783 | 2.061 | 2.626 | 0.49 | 0.38 | 0.38 | 0.30 |
-| binary_trees | 1.322 | 1.420 | 1.498 | 1.158 | 2.320 | 6.617 | 0.57 | 0.20 | 0.50 | 0.18 |
-| bitops | 1.070 | 1.054 | 1.139 | 0.912 | 2.123 | 1.890 | 0.50 | 0.57 | 0.43 | 0.48 |
-| closures | 1.279 | 1.404 | 1.530 | 0.961 | 1.965 | 3.356 | 0.65 | 0.38 | 0.49 | 0.29 |
-| deltablue | 1.138 | 1.233 | 1.327 | 0.968 | 1.982 | 3.499 | 0.57 | 0.33 | 0.49 | 0.28 |
-| fannkuch | 0.606 | 0.589 | 0.662 | 0.484 | 1.663 | 1.912 | 0.36 | 0.32 | 0.29 | 0.25 |
-| json | 1.230 | 1.248 | 1.309 | 1.197 | 2.024 | 2.982 | 0.61 | 0.41 | 0.59 | 0.40 |
-| nbody | 0.552 | 0.551 | 0.585 | 0.424 | 2.479 | 1.702 | 0.22 | 0.32 | 0.17 | 0.25 |
-| properties | 1.109 | 1.130 | 1.180 | 0.947 | 2.171 | 2.198 | 0.51 | 0.50 | 0.44 | 0.43 |
-| raytrace | 0.658 | 0.667 | 0.725 | 0.606 | 1.952 | 2.937 | 0.34 | 0.22 | 0.31 | 0.21 |
-| richards | 0.979 | 1.064 | 1.143 | 0.908 | 1.923 | 2.632 | 0.51 | 0.37 | 0.47 | 0.34 |
-| sort | 1.190 | 1.188 | 1.309 | 1.007 | 1.857 | 2.408 | 0.64 | 0.49 | 0.54 | 0.42 |
-| spectral_norm | 1.194 | 1.209 | 1.275 | 0.986 | 2.156 | 1.827 | 0.55 | 0.65 | 0.46 | 0.54 |
-| strings | 1.741 | 1.681 | 1.835 | 1.620 | 2.241 | 2.999 | 0.78 | 0.58 | 0.72 | 0.54 |
-| **geomean** |  |  |  |  |  |  | **0.50** | **0.39** | **0.43** | **0.33** |
+| awfy_micro | 0.773 | 0.794 | 0.963 | 0.643 | 1.594 | 2.049 | 0.48 | 0.38 | 0.40 | 0.31 |
+| binary_trees | 0.983 | 1.104 | 1.190 | 0.804 | 1.789 | 5.117 | 0.55 | 0.19 | 0.45 | 0.16 |
+| bitops | 0.696 | 0.712 | 0.869 | 0.533 | 1.622 | 1.439 | 0.43 | 0.48 | 0.33 | 0.37 |
+| closures | 0.897 | 0.990 | 1.200 | 0.649 | 1.509 | 2.631 | 0.59 | 0.34 | 0.43 | 0.25 |
+| deltablue | 0.840 | 0.902 | 1.040 | 0.672 | 1.521 | 2.657 | 0.55 | 0.32 | 0.44 | 0.25 |
+| fannkuch | 0.466 | 0.453 | 0.578 | 0.381 | 1.324 | 1.524 | 0.35 | 0.31 | 0.29 | 0.25 |
+| json | 0.914 | 0.933 | 1.061 | 0.888 | 1.550 | 2.299 | 0.59 | 0.40 | 0.57 | 0.39 |
+| nbody | 0.428 | 0.437 | 0.547 | 0.316 | 1.893 | 1.363 | 0.23 | 0.31 | 0.17 | 0.23 |
+| properties | 0.850 | 0.860 | 0.927 | 0.725 | 1.564 | 1.628 | 0.54 | 0.52 | 0.46 | 0.45 |
+| raytrace | 0.459 | 0.475 | 0.561 | 0.417 | 1.448 | 2.224 | 0.32 | 0.21 | 0.29 | 0.19 |
+| richards | 0.748 | 0.829 | 0.928 | 0.667 | 1.465 | 2.023 | 0.51 | 0.37 | 0.46 | 0.33 |
+| sort | 0.854 | 0.858 | 1.028 | 0.729 | 1.399 | 1.836 | 0.61 | 0.47 | 0.52 | 0.40 |
+| spectral_norm | 0.846 | 0.857 | 0.992 | 0.656 | 1.612 | 1.415 | 0.52 | 0.60 | 0.41 | 0.46 |
+| strings | 1.164 | 1.157 | 1.283 | 1.065 | 1.697 | 2.243 | 0.69 | 0.52 | 0.63 | 0.47 |
+| **geomean** |  |  |  |  |  |  | **0.48** | **0.37** | **0.40** | **0.31** |
 
 Times in seconds.
 
@@ -460,87 +438,68 @@ Times in seconds.
 
 | benchmark | tailcall | goto | switch | jit | gauche | guile-nojit | guile | tailcall/gauche | tailcall/guile-nojit | tailcall/guile | jit/gauche | jit/guile-nojit | jit/guile |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| ack | 0.598 | 0.659 | 0.674 | 0.466 | 4.141 | 1.207 | 0.287 | 0.14 | 0.50 | 2.08 | 0.11 | 0.39 | 1.62 |
-| array1 | 0.455 | 0.487 | 0.485 | 0.326 | 1.155 | 1.315 | 0.369 | 0.39 | 0.35 | 1.23 | 0.28 | 0.25 | 0.88 |
-| browse | 0.022 | 0.022 | 0.023 | 0.022 | 0.117 | 0.038 | 0.026 | 0.19 | 0.58 | 0.85 | 0.19 | 0.58 | 0.85 |
-| chudnovsky | 0.215 | 0.213 | 0.218 | 0.223 | 1.353 | 0.249 | 0.195 | 0.16 | 0.86 | 1.10 | 0.16 | 0.90 | 1.14 |
-| conform | 0.156 | 0.159 | 0.171 | 0.136 | 0.611 | 0.236 | 0.103 | 0.26 | 0.66 | 1.51 | 0.22 | 0.58 | 1.32 |
-| cpstak | 0.345 | 0.350 | 0.359 | 0.258 | 1.767 | 0.568 | 0.272 | 0.20 | 0.61 | 1.27 | 0.15 | 0.45 | 0.95 |
-| ctak | 0.033 | 0.032 | 0.032 | 0.030 | 0.381 | 0.715 | 0.684 | 0.09 | 0.05 | 0.05 | 0.08 | 0.04 | 0.04 |
-| deriv | 0.292 | 0.303 | 0.313 | 0.277 | 1.039 | 0.529 | 0.252 | 0.28 | 0.55 | 1.16 | 0.27 | 0.52 | 1.10 |
-| destruc | 0.167 | 0.168 | 0.172 | 0.128 | 0.638 | 0.298 | 0.121 | 0.26 | 0.56 | 1.38 | 0.20 | 0.43 | 1.06 |
-| diviter | 0.196 | 0.194 | 0.206 | 0.161 | 0.673 | 0.464 | 0.226 | 0.29 | 0.42 | 0.87 | 0.24 | 0.35 | 0.71 |
-| divrec | 0.267 | 0.279 | 0.294 | 0.238 | 0.885 | 0.584 | 0.294 | 0.30 | 0.46 | 0.91 | 0.27 | 0.41 | 0.81 |
-| earley | 0.056 | 0.056 | 0.058 | 0.052 | 0.198 | 0.085 | 0.043 | 0.28 | 0.66 | 1.30 | 0.26 | 0.61 | 1.21 |
-| fft | 0.073 | 0.072 | 0.074 | 0.053 | 0.436 | 0.258 | 0.221 | 0.17 | 0.28 | 0.33 | 0.12 | 0.21 | 0.24 |
-| fib | 0.624 | 0.670 | 0.772 | 0.543 | 1.844 | 1.377 | 0.360 | 0.34 | 0.45 | 1.73 | 0.29 | 0.39 | 1.51 |
-| fibc | 0.047 | 0.045 | 0.045 | 0.039 | 0.524 | 0.847 | 0.799 | 0.09 | 0.06 | 0.06 | 0.07 | 0.05 | 0.05 |
-| fibfp | 0.238 | 0.254 | 0.276 | 0.177 | 0.682 | 1.084 | 0.876 | 0.35 | 0.22 | 0.27 | 0.26 | 0.16 | 0.20 |
-| gcbench | 0.027 | 0.026 | 0.027 | 0.022 | 0.190 | 0.038 | 0.023 | 0.14 | 0.71 | 1.17 | 0.12 | 0.58 | 0.96 |
-| graphs | 0.165 | 0.172 | 0.176 | 0.152 | 0.866 | 0.276 | 0.094 | 0.19 | 0.60 | 1.76 | 0.18 | 0.55 | 1.62 |
-| lattice | 0.071 | 0.073 | 0.079 | 0.067 | 0.295 | 0.134 | 0.057 | 0.24 | 0.53 | 1.25 | 0.23 | 0.50 | 1.18 |
-| matrix | 0.092 | 0.096 | 0.098 | 0.081 | 0.379 | 0.153 | 0.069 | 0.24 | 0.60 | 1.33 | 0.21 | 0.53 | 1.17 |
-| maze | 0.049 | 0.051 | 0.057 | 0.041 | 0.270 | 0.097 | 0.051 | 0.18 | 0.51 | 0.96 | 0.15 | 0.42 | 0.80 |
-| mazefun | 0.177 | 0.189 | 0.194 | 0.142 | 0.592 | 0.379 | 0.125 | 0.30 | 0.47 | 1.42 | 0.24 | 0.37 | 1.14 |
-| mbrot | 0.067 | 0.066 | 0.071 | 0.049 | 0.276 | 0.399 | 0.339 | 0.24 | 0.17 | 0.20 | 0.18 | 0.12 | 0.14 |
-| mperm | 0.185 | 0.193 | 0.201 | 0.141 | 0.541 | 0.252 | 0.080 | 0.34 | 0.73 | 2.31 | 0.26 | 0.56 | 1.76 |
-| nboyer | 0.901 | 0.961 | 1.005 | 0.754 | 1.618 | 1.185 | 0.450 | 0.56 | 0.76 | 2.00 | 0.47 | 0.64 | 1.68 |
-| nqueens | 0.408 | 0.402 | 0.437 | 0.320 | 0.913 | 0.653 | 0.232 | 0.45 | 0.62 | 1.76 | 0.35 | 0.49 | 1.38 |
-| ntakl | 0.222 | 0.245 | 0.245 | 0.146 | 0.676 | 0.404 | 0.098 | 0.33 | 0.55 | 2.27 | 0.22 | 0.36 | 1.49 |
-| nucleic | 0.092 | 0.090 | 0.095 | 0.088 | 0.544 | 0.262 | 0.196 | 0.17 | 0.35 | 0.47 | 0.16 | 0.34 | 0.45 |
-| paraffins | 0.052 | 0.052 | 0.054 | 0.048 | 0.201 | 0.071 | 0.042 | 0.26 | 0.73 | 1.24 | 0.24 | 0.68 | 1.14 |
-| peval | 0.130 | 0.129 | 0.143 | 0.098 | 0.549 | 0.265 | 0.104 | 0.24 | 0.49 | 1.25 | 0.18 | 0.37 | 0.94 |
-| pi | 0.181 | 0.180 | 0.181 | 0.193 | 3.940 | 0.142 | 0.139 | 0.05 | 1.27 | 1.30 | 0.05 | 1.36 | 1.39 |
-| pnpoly | 0.103 | 0.104 | 0.107 | 0.083 | 0.298 | 0.468 | 0.298 | 0.35 | 0.22 | 0.35 | 0.28 | 0.18 | 0.28 |
-| primes | 0.180 | 0.195 | 0.204 | 0.151 | 0.783 | 0.419 | 0.275 | 0.23 | 0.43 | 0.65 | 0.19 | 0.36 | 0.55 |
-| puzzle | 0.122 | 0.133 | 0.142 | 0.094 | 0.382 | 0.312 | 0.116 | 0.32 | 0.39 | 1.05 | 0.25 | 0.30 | 0.81 |
-| quicksort | 0.141 | 0.145 | 0.149 | 0.110 | 0.403 | 0.255 | 0.100 | 0.35 | 0.55 | 1.41 | 0.27 | 0.43 | 1.10 |
-| sboyer | 0.902 | 0.980 | 1.050 | 0.724 | 1.679 | 1.292 | 0.409 | 0.54 | 0.70 | 2.21 | 0.43 | 0.56 | 1.77 |
-| simplex | 0.157 | 0.162 | 0.170 | 0.127 | 0.738 | 0.322 | 0.151 | 0.21 | 0.49 | 1.04 | 0.17 | 0.39 | 0.84 |
-| string | 0.028 | 0.028 | 0.028 | 0.028 | 0.189 | 0.036 | 0.037 | 0.15 | 0.78 | 0.76 | 0.15 | 0.78 | 0.76 |
-| sum | 0.432 | 0.481 | 0.474 | 0.247 | 1.079 | 0.816 | 0.217 | 0.40 | 0.53 | 1.99 | 0.23 | 0.30 | 1.14 |
-| sumfp | 0.136 | 0.142 | 0.146 | 0.079 | 0.365 | 0.740 | 0.709 | 0.37 | 0.18 | 0.19 | 0.22 | 0.11 | 0.11 |
-| tak | 0.636 | 0.616 | 0.672 | 0.463 | 1.599 | 1.225 | 0.301 | 0.40 | 0.52 | 2.11 | 0.29 | 0.38 | 1.54 |
-| takl | 0.108 | 0.106 | 0.119 | 0.077 | 0.408 | 0.207 | 0.057 | 0.26 | 0.52 | 1.89 | 0.19 | 0.37 | 1.35 |
-| triangl | 0.211 | 0.229 | 0.250 | 0.151 | 0.543 | 0.547 | 0.168 | 0.39 | 0.39 | 1.26 | 0.28 | 0.28 | 0.90 |
-| **geomean** |  |  |  |  |  |  |  | **0.25** | **0.45** | **0.94** | **0.20** | **0.36** | **0.76** |
+| ack | 0.433 | 0.464 | 0.488 | 0.292 | 2.960 | 0.941 | 0.218 | 0.15 | 0.46 | 1.99 | 0.10 | 0.31 | 1.34 |
+| array1 | 0.360 | 0.383 | 0.388 | 0.256 | 0.882 | 1.008 | 0.289 | 0.41 | 0.36 | 1.25 | 0.29 | 0.25 | 0.89 |
+| browse | 0.012 | 0.012 | 0.014 | 0.010 | 0.091 | 0.030 | 0.020 | 0.13 | 0.40 | 0.60 | 0.11 | 0.33 | 0.50 |
+| chudnovsky | 0.140 | 0.140 | 0.143 | 0.141 | 0.997 | 0.189 | 0.149 | 0.14 | 0.74 | 0.94 | 0.14 | 0.75 | 0.95 |
+| conform | 0.089 | 0.090 | 0.098 | 0.063 | 0.462 | 0.183 | 0.078 | 0.19 | 0.49 | 1.14 | 0.14 | 0.34 | 0.81 |
+| cpstak | 0.229 | 0.245 | 0.248 | 0.182 | 1.211 | 0.436 | 0.211 | 0.19 | 0.53 | 1.09 | 0.15 | 0.42 | 0.86 |
+| ctak | 0.019 | 0.019 | 0.019 | 0.017 | 0.253 | 0.530 | 0.514 | 0.08 | 0.04 | 0.04 | 0.07 | 0.03 | 0.03 |
+| deriv | 0.125 | 0.125 | 0.143 | 0.107 | 0.732 | 0.383 | 0.195 | 0.17 | 0.33 | 0.64 | 0.15 | 0.28 | 0.55 |
+| destruc | 0.118 | 0.124 | 0.131 | 0.090 | 0.477 | 0.232 | 0.094 | 0.25 | 0.51 | 1.26 | 0.19 | 0.39 | 0.96 |
+| diviter | 0.141 | 0.143 | 0.155 | 0.121 | 0.507 | 0.356 | 0.174 | 0.28 | 0.40 | 0.81 | 0.24 | 0.34 | 0.70 |
+| divrec | 0.172 | 0.174 | 0.200 | 0.153 | 0.658 | 0.452 | 0.224 | 0.26 | 0.38 | 0.77 | 0.23 | 0.34 | 0.68 |
+| earley | 0.034 | 0.034 | 0.038 | 0.031 | 0.147 | 0.066 | 0.033 | 0.23 | 0.52 | 1.03 | 0.21 | 0.47 | 0.94 |
+| fft | 0.058 | 0.058 | 0.060 | 0.043 | 0.321 | 0.201 | 0.169 | 0.18 | 0.29 | 0.34 | 0.13 | 0.21 | 0.25 |
+| fib | 0.405 | 0.429 | 0.451 | 0.336 | 1.454 | 1.098 | 0.289 | 0.28 | 0.37 | 1.40 | 0.23 | 0.31 | 1.16 |
+| fibc | 0.029 | 0.029 | 0.029 | 0.023 | 0.360 | 0.643 | 0.615 | 0.08 | 0.05 | 0.05 | 0.06 | 0.04 | 0.04 |
+| fibfp | 0.161 | 0.167 | 0.182 | 0.122 | 0.528 | 0.851 | 0.675 | 0.30 | 0.19 | 0.24 | 0.23 | 0.14 | 0.18 |
+| gcbench | 0.009 | 0.009 | 0.011 | 0.008 | 0.145 | 0.030 | 0.018 | 0.06 | 0.30 | 0.50 | 0.06 | 0.27 | 0.44 |
+| graphs | 0.112 | 0.112 | 0.131 | 0.099 | 0.626 | 0.210 | 0.074 | 0.18 | 0.53 | 1.51 | 0.16 | 0.47 | 1.34 |
+| lattice | 0.043 | 0.042 | 0.049 | 0.034 | 0.224 | 0.102 | 0.044 | 0.19 | 0.42 | 0.98 | 0.15 | 0.33 | 0.77 |
+| matrix | 0.062 | 0.060 | 0.068 | 0.052 | 0.282 | 0.120 | 0.053 | 0.22 | 0.52 | 1.17 | 0.18 | 0.43 | 0.98 |
+| maze | 0.029 | 0.030 | 0.034 | 0.022 | 0.200 | 0.075 | 0.039 | 0.14 | 0.39 | 0.74 | 0.11 | 0.29 | 0.56 |
+| mazefun | 0.120 | 0.128 | 0.136 | 0.099 | 0.439 | 0.289 | 0.096 | 0.27 | 0.42 | 1.25 | 0.23 | 0.34 | 1.03 |
+| mbrot | 0.052 | 0.054 | 0.054 | 0.037 | 0.208 | 0.303 | 0.260 | 0.25 | 0.17 | 0.20 | 0.18 | 0.12 | 0.14 |
+| mperm | 0.141 | 0.147 | 0.153 | 0.107 | 0.412 | 0.194 | 0.063 | 0.34 | 0.73 | 2.24 | 0.26 | 0.55 | 1.70 |
+| nboyer | 0.634 | 0.681 | 0.712 | 0.496 | 1.230 | 0.922 | 0.350 | 0.52 | 0.69 | 1.81 | 0.40 | 0.54 | 1.42 |
+| nqueens | 0.275 | 0.278 | 0.306 | 0.211 | 0.686 | 0.497 | 0.176 | 0.40 | 0.55 | 1.56 | 0.31 | 0.42 | 1.20 |
+| ntakl | 0.169 | 0.187 | 0.182 | 0.111 | 0.533 | 0.320 | 0.078 | 0.32 | 0.53 | 2.17 | 0.21 | 0.35 | 1.42 |
+| nucleic | 0.055 | 0.057 | 0.065 | 0.051 | 0.405 | 0.201 | 0.151 | 0.14 | 0.27 | 0.36 | 0.13 | 0.25 | 0.34 |
+| paraffins | 0.028 | 0.028 | 0.032 | 0.025 | 0.152 | 0.056 | 0.033 | 0.18 | 0.50 | 0.85 | 0.16 | 0.45 | 0.76 |
+| peval | 0.080 | 0.081 | 0.096 | 0.056 | 0.406 | 0.207 | 0.079 | 0.20 | 0.39 | 1.01 | 0.14 | 0.27 | 0.71 |
+| pi | 0.117 | 0.117 | 0.117 | 0.122 | 2.968 | 0.108 | 0.107 | 0.04 | 1.08 | 1.09 | 0.04 | 1.13 | 1.14 |
+| pnpoly | 0.077 | 0.077 | 0.084 | 0.060 | 0.225 | 0.364 | 0.231 | 0.34 | 0.21 | 0.33 | 0.27 | 0.16 | 0.26 |
+| primes | 0.131 | 0.170 | 0.148 | 0.106 | 0.578 | 0.319 | 0.213 | 0.23 | 0.41 | 0.62 | 0.18 | 0.33 | 0.50 |
+| puzzle | 0.101 | 0.105 | 0.117 | 0.064 | 0.292 | 0.241 | 0.089 | 0.35 | 0.42 | 1.13 | 0.22 | 0.27 | 0.72 |
+| quicksort | 0.106 | 0.111 | 0.116 | 0.080 | 0.302 | 0.199 | 0.078 | 0.35 | 0.53 | 1.36 | 0.26 | 0.40 | 1.03 |
+| sboyer | 0.599 | 0.629 | 0.708 | 0.433 | 1.287 | 0.975 | 0.311 | 0.47 | 0.61 | 1.93 | 0.34 | 0.44 | 1.39 |
+| simplex | 0.097 | 0.098 | 0.113 | 0.083 | 0.547 | 0.254 | 0.117 | 0.18 | 0.38 | 0.83 | 0.15 | 0.33 | 0.71 |
+| string | 0.018 | 0.018 | 0.017 | 0.018 | 0.135 | 0.029 | 0.028 | 0.13 | 0.62 | 0.64 | 0.13 | 0.62 | 0.64 |
+| sum | 0.337 | 0.369 | 0.367 | 0.194 | 0.835 | 0.648 | 0.173 | 0.40 | 0.52 | 1.95 | 0.23 | 0.30 | 1.12 |
+| sumfp | 0.106 | 0.120 | 0.115 | 0.064 | 0.291 | 0.563 | 0.537 | 0.36 | 0.19 | 0.20 | 0.22 | 0.11 | 0.12 |
+| tak | 0.391 | 0.368 | 0.445 | 0.283 | 1.266 | 0.975 | 0.237 | 0.31 | 0.40 | 1.65 | 0.22 | 0.29 | 1.19 |
+| takl | 0.082 | 0.080 | 0.107 | 0.057 | 0.315 | 0.167 | 0.045 | 0.26 | 0.49 | 1.82 | 0.18 | 0.34 | 1.27 |
+| triangl | 0.156 | 0.163 | 0.185 | 0.110 | 0.421 | 0.426 | 0.132 | 0.37 | 0.37 | 1.18 | 0.26 | 0.26 | 0.83 |
+| **geomean** |  |  |  |  |  |  |  | **0.22** | **0.38** | **0.80** | **0.17** | **0.30** | **0.63** |
 
 Times in seconds.
-
-**Update 2026-11-04 (096e04e, tailcall only).** After a third round of
-interpreter work (builtins as ops, allocation without a stack frame, no
-register clearing on calls, aliases, loop-invariant free variables;
-[bench/scheme/README.md](../bench/scheme/README.md#third-phase-calls-allocation-builtins-2026-11-04)),
-`compare.py -n 3 --align 64` against the commit of this table (091245f)
-in one interleaved run: ours/before 0.894; Gauche 0.251 → 0.224, Guile
-without JIT 0.446 → 0.398, Guile with JIT 0.945 → 0.845 (host load 2-4,
-so the absolute times are lower than above). goto, switch and jit
-builds were not rerun.
-
-**Update 2026-11-04, later (tailcall only).** A fourth round (known
-calls as `CALLK`, records, `call/cc`, `reverse`, `append`, `length` and
-other builtins as ops, `symbol->string` cached, unzeroed strings with
-`std.gc`'s `new_uninit`, faster `std.bigint` division and square roots;
-[bench/scheme/README.md](../bench/scheme/README.md#fourth-phase-known-calls-more-builtins-as-ops-strings-bigints-2026-11-04-later)):
-against 5f50eb4, interleaved, `-n 3 --align 64`, ours/before 0.941;
-Gauche 0.218 → 0.205, Guile without JIT 0.398 → 0.374, Guile with JIT
-0.848 → 0.797 (host load about 3).
 
 ### lox
 
 | benchmark | tailcall | goto | switch | clox | tailcall/clox |
 |---|---:|---:|---:|---:|---:|
-| binary_trees | 0.912 | 0.977 | 0.940 | 3.609 | 0.25 |
-| equality | 1.351 | 1.334 | 1.576 | 4.107 | 0.33 |
-| fib | 0.509 | 0.557 | 0.512 | 1.255 | 0.41 |
-| instantiation | 0.452 | 0.454 | 0.445 | 0.686 | 0.66 |
-| invocation | 0.183 | 0.208 | 0.188 | 0.350 | 0.52 |
-| method_call | 0.105 | 0.118 | 0.106 | 0.228 | 0.46 |
-| properties | 0.238 | 0.258 | 0.243 | 0.535 | 0.44 |
-| trees | 1.686 | 1.821 | 1.741 | 3.084 | 0.55 |
-| zoo | 0.192 | 0.218 | 0.195 | 0.394 | 0.49 |
-| zoo_batch | 1.172 | 1.308 | 1.185 | 2.468 | 0.47 |
-| **geomean** |  |  |  |  | **0.44** |
+| binary_trees | 0.725 | 0.750 | 0.766 | 3.184 | 0.23 |
+| equality | 0.981 | 1.001 | 1.200 | 3.117 | 0.31 |
+| fib | 0.396 | 0.408 | 0.436 | 0.987 | 0.40 |
+| instantiation | 0.339 | 0.337 | 0.346 | 0.536 | 0.63 |
+| invocation | 0.142 | 0.142 | 0.150 | 0.276 | 0.51 |
+| method_call | 0.082 | 0.088 | 0.088 | 0.174 | 0.47 |
+| properties | 0.212 | 0.192 | 0.204 | 0.415 | 0.51 |
+| trees | 1.346 | 1.373 | 1.362 | 2.408 | 0.56 |
+| zoo | 0.158 | 0.161 | 0.179 | 0.309 | 0.51 |
+| zoo_batch | 0.957 | 0.957 | 1.010 | 1.924 | 0.50 |
+| **geomean** |  |  |  |  | **0.45** |
 
 Times in seconds.
 
@@ -548,15 +507,15 @@ Times in seconds.
 
 | benchmark | tailcall | goto | switch | pcre2 | python-re | tailcall/pcre2 | tailcall/python-re |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| alt-heavy | 30.2 | 29.8 | 30.8 | 63.5 | 41.0 | 0.48 | 0.74 |
-| capture | 22.0 | 23.1 | 24.7 | 64.2 | 141.6 | 0.34 | 0.16 |
-| class | 80.6 | 77.0 | 79.5 | 281.1 | 195.6 | 0.29 | 0.41 |
-| dot-star | 12.9 | 12.3 | 12.9 | 27.2 | 10.3 | 0.47 | 1.25 |
-| literal | 4.0 | 4.0 | 3.9 | 3.2 | 3.1 | 1.26 | 1.29 |
-| literal-alt | 11.2 | 11.2 | 11.2 | 23.0 | 47.5 | 0.49 | 0.24 |
-| patho-alt | 56.5 | 60.1 | 78.3 | 196.0 | 155.8 | 0.29 | 0.36 |
-| pathological | 0.0 | 0.0 | 0.0 | 0.0 | 550.7 | — | — |
-| words | 25.1 | 27.6 | 28.4 | 69.1 | 198.3 | 0.36 | 0.13 |
+| alt-heavy | 23.3 | 23.8 | 25.9 | 49.9 | 32.0 | 0.47 | 0.73 |
+| capture | 17.1 | 18.6 | 19.3 | 51.1 | 110.2 | 0.34 | 0.16 |
+| class | 60.8 | 58.1 | 65.8 | 220.5 | 154.2 | 0.28 | 0.39 |
+| dot-star | 10.1 | 10.3 | 10.4 | 21.4 | 8.1 | 0.47 | 1.25 |
+| literal | 3.1 | 3.5 | 3.1 | 2.5 | 2.5 | 1.24 | 1.25 |
+| literal-alt | 8.9 | 9.1 | 9.1 | 18.1 | 36.6 | 0.49 | 0.24 |
+| patho-alt | 45.0 | 44.9 | 64.4 | 154.7 | 122.6 | 0.29 | 0.37 |
+| pathological | 0.0 | 0.0 | 0.0 | 0.0 | 431.9 | — | — |
+| words | 20.1 | 21.9 | 22.6 | 54.6 | 156.0 | 0.37 | 0.13 |
 | **geomean** |  |  |  |  |  | **0.44** | **0.41** |
 
 Times in milliseconds.
@@ -565,14 +524,14 @@ Times in milliseconds.
 
 | benchmark | tailcall | goto | switch | wasm3 | tailcall/wasm3 |
 |---|---:|---:|---:|---:|---:|
-| binarytrees | 1.725 | 1.872 | 2.072 | 1.865 | 0.92 |
-| coremark | 2.371 | 2.496 | 2.967 | 2.629 | 0.90 |
-| fannkuchredux | 1.780 | 1.857 | 2.219 | 2.101 | 0.85 |
-| fasta | 1.409 | 1.515 | 1.711 | 1.496 | 0.94 |
-| mandelbrot | 1.924 | 2.056 | 2.679 | 2.566 | 0.75 |
-| nbody | 2.300 | 2.393 | 2.785 | 2.519 | 0.91 |
-| spectralnorm | 2.081 | 2.111 | 2.848 | 2.576 | 0.81 |
-| **geomean** |  |  |  |  | **0.87** |
+| binarytrees | 1.296 | 1.415 | 1.633 | 1.457 | 0.89 |
+| coremark | 1.792 | 1.908 | 2.280 | 2.017 | 0.89 |
+| fannkuchredux | 1.317 | 1.394 | 1.720 | 1.657 | 0.79 |
+| fasta | 1.105 | 1.137 | 1.321 | 1.172 | 0.94 |
+| mandelbrot | 1.498 | 1.596 | 2.033 | 2.003 | 0.75 |
+| nbody | 1.748 | 1.819 | 2.187 | 2.006 | 0.87 |
+| spectralnorm | 1.613 | 1.634 | 2.162 | 1.913 | 0.84 |
+| **geomean** |  |  |  |  | **0.85** |
 
 Times in seconds.
 
@@ -580,9 +539,9 @@ Times in seconds.
 
 | benchmark | tailcall | goto | switch | mvp | tailcall/mvp |
 |---|---:|---:|---:|---:|---:|
-| fannkuchredux_simd | 1.748 | 1.849 | 2.247 | 1.780 | 0.98 |
-| nbody_simd | 2.196 | 2.247 | 2.771 | 2.300 | 0.95 |
-| spectralnorm_simd | 2.103 | 2.123 | 2.877 | 2.081 | 1.01 |
+| fannkuchredux_simd | 1.314 | 1.372 | 1.712 | 1.317 | 1.00 |
+| nbody_simd | 1.666 | 1.727 | 2.061 | 1.748 | 0.95 |
+| spectralnorm_simd | 1.617 | 1.632 | 2.164 | 1.613 | 1.00 |
 | **geomean** |  |  |  |  | **0.98** |
 
 Times in seconds.
@@ -592,65 +551,54 @@ Times in seconds.
 The 30 PolyBench/C 4.2.1 kernels, built like the `wasm` programs, each at
 the largest standard dataset that runs in at most about 2 s under wasm3
 (`bench/wasm/polybench.sh`); the interpreter was not tuned on them.
-Geometric means of the times: wasm3 0.252 s, tail-call 0.226, goto
-0.231, switch 0.279.
+Geometric means of the times: wasm3 0.193 s, tail-call 0.161, goto
+0.170, switch 0.201.
 
 | benchmark | tailcall | goto | switch | wasm3 | tailcall/wasm3 |
 |---|---:|---:|---:|---:|---:|
-| 2mm | 0.154 | 0.153 | 0.189 | 0.165 | 0.93 |
-| 3mm | 0.240 | 0.234 | 0.294 | 0.255 | 0.94 |
-| adi | 0.277 | 0.302 | 0.346 | 0.323 | 0.86 |
-| atax | 0.127 | 0.130 | 0.150 | 0.135 | 0.94 |
-| bicg | 0.130 | 0.133 | 0.159 | 0.131 | 0.99 |
-| cholesky | 0.859 | 0.868 | 1.019 | 0.963 | 0.89 |
-| correlation | 0.076 | 0.081 | 0.094 | 0.082 | 0.93 |
-| covariance | 0.079 | 0.080 | 0.093 | 0.082 | 0.96 |
-| deriche | 1.095 | 1.150 | 1.296 | 1.454 | 0.75 |
-| doitgen | 0.068 | 0.070 | 0.087 | 0.072 | 0.94 |
-| durbin | 0.176 | 0.171 | 0.221 | 0.193 | 0.91 |
-| fdtd-2d | 0.206 | 0.217 | 0.266 | 0.246 | 0.84 |
-| floyd-warshall | 1.791 | 1.817 | 2.094 | 1.919 | 0.93 |
-| gemm | 0.127 | 0.127 | 0.157 | 0.129 | 0.98 |
-| gemver | 0.892 | 0.897 | 1.135 | 1.036 | 0.86 |
-| gesummv | 0.346 | 0.349 | 0.417 | 0.341 | 1.01 |
-| gramschmidt | 0.134 | 0.137 | 0.161 | 0.140 | 0.96 |
-| heat-3d | 0.300 | 0.326 | 0.412 | 0.372 | 0.81 |
-| jacobi-1d | 0.093 | 0.097 | 0.118 | 0.109 | 0.85 |
-| jacobi-2d | 0.211 | 0.221 | 0.264 | 0.258 | 0.82 |
-| lu | 0.961 | 1.006 | 1.169 | 1.102 | 0.87 |
-| ludcmp | 0.900 | 0.941 | 1.116 | 1.083 | 0.83 |
-| mvt | 0.556 | 0.564 | 0.686 | 0.628 | 0.89 |
-| nussinov | 0.246 | 0.246 | 0.305 | 0.321 | 0.77 |
-| seidel-2d | 0.379 | 0.418 | 0.484 | 0.447 | 0.85 |
-| symm | 0.098 | 0.101 | 0.122 | 0.112 | 0.88 |
-| syr2k | 0.131 | 0.135 | 0.174 | 0.136 | 0.96 |
-| syrk | 0.071 | 0.069 | 0.087 | 0.078 | 0.91 |
-| trisolv | 0.142 | 0.136 | 0.164 | 0.156 | 0.91 |
-| trmm | 0.054 | 0.056 | 0.065 | 0.057 | 0.95 |
-| **geomean** |  |  |  |  | **0.90** |
+| 2mm | 0.103 | 0.105 | 0.127 | 0.122 | 0.84 |
+| 3mm | 0.158 | 0.161 | 0.192 | 0.188 | 0.84 |
+| adi | 0.207 | 0.224 | 0.259 | 0.242 | 0.86 |
+| atax | 0.089 | 0.093 | 0.111 | 0.102 | 0.87 |
+| bicg | 0.091 | 0.095 | 0.116 | 0.101 | 0.90 |
+| cholesky | 0.569 | 0.628 | 0.706 | 0.718 | 0.79 |
+| correlation | 0.054 | 0.056 | 0.066 | 0.063 | 0.86 |
+| covariance | 0.051 | 0.053 | 0.062 | 0.060 | 0.85 |
+| deriche | 0.811 | 0.848 | 0.984 | 1.129 | 0.72 |
+| doitgen | 0.047 | 0.050 | 0.059 | 0.056 | 0.84 |
+| durbin | 0.127 | 0.126 | 0.165 | 0.148 | 0.86 |
+| fdtd-2d | 0.155 | 0.171 | 0.206 | 0.190 | 0.82 |
+| floyd-warshall | 1.266 | 1.287 | 1.497 | 1.487 | 0.85 |
+| gemm | 0.090 | 0.128 | 0.120 | 0.101 | 0.89 |
+| gemver | 0.679 | 0.699 | 0.853 | 0.838 | 0.81 |
+| gesummv | 0.245 | 0.253 | 0.302 | 0.265 | 0.92 |
+| gramschmidt | 0.096 | 0.098 | 0.112 | 0.109 | 0.88 |
+| heat-3d | 0.233 | 0.246 | 0.322 | 0.289 | 0.81 |
+| jacobi-1d | 0.065 | 0.069 | 0.083 | 0.084 | 0.77 |
+| jacobi-2d | 0.163 | 0.173 | 0.202 | 0.205 | 0.80 |
+| lu | 0.644 | 0.709 | 0.795 | 0.806 | 0.80 |
+| ludcmp | 0.616 | 0.675 | 0.763 | 0.811 | 0.76 |
+| mvt | 0.443 | 0.455 | 0.530 | 0.526 | 0.84 |
+| nussinov | 0.161 | 0.163 | 0.205 | 0.244 | 0.66 |
+| seidel-2d | 0.296 | 0.324 | 0.370 | 0.350 | 0.85 |
+| symm | 0.070 | 0.072 | 0.087 | 0.084 | 0.83 |
+| syr2k | 0.084 | 0.090 | 0.107 | 0.102 | 0.82 |
+| syrk | 0.051 | 0.051 | 0.067 | 0.058 | 0.88 |
+| trisolv | 0.111 | 0.103 | 0.126 | 0.120 | 0.93 |
+| trmm | 0.040 | 0.043 | 0.049 | 0.043 | 0.93 |
+| **geomean** |  |  |  |  | **0.83** |
 
 Times in seconds.
-
-**2026-11-04, wasm round three** (after this run; tail-call only, best of
-7 interleaved, `--align-functions=64`): 0.838 of wasm3's time on
-PolyBench (0.932 for the build of this table in the same run) and 0.837
-on the seven `wasm` programs (0.850). Most of the PolyBench change is
-cholesky, lu and ludcmp (0.61–0.64 of their time): one handler's
-dispatch jump ended on a 32-byte boundary, which Intel's JCC erratum
-fix penalizes on this Skylake, and `loimi build` now pads vm branches
-off those boundaries; the rest is bounds checks against the end of the
-access and array-element loads as one op
-([examples/wasm/FRICTION.md](../examples/wasm/FRICTION.md), "Round three").
 
 ### stack
 
 | benchmark | tailcall | goto | switch |
 |---|---:|---:|---:|
-| fib | 0.067 | 0.075 | 0.091 |
-| loop | 0.932 | 0.910 | 0.984 |
-| nbody | 0.191 | 0.204 | 0.271 |
-| sieve | 0.118 | 0.124 | 0.134 |
-| strings | 0.163 | 0.156 | 0.163 |
+| fib | 0.052 | 0.059 | 0.066 |
+| loop | 0.739 | 0.714 | 0.750 |
+| nbody | 0.149 | 0.159 | 0.177 |
+| sieve | 0.090 | 0.096 | 0.098 |
+| strings | 0.124 | 0.118 | 0.123 |
 | **geomean** |  |  |  |
 
 Times in seconds.
@@ -659,68 +607,55 @@ Times in seconds.
 
 | benchmark | tailcall | goto | switch | cpython | micropython | tailcall/cpython | tailcall/micropython |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| chaos | 0.321 | 0.357 | 0.374 | 0.877 | 2.253 | 0.37 | 0.14 |
-| deltablue | 0.465 | 0.509 | 0.566 | 1.234 | 5.818 | 0.38 | 0.08 |
-| fannkuch | 0.426 | 0.447 | 0.480 | 1.109 | 1.717 | 0.38 | 0.25 |
-| float | 0.287 | 0.288 | 0.347 | 1.098 | 2.652 | 0.26 | 0.11 |
-| go | 0.408 | 0.442 | 0.483 | 1.056 | 2.433 | 0.39 | 0.17 |
-| hexiom | 0.496 | 0.516 | 0.621 | 0.922 | 3.939 | 0.54 | 0.13 |
-| nbody | 0.471 | 0.481 | 0.606 | 1.235 | 4.482 | 0.38 | 0.11 |
-| nqueens | 0.702 | 0.738 | 0.822 | 1.055 | 2.186 | 0.67 | 0.32 |
-| raytrace | 0.440 | 0.447 | 0.471 | 1.152 | 4.501 | 0.38 | 0.10 |
-| richards | 0.237 | 0.261 | 0.295 | 1.095 | 4.163 | 0.22 | 0.06 |
-| spectral_norm | 0.267 | 0.257 | 0.293 | 0.931 | 1.817 | 0.29 | 0.15 |
-| **geomean** |  |  |  |  |  | **0.37** | **0.13** |
+| chaos | 0.248 | 0.279 | 0.280 | 0.706 | 1.842 | 0.35 | 0.13 |
+| deltablue | 0.342 | 0.376 | 0.412 | 0.959 | 4.762 | 0.36 | 0.07 |
+| fannkuch | 0.275 | 0.298 | 0.304 | 0.907 | 1.393 | 0.30 | 0.20 |
+| float | 0.205 | 0.220 | 0.238 | 0.870 | 2.149 | 0.24 | 0.10 |
+| go | 0.286 | 0.311 | 0.335 | 0.796 | 1.826 | 0.36 | 0.16 |
+| hexiom | 0.295 | 0.324 | 0.356 | 0.682 | 2.973 | 0.43 | 0.10 |
+| nbody | 0.353 | 0.432 | 0.457 | 0.958 | 3.387 | 0.37 | 0.10 |
+| nqueens | 0.334 | 0.356 | 0.370 | 0.794 | 1.660 | 0.42 | 0.20 |
+| raytrace | 0.300 | 0.335 | 0.339 | 0.867 | 3.394 | 0.35 | 0.09 |
+| richards | 0.179 | 0.202 | 0.233 | 0.817 | 3.175 | 0.22 | 0.06 |
+| spectral_norm | 0.200 | 0.208 | 0.212 | 0.699 | 1.365 | 0.29 | 0.15 |
+| **geomean** |  |  |  |  |  | **0.33** | **0.11** |
 
 Times in seconds.
-
-**Update 2026-11-04 (1b6c661, tailcall only).** After a third round of
-interpreter work (class instantiation and default arguments without the
-generic call path, generator expressions consumed by builtins run
-inline, `super(..).m(..)` as one op, list slices with raw copies;
-[examples/python/FRICTION.md](../examples/python/FRICTION.md#optimizations-third-round-calls-generator-expressions-slices-2026-11-04)),
-`compare.py -n 5` against b9e179a in one interleaved run: ours/before
-0.88 (nqueens 0.62, hexiom 0.78, fannkuch 0.81; nbody, richards,
-spectral_norm unchanged); CPython 0.38 → 0.33, MicroPython 0.13 → 0.11
-(host load 2-3, so the absolute times are lower than above). goto and
-switch builds were not rerun.
 
 ### prolog
 
 | benchmark | tailcall | goto | switch | jit | swipl | trealla | tailcall/swipl | tailcall/trealla | jit/swipl | jit/trealla |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| boyer | 0.708 | 0.767 | 0.795 | 0.724 | 1.384 | 6.622 | 0.51 | 0.11 | 0.52 | 0.11 |
-| browse | 0.886 | 0.921 | 0.992 | 0.906 | 1.301 | 8.451 | 0.68 | 0.10 | 0.70 | 0.11 |
-| chat_parser | 0.961 | 1.010 | 1.053 | 1.022 | 1.353 | 4.867 | 0.71 | 0.20 | 0.76 | 0.21 |
-| crypt | 0.530 | 0.523 | 0.547 | 0.530 | 1.313 | 4.959 | 0.40 | 0.11 | 0.40 | 0.11 |
-| derive | 0.651 | 0.723 | 0.715 | 0.809 | 1.327 | 3.691 | 0.49 | 0.18 | 0.61 | 0.22 |
-| divide10 | 0.685 | 0.760 | 0.779 | 0.898 | 1.312 | 3.687 | 0.52 | 0.19 | 0.68 | 0.24 |
-| eval | 0.644 | 0.646 | 0.644 | 0.626 | 1.269 | 3.357 | 0.51 | 0.19 | 0.49 | 0.19 |
-| fast_mu | 0.722 | 0.733 | 0.793 | 0.897 | 1.341 | 5.273 | 0.54 | 0.14 | 0.67 | 0.17 |
-| flatten | 0.665 | 0.689 | 0.762 | 0.721 | 1.342 | 7.160 | 0.50 | 0.09 | 0.54 | 0.10 |
-| log10 | 0.615 | 0.708 | 0.690 | 0.655 | 1.312 | 4.711 | 0.47 | 0.13 | 0.50 | 0.14 |
-| meta_qsort | 0.631 | 0.708 | 0.750 | 0.901 | 1.301 | 6.899 | 0.49 | 0.09 | 0.69 | 0.13 |
-| mu | 0.577 | 0.633 | 0.691 | 0.726 | 1.280 | 5.533 | 0.45 | 0.10 | 0.57 | 0.13 |
-| nand | 0.793 | 0.811 | 0.887 | 0.879 | 1.282 | 4.968 | 0.62 | 0.16 | 0.69 | 0.18 |
-| nreverse | 0.883 | 0.903 | 0.921 | 0.891 | 1.319 | 10.853 | 0.67 | 0.08 | 0.68 | 0.08 |
-| ops8 | 0.681 | 0.717 | 0.730 | 0.808 | 1.340 | 4.258 | 0.51 | 0.16 | 0.60 | 0.19 |
-| perfect | 0.767 | 0.798 | 0.846 | 0.791 | 1.311 | 6.488 | 0.59 | 0.12 | 0.60 | 0.12 |
-| poly_10 | 0.694 | 0.723 | 0.766 | 0.894 | 1.159 | 3.575 | 0.60 | 0.19 | 0.77 | 0.25 |
-| prover | 0.629 | 0.675 | 0.744 | 0.821 | 1.340 | 4.803 | 0.47 | 0.13 | 0.61 | 0.17 |
-| qsort | 0.702 | 0.692 | 0.743 | 0.738 | 1.322 | 8.015 | 0.53 | 0.09 | 0.56 | 0.09 |
-| queens_8 | 0.549 | 0.519 | 0.552 | 0.540 | 1.329 | 7.091 | 0.41 | 0.08 | 0.41 | 0.08 |
-| query | 0.590 | 0.543 | 0.585 | 0.649 | 1.342 | 6.256 | 0.44 | 0.09 | 0.48 | 0.10 |
-| reducer | 1.024 | 1.058 | 1.201 | 1.061 | 1.350 | 6.281 | 0.76 | 0.16 | 0.79 | 0.17 |
-| sendmore | 0.626 | 0.634 | 0.659 | 0.698 | 1.274 | 4.586 | 0.49 | 0.14 | 0.55 | 0.15 |
-| serialise | 0.745 | 0.762 | 0.791 | 0.811 | 1.323 | 6.918 | 0.56 | 0.11 | 0.61 | 0.12 |
-| sieve | 1.213 | 1.262 | 1.311 | 58.008† | 1.310 | 3.374 | 0.93 | 0.36 | 44.28 | 17.19 |
-| simple_analyzer | 0.734 | 0.749 | 0.817 | 0.720 | 1.317 | 6.778 | 0.56 | 0.11 | 0.55 | 0.11 |
-| tak | 0.266 | 0.263 | 0.274 | 0.255 | 1.310 | 4.908 | 0.20 | 0.05 | 0.19 | 0.05 |
-| times10 | 0.610 | 0.710 | 0.728 | 0.824 | 1.290 | 3.877 | 0.47 | 0.16 | 0.64 | 0.21 |
-| unify | 0.786 | 0.787 | 0.865 | 0.724 | 1.296 | 8.755 | 0.61 | 0.09 | 0.56 | 0.08 |
-| zebra | 0.902 | 0.970 | 1.035 | 0.987 | 1.296 | 4.728 | 0.70 | 0.19 | 0.76 | 0.21 |
-| **geomean** |  |  |  |  |  |  | **0.53** | **0.13** | **0.66** | **0.16** |
+| boyer | 0.555 | 0.568 | 0.615 | 0.506 | 1.032 | 4.969 | 0.54 | 0.11 | 0.49 | 0.10 |
+| browse | 0.686 | 0.693 | 0.788 | 0.690 | 1.014 | 6.451 | 0.68 | 0.11 | 0.68 | 0.11 |
+| chat_parser | 0.727 | 0.761 | 0.806 | 0.704 | 1.026 | 3.689 | 0.71 | 0.20 | 0.69 | 0.19 |
+| crypt | 0.415 | 0.387 | 0.421 | 0.389 | 1.014 | 3.800 | 0.41 | 0.11 | 0.38 | 0.10 |
+| derive | 0.468 | 0.530 | 0.557 | 0.509 | 1.016 | 2.823 | 0.46 | 0.17 | 0.50 | 0.18 |
+| divide10 | 0.504 | 0.574 | 0.594 | 0.487 | 1.023 | 2.790 | 0.49 | 0.18 | 0.48 | 0.17 |
+| eval | 0.470 | 0.484 | 0.497 | 0.454 | 0.968 | 2.587 | 0.49 | 0.18 | 0.47 | 0.18 |
+| fast_mu | 0.541 | 0.553 | 0.608 | 0.582 | 1.019 | 3.964 | 0.53 | 0.14 | 0.57 | 0.15 |
+| flatten | 0.517 | 0.524 | 0.588 | 0.483 | 1.001 | 5.391 | 0.52 | 0.10 | 0.48 | 0.09 |
+| log10 | 0.439 | 0.506 | 0.537 | 0.448 | 1.008 | 3.614 | 0.44 | 0.12 | 0.44 | 0.12 |
+| meta_qsort | 0.493 | 0.544 | 0.596 | 0.526 | 1.010 | 5.233 | 0.49 | 0.09 | 0.52 | 0.10 |
+| mu | 0.445 | 0.483 | 0.536 | 0.503 | 0.984 | 4.257 | 0.45 | 0.10 | 0.51 | 0.12 |
+| nand | 0.613 | 0.620 | 0.696 | 0.633 | 0.969 | 3.699 | 0.63 | 0.17 | 0.65 | 0.17 |
+| nreverse | 0.612 | 0.589 | 0.609 | 0.642 | 1.011 | 8.149 | 0.61 | 0.08 | 0.64 | 0.08 |
+| ops8 | 0.496 | 0.532 | 0.572 | 0.525 | 1.014 | 3.279 | 0.49 | 0.15 | 0.52 | 0.16 |
+| perfect | 0.567 | 0.598 | 0.643 | 0.519 | 1.003 | 4.969 | 0.57 | 0.11 | 0.52 | 0.10 |
+| poly_10 | 0.531 | 0.539 | 0.604 | 0.543 | 1.003 | 2.727 | 0.53 | 0.19 | 0.54 | 0.20 |
+| prover | 0.486 | 0.518 | 0.577 | 0.515 | 1.012 | 3.675 | 0.48 | 0.13 | 0.51 | 0.14 |
+| qsort | 0.534 | 0.512 | 0.541 | 0.528 | 1.010 | 6.165 | 0.53 | 0.09 | 0.52 | 0.09 |
+| queens_8 | 0.426 | 0.395 | 0.425 | 0.411 | 0.998 | 5.418 | 0.43 | 0.08 | 0.41 | 0.08 |
+| query | 0.464 | 0.430 | 0.449 | 0.533 | 1.023 | 4.737 | 0.45 | 0.10 | 0.52 | 0.11 |
+| reducer | 0.759 | 0.788 | 0.911 | 0.676 | 1.014 | 4.791 | 0.75 | 0.16 | 0.67 | 0.14 |
+| sendmore | 0.513 | 0.477 | 0.531 | 0.543 | 0.978 | 3.469 | 0.52 | 0.15 | 0.56 | 0.16 |
+| serialise | 0.605 | 0.616 | 0.679 | 0.602 | 1.003 | 5.171 | 0.60 | 0.12 | 0.60 | 0.12 |
+| sieve | 0.975 | 0.990 | 1.030 | 1.320 | 0.984 | 2.617 | 0.99 | 0.37 | 1.34 | 0.50 |
+| simple_analyzer | 0.562 | 0.575 | 0.623 | 0.485 | 1.010 | 4.986 | 0.56 | 0.11 | 0.48 | 0.10 |
+| tak | 0.206 | 0.198 | 0.209 | 0.159 | 1.118 | 3.821 | 0.18 | 0.05 | 0.14 | 0.04 |
+| times10 | 0.463 | 0.526 | 0.545 | 0.444 | 1.017 | 2.942 | 0.46 | 0.16 | 0.44 | 0.15 |
+| unify | 0.580 | 0.595 | 0.674 | 0.503 | 0.968 | 6.505 | 0.60 | 0.09 | 0.52 | 0.08 |
+| zebra | 0.710 | 0.761 | 0.812 | 0.741 | 1.008 | 3.642 | 0.70 | 0.19 | 0.74 | 0.20 |
+| **geomean** |  |  |  |  |  |  | **0.52** | **0.13** | **0.52** | **0.13** |
 
 Times in seconds.
-
-† jit on sieve: every assert/retract makes code objects that are never freed, and the JIT compiles each one as it gets hot.
