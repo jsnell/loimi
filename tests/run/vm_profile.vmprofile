@@ -1,0 +1,3 @@
+// The hot ops of tests/run/vm_profile.lm, hottest first.
+MUL
+ADD

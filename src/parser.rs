@@ -55,6 +55,7 @@ const ATTRS: &[(&str, &str)] = &[
     ("thread_local", "module-level `var`s"),
     ("require_verified", "`vm` declarations"),
     ("dispatch", "`vm` declarations"),
+    ("profile", "`vm` declarations (`#[profile(\"file\")]`: handlers laid out by a dispatch profile)"),
     ("forward", "`super` declarations in a vm"),
     ("accumulate", "`op` declarations in a vm with an `accumulator`"),
     ("catch_panic", "`export \"C\"` functions"),
@@ -67,7 +68,7 @@ const ATTRS: &[(&str, &str)] = &[
 /// Attributes on functions (also extern, trait and vm functions).
 pub const FN_ATTRS: &[&str] = &["inline", "cold", "unsafe", "raw", "catch_panic", "c_const", "test", "track_caller", "may_alias", "shrinks"];
 /// Attributes on `vm` declarations.
-pub const VM_ATTRS: &[&str] = &["require_verified", "dispatch"];
+pub const VM_ATTRS: &[&str] = &["require_verified", "dispatch", "profile"];
 
 /// Levenshtein distance, for "did you mean" suggestions.
 pub fn edit_distance(a: &str, b: &str) -> usize {
@@ -128,6 +129,9 @@ pub fn check_attrs(attrs: &Attrs, what: &str, known: &[&str]) -> Res<()> {
             }
             if n == "c_const" && args.is_empty() {
                 return Err(Diag::new(*sp, "`#[c_const(p, ..)]` takes the pointer parameters that are `const` in C"));
+            }
+            if n == "profile" && args.len() != 1 {
+                return Err(Diag::new(*sp, "`#[profile(\"file\")]` takes one file: `--vm-stats` output or a list of op names, hottest first"));
             }
             if n == "dispatch" && args.len() != 1 {
                 return Err(Diag::new(*sp, "`#[dispatch(..)]` takes one dispatch mode: tailcall, goto or switch"));

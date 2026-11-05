@@ -334,7 +334,8 @@ enum Token { Num(f64), Ident(Symbol), Punct(u8), Eof }
   functions take `#[catch_panic]` and `#[c_const(..)]`, and structs and
   enums named in a C header `#[c_name("..")]` (section 10.1); an
   `object` takes `#[trace(f)]` (section 8); a `vm`
-  takes `#[require_verified]` and `#[dispatch(mode)]`; a module-level
+  takes `#[require_verified]`, `#[dispatch(mode)]` and
+  `#[profile("file")]` (section 3.7); a module-level
   `var` takes `#[thread_local]`; a `super` takes `#[forward]`.
 - **Tests.** `#[test]` marks a function `fn name()` (no parameters or
   result; it may declare effects) as a unit test. In a normal build it
@@ -2083,6 +2084,43 @@ by default the compiler uses a register only if the vm declares variants,
 and in tail-call mode on AArch64, where a global's address would take
 `adrp` and `add` in every handler (`lowering.md` §3, "The dispatch
 table's address").
+
+**Handler order.** `#[profile("file")]` on a vm lays its handlers out by
+a dispatch profile: the ops the profile counts first, the most
+dispatched first, together in a section of their own that starts on a
+page; the rest after them in declaration order. The path is relative
+to the file declaring the vm. The file is the standard error of a
+`--vm-stats` build (section 7.3), as many runs concatenated as you like
+(each run's counts weigh the same however long it ran), or a list of op
+names, hottest first, one per line, `//` comments allowed:
+
+<!-- snippet: excerpt tests/run/vm_profile.lm -->
+```loimi
+#[profile("vm_profile.vmprofile")]
+vm V {
+    state { pc: *u32, acc: i64 }
+    encoding fixed(u32) { format A { op: 8, x: 24 } }
+    op ADD(x: imm) : A { acc = acc + (x as i64); next }
+    op SUB(x: imm) : A { acc = acc - (x as i64); next }
+    op MUL(x: imm) : A { acc = acc * (x as i64); next }
+    op HALT() : A { exit acc }
+```
+
+```sh
+loimi build --vm-stats --release main.lm -o vm-stats
+for b in bench/*.in; do ./vm-stats $b > /dev/null 2>> vm.vmprofile; done
+```
+
+It changes only where the machine code goes, never what it does: an op
+the profile does not name, or a name that is no longer an op (a warning:
+regenerate the profile), is laid out as without one. Its use is steadier
+timings rather than speed: which handlers share a cache line, a
+uop-cache set or a branch-predictor entry otherwise depends on the size
+of every function before them, so that unrelated changes move single
+benchmarks by several percent; with a profile, the hot handlers' layout
+depends only on their own code (`lowering.md` §12, "Handler order").
+`--vm-profile=FILE` uses FILE for every vm of the program instead,
+`--vm-profile=none` no profile, for A/B measurements.
 
 ---
 

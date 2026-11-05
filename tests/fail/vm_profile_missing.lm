@@ -1,0 +1,11 @@
+// error: cannot read the profile
+#[profile("no_such_file.vmprofile")]
+vm M {
+    context c: *u8;
+    state { pc: *u32 }
+    encoding fixed(u32) { format X { op: 8 } }
+    op HALT() : X { exit 0 }
+    entry run(code: *u32) -> i64 { jump code }
+}
+
+fn main() {}

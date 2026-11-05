@@ -7,6 +7,7 @@ mod diag;
 mod elf;
 mod framelint;
 mod gcgen;
+mod hotorder;
 mod generics;
 mod header;
 mod jitgen;
@@ -58,6 +59,10 @@ struct Opts {
     /// `--no-branch-align` clears it: x86-64 vm programs keep indirect
     /// branches off 32-byte boundaries (`BRANCH_ALIGN_LLVM_ARGS`).
     branch_align: bool,
+    /// `--vm-profile=FILE`: lay out every vm's handlers by FILE (a
+    /// dispatch profile, `hotorder`) instead of its `#[profile]`;
+    /// `--vm-profile=none`: in declaration order.
+    vm_profile: Option<String>,
     /// What to build: an executable, a static archive or a shared object.
     kind: OutKind,
     /// `--header out.h`: also write a C header for the `export "C"` functions.
@@ -187,6 +192,7 @@ usage: loimi build <file.lm> [-o out] [--release | -O] [--emit-llvm] [--dispatch
                   [--explain-values]   (print each value type's encoding and which tuple tests merge, then stop)
                   [--target=aarch64-linux-gnu|x86_64-linux-gnu [--sysroot=DIR]]   (cross-compile; links with lld)
                   [--cpu=NAME]   (x86-64, x86-64-v2, x86-64-v3, native, ..: clang's -march (-mcpu on AArch64); default: the baseline)
+                  [--vm-profile=FILE|none]   (lay out vm handlers by FILE, --vm-stats output or op names, instead of the vm's #[profile(..)]; docs/lowering.md section 12)
        loimi run <file.lm> [build options] [-- args...]
                   (LOIMI_RUNNER=\"qemu-aarch64 -L DIR\" runs the program under that command)
        loimi test <file.lm> [build options] [--update] [--list] [FILTER...]";
@@ -408,7 +414,8 @@ fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, O
         print!("{}", values::explain(&c));
         std::process::exit(0);
     }
-    let prog = c.prog;
+    let mut prog = c.prog;
+    order_handlers(&mut prog, sm, opts)?;
     // Lint `handler_frame`: the tail-call handlers to check in the
     // assembly, minus those under `#[allow(handler_frame)]`.
     let mut frame_sites = Vec::new();
@@ -508,6 +515,51 @@ fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, O
         ir
     };
     Ok((ir, header, jit, llvm_args, frame_sites))
+}
+
+/// Hot-handler ordering (`hotorder`): each vm's handler layout from its
+/// profile, `--vm-profile` before `#[profile("file")]` (relative to the
+/// file declaring the vm). A profile naming no op of the vm, or names
+/// that are not its ops (a stale profile), is a warning.
+fn order_handlers(prog: &mut tir::Program, sm: &SourceMap, opts: &Opts) -> Result<(), Diag> {
+    let nowhere = Span { file: u32::MAX, lo: 0, hi: 0 };
+    for vd in prog.vms.iter_mut() {
+        let (path, span) = match (&opts.vm_profile, &vd.profile) {
+            (Some(p), _) if p == "none" => continue,
+            (Some(p), _) => (PathBuf::from(p), nowhere),
+            (None, Some((p, sp))) => {
+                let dir = Path::new(&sm.files[sp.file as usize].path).parent().map(Path::to_path_buf).unwrap_or_default();
+                (dir.join(p), *sp)
+            }
+            (None, None) => continue,
+        };
+        let text = std::fs::read_to_string(&path).map_err(|e| Diag::new(span, format!("cannot read the profile {}: {}", path.display(), e)))?;
+        let names: Vec<&str> = vd.ops.iter().map(|o| o.name.as_str()).collect();
+        let (w, unknown) = hotorder::weights(&text, &vd.name, &names);
+        let layout = hotorder::layout(&w);
+        if layout.hot == 0 {
+            if opts.vm_profile.is_some() {
+                continue; // one file for every vm: this one is not in it
+            }
+            eprintln!("warning: the profile {} has no dispatches of vm `{}`: handlers stay in declaration order", path.display(), vd.name);
+            continue;
+        }
+        if !unknown.is_empty() {
+            let n = unknown.len();
+            let shown: Vec<&str> = unknown.iter().take(5).map(|s| s.as_str()).collect();
+            eprintln!(
+                "warning: the profile {} names {} op{} vm `{}` does not have ({}{}); regenerate it with --vm-stats",
+                path.display(),
+                n,
+                if n == 1 { "" } else { "s" },
+                vd.name,
+                shown.join(", "),
+                if n > 5 { ", .." } else { "" }
+            );
+        }
+        vd.layout = layout;
+    }
+    Ok(())
 }
 
 /// `--jit-stencils`: compile the stencils to an object file, read them
@@ -646,6 +698,7 @@ fn parse_args() -> Result<Opts, String> {
         warn: vec![],
         align_functions: None,
         branch_align: true,
+        vm_profile: None,
         kind: OutKind::Exe,
         header: None,
         header_prefix: String::new(),
@@ -682,6 +735,7 @@ fn parse_args() -> Result<Opts, String> {
             "--emit-llvm" => o.emit_llvm = true,
             "--keep-ll" => o.keep_ll = true,
             "--no-branch-align" => o.branch_align = false,
+            s if s.starts_with("--vm-profile=") => o.vm_profile = Some(s["--vm-profile=".len()..].to_string()),
             "--lib" => o.kind = OutKind::Static,
             "--shared" => o.kind = OutKind::Shared,
             "--header" => o.header = Some(PathBuf::from(args.next().ok_or("--header needs a path")?)),

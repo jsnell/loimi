@@ -1124,6 +1124,53 @@ fn keep_ll() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Hot-handler ordering (docs/lowering.md §12, "Handler order"): the
+/// handlers tests/run/vm_profile.vmprofile names come first, hottest
+/// first, in the vm's hot section (page-aligned), the rest after in
+/// declaration order; `--vm-profile=none` keeps declaration order and
+/// no section; `--vm-profile=FILE` replaces the vm's `#[profile]`.
+#[test]
+fn vm_profile_layout() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let src = root.join("tests/run/vm_profile.lm");
+    let ir = |extra: &[&str]| {
+        let out = loimi().arg("build").arg(&src).args(extra).args(["--emit-llvm", "-o", "-"]).output().unwrap();
+        assert!(out.status.success(), "build failed:\n{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap()
+    };
+    // Tail-call mode: one function per handler, in layout order.
+    let handlers = |text: &str| -> Vec<(String, bool)> {
+        text.lines()
+            .filter(|l| l.starts_with("define ") && l.contains("@\"main.V.op."))
+            .map(|l| {
+                let name = l.split("@\"main.V.op.").nth(1).unwrap().split('"').next().unwrap().to_string();
+                (name, l.contains("section \".text.hot.main.V\""))
+            })
+            .collect()
+    };
+    let t = ir(&["--dispatch=tailcall"]);
+    let want: Vec<(String, bool)> = [("MUL", true), ("ADD", true), ("SUB", false), ("HALT", false)].iter().map(|(n, h)| (n.to_string(), *h)).collect();
+    assert_eq!(handlers(&t), want);
+    assert!(t.lines().any(|l| l.contains("@\"main.V.op.MUL\"") && l.contains("align 4096")), "the hot section does not start on a page");
+    let none = ir(&["--dispatch=tailcall", "--vm-profile=none"]);
+    let decl: Vec<(String, bool)> = ["ADD", "SUB", "MUL", "HALT"].iter().map(|n| (n.to_string(), false)).collect();
+    assert_eq!(handlers(&none), decl);
+    // `--vm-profile=FILE`, here a `--vm-stats` report.
+    let dir = std::env::temp_dir().join(format!("loimi-vm-profile-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let stats = dir.join("stats.txt");
+    std::fs::write(&stats, "\n== vm stats: V ==\n         count       %  op\n             9   90.0%  HALT\n             1   10.0%  SUB\n").unwrap();
+    let other = ir(&["--dispatch=tailcall", &format!("--vm-profile={}", stats.display())]);
+    let _ = std::fs::remove_dir_all(&dir);
+    let names: Vec<String> = handlers(&other).into_iter().map(|(n, _)| n).collect();
+    assert_eq!(names, ["HALT", "SUB", "ADD", "MUL"]);
+    // Goto mode: handler blocks in layout order, the vm's function in the section.
+    let g = ir(&["--dispatch=goto"]);
+    let labels: Vec<&str> = g.lines().filter(|l| l.starts_with("op.") && l.ends_with(':')).map(|l| l.split('.').nth(1).unwrap()).collect();
+    assert_eq!(labels, ["MUL", "ADD", "SUB", "HALT"]);
+    assert!(g.lines().any(|l| l.starts_with("define ") && l.contains("@\"main.V.run\"") && l.contains("section \".text.hot.main.V\" align 4096")));
+}
+
 /// Build `lib` as a static archive and as a shared object (with the C
 /// header from `--header`), compile `host` against each with clang, and
 /// compare the host's output with `expected`. `header_golden`: the header

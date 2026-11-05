@@ -391,7 +391,8 @@ impl<'p> Codegen<'p> {
             let _ = writeln!(self.globals, "@\"{}\" = internal {}global {} {}, align {}", g.symbol, tl, llty(p, &g.ty), init, align);
         }
         let keep = lazy_used(p, self.opts.gc_check_roots);
-        for (i, f) in p.fns.iter().enumerate() {
+        for i in fn_order(p) {
+            let f = &p.fns[i];
             if is_lazy(f) && !keep[i] {
                 continue;
             }
@@ -827,17 +828,49 @@ impl<'a, 'p> FnGen<'a, 'p> {
                 attrs.push("noinline");
             }
         }
+        // Hot-handler ordering (docs/lowering.md §12, "Handler order"):
+        // the handlers a vm's profile saw (tail-call mode), or the
+        // function holding them all (goto and switch modes), go to the
+        // vm's hot section.
+        // The section starts on a page, so that the hot handlers' addresses
+        // modulo 4096 depend only on their own code. Their outlined cold
+        // blocks go after it: in `.text.unlikely` they would come first,
+        // and every change to a slow path would move the hot handlers.
+        let section = match (f.vm, f.vm_role) {
+            (Some(v), role) if self.stencil.is_none() && !self.jit_count && p.vms[v as usize].layout.hot > 0 => {
+                let vd = &p.vms[v as usize];
+                let hot = match (vd.dispatch, role) {
+                    _ if cold.is_some() => false,
+                    (Dispatch::TailCall, VmRole::Handler(k)) => vd.layout.order[..vd.layout.hot].contains(&(k as usize)),
+                    (Dispatch::Goto | Dispatch::Switch, VmRole::Entry) => true,
+                    _ => false,
+                };
+                let first = match (vd.dispatch, role) {
+                    (Dispatch::TailCall, VmRole::Handler(k)) => vd.layout.order[0] == k as usize,
+                    _ => vd.entries.first() == Some(&self.fid),
+                };
+                if hot {
+                    format!(" section \"{}\"{}", hot_section(vd), if first { " align 4096" } else { "" })
+                } else if cold.is_some() {
+                    format!(" section \".text.{}.cold\"", vd.symbol)
+                } else {
+                    String::new()
+                }
+            }
+            _ => String::new(),
+        };
         let mut out = String::new();
         let _ = writeln!(
             out,
-            "define {}{}{}{} @\"{}\"({}) {} {{",
+            "define {}{}{}{} @\"{}\"({}) {}{} {{",
             linkage,
             cc_str(f.cc),
             if f.linkage == Linkage::Export && cold.is_none() && !through_slot { c_abi_attr(&f.ret) } else { "" },
             if through_slot { "void".to_string() } else { ret_llty(p, &f.ret) },
             symbol,
             params.join(", "),
-            attrs.join(" ")
+            attrs.join(" "),
+            section
         );
         let _ = writeln!(out, "entry:");
         out.push_str(&self.allocas);
@@ -3177,4 +3210,39 @@ fn str_lits(p: &TPat) -> Option<Vec<&[u8]>> {
         }
         _ => None,
     }
+}
+
+/// The order functions are emitted in: the program's, except that the
+/// handlers of a tail-call vm with a profile (`VmDef::layout`) go where
+/// its first handler was, in the layout's order (docs/lowering.md §12,
+/// "Handler order").
+fn fn_order(p: &Program) -> Vec<usize> {
+    let mut placed: Vec<Option<usize>> = vec![None; p.fns.len()];
+    for (vi, vd) in p.vms.iter().enumerate() {
+        if vd.dispatch == Dispatch::TailCall && !vd.layout.order.is_empty() {
+            for o in &vd.ops {
+                placed[o.fid as usize] = Some(vi);
+            }
+        }
+    }
+    let mut done = vec![false; p.vms.len()];
+    let mut order = Vec::with_capacity(p.fns.len());
+    for (i, pl) in placed.iter().enumerate() {
+        match *pl {
+            None => order.push(i),
+            Some(vi) if !done[vi] => {
+                done[vi] = true;
+                let vd = &p.vms[vi];
+                order.extend(vd.layout.order.iter().map(|&k| vd.ops[k].fid as usize));
+            }
+            Some(_) => {}
+        }
+    }
+    order
+}
+
+/// The section of a vm's hot handlers (`VmDef::layout`): a `.text.hot.`
+/// name, which linkers place together ahead of the rest of `.text`.
+pub fn hot_section(vd: &VmDef) -> String {
+    format!(".text.hot.{}", vd.symbol)
 }

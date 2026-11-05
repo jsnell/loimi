@@ -763,6 +763,8 @@ pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
         variants: vec![],
         tbl_idx,
         cont_fns: vec![],
+        profile: d.attrs.list.iter().find(|(n, _, _)| n == "profile").map(|(_, a, sp)| (a[0].clone(), *sp)),
+        layout: Default::default(),
     });
     c.vms.push(VmInfo {
         module: m,

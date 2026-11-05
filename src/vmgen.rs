@@ -222,8 +222,18 @@ pub fn epilogue(g: &mut FnGen) {
             g.term("unreachable");
         }
     };
-    for (k, op) in vd.ops.iter().enumerate() {
-        emit_body(g, op.fid, &hg.op_labels[k]);
+    // In the profile's order, hottest first, if the vm has one
+    // (docs/lowering.md §12, "Handler order"); LLVM's block placement
+    // keeps the handlers, which only an indirect branch or the switch
+    // reaches, in this order.
+    if vd.layout.order.is_empty() {
+        for (k, op) in vd.ops.iter().enumerate() {
+            emit_body(g, op.fid, &hg.op_labels[k]);
+        }
+    } else {
+        for &k in &vd.layout.order {
+            emit_body(g, vd.ops[k].fid, &hg.op_labels[k]);
+        }
     }
     if let Some(rf) = vd.on_raise {
         emit_body(g, rf, &hg.raise_label);

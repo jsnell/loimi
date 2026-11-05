@@ -626,6 +626,12 @@ pub struct VmDef {
     /// continuation for `next` (`TVm::Shared`): those reachable from a
     /// super's part before the last.
     pub cont_fns: Vec<bool>,
+    /// `#[profile("file")]`: the dispatch profile named on the vm, and the
+    /// attribute's span (its file locates the path).
+    pub profile: Option<(String, crate::diag::Span)>,
+    /// The order handlers are laid out in (`crate::hotorder`); empty:
+    /// declaration order, no hot section.
+    pub layout: crate::hotorder::Layout,
 }
 
 impl VmDef {
