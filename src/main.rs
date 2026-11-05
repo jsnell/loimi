@@ -528,8 +528,16 @@ fn order_handlers(prog: &mut tir::Program, sm: &SourceMap, opts: &Opts) -> Resul
             (Some(p), _) if p == "none" => continue,
             (Some(p), _) => (PathBuf::from(p), nowhere),
             (None, Some((p, sp))) => {
-                let dir = Path::new(&sm.files[sp.file as usize].path).parent().map(Path::to_path_buf).unwrap_or_default();
-                (dir.join(p), *sp)
+                // Next to the file declaring the vm, or, if that is a
+                // link (a directory of links to an interpreter's modules),
+                // next to the file it links to.
+                let file = Path::new(&sm.files[sp.file as usize].path);
+                let near = |f: &Path| f.parent().map(|d| d.join(p)).unwrap_or_else(|| PathBuf::from(p));
+                let path = match near(file) {
+                    q if q.exists() => q,
+                    q => std::fs::canonicalize(file).map(|f| near(&f)).ok().filter(|r| r.exists()).unwrap_or(q),
+                };
+                (path, *sp)
             }
             (None, None) => continue,
         };
