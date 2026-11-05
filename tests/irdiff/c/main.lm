@@ -1,0 +1,16 @@
+// `loimi ir-diff` fixture: ../a/main.lm with `half` dividing by another number.
+import std.io;
+import std.os;
+
+var NAMES: [str; 3] = ["zero", "one", "two"];
+
+fn pick(i: u64) -> str { NAMES[i] }
+
+fn half(x: i64) -> i64 { x / (os.arg_count() as i64 - 9) }
+
+fn main() {
+    let n = os.arg_count() as u64;
+    io.println(pick(n));
+    io.print_int(half(n as i64 * 10));
+    io.println("");
+}

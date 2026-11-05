@@ -8,6 +8,7 @@ mod elf;
 mod framelint;
 mod gcgen;
 mod generics;
+mod irdiff;
 mod header;
 mod jitgen;
 mod objref;
@@ -85,6 +86,8 @@ struct Opts {
     /// `--cpu=NAME` (or `LOIMI_CPU`): the CPU to compile for (clang's
     /// `-march` on x86-64, `-mcpu` on AArch64). None: the target's baseline.
     cpu: Option<Cpu>,
+    /// `loimi ir-diff A B`: the second input and the diff's options.
+    ir_diff: Option<irdiff::DiffOpts>,
 }
 
 /// A `--cpu`: its name and what clang says it has.
@@ -189,7 +192,9 @@ usage: loimi build <file.lm> [-o out] [--release | -O] [--emit-llvm] [--dispatch
                   [--cpu=NAME]   (x86-64, x86-64-v2, x86-64-v3, native, ..: clang's -march (-mcpu on AArch64); default: the baseline)
        loimi run <file.lm> [build options] [-- args...]
                   (LOIMI_RUNNER=\"qemu-aarch64 -L DIR\" runs the program under that command)
-       loimi test <file.lm> [build options] [--update] [--list] [FILTER...]";
+       loimi test <file.lm> [build options] [--update] [--list] [FILTER...]
+       loimi ir-diff <a.lm|a.ll> <b.lm|b.ll> [build options] [--asm] [--context=N] [--max-lines=N] [--keep=DIR]
+                  (compare two builds' optimized code per function, ignoring source locations and names; docs/status.md)";
 
 fn std_root() -> PathBuf {
     if let Ok(p) = std::env::var("LOIMI_STD") {
@@ -662,6 +667,7 @@ fn parse_args() -> Result<Opts, String> {
         sysroot: std::env::var_os("LOIMI_SYSROOT").filter(|s| !s.is_empty()).map(PathBuf::from),
         cfg: vec![],
         cpu: None,
+        ir_diff: None,
     };
     // `LOIMI_CPU`: a default for `--cpu` (for running whole test suites
     // for one CPU).
@@ -673,6 +679,7 @@ fn parse_args() -> Result<Opts, String> {
             o.run = true;
             o.test = true;
         }
+        "ir-diff" => o.ir_diff = Some(irdiff::DiffOpts::default()),
         _ => return Err(USAGE.into()),
     }
     while let Some(a) = args.next() {
@@ -739,7 +746,18 @@ fn parse_args() -> Result<Opts, String> {
                     d => return Err(format!("unknown dispatch mode `{}`", d)),
                 })
             }
+            "--asm" if o.ir_diff.is_some() => o.ir_diff.as_mut().unwrap().asm = true,
+            s if o.ir_diff.is_some() && s.starts_with("--context=") => {
+                o.ir_diff.as_mut().unwrap().context = s["--context=".len()..].parse().map_err(|_| "--context takes a number")?
+            }
+            s if o.ir_diff.is_some() && s.starts_with("--max-lines=") => {
+                o.ir_diff.as_mut().unwrap().max_lines = s["--max-lines=".len()..].parse().map_err(|_| "--max-lines takes a number")?
+            }
+            s if o.ir_diff.is_some() && s.starts_with("--keep=") => o.ir_diff.as_mut().unwrap().keep = Some(PathBuf::from(&s["--keep=".len()..])),
             s if s.starts_with('-') => return Err(format!("unknown option `{}`", s)),
+            s if o.input.is_some() && o.ir_diff.as_ref().is_some_and(|d| d.other.is_none()) => {
+                o.ir_diff.as_mut().unwrap().other = Some(PathBuf::from(s));
+            }
             s => {
                 if o.input.is_some() {
                     o.run_args.push(s.to_string());
@@ -803,6 +821,9 @@ fn compiler_main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if opts.ir_diff.is_some() {
+        return irdiff::main(opts);
+    }
     let mut sm = SourceMap::default();
     let (mut ir, header, jit, llvm_args, frame_sites) = match compile(&mut sm, &opts) {
         Ok(r) => r,

@@ -224,6 +224,38 @@ fn compile_errors() {
     }
 }
 
+/// `loimi ir-diff`: tests/irdiff/b is tests/irdiff/a with lines moved
+/// and a table and a function renamed (the same code: exit 0); c changes
+/// one constant (exit 1, naming the function and the line).
+#[test]
+fn ir_diff() {
+    if cross() {
+        return;
+    }
+    let run = |b: &str, extra: &[&str]| {
+        let out = loimi().arg("ir-diff").arg("tests/irdiff/a/main.lm").arg(format!("tests/irdiff/{}/main.lm", b)).args(extra).output().unwrap();
+        (out.status.code(), String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr))
+    };
+    for flags in [&["--release", "--asm"][..], &[]] {
+        let (code, text) = run("b", flags);
+        assert_eq!(code, Some(0), "ir-diff a b {:?}:\n{}", flags, text);
+        assert!(text.contains("result: same code"), "{}", text);
+    }
+    let (code, text) = run("c", &["--release", "--asm"]);
+    assert_eq!(code, Some(1), "ir-diff a c:\n{}", text);
+    assert!(text.contains("differs: main ") && text.contains("+  %v15 = add nsw i64 %v14, -9") && text.contains("+\taddq\t$-9"), "{}", text);
+    // `.ll` inputs (from `build --emit-llvm`) compare the same way.
+    let dir = std::env::temp_dir().join(format!("loimi-irdiff-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for x in ["a", "b"] {
+        let st = loimi().args(["build", &format!("tests/irdiff/{}/main.lm", x), "--release", "--emit-llvm", "-o"]).arg(dir.join(format!("{}.ll", x))).status().unwrap();
+        assert!(st.success());
+    }
+    let out = loimi().arg("ir-diff").arg(dir.join("a.ll")).arg(dir.join("b.ll")).arg("--release").output().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stdout));
+}
+
 /// `loimi test` (std.test): run each tests/test/NAME.lm from its
 /// directory with the `// args:` as filters; stdout must equal
 /// NAME.expected and the exit status `// expect-exit:` (default 0).
