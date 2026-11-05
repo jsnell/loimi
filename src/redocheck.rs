@@ -1,5 +1,6 @@
 //! `redo` safety, and `new` in handlers lowered to the refill form
-//! (docs/lowering.md section 13).
+//! (docs/lowering.md section 10, "Allocation in handlers, polls and
+//! `redo`").
 //!
 //! `redo` dispatches the current instruction again, from the start of
 //! its handler (or of its part, in a superinstruction). That is right

@@ -448,6 +448,9 @@ fn main() {}
   calls in the handler that can cause it (with the message of each panic
   site: `.unwrap()`, bounds checks); it compiles the IR to assembly a
   second time, so it roughly doubles the build's clang time.
+  `redo_effect` (section 4, "`redo`, polls"), an effect on a path before
+  a `redo`, is an error unless an `#[allow(redo_effect)]` covers the
+  `redo` or the effect.
   The retired `state_root` (section 8: traced state is now rooted
   automatically) is still accepted by `#[allow(..)]`, with no effect.
 - **Attributes** are checked where they appear: an unknown or misplaced
@@ -1939,7 +1942,7 @@ A handler body has type `never`: **every path must end in a control word**.
 |---|---|
 | `next` | advance `pc` past this instruction and its inline caches, then dispatch |
 | `jump t` | set `pc = t` and dispatch |
-| `redo` | dispatch the current instruction again (after `become`) |
+| `redo` | dispatch the current instruction again (after `become`, a collection, a refill); nothing before it may have an effect (section 4, "`redo`, polls") |
 | `exit v` | leave the run loop; the entry returns `v` (its declared result type: `exit Ok(x)` for a `Result`) |
 | `raise e` | transfer to the `on raise` handler with the current `pc` |
 | `fail e` | leave the run loop, returning `Err(e)` |
@@ -2312,14 +2315,20 @@ generated code (section 1.2, under Warnings).
 after `o.f = v` makes no call (its rare slow path pushes onto the
 remembered set inline), so stores of references cost a handler no frame;
 stores of values statically free of references (`Term.Unb`, `Int(n)`,
-`None`, literals of such) have no barrier at all. `new` does call: its
-free-list refill (rare, but a call site) gives the handler a frame. In a
-handler, allocate with `try_new`, which takes only the allocator's
-inline path and is `None` where `new` would refill, and refill in a cold
-block that runs the op again:
+`None`, literals of such) have no barrier at all. The allocator's
+free-list refill is a call (rare, but a call site gives the handler a
+frame), so in an op handler `new` is compiled to take only the
+allocator's inline path, and to refill in a cold block that runs the op
+again:
 
 <!-- snippet: skip excerpt of a vm, declarations elided -->
 ```loimi
+op CONS(dst: reg, a: reg, b: reg) : ABC {
+    let c = new(&ctx.heap, Pair { head: a, tail: b });
+    dst = Value.Pair(c);
+    next
+}
+// is compiled as
 op CONS(dst: reg, a: reg, b: reg) : ABC {
     let Some(c) = try_new(&ctx.heap, Pair { head: a, tail: b }) else cold {
         gc.make_room(&ctx.heap, size_of<Pair>());   // never collects
@@ -2330,11 +2339,98 @@ op CONS(dst: reg, a: reg, b: reg) : ABC {
 }
 ```
 
+That happens where it is the same code with the call off the fast
+path, and safe to run the op again: a `new` directly in an op (not in a
+vm function or a `cold` block, not in a loop of the op), of a constant
+size of at most 496 bytes (an object, or one with a trailing array of a
+literal length), with a heap expression that can be evaluated again
+(`&ctx.heap`), and with nothing before it on any path that has an
+effect `redo` would repeat (see "`redo`, polls" below). Elsewhere `new`
+is the plain call: a large object or a trailing array of a variable
+length is a call in either form (`std.gc.alloc_large`, `memset`), and
+in a loop each refill would start the loop over. `LOIMI_REDO_AUDIT=1`
+lists the handlers whose `new` was lowered.
+
 `try_new(h, T { .. })` (and `try_new(h, T { .. }, n)` for a trailing
-array) has type `?Gc<T>`; nothing before it in the op may have side
-effects that `redo` would repeat. Objects over 496 bytes (with the
-header) and the zeroing of a trailing array whose length is not a
-constant are calls (`std.gc.alloc_large`, `memset`) as with `new`.
+array) is the form written by hand: it has type `?Gc<T>`, `None` where
+`new` would refill, and `gc.make_room(h, size)` makes the next
+allocation of that size succeed. Use it for what the lowering does not
+cover, such as a helper that picks a constant length per case (Prolog's
+`try_struct`) or a slow path other than `redo`.
+
+**`redo`, polls.** `redo` dispatches the instruction again from the start
+of its handler, so it is right only if nothing the op did before it is
+seen by the second run. The compiler checks that: on every path to a
+`redo`, before the block that ends in it, the op must not have stored
+to memory (an operand, an object, the context), to a state register, or
+called a function that may store (functions are summarized through what
+they call; an extern that takes a pointer may store). The block that
+ends in the `redo` is its fix-up and may do anything: collect, refill
+the allocator, `become` another op, grow a stack. Allocating, reading,
+writing locals, `become`, stores to the instruction's own inline cache,
+`use_variant`, and calls into `std.gc` and `std.gil` (the runtime's
+bookkeeping, which is what a safepoint is for) are not effects. A
+violation is the error `redo_effect`:
+
+```
+error[redo_effect]: `redo` runs `ADD` again from its start, but on the way here the op may already have made a store to memory, and the second run would make it again
+  --> vm.lm:12:100
+   12 |     poll gc { if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } } }
+note: this runs before the `redo`: put the poll or the allocation before it, or end the path with `next` or `jump`; if running it twice is harmless, `#[allow(redo_effect)]` on the op says so
+  --> vm.lm:14:9
+   14 |         dst = a + b;
+```
+
+The summaries are conservative: Python's `CALL_NEW` calls `ensure`,
+which stores only on a path where it returns true and the op goes on to
+push a frame, so its `redo` (after `become CALL`) is
+`#[allow(redo_effect)]`.
+
+A vm declares the check an op starts with once, as a **poll**, and an
+op names it:
+
+<!-- snippet: check
+import std.gc;
+struct Ctx { heap: gc.Heap }
+vm V {
+    context ctx: *Ctx;
+    state { pc: *u32, regs: *i64 }
+    operand reg = regs[it];
+    operand imm = it;
+    encoding fixed(u32) { format ABC { op: 8, a: 8, b: 8, c: 8 } }
+{snippet}
+    op HALT() : ABC { exit 0 }
+    entry run(c: *Ctx, code: *u32, r: *i64) -> i64 uses gc { ctx = c; regs = r; jump code }
+}
+fn main() {}
+-->
+```loimi
+poll gc { if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } } }
+#[cfg(gil)] poll gil { if unlikely(ctx.gil.waiting()) { cold { ctx.gil.yield_now(); } } }
+
+#[poll(gc)] op SUM(dst: reg, a: reg, n: imm) : ABC {
+    var s = 0;
+    for i in 0..n as u64 { s += regs[a.raw + i]; }
+    dst = s;
+    next
+}
+op JNZ(a: reg, d: imm) : ABC {
+    if a != 0 { poll gil; jump pc - d as u64 }
+    next
+}
+```
+
+`poll NAME { .. }` is a vm item, declared before its uses; `#[poll(a,
+b)]` on an op or a `family` puts the statements of polls `a` and `b`, in
+that order, before the op's own, and `poll NAME;` is a statement for
+anywhere in the vm's code (a branch of a jump op, a vm function). The
+statements are the poll's text, so the code is what writing them out
+gives: a poll that ends in `redo` runs the op again after collecting
+(nothing has happened yet at its start, which the check confirms); one
+whose cold block falls through gets the rest of the op copied into it,
+as a written-out one does. A poll under a `#[cfg]` that is off expands
+to nothing, so its uses need no `#[cfg]` of their own. Errors in a
+poll's statements point at the declaration.
 
 Outlining fall-through cold blocks as
 calls that return (`preserve_most`, with their captures and the state

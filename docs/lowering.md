@@ -1032,6 +1032,68 @@ the fast path too). A store of a value with no references (a payload-free
 variant, `None`, literals of such: `gcgen::holds_no_refs`) gets no
 barrier.
 
+**Allocation in handlers, polls and `redo`.** `std.gc.alloc` refills a
+size class's free run with a call (`refill`), which in a tail-call
+handler sets up a stack frame on every execution, not only when it
+refills. So a `new` in an op handler is rewritten, after checking, into
+the form handlers used to write by hand (`src/redocheck.rs`):
+
+<!-- snippet: skip the rewritten typed tree, shown as source -->
+```loimi
+let c = new(&ctx.heap, Pair { head: a, tail: b });
+// becomes
+let Some(c) = try_new(&ctx.heap, Pair { head: a, tail: b }) else cold {
+    gc.make_room(&ctx.heap, 32);   // the object's size, a constant
+    redo
+};
+```
+
+`try_new` is `std.gc.try_alloc`, `alloc` without the refill branch
+(`#[inline]`, a null result where `alloc` would call `refill`);
+`make_room` refills the class and never collects. The rewrite is of the
+typed tree, not the source, so it is exactly the hand-written form:
+Python's `MAKECELL`, `r = Cell(new(..))`, lost its frame (`pushq %rbp;
+subq $16, %rsp` and the inline `refill` call with its spills, 47 lines
+of assembly to 33), and a test vm written both ways gives the same
+assembly in the three dispatch modes. A `new` inside an expression
+becomes `match try_new(..) { Some(t) => t, _ => cold { .. } }`. The
+rewrite applies only where the size is a constant of at most 496 bytes
+(the inline path of `try_alloc`; above that, or with a variable
+trailing length, `try_new` is a call too, so the plain `new`, which does
+not run the op twice on a refill, is kept), outside loops of the op and
+cold blocks, and where the path to it has no effect.
+
+"No effect" is the same analysis that checks every `redo`. It runs
+over each op handler (and each superinstruction resume function) after
+type checking, in evaluation order, with a state per program point:
+unreachable, clean, or dirty with the first effect seen. Branches join
+(dirty wins), loops iterate to a fixpoint (the state has three values),
+a superinstruction part starts clean (`redo` there runs the part's word
+alone), and a `-> never` vm function's shared copy is walked from the
+call's state. An effect is a store whose place is not a local (a
+pointer, a `Gc`, a slice, a global or a state register; the instruction's
+own words and the dispatch-table register are exempt), an atomic or
+unaligned store, or a call of a function that may store. Whether a
+function may store is a least fixpoint over the call graph: a store, a
+call through a value, or an extern that takes a pointer, directly or in
+a callee; calls into `std.gc` and `std.gil` are not effects. At a
+`redo` that ends a block, the state checked is the one at the block's
+entry, so the fix-up the block makes (a collection, `become`, a stack
+grown) is allowed; elsewhere it is the state at the `redo`. Every
+example interpreter passes; the one exception is Python's `CALL_NEW`,
+whose `ensure` stores only when the op goes on to push a frame, so it is
+`#[allow(redo_effect)]` (the check is a lint that is an error unless
+allowed).
+
+A `poll` is a parser-level expansion: `#[poll(gc)]` on an op prepends
+the declaration's statements to the op's body, and `poll gc;` splices
+them where it stands, so the checker, the lifetimes pass, the cold-block
+outlining (`tirwalk::extend_cold` copies the rest of the op into a poll
+whose cold block falls through) and the stencils see the same tree as
+for the statements written out. `--vm-stats` counts a poll's cold block
+under each op, with the poll's source line; a `new`'s refill block is
+counted at the `new`.
+
 **Generational GC: moving or not.** The design question (roadmap, open
 question 2) was settled for the non-moving scheme with sticky mark bits.
 It needs no reloading after `gc` calls, keeps raw pointers into objects
