@@ -152,6 +152,11 @@ pub vm Scheme {
     // The collector scans frames and registers up to ctx.fp.
     sync { ctx.fp = fp; }
 
+    /// `#[poll(gc)]`: collect at the start of an op that allocates, then
+    /// run it again; `gc_fall` goes on with the op instead.
+    poll gc { if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } } }
+    poll gc_fall { if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } } }
+
     op LOADK(dst: reg, c: kst) : ABx { dst = c; next }
     op LOADI(dst: reg, v: simm) : AsBx { dst = Int(v as i32); next }
     op MOVE(dst: reg, src: reg) : ABC { dst = src; next }
@@ -202,13 +207,9 @@ pub vm Scheme {
         next
     }
     /// Box R[r] (an assigned variable that is captured by a closure).
-    op MKBOX(r: reg) : ABC {
-        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
+    #[poll(gc)] op MKBOX(r: reg) : ABC {
         let v = r;
-        let Some(b) = try_new(&ctx.heap, Vect { rtd: V.Imm(value.IMM_NIL) }, 1) else cold {
-            gc.make_room(&ctx.heap, size_of<Vect>() + size_of<V>());
-            redo
-        };
+        let b = new(&ctx.heap, Vect { rtd: V.Imm(value.IMM_NIL) }, 1);
         b.data.ptr[0] = v;
         r = Vec(b);
         next
@@ -223,8 +224,7 @@ pub vm Scheme {
     }
     /// R[dst] = a new closure of child prototype `i`, capturing values as
     /// its descriptors say.
-    op CLOSURE(dst: reg, i: child) : ABx {
-        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
+    #[poll(gc)] op CLOSURE(dst: reg, i: child) : ABx {
         let parent = fp.cl;
         let p = parent.proto.protos.data.ptr[i];
         let n = p.nfree as u64;
@@ -386,18 +386,13 @@ pub vm Scheme {
         if let P(p) = a { dst = p.cdr; next }
         cold { raise rt.type_err(ctx, "cdr", "pair", a) }
     }
-    op CONS(dst: reg, a: reg, b: reg) : ABC {
-        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
-        let Some(c) = try_new(&ctx.heap, Pair { car: a, cdr: b }) else cold {
-            gc.make_room(&ctx.heap, size_of<Pair>());
-            redo
-        };
+    #[poll(gc)] op CONS(dst: reg, a: reg, b: reg) : ABC {
+        let c = new(&ctx.heap, Pair { car: a, cdr: b });
         dst = P(c);
         next
     }
     /// R[dst] = (vector R[base] .. R[base+n-1]).
-    op VECTOR(dst: reg, base: callbase, n: imm) : ABC {
-        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
+    #[poll(gc)] op VECTOR(dst: reg, base: callbase, n: imm) : ABC {
         let cnt = n as u64;
         let src = regs + base as u64;
         if cnt > 8 or cnt == 0 { cold { dst = Vec(big_vect(&ctx.heap, V.Imm(value.IMM_NIL), src, cnt)); next } }
@@ -411,8 +406,7 @@ pub vm Scheme {
     }
     /// R[dst] = a record of type R[base] with fields R[base+1] .. R[base+n]
     /// (the constructor of a define-record-type).
-    op RECORD(dst: reg, base: callbase, n: imm) : ABC {
-        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
+    #[poll(gc)] op RECORD(dst: reg, base: callbase, n: imm) : ABC {
         let cnt = n as u64;
         let src = regs + base as u64;
         if cnt > 8 or cnt == 0 { cold { dst = Vec(big_vect(&ctx.heap, src[0], src + 1, cnt)); next } }
@@ -565,8 +559,7 @@ pub vm Scheme {
     // current run of free memory; when it runs out (or on an improper
     // list), the native does the whole call (what was allocated is
     // garbage).
-    op REVERSE(dst: reg, a: callbase) : ABC {
-        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
+    #[poll(gc)] op REVERSE(dst: reg, a: callbase) : ABC {
         var r = V.Imm(value.IMM_NIL);
         var cur = regs[a as u64];
         while let P(p) = cur {
@@ -582,8 +575,7 @@ pub vm Scheme {
         next
     }
     /// (append R[base] R[base+1]).
-    op APPEND2(dst: reg, base: callbase) : ABC {
-        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
+    #[poll(gc)] op APPEND2(dst: reg, base: callbase) : ABC {
         let x = regs[base as u64];
         if x == V.Imm(value.IMM_NIL) {
             dst = regs[base as u64 + 1];
@@ -670,8 +662,7 @@ pub vm Scheme {
 
     /// R[base] = (call/cc R[base+1]) of the builtin (never redefined);
     /// `tail`: return it.
-    op CALLCC(base: callbase, tail: imm) : ABC {
-        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
+    #[poll(gc_fall)] op CALLCC(base: callbase, tail: imm) : ABC {
         callcc(base as u64, tail != 0)
     }
 
@@ -794,8 +785,7 @@ pub vm Scheme {
 
     /// R[base] = builtin `id` (R[base+1] .. R[base+nargs]): a call of a
     /// builtin the program never redefines (not apply or call/cc).
-    op PRIMCALL(base: callbase, nargs: imm, id: imm) : ABC {
-        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
+    #[poll(gc_fall)] op PRIMCALL(base: callbase, nargs: imm, id: imm) : ABC {
         regs[base] = builtins.call_native(ctx, id as Prim, regs + base + 1, nargs as u64)?;
         next
     }

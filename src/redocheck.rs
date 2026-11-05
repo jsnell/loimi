@@ -531,7 +531,17 @@ impl Cx<'_> {
         let bytes = match (len, &p.structs[sid as usize].trailing) {
             (Some(l), Some((_, et))) => {
                 let es = crate::layout::size_of(p, et) as i128;
-                let n = mk(u64t.clone(), TK::Binary(BinOp::Mul, l.clone(), Box::new(mk(u64t.clone(), TK::Int(es), span))), span);
+                // The array's bytes as one constant (the length is a
+                // literal), as `size_of<T>() + size_of<E>()` is written.
+                let lit = match &l.kind {
+                    TK::Int(n) => Some(*n),
+                    TK::Cast(a) => if let TK::Int(n) = a.kind { Some(n) } else { None },
+                    _ => None,
+                };
+                let n = match lit {
+                    Some(k) => mk(u64t.clone(), TK::Int(k * es), span),
+                    None => mk(u64t.clone(), TK::Binary(BinOp::Mul, l.clone(), Box::new(mk(u64t.clone(), TK::Int(es), span))), span),
+                };
                 mk(u64t.clone(), TK::Binary(BinOp::Add, Box::new(mk(u64t.clone(), TK::Int(size), span)), Box::new(n)), span)
             }
             _ => mk(u64t.clone(), TK::Int(size), span),

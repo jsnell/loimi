@@ -404,17 +404,18 @@ pub vm Stak {
         }
         cold { raise type_error("len", tos, ctx) }
     }
+    /// `poll gc;`: collect if the heap has grown, then go on with the op.
+    poll gc { if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } } }
     op ARRAY() : N stack(n -- arr) {
         if let Int(n) = tos and n >= 0 and n <= MAX_LEN {
-            if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
+            poll gc;
             tos = Arr(value.new_arr(&ctx.heap, n as u64));
             next
         }
         cold { raise "array: the size must be an integer from 0 to 2^24" }
     }
     /// The top `n` values become an array.
-    op MKARRAY(n: cnt) : N stack(xs[n] -- arr) {
-        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
+    #[poll(gc)] op MKARRAY(n: cnt) : N stack(xs[n] -- arr) {
         let a = new(&ctx.heap, value.Arr {}, n);
         if n == 0 { push(Arr(a)); next }
         // The first n-1 values are in memory, the last in `tos`.

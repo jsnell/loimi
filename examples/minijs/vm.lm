@@ -451,20 +451,23 @@ pub vm JS {
         if let F(f) = c { f.free.ptr[i] = src; }
         next
     }
+    /// `#[poll(gc)]`: collect at the start of an op that allocates, then
+    /// run it again; `gc_fall` goes on with the op instead.
+    poll gc { if ctx.heap.allocated > ctx.heap.threshold { cold { gc.collect(&ctx.heap); redo } } }
+    poll gc_fall { if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } } }
+
     /// Put R[r] in a new box (a captured variable that is assigned).
-    op BOXNEW(r: reg) : ABC {
-        if ctx.heap.allocated > ctx.heap.threshold { cold { gc.collect(&ctx.heap); redo } }
+    #[poll(gc)] op BOXNEW(r: reg) : ABC {
         let v = r;
-        let Some(b) = try_new(&ctx.heap, Box { v: v }) else cold { gc.make_room(&ctx.heap, size_of<Box>()); redo };
+        let b = new(&ctx.heap, Box { v: v });
         r = B(b);
         next
     }
     /// A fresh box holding the value of the box in R[r] (per-iteration
     /// bindings of `for (let ...)`).
-    op REBOX(r: reg) : ABC {
-        if ctx.heap.allocated > ctx.heap.threshold { cold { gc.collect(&ctx.heap); redo } }
+    #[poll(gc)] op REBOX(r: reg) : ABC {
         if let B(b) = r {
-            let Some(nb) = try_new(&ctx.heap, Box { v: b.v }) else cold { gc.make_room(&ctx.heap, size_of<Box>()); redo };
+            let nb = new(&ctx.heap, Box { v: b.v });
             r = B(nb);
         }
         next
@@ -477,20 +480,17 @@ pub vm JS {
         if let B(x) = b { x.v = src; }
         next
     }
-    op CLOSURE(dst: reg, i: child) : ABx {
-        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
+    #[poll(gc_fall)] op CLOSURE(dst: reg, i: child) : ABx {
         dst = F(make_closure(ctx, fp.cl, regs, i as u64));
         next
     }
 
-    op NEWOBJ(dst: reg, n: imm) : ABC {
-        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
+    #[poll(gc_fall)] op NEWOBJ(dst: reg, n: imm) : ABC {
         dst = O(ctx.new_literal(n as u32));
         next
     }
     /// R[dst] = [R[base] .. R[base+n-1]].
-    op NEWARR(dst: reg, base: callbase, n: imm) : ABC {
-        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
+    #[poll(gc_fall)] op NEWARR(dst: reg, base: callbase, n: imm) : ABC {
         let a = ctx.new_array(n as u64, n as u64);
         for i in 0..n as u64 { a.ptr[i] = regs[base + i]; }
         dst = A(a);
@@ -1369,7 +1369,7 @@ pub vm JS {
         // current prototype: allocate here and enter it.
         if let F(cl) = regs[base] and cl.native == 0 and let Some(sh) = cl.ctor_shape and let Some(cp) = cl.ctor_proto
                 and let Some(bag) = cl.props and bag.dict.is_none() and bag.shape.count >= 1 and bag.inline.ptr[0] == V.O(cp) {
-            if ctx.heap.allocated > ctx.heap.threshold { cold { gc.collect(&ctx.heap); redo } }
+            poll gc;
             // Up to 8 inline slots: the allocator's inline path with a
             // constant size (no call, so no stack frame).
             let n = cl.hint as u64;
