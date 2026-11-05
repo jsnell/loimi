@@ -83,6 +83,7 @@ impl Parser {
         // `inline for` variables replace every matching token in the body,
         // so one named like a state variable would silently replace it.
         let mut loop_vars: Vec<Ident> = Vec::new();
+        self.vm_polls.clear();
         while !self.eat("}") {
             if self.is_kw("inline") && self.is_kw_at(1, "for") {
                 loop_vars.extend(self.expand_inline_for(false)?);
@@ -102,7 +103,8 @@ impl Parser {
                 "fn" => ("a vm function".into(), crate::parser::FN_ATTRS),
                 "super" => ("a `super`".into(), &["forward"]),
                 "on" => ("`on raise` or `on break`".into(), &[]),
-                "op" => ("an `op`".into(), &["accumulate"]),
+                "op" => ("an `op`".into(), &["accumulate", "poll"]),
+                "family" => ("a `family`".into(), &["poll"]),
                 "variant" => ("a `variant`".into(), &["unfused"]),
                 "operand" | "entry" => (format!("an `{}`", kw), &[]),
                 _ => (format!("a `{}`", kw), &[]),
@@ -213,10 +215,23 @@ impl Parser {
                     self.expect("}")?;
                     vm.caches.push(CacheDecl { name: n, fields });
                 }
+                "poll" => {
+                    // `poll gc { .. }`: statements that `#[poll(gc)]` on
+                    // an op puts at its start, and `poll gc;` anywhere in
+                    // the vm's code.
+                    self.bump();
+                    let n = self.ident()?;
+                    if let Some((p, _)) = self.vm_polls.iter().find(|(p, _)| p.name == n.name) {
+                        return Err(Diag::new(n.span, format!("poll `{}` is declared twice", n.name)).note(p.span, "first declared here"));
+                    }
+                    let body = self.vm_block()?;
+                    self.vm_polls.push((n, keep.then_some(body)));
+                }
                 "op" => {
                     self.bump();
                     let (name, params, format, cache, then, stack) = self.parse_op_head()?;
-                    let body = self.vm_block()?;
+                    let mut body = self.vm_block()?;
+                    self.add_polls(&item_attrs, &mut body)?;
                     vm.ops.push(OpDecl { name, params, format, cache, body, family: None, then, stack, accumulate: item_attrs.has("accumulate") });
                 }
                 "family" => {
@@ -225,7 +240,8 @@ impl Parser {
                     self.expect("{")?;
                     while !self.eat("}") {
                         let member = self.ident()?;
-                        let body = self.vm_block()?;
+                        let mut body = self.vm_block()?;
+                        self.add_polls(&item_attrs, &mut body)?;
                         let mname = if member.name == "generic" {
                             name.clone()
                         } else {
@@ -451,6 +467,28 @@ impl Parser {
             }
         }
         Ok(vm)
+    }
+
+    /// `#[poll(a, b)]` on an op or family: the polls' statements, in
+    /// that order, before the body's.
+    fn add_polls(&self, attrs: &Attrs, body: &mut Block) -> Res<()> {
+        let mut pre = Vec::new();
+        for (n, args, sp) in &attrs.list {
+            if n != "poll" {
+                continue;
+            }
+            if args.is_empty() {
+                return Err(Diag::new(*sp, "`#[poll(..)]` names the polls to run at the start of the op: `#[poll(gc)]`"));
+            }
+            for a in args {
+                pre.extend(self.poll_body(&Ident { name: a.clone(), span: *sp })?);
+            }
+        }
+        if !pre.is_empty() {
+            pre.append(&mut body.stmts);
+            body.stmts = pre;
+        }
+        Ok(())
     }
 
     fn vm_block(&mut self) -> Res<Block> {

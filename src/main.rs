@@ -18,6 +18,7 @@ mod lifetimes;
 mod layout;
 mod lexer;
 mod parser;
+mod redocheck;
 mod rtgen;
 mod safety;
 mod tir;
@@ -373,6 +374,18 @@ fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, O
     // Checking goes on past errors in bodies; the passes after it run
     // only on a program that checked.
     c.run_all().map_err(Diags)?;
+    // `redo` only where nothing before it has an effect; `new` in a
+    // handler lowered to `try_new` and a refill that redoes the op
+    // (src/redocheck.rs).
+    // An error unless `#[allow(redo_effect)]` covers the `redo` or the
+    // effect.
+    if let Err(ds) = redocheck::run(&mut c.prog) {
+        let covers = |sp: Span| allows.iter().any(|(n, _, r)| n == "redo_effect" && r.file == sp.file && r.lo <= sp.lo && sp.hi <= r.hi);
+        let errs: Vec<Diag> = ds.into_iter().filter(|d| !covers(d.span) && !d.notes.first().is_some_and(|n| covers(n.0))).collect();
+        if !errs.is_empty() {
+            return Err(Diags(errs));
+        }
+    }
     // References into objects that a store could skip the write barrier
     // through (src/objref.rs).
     let safe_files: std::collections::HashSet<u32> = modules

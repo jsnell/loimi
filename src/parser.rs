@@ -16,6 +16,10 @@ pub struct Parser {
     /// Variables of `inline for` statements expanded inside vm bodies,
     /// checked against the vm's state names when the vm is complete.
     pub vm_loop_vars: Vec<Ident>,
+    /// The `poll` declarations of the vm being parsed, in order: name
+    /// and body (None: dropped by `#[cfg]`, so its uses expand to
+    /// nothing).
+    pub vm_polls: Vec<(Ident, Option<Block>)>,
     /// `#[allow(lint)]` attributes: (lint, attribute span, region). The
     /// region runs from the attribute to the end of what it is attached to
     /// (an item, a vm item, a match arm), or is the whole file for
@@ -168,6 +172,7 @@ impl Parser {
             in_vm: false,
             cast_type: false,
             vm_loop_vars: Vec::new(),
+            vm_polls: Vec::new(),
             allows: Vec::new(),
             open_allows: Vec::new(),
         }
@@ -1193,6 +1198,17 @@ impl Parser {
                 continue;
             }
             let keep = self.take_cfg()?;
+            if self.in_vm && self.is_kw("poll") && matches!(self.peek_at(1), Tok::Ident(_)) && self.is_at(2, ";") {
+                // `poll NAME;`: the statements of the vm's poll NAME.
+                self.bump();
+                let n = self.ident()?;
+                self.expect(";")?;
+                let body = self.poll_body(&n)?;
+                if keep {
+                    stmts.extend(body);
+                }
+                continue;
+            }
             let st = self.parse_stmt()?;
             if keep {
                 stmts.push(st);
@@ -1201,6 +1217,29 @@ impl Parser {
         let end = self.expect("}")?;
         self.no_struct = saved;
         Ok(Block { stmts, span: start.to(end) })
+    }
+
+    /// The statements `poll NAME;` and `#[poll(NAME)]` stand for: the
+    /// body of the vm's `poll NAME { .. }`, declared before the use.
+    pub fn poll_body(&self, n: &Ident) -> Res<Vec<Stmt>> {
+        let Some((_, b)) = self.vm_polls.iter().find(|(p, _)| p.name == n.name) else {
+            let known: Vec<String> = self.vm_polls.iter().map(|(p, _)| format!("`{}`", p.name)).collect();
+            return Err(Diag::new(
+                n.span,
+                if known.is_empty() {
+                    format!("unknown poll `{}`: declare it in the vm first, `poll {} {{ .. }}`", n.name, n.name)
+                } else {
+                    format!("unknown poll `{}` (declared before this point: {})", n.name, known.join(", "))
+                },
+            ));
+        };
+        let mut stmts = b.as_ref().map_or(Vec::new(), |b| b.stmts.clone());
+        for s in &mut stmts {
+            if let Stmt::Expr { semi, .. } = s {
+                *semi = true;
+            }
+        }
+        Ok(stmts)
     }
 
     fn parse_stmt(&mut self) -> Res<Stmt> {
