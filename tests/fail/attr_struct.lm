@@ -1,4 +1,4 @@
-// error: attribute `inline` does not apply to a `struct`: it is for functions (here: `allow`, `c_name`)
+// error: attribute `inline` does not apply to a `struct`: it is for functions (here: `allow`, `c_name`, `trace`)
 #[inline]
 struct S { x: i64 }
 
