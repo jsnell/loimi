@@ -15,7 +15,7 @@ implementation; `git log` has the details.
   after a statement that can leave it); `#[hot]` on the control word
   opts out, and `LOIMI_COLD_AUDIT=1` lists what was made cold
   ([language.md §4](docs/language.md#4-slow-paths-cold-blocks)). The
-  examples lost 145 `cold { }` wrappers with the same code. Raises and
+  examples lost 138 `cold { }` wrappers with the same code. Raises and
   outlined cold blocks no longer pass the instruction word when nothing
   reads it, so handlers whose cold branch follows a call keep no
   register for it, and others branch straight to the cold function: 300

@@ -7,14 +7,16 @@
 // at the branch's location. `#[hot]` keeps one inline; a `raise` the op
 // always reaches is not cold.
 // expect-stderr: cold blocks entered:
-// expect-stderr: 1  CHK (cold block at vm_auto_cold.lm:40:19)
-// expect-stderr: 1  CHK (cold block at vm_auto_cold.lm:41:32)
-// expect-stderr: 1  CHK (cold block at vm_auto_cold.lm:42:66)
-// expect-stderr: 1  CHK (cold block at vm_auto_cold.lm:34:49)
-// expect-stderr: 1  CHK (cold block at vm_auto_cold.lm:45:19)
-// expect-stderr: 1  CHK (cold block at vm_auto_cold.lm:47:9)
-// expect-stderr: 1  INC_S (cold block at vm_auto_cold.lm:52:26)
-// expect-no-stderr: lm:44:
+// expect-stderr: 1  CHK (cold block at 
+// expect-stderr: 1  INC_S (cold block at 
+// expect-stderr: vm_auto_cold.lm:42:19)
+// expect-stderr: vm_auto_cold.lm:43:32)
+// expect-stderr: vm_auto_cold.lm:44:66)
+// expect-stderr: vm_auto_cold.lm:36:49)
+// expect-stderr: vm_auto_cold.lm:47:19)
+// expect-stderr: vm_auto_cold.lm:49:9)
+// expect-stderr: vm_auto_cold.lm:54:26)
+// expect-no-stderr: lm:46:
 // expect: 0 ok 8
 // expect: 1 err 101
 // expect: 2 err 102

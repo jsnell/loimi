@@ -21,8 +21,8 @@ against master at 627c1ca.
 - **Item 6** (errors and deoptimization cold by default): built, for
   branches and for the rest of a block after a statement that leaves
   it, with `#[hot]` to opt out
-  ([language.md §4](../language.md#4-slow-paths-cold-blocks)); 145
-  wrappers removed in nine interpreters. Raises and outlined cold blocks
+  ([language.md §4](../language.md#4-slow-paths-cold-blocks)); 138
+  wrappers removed in eight interpreters. Raises and outlined cold blocks
   no longer pass the instruction word where nothing reads it, which
   made 300-odd handlers shorter (see the item).
 - **Item 7** (every error of a build): built; see its row below and section 2.
