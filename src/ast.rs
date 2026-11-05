@@ -326,6 +326,11 @@ pub struct StructDecl {
     /// `#[trace(f)]` on an `object`: a function of the same module that
     /// traces the trailing array and any memory the object owns.
     pub trace: Option<Ident>,
+    /// `#[trace]` on a plain struct: `S.trace(s, heap)` is generated,
+    /// marking its fields (src/parser.rs `trace_method`), except those
+    /// marked `#[untraced]` (listed here).
+    pub derive_trace: Option<Span>,
+    pub untraced: Vec<Ident>,
 }
 
 #[derive(Clone, Debug)]

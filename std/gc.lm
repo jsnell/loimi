@@ -844,16 +844,21 @@ pub fn remember(obj: *u8) {
 /// Register a root scanner: `scan(heap, data)` must `gc_mark` every
 /// reference it owns. Scanners (and sweepers) run during a collection, so
 /// they must not collect: their type has no effects, and a `uses gc`
-/// function cannot be registered.
-pub fn Heap.add_scanner(h: *Heap, data: *u8, scan: fn(*Heap, *u8)) {
-    h.scanners.push(Scanner { data: data, scan: scan });
+/// function cannot be registered. `data` is any pointer, and `scan` takes
+/// it as its own type: `h.add_scanner(ctx, scan_roots)` with `fn
+/// scan_roots(h: *gc.Heap, c: *Ctx)`.
+pub fn Heap.add_scanner<T>(h: *Heap, data: *T, scan: fn(*Heap, *T)) {
+    // unsafe: `scan` is only ever called with `data`, its own `*T`.
+    h.scanners.push(Scanner { data: data as *u8, scan: unsafe { scan as fn(*Heap, *u8) } });
 }
 
 /// Register a sweeper: `sweep(heap, data)` runs after marking and before
 /// sweeping, and may drop references to unmarked objects (`is_marked`),
-/// which makes them weak.
-pub fn Heap.add_sweeper(h: *Heap, data: *u8, sweep: fn(*Heap, *u8)) {
-    h.sweepers.push(Scanner { data: data, scan: sweep });
+/// which makes them weak. `data` and `sweep` are typed as for
+/// `add_scanner`.
+pub fn Heap.add_sweeper<T>(h: *Heap, data: *T, sweep: fn(*Heap, *T)) {
+    // unsafe: `sweep` is only ever called with `data`, its own `*T`.
+    h.sweepers.push(Scanner { data: data as *u8, scan: unsafe { sweep as fn(*Heap, *u8) } });
 }
 
 fn drain(h: *Heap) {

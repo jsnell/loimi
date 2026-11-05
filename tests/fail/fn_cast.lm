@@ -1,0 +1,8 @@
+// errors: 2
+struct A { x: i64 }
+fn f(a: *A) -> i64 { a.x }
+fn g() -> fn(*u8) -> i64 { f as fn(*u8) -> i64 }
+fn k() -> fn(i64) -> i64 { unsafe { f as fn(i64) -> i64 } }
+fn main() {}
+// error: casting `fn(*A) -> i64` to `fn(*u8) -> i64` is unsafe
+// error: cannot cast `fn(*A) -> i64` to `fn(i64) -> i64`: a function type converts only to one that differs in the types of raw pointers

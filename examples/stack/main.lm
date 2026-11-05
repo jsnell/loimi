@@ -95,7 +95,7 @@ fn main() -> i32 uses gc {
     m.fp.word = prog.main;
     m.lp = m.lstack;
     m.sp = m.stack - 1;
-    m.heap.add_scanner(&m as *u8, vm.scan_roots);
+    m.heap.add_scanner(&m, vm.scan_roots);
     if stress { m.heap.set_stress(true); }
 
     for i in 0..prog.words.len {

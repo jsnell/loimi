@@ -1,0 +1,72 @@
+// matrix: check-roots
+// `#[trace] struct`: the generated `S.trace(s, heap)` marks every GC
+// reference in the fields (Gc, options, `value` types, nested structs,
+// fixed arrays, `mem.Vec` and `map.HashMap` of them), not the
+// `#[untraced]` ones; registered with the typed `add_scanner`, no casts.
+// Each kind of field holds the only reference to an object; after
+// collections they are all alive, and the untraced one is the scanner's.
+import std.io;
+import std.gc;
+import std.mem;
+import std.map;
+
+object Box { v: i64 }
+value V repr nanbox { Num(f64) unboxed, Int(i32), B(Gc<Box>), Nil }
+struct Pair { a: ?Gc<Box>, n: i64 }
+struct Syms { all: mem.Vec<Gc<Box>>, n: u64 }
+
+#[trace]
+struct Ctx {
+    heap: gc.Heap,
+    one: ?Gc<Box>,
+    val: V,
+    pair: Pair,
+    /// Nested: its Vec is traced.
+    syms: Syms,
+    arr: [?Gc<Box>; 3],
+    nums: [u32; 8],
+    vec: mem.Vec<V>,
+    raw: mem.Vec<u64>,
+    tab: map.HashMap<u64, Gc<Box>>,
+    /// Marked by the scanner itself.
+    #[untraced] own: ?Gc<Box>,
+    stack: *V,
+}
+
+fn scan(h: *gc.Heap, c: *Ctx) {
+    c.trace(h);
+    gc_mark(h, c.own);
+}
+
+fn mk(c: *Ctx, v: i64) -> Gc<Box> uses gc { new(&c.heap, Box { v: v }) }
+
+fn get(b: ?Gc<Box>) -> i64 { if let Some(x) = b { x.v } else { -1 } }
+
+fn main() -> i32 uses gc {
+    var c = Ctx {
+        heap: gc.Heap.new(), val: V.Nil, pair: Pair { a: None, n: 0 }, syms: Syms { all: mem.Vec.new(), n: 0 }, vec: mem.Vec.new(), raw: mem.Vec.new(), tab: map.HashMap.new(),
+        ..zero
+    };
+    c.heap.add_scanner(&c, scan);
+    c.one = Some(mk(&c, 1));
+    c.val = V.B(mk(&c, 2));
+    c.pair.a = Some(mk(&c, 3));
+    for i in 0..3 { c.arr[i] = Some(mk(&c, 10 + (i as i64))); }
+    for i in 0..20 { let b = mk(&c, 100 + (i as i64)); c.vec.push(V.B(b)); }
+    for i: u64 in 0..20 { let b = mk(&c, 200 + (i as i64)); c.tab.insert(i, b); }
+    c.own = Some(mk(&c, 4));
+    c.syms.all.push(mk(&c, 1000));
+    for _ in 0..3 {
+        for i in 0..1000 { mk(&c, i); }
+        gc.collect(&c.heap);
+    }
+    var sum = get(c.one) + (c.val as! B).v + get(c.pair.a) + get(c.own);
+    for i in 0..3 { sum += get(c.arr[i]); }
+    sum += c.syms.all.at(0).v;
+    for i: u64 in 0..20 { sum += (c.vec.at(i) as! B).v; }
+    for i: u64 in 0..20 { sum += c.tab.get(i).unwrap().v; }
+    // expect: 7423
+    io.print_int(sum);
+    io.println("");
+    0
+}

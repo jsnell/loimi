@@ -81,8 +81,7 @@ pub fn no_host(c: *Ctx, id: i32, args: *V, n: u64) -> Result<V, V> {
 /// GC roots: globals, the error being passed on, open upvalues, and every
 /// active frame's closure and registers (those of nested runs included:
 /// they are frames above the native that started them).
-pub fn scan_roots(h: *gc.Heap, data: *u8) {
-    let c = data as *Ctx;
+pub fn scan_roots(h: *gc.Heap, c: *Ctx) {
     gc_mark(h, c.globals);
     gc_mark(h, c.rethrow);
     if let Some(u) = c.open { gc_mark(h, u); }

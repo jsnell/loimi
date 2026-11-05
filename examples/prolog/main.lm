@@ -227,7 +227,7 @@ fn main() -> i32 uses gc {
     let m = mem.alloc<Machine>(1);
     m.supers = supers;
     setup(m);
-    m.heap.add_scanner(m as *u8, machine.scan_roots);
+    m.heap.add_scanner(m, machine.scan_roots);
     consult(m, prelude.SOURCE, true);
     m.stress = disasm;
     if stress { m.heap.set_stress(true); }

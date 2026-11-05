@@ -43,6 +43,7 @@ pub const CP_CATCH_OFF: u64 = 2;
 
 pub const CHOICE_WORDS: u64 = 9;
 
+#[trace]
 pub struct Machine {
     x: [Term; 256],
     /// Slots of head structures being built, per register (vm
@@ -410,17 +411,14 @@ pub fn Machine.flush(m: *Machine) {
     m.out.flush();
 }
 
-/// The root scanner: argument registers, the live part of the environment
-/// stack, choicepoints' saved arguments, the trail, the pending exception
-/// ball, findall bags and the clause terms kept for clause/2 and retract/1.
-pub fn scan_roots(h: *gc.Heap, data: *u8) {
-    let m = data as *Machine;
-    for i in 0..NREGS { gc_mark(h, m.x[i]); }
-    gc_mark(h, m.ball);
-    for i in 0..m.bags.len { gc_mark(h, m.bags.ptr[i]); }
-    for i in 0..m.inits.len { gc_mark(h, m.inits.ptr[i]); }
-    // Code constants: big integers are in the heap.
-    for i in 0..m.consts.len { gc_mark(h, m.consts.ptr[i]); }
+/// The root scanner: the machine's fields (`#[trace]`: argument
+/// registers, the pending exception ball, findall bags, initialization
+/// goals, code constants (big integers are in the heap), global variables
+/// and code objects), then the trail, the live part of the environment
+/// stack, choicepoints' saved arguments and the clause terms kept for
+/// clause/2 and retract/1.
+pub fn scan_roots(h: *gc.Heap, m: *Machine) {
+    m.trace(h);
     for i in 0..m.tr { gc_mark(h, m.trail[i]); }
     // Environments: everything below the live top is scanned. Frames hold
     // raw pointers next to terms, which read as floats: `Term` is
@@ -442,9 +440,6 @@ pub fn scan_roots(h: *gc.Heap, data: *u8) {
         if c.prev == c { break; }
         c = c.prev;
     }
-    var gi: u64 = 0;
-    while let Some(sl) = m.globals.next(&gi) { gc_mark(h, sl.value); }
-    for i in 0..m.codes.len { gc_mark(h, m.codes.ptr[i]); }
     for i in 0..m.preds.len {
         let pr = m.preds.ptr[i];
         var cur = pr.first;

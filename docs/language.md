@@ -459,7 +459,8 @@ fn main() {}
   `#[unsafe]`, `#[raw]` (section 1.3), `#[test]` and `#[track_caller]` (below); `export "C"`
   functions take `#[catch_panic]` and `#[c_const(..)]`, and structs and
   enums named in a C header `#[c_name("..")]` (section 10.1); an
-  `object` takes `#[trace(f)]` (section 8); a `vm`
+  `object` takes `#[trace(f)]` and a plain struct `#[trace]`, with
+  `#[untraced]` on its fields (section 8); a `vm`
   takes `#[require_verified]` and `#[dispatch(mode)]`; a module-level
   `var` takes `#[thread_local]`; a `super` takes `#[forward]`.
 - **Tests.** `#[test]` marks a function `fn name()` (no parameters or
@@ -2497,7 +2498,7 @@ struct Hooks {
 - Callbacks that run while the runtime is in a fragile state have no
   effects in their type, which makes the restriction checked: the GC's
   root scanners run during a collection, so `Heap.add_scanner` takes a
-  `fn(*Heap, *u8)` and rejects a `uses gc` function.
+  `fn(*Heap, *T)` and rejects a `uses gc` function.
 
 Because allocation fast paths are inlined (`std.gc` bump allocation) and only
 their refill path carries `uses gc`, allocating a value in a handler costs
@@ -3365,6 +3366,65 @@ enough to make it precise and cheap:
   `Gc<gc.Weak<T>>` that reads None once `x` died, and
   `gc.Ephemerons<K, V>` maps objects to values that only the key keeps
   alive. There is no `weak` field qualifier.
+- **Root scanners and `#[trace] struct`.** What the compiler does not
+  root (an interpreter's context: its globals, interned names, tables of
+  values; the VM stacks in memory) a root scanner marks:
+  `heap.add_scanner(ctx, scan)` registers `scan: fn(*gc.Heap, *Ctx)`
+  (no effects: it runs inside a collection), called with `ctx` at every
+  collection. `add_scanner<T>` takes any `*T` and a function of that
+  type (`add_sweeper` likewise), so neither side casts through `*u8`.
+  `#[trace]` on a plain struct generates `S.trace(s: *S, h: *gc.Heap)`,
+  which marks every GC reference in the fields, in declaration order,
+  with the code a scanner would write by hand: `gc_mark(h, s.f)` for a
+  field that holds them inline (`Gc`, options, `value` types, structs,
+  tuples, enums); a loop over a fixed array of those; a loop over the
+  elements of a `mem.Vec` and over the keys and values of a
+  `map.HashMap` that hold them; and the fields of a nested struct, in
+  turn. Raw pointers are not followed (the scanner marks the stack
+  ranges they delimit), and `#[untraced]` on a field leaves it to the
+  scanner. A field that holds GC references `#[trace]` cannot reach (any
+  other container, an array of `Vec`s, a raw pointer inside a nested
+  struct) is an error naming the field,
+  so a context field cannot be left unscanned silently. The method is
+  compiled only if called; `LOIMI_DUMP_VM_EXPANSION=1` lists what it
+  marks (`Ctx.trace marks globals, types[0..24], strs (HashMap
+  values), ..`). Python's `Ctx` and Prolog's `Machine` are written this
+  way.
+
+  <!-- snippet: run "3" -->
+  ```loimi
+  import std.io;
+  import std.gc;
+  import std.mem;
+  object Box { v: i64 }
+  #[trace]
+  struct Ctx {
+      heap: gc.Heap,
+      top: ?Gc<Box>,
+      consts: mem.Vec<Gc<Box>>,
+      stack: *Gc<Box>,
+      sp: u64,
+  }
+  fn scan(h: *gc.Heap, c: *Ctx) {
+      c.trace(h);                                     // top, consts
+      for i in 0..c.sp { gc_mark(h, c.stack[i]); }    // the live stack
+  }
+  fn main() uses gc {
+      var c = Ctx { heap: gc.Heap.new(), consts: mem.Vec.new(), ..zero };
+      c.heap.add_scanner(&c, scan);
+      c.top = Some(new(&c.heap, Box { v: 1 }));
+      c.consts.push(new(&c.heap, Box { v: 2 }));
+      gc.collect(&c.heap);
+      io.print_int(c.top.unwrap().v + c.consts.at(0).v);
+      io.println("");
+  }
+  ```
+
+  A function value converts to a function type that differs only in
+  the types of raw pointers (`scan as fn(*gc.Heap, *u8)`) inside
+  `unsafe { }`: the callback is then called with pointers of the types
+  it was written for only if its caller says so, as `add_scanner<T>`
+  does.
 - **Roots.** These come from three places: the VM stacks (described by the
   `state` kinds and the `ctx.sync` area), compiler-managed temporary roots at
   effectful calls (section 5), and explicit `Root<T>` handles for host data

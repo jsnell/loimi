@@ -102,8 +102,7 @@ fn poisoned(s: *MiniState) -> bool {
 }
 
 /// GC roots of the API: the value stack and the pending result.
-fn scan_api(h: *gc.Heap, data: *u8) {
-    let s = data as *MiniState;
+fn scan_api(h: *gc.Heap, s: *MiniState) {
     gc_mark(h, s.ret);
     for i in 0..s.vals.len { gc_mark(h, s.vals.at(i)); }
 }
@@ -293,7 +292,7 @@ export "C" fn mini_new() -> ?*MiniState {
         me.data = t as *u8;
         s.ctx.gil.set_hooks(gil.Hooks { data: s as *u8, save: api_save, load: api_load, scan: api_scan });
     }
-    s.ctx.heap.add_scanner(s as *u8, scan_api);
+    s.ctx.heap.add_scanner(s, scan_api);
     s.natives = mem.Vec.new();
     s.arena = mem.Arena.new();
     s.err = text.StrBuf.new();

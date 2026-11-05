@@ -2251,6 +2251,33 @@ impl<'a> Checker<'a> {
                     }
                     return Ok(mk(to, TK::Cast(Box::new(v)), span));
                 }
+                // `f as fn(*Heap, *u8)` from `fn(*Heap, *T)`: the same
+                // function called with other pointer types (a callback
+                // registered with untyped data; `gc.Heap.add_scanner<T>`).
+                if let (Ty::Fn(ps, r, e), Ty::Fn(qs, r2, e2)) = (&v.ty, &to) {
+                    let same = |a: &Ty, b: &Ty| a == b || matches!((a, b), (Ty::Ptr(_), Ty::Ptr(_)));
+                    if ps.len() != qs.len() || !same(r, r2) || e2 < e || !ps.iter().zip(qs).all(|(a, b)| same(a, b)) {
+                        return Err(Diag::new(
+                            span,
+                            format!(
+                                "cannot cast `{}` to `{}`: a function type converts only to one that differs in the types of raw pointers (and has at least its effects)",
+                                self.ty_name(&v.ty),
+                                self.ty_name(&to)
+                            ),
+                        ));
+                    }
+                    if cx.unsafe_depth == 0 {
+                        return Err(Diag::new(
+                            span,
+                            format!(
+                                "casting `{}` to `{}` is unsafe: the function must only be called with pointers to what it expects; wrap the cast in `unsafe {{ }}`",
+                                self.ty_name(&v.ty),
+                                self.ty_name(&to)
+                            ),
+                        ));
+                    }
+                    return Ok(mk(to, TK::Cast(Box::new(v)), span));
+                }
                 if !self.castable(&v.ty, &to) {
                     let why = match &to {
                         Ty::Enum(_) if v.ty.is_int() => " (only enums without payloads can be cast from integers)",
@@ -3073,6 +3100,179 @@ impl<'a> Checker<'a> {
             a.body = self.coerce(body, &ty)?;
         }
         Ok(mk(ty, TK::Match(Box::new(s), tarms), span))
+    }
+
+    /// The body of a `#[trace] struct`'s generated `S.trace(s, h)`
+    /// (src/parser.rs `trace_method`), `__gc_trace_fields(h, s)`: what a
+    /// hand-written root scanner writes for each field, in declaration
+    /// order, checked as source (`Checker::trace_place`). Fields marked
+    /// `#[untraced]` are skipped.
+    fn trace_fields(&mut self, cx: &mut FnCx, h: &Expr, s: &Expr, span: Span) -> Res<TExpr> {
+        let sv = self.expr(cx, s, None)?;
+        let Ty::Ptr(st) = &sv.ty else { return Err(Diag::new(span, "`__gc_trace_fields` takes a heap and a pointer to a struct")) };
+        let Ty::Struct(sid) = **st else { return Err(Diag::new(span, "`__gc_trace_fields` takes a heap and a pointer to a struct")) };
+        let decl = self.modules[cx.module].items.iter().find_map(|it| match it {
+            Item::Struct(d) if d.derive_trace.is_some() && matches!(self.scopes[cx.module].get(&d.name.name), Some((Def::Struct(i), _)) if *i == sid) => Some(d),
+            _ => None,
+        });
+        let Some(decl) = decl else { return Err(Diag::new(span, "`__gc_trace_fields` is for the generated `trace` of a `#[trace] struct`")) };
+        let fields = self.prog.structs[sid as usize].fields.clone();
+        let sname = decl.name.name.clone();
+        let mut stmts = Vec::new();
+        let mut marked: Vec<String> = Vec::new();
+        for (fname, fty) in &fields {
+            if decl.untraced.iter().any(|u| u.name == *fname) {
+                continue;
+            }
+            let fspan = decl.fields.iter().find(|(f, _)| f.name == *fname).map_or(span, |(f, _)| f.span);
+            let place = Expr { kind: ExprKind::Field(Box::new(s.clone()), Ident { name: fname.clone(), span }), span };
+            if let Err(why) = self.trace_place(h, place, fname, fty, span, &mut stmts, &mut marked) {
+                return Err(Diag::new(
+                    fspan,
+                    format!(
+                        "`#[trace] struct {}`: field `{}` holds GC references that `#[trace]` cannot reach ({}; it traces `Gc`, options, `value` types, structs, tuples, enums and fixed arrays of them, and `mem.Vec` and `map.HashMap`); mark them in a root scanner, and the field `#[untraced]`",
+                        sname, fname, why
+                    ),
+                ));
+            }
+        }
+        if std::env::var_os("LOIMI_DUMP_VM_EXPANSION").is_some() {
+            eprintln!("// <#[trace] struct {}>: {}.trace marks {}", sname, sname, if marked.is_empty() { "nothing".into() } else { marked.join(", ") });
+        }
+        // The generated code reads `Vec.ptr`: it is not the user's raw
+        // pointer operation.
+        let body = Expr { kind: ExprKind::Unsafe(Block { stmts, span }), span };
+        self.expr(cx, &body, Some(&Ty::Unit))
+    }
+
+    /// The statements marking the GC references in `place` (named `name`
+    /// in `marked`), of type `ty`, as a hand-written scanner does:
+    /// - a type that holds them inline (`Gc`, an option, a `value` type,
+    ///   a struct, tuple or enum holding one): `gc_mark(h, place);`
+    /// - a fixed array of those: `for i: u64 in 0..N { gc_mark(h, place[i]); }`
+    /// - `mem.Vec<T>`: `for i in 0..place.len { gc_mark(h, place.ptr[i]); }`
+    /// - `map.HashMap<K, V>`: each entry's key and value that hold them;
+    /// - another struct: its fields, in turn (a struct holding a `Vec`).
+    /// Raw pointers are not followed (a scanner marks what they point to
+    /// by hand, as for any object). Any other type holding references
+    /// behind a pointer (a container this does not know, an array of
+    /// `Vec`s) is an error, saying why: no field is left unscanned
+    /// silently.
+    #[allow(clippy::too_many_arguments)]
+    fn trace_place(&self, h: &Expr, place: Expr, name: &str, ty: &Ty, span: Span, stmts: &mut Vec<Stmt>, marked: &mut Vec<String>) -> Result<(), String> {
+        let ex = |kind| Expr { kind, span };
+        let id = |n: &str| ex(ExprKind::Ident(n.into()));
+        let field = |e: Expr, n: &str| ex(ExprKind::Field(Box::new(e), Ident { name: n.into(), span }));
+        let mark = |v: Expr| Stmt::Expr { expr: ex(ExprKind::Call(Box::new(id("gc_mark")), vec![h.clone(), v])), semi: true };
+        let block = |stmts: Vec<Stmt>| Block { stmts, span };
+        let u64t = TypeExpr { kind: TypeKind::Named(vec![Ident { name: "u64".into(), span }], vec![]), span };
+        let traced = |t: &Ty| crate::gcgen::is_traced(&self.prog, t);
+        let lp = |var: &str, ty: Option<TypeExpr>, hi: Expr, body: Stmt| Stmt::Expr {
+            expr: ex(ExprKind::For(Ident { name: var.into(), span }, ty, Box::new(ex(ExprKind::Int(0))), Some(Box::new(hi)), block(vec![body]))),
+            semi: false,
+        };
+        // A fresh loop variable per nesting level (`s.a.v` in `s.a`'s loop).
+        let var = format!("i{}", name.matches('.').count());
+        if let Ty::Array(et, n) = ty {
+            if traced(et) {
+                stmts.push(lp(&var, Some(u64t), ex(ExprKind::Int(*n as i64 as _)), mark(ex(ExprKind::Index(Box::new(place), Box::new(id(&var)))))));
+                marked.push(format!("{}[0..{}]", name, n));
+                return Ok(());
+            }
+        }
+        if traced(ty) {
+            stmts.push(mark(place));
+            marked.push(name.to_string());
+            return Ok(());
+        }
+        let inst = self.generics.inst_of.get(ty).map(|(g, args)| {
+            let gt = &self.generics.types[*g as usize];
+            (self.modules[gt.module].path.join("."), gt.name.clone(), args.clone())
+        });
+        match (&inst, ty) {
+            (Some((m, n, args)), _) if m == "std.mem" && n == "Vec" => {
+                if traced(&args[0]) {
+                    let elem = ex(ExprKind::Index(Box::new(field(place.clone(), "ptr")), Box::new(id(&var))));
+                    stmts.push(lp(&var, None, field(place, "len"), mark(elem)));
+                    marked.push(format!("{} (Vec)", name));
+                } else if self.holds_gc(&args[0], 0) {
+                    return Err(format!("a `Vec` of `{}`", self.ty_name(&args[0])));
+                }
+            }
+            (Some((m, n, args)), _) if m == "std.map" && n == "HashMap" => {
+                let (tk, tv) = (traced(&args[0]), traced(&args[1]));
+                for (t, ok) in [(&args[0], tk), (&args[1], tv)] {
+                    if !ok && self.holds_gc(t, 0) {
+                        return Err(format!("a `HashMap` of `{}`", self.ty_name(t)));
+                    }
+                }
+                if tk || tv {
+                    // { var it: u64 = 0; while let Some(e) = place.next(&it) { gc_mark(h, e.key); .. } }
+                    let it = Stmt::Let {
+                        pat: Pat { kind: PatKind::Ident("it".into(), false), span },
+                        mutable: true,
+                        ty: Some(u64t),
+                        init: Some(ex(ExprKind::Int(0))),
+                        els: None,
+                        span,
+                    };
+                    let next = ex(ExprKind::Call(Box::new(field(place, "next")), vec![ex(ExprKind::Unary(UnOp::AddrOf, Box::new(id("it"))))]));
+                    let mut body = Vec::new();
+                    if tk {
+                        body.push(mark(field(id("e"), "key")));
+                    }
+                    if tv {
+                        body.push(mark(field(id("e"), "value")));
+                    }
+                    let pat = Pat { kind: PatKind::Variant(vec![Ident { name: "Some".into(), span }], Some(vec![Pat { kind: PatKind::Ident("e".into(), false), span }])), span };
+                    let w = ex(ExprKind::While(vec![Cond::Let(pat, next)], block(body)));
+                    stmts.push(Stmt::Expr { expr: ex(ExprKind::Block(block(vec![it, Stmt::Expr { expr: w, semi: false }]))), semi: false });
+                    marked.push(format!("{} (HashMap {})", name, if tk && tv { "keys and values" } else if tk { "keys" } else { "values" }));
+                }
+            }
+            (_, Ty::Struct(sid)) if self.prog.structs[*sid as usize].object.is_none() => {
+                for (f, ft) in self.prog.structs[*sid as usize].fields.clone() {
+                    self.trace_place(h, field(place.clone(), &f), &format!("{}.{}", name, f), &ft, span, stmts, marked)?;
+                }
+            }
+            // A raw pointer of the context itself delimits memory the
+            // scanner walks (a stack); one inside a field's struct is a
+            // container this does not know.
+            (_, Ty::Ptr(inner)) if name.contains('.') && self.holds_gc(inner, 0) => {
+                return Err(format!("`{}` points to `{}`", name, self.ty_name(inner)))
+            }
+            _ if self.holds_gc(ty, 0) => return Err(format!("its type is `{}`", self.ty_name(ty))),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Whether a value of `t` holds GC references, inline or in the
+    /// memory of a std container (a `Vec<Value>` in a struct): where
+    /// `#[trace]` must look.
+    fn holds_gc(&self, t: &Ty, depth: u32) -> bool {
+        if depth > 8 {
+            return false;
+        }
+        if crate::gcgen::is_traced(&self.prog, t) {
+            return true;
+        }
+        if let Some((_, args)) = self.generics.inst_of.get(t) {
+            if args.iter().any(|a| self.holds_gc(a, depth + 1)) {
+                return true;
+            }
+        }
+        match t {
+            Ty::Option(i) | Ty::Array(i, _) => self.holds_gc(i, depth + 1),
+            Ty::Tuple(ts) => ts.iter().any(|x| self.holds_gc(x, depth + 1)),
+            Ty::Result(a, b) => self.holds_gc(a, depth + 1) || self.holds_gc(b, depth + 1),
+            Ty::Enum(i) => self.prog.enums[*i as usize].variants.iter().any(|v| v.fields.iter().any(|x| self.holds_gc(x, depth + 1))),
+            Ty::Struct(i) => {
+                let sd = &self.prog.structs[*i as usize];
+                sd.object.is_none() && sd.fields.iter().any(|(_, x)| self.holds_gc(x, depth + 1))
+            }
+            _ => false,
+        }
     }
 
     /// `e is P`: `match e { P => true, _ => false }`, where `P` binds
@@ -4830,6 +5030,9 @@ impl<'a> Checker<'a> {
             };
             let m = self.expr(cx, &args[0], None)?;
             return Ok(Some(mk(Ty::Never, TK::Intrinsic(Intr::Panic, vec![m]), span)));
+        }
+        if name == "__gc_trace_fields" && args.len() == 2 {
+            return Ok(Some(self.trace_fields(cx, &args[0], &args[1], span)?));
         }
         if name == "gc_mark" {
             if args.len() != 2 {

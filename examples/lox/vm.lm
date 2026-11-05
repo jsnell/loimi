@@ -98,8 +98,7 @@ pub fn Machine.free(m: *Machine) {
 
 /// The GC's roots: every active frame's closure and registers, every
 /// function's constants, the globals.
-pub fn scan_roots(h: *gc.Heap, data: *u8) {
-    let m = data as *Machine;
+pub fn scan_roots(h: *gc.Heap, m: *Machine) {
     var f = m.frames;
     while f <= m.fp {
         gc_mark(h, f.cl);

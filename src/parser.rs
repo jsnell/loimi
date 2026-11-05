@@ -120,7 +120,7 @@ pub fn check_attrs(attrs: &Attrs, what: &str, known: &[&str]) -> Res<()> {
             if n == "catch_panic" && args.len() > 1 {
                 return Err(Diag::new(*sp, "`#[catch_panic]` takes at most one value: what the function returns after a panic"));
             }
-            if n == "trace" && args.len() != 1 {
+            if n == "trace" && (args.len() > 1 || (args.is_empty() && what.contains("object"))) {
                 return Err(Diag::new(*sp, "`#[trace(f)]` names one function of the same module: `fn f(h: *gc.Heap, obj: Gc<Obj>)`"));
             }
             if n == "c_name" && args.len() != 1 {
@@ -525,6 +525,14 @@ impl Parser {
                 items.push(item);
             }
         }
+        let methods = items
+            .iter()
+            .filter_map(|it| match it {
+                Item::Struct(sd) if sd.derive_trace.is_some() => Some(trace_method(sd, &items)),
+                _ => None,
+            })
+            .collect::<Res<Vec<_>>>()?;
+        items.extend(methods.into_iter().map(Item::Fn));
         if let Some((_, _, sp)) = mod_attrs.list.iter().find(|(n, a, _)| n == "lifetimes" && !a.is_empty()).filter(|_| mod_attrs.has("safe")) {
             return Err(Diag::new(*sp, "a `#![safe]` module is always checked for pointer stability: `#![lifetimes(off)]` does not apply (use `unsafe { }` at the site)"));
         }
@@ -661,7 +669,7 @@ impl Parser {
             "var" => ("a module-level `var`".into(), &["thread_local"]),
             "vm" => ("a vm".into(), VM_ATTRS),
             "enum" => ("an `enum`".into(), &["c_name", "data", "names"]),
-            "struct" => ("a `struct`".into(), &["c_name"]),
+            "struct" => ("a `struct`".into(), &["c_name", "trace"]),
             "object" => ("an `object`".into(), &["trace"]),
             "value" => ("a `value` type".into(), &["scan_raw_words"]),
             "impl" | "import" => (format!("an `{}`", kw), &[]),
@@ -699,11 +707,12 @@ impl Parser {
             let (generics, bounds) = self.parse_generics()?;
             self.expect("{")?;
             let mut fields = Vec::new();
+            let mut untraced = Vec::new();
             while !self.is("}") {
                 let keep = self.take_cfg()?;
                 let mark = self.allow_mark();
                 let fattrs = self.parse_attrs()?;
-                check_attrs(&fattrs, "a field", &[])?;
+                check_attrs(&fattrs, "a field", &["untraced"])?;
                 let f = self.ident()?;
                 self.expect(":")?;
                 let t = if self.is_kw("verified") && self.is_at(1, "[") {
@@ -723,6 +732,12 @@ impl Parser {
                     self.parse_type()?
                 };
                 if keep {
+                    if let Some((_, _, sp)) = fattrs.list.iter().find(|(n, _, _)| n == "untraced") {
+                        if is_object || !attrs.list.iter().any(|(n, a, _)| n == "trace" && a.is_empty()) {
+                            return Err(Diag::new(*sp, "`#[untraced]` is for fields of a `#[trace] struct`"));
+                        }
+                        untraced.push(f.clone());
+                    }
                     fields.push((f, t));
                 }
                 self.close_allows(mark);
@@ -732,8 +747,23 @@ impl Parser {
             }
             self.expect("}")?;
             let c_name = attrs.get("c_name").map(|a| a[0].clone());
-            let trace = attrs.list.iter().find(|(n, _, _)| n == "trace").map(|(_, a, sp)| Ident { name: a[0].clone(), span: *sp });
-            return Ok(Item::Struct(StructDecl { name, generics, bounds, is_object, fields, is_pub, c_name, trace }));
+            let mut derive_trace = None;
+            if let Some((_, a, sp)) = attrs.list.iter().find(|(n, _, _)| n == "trace") {
+                if !is_object && !a.is_empty() {
+                    return Err(Diag::new(*sp, "`#[trace]` on a struct takes no function: it generates `S.trace(s, heap)`"));
+                }
+                if is_object && a.is_empty() {
+                    return Err(Diag::new(*sp, "`#[trace(f)]` on an object names the function that traces its trailing array"));
+                }
+                if !is_object && !generics.is_empty() {
+                    return Err(Diag::new(*sp, "`#[trace]` is for structs without type parameters"));
+                }
+                if !is_object {
+                    derive_trace = Some(*sp);
+                }
+            }
+            let trace = attrs.list.iter().find(|(n, _, _)| n == "trace").filter(|_| is_object).map(|(_, a, sp)| Ident { name: a[0].clone(), span: *sp });
+            return Ok(Item::Struct(StructDecl { name, generics, bounds, is_object, fields, is_pub, c_name, trace, derive_trace, untraced }));
         }
         if self.is_kw("trait") && matches!(self.peek_at(1), Tok::Ident(_)) {
             self.bump();
@@ -2128,4 +2158,46 @@ pub fn is_reserved(s: &str) -> bool {
             | "unsafe"
             | "never"
     )
+}
+
+/// `#[trace] struct S { .. }`: the method `fn S.trace(s: *S, h:
+/// *gc.Heap)`, which marks the GC references in the fields, for a root
+/// scanner to call. Its body is `__gc_trace_fields(h, s)`, which the
+/// checker expands by the fields' types (`Checker::trace_fields`).
+/// Emitted only if called (`#[__lazy]`).
+fn trace_method(sd: &StructDecl, items: &[Item]) -> Res<FnDecl> {
+    let sp = sd.derive_trace.unwrap();
+    let id = |n: &str| Ident { name: n.into(), span: sp };
+    // The heap's type, as this module names it.
+    let heap = items.iter().find_map(|it| match it {
+        Item::Import(Import { path, names, .. }) if path.len() == 2 && path[0].name == "std" && path[1].name == "gc" => match names {
+            None => Some(vec![id(&path[1].name), id("Heap")]),
+            Some(ns) => ns.iter().find(|n| n.name == "Heap").map(|_| vec![id("Heap")]),
+        },
+        _ => None,
+    });
+    let Some(heap) = heap else {
+        return Err(Diag::new(sp, "`#[trace]` generates `S.trace(s, heap: *gc.Heap)`: add `import std.gc;`"));
+    };
+    let named = |path: Vec<Ident>| TypeExpr { kind: TypeKind::Named(path, vec![]), span: sp };
+    let ptr = |t: TypeExpr| TypeExpr { kind: TypeKind::Ptr(Box::new(t)), span: sp };
+    let ident = |n: &str| Expr { kind: ExprKind::Ident(n.into()), span: sp };
+    let call = Expr { kind: ExprKind::Call(Box::new(ident("__gc_trace_fields")), vec![ident("h"), ident("s")]), span: sp };
+    let mut attrs = Attrs::default();
+    attrs.list.push((crate::vmexpand::LAZY_ATTR.into(), vec![], sp));
+    Ok(FnDecl {
+        name: id("trace"),
+        generics: vec![],
+        bounds: vec![],
+        recv_generics: 0,
+        recv: Some(sd.name.clone()),
+        params: vec![Param { name: id("s"), ty: ptr(named(vec![sd.name.clone()])) }, Param { name: id("h"), ty: ptr(named(heap)) }],
+        variadic: false,
+        ret: None,
+        body: Some(Block { stmts: vec![Stmt::Expr { expr: call, semi: false }], span: sp }),
+        linkage: Linkage::Internal,
+        attrs,
+        is_pub: sd.is_pub,
+        link_name: None,
+    })
 }

@@ -78,8 +78,7 @@ pub fn Ctx.global(c: *Ctx, s: Gc<Sym>) -> u32 {
 
 /// GC roots: symbols, globals, the pending error, and every active frame's
 /// closure and registers.
-pub fn scan_roots(h: *gc.Heap, data: *u8) {
-    let c = data as *Ctx;
+pub fn scan_roots(h: *gc.Heap, c: *Ctx) {
     for i in 0..c.syms.all.len { gc_mark(h, c.syms.all.at(i)); }
     for i in 0..c.gvals.len { gc_mark(h, c.gvals.at(i)); }
     gc_mark(h, c.error);

@@ -1,6 +1,6 @@
 # Design note: an ergonomics audit (zero run-time cost)
 
-Status: **proposal; items 2, 4 (step 1) and 7, and part of section 2, built.** Written 2026-11-05
+Status: **proposal; items 2, 4 (step 1), 7, 9 and 10, and part of section 2, built.** Written 2026-11-05
 against master at 627c1ca.
 - **Item 2** (names and data on enum variants): built as `#[name]`,
   `#[names]` and `#[data(key: Type = default)]`
@@ -11,6 +11,11 @@ against master at 627c1ca.
   ([status.md](../status.md#comparing-builds-loimi-ir-diff)). The
   examples' `#[cfg]` lines are not unpacked yet.
 - **Item 7** (every error of a build): built; see its row below and section 2.
+- **Item 9** (derived root scanning, typed `add_scanner`): built as
+  `#[trace] struct` and `add_scanner<T>`; Python and Prolog are ported
+  (see the item for what changed and what the IR diff showed).
+- **Item 10** (`is` and checked unwrap): built as `e is P` and `e as!
+  V`; ports in six interpreters, release code unchanged (see the item).
 
 > Where could we give the user meaningfully better ergonomics at no
 > run-time cost, even if it makes the Loimi implementation itself more
@@ -72,8 +77,8 @@ interpreters affected) against the compiler cost. Cost is S (days), M
 | 6 | Terminal `raise`, `fail` and `become ..; redo` are cold by default | 119 `cold { raise .. }` in 8 vms; 21 `cold { become X; redo }` | S–M |
 | 7 | Report more than one error per build (**built**) | Python: ~15 fix-and-rebuild cycles for 10k lines (FRICTION 582) | S |
 | 8 | Infer effects of private functions | 136 `uses` on signatures (73 non-`pub`), 18 on fn types; Python `ops.lm` alone 43 | M |
-| 9 | Derived root scanning for context structs; a typed `add_scanner` | 93 `gc_mark` calls in hand-written scanners, ~45 of them fixed fields or arrays; 10 `add_scanner(.. as *u8, ..)` with casts back | S–M |
-| 10 | `is` patterns and checked unwrap | 36 `=> true, _ => false` predicates; 79 `let X(v) = e else { trap() }` | S |
+| 9 | **Built.** Derived root scanning for context structs; a typed `add_scanner` | 93 `gc_mark` calls in hand-written scanners, ~45 of them fixed fields or arrays; 10 `add_scanner(.. as *u8, ..)` with casts back | S–M |
+| 10 | **Built.** `is` patterns and checked unwrap | 36 `=> true, _ => false` predicates; 79 `let X(v) = e else { trap() }` | S |
 | 11 | Op selectors for `accumulate`, `variant .. wraps`; defaults and derived names for `super` groups | Wasm's 140-name `accumulate` list; Stack's hand list of jumping ops for `wraps`; ~140 supers, nearly all named as their parts joined, ~100 `#[forward]`, 54 `#[allow(super_overlap)]` | S |
 | 12 | A typed host-side decoder `Vm.decode(w)`, and encoders that take any integer with checked ranges | 42 `Vm.FMT_field(w)` calls with the format chosen by hand; ~300 `as u8` casts at encoder calls; silent masking (regex FRICTION 241); 12 hand decodes in Mini and Prolog compilers | M |
 
@@ -826,6 +831,70 @@ containers would expose a `trace` that the generator calls.
 - **GC fuzzing:** the rooting fuzzer (`status.md`) is unchanged.
 - **Dispatch and stencils:** none.
 
+**As built** (2026-11-05). `#[trace]` on a plain struct generates
+`S.trace(s: *S, h: *gc.Heap)` ([language.md
+§8](../language.md#8-gc-integration)). Refinements of the proposal:
+- **Generated as checked source, by type.** The parser adds the method
+  (`#[__lazy]`, so it is compiled only if called) with the body
+  `__gc_trace_fields(h, s)`, and the checker expands that into the
+  statements a scanner writes by hand, from the resolved field types:
+  `gc_mark(h, s.f)` for a type that holds references inline, `for i:
+  u64 in 0..N { gc_mark(h, s.f[i]); }` for a fixed array, `for i in
+  0..s.f.len { gc_mark(h, s.f.ptr[i]); }` for a `mem.Vec`, the `next`
+  loop for a `map.HashMap` (keys and values, whichever hold
+  references), and recursion into nested plain structs. So it needs no
+  `trace` method in the std containers, and the code is what the
+  examples wrote. `gc_mark(h, *s)` on the whole struct would have
+  marked the inline fields too, but loads the context (Python's is 4
+  KiB) as one LLVM aggregate and misses the containers.
+- **No silent miss.** A field whose type holds references that this
+  cannot reach (another container, an array of `Vec`s, a raw pointer in
+  a nested struct) is an error naming the field and why; `#[untraced]` says
+  the scanner handles it. Raw pointers are not followed, as in object
+  tracing: the scanner marks the stack ranges they delimit. Python's
+  and Prolog's contexts needed no `#[untraced]`.
+- **The order** is the declaration order, and a scanner calls
+  `c.trace(h)` before or after its dynamic ranges. Marking order does
+  not matter to the collector (marking pushes onto one mark stack).
+- **Typed `add_scanner<T>`** (and `add_sweeper<T>`): `data: *T, scan:
+  fn(*Heap, *T)`. Inside std, the function value is converted with
+  `unsafe { scan as fn(*Heap, *u8) }`, a new cast: a function type
+  converts, in `unsafe` only, to one that differs in the types of raw
+  pointers. Existing `as *u8` callers still compile (`T = u8`).
+- `LOIMI_DUMP_VM_EXPANSION=1` lists what each `trace` marks, which is
+  how the ports were checked against the hand-written scanners.
+
+**Ports, and what `ir-diff` showed** (`--release --asm`, tail-call
+dispatch, against the unported sources built by the same compiler):
+- **Python** (`vm.lm`): `Ctx.trace marks globals, builtins, modules,
+  types[0..24], excs[0..32], strs (HashMap values), n_init, n_str,
+  n_repr, pre_list, pre_via1, pre_via2, dn[0..40], shape_roots[0..65],
+  shape_dict`, the 15 lines it replaced, in the same order. 707 of 708
+  functions the same; `scan_roots` differs in the operand order of one
+  commutative `and` (same instructions), and LLVM no longer infers
+  `nocapture` on its context parameter (the function is only called
+  through the scanner pointer, so nothing uses the attribute).
+- **Prolog** (`machine.lm`): `Machine.trace marks x[0..256], ball, bags
+  (Vec), consts (Vec), codes (Vec), globals (HashMap values), inits
+  (Vec)`, the 7 roots the scanner marked among its stack walks. 444 of
+  445 functions the same; `scan_roots` has the same 252 instructions
+  (the same multiset of opcodes) in another order, since the fixed
+  roots are now marked first.
+- **Typed scanners everywhere**: every scanner and sweeper of the
+  examples (Lox, Mini's four, MiniJS, Scheme, Stack, Python, Prolog)
+  takes its own type, and the ten `as *u8` registrations are gone.
+  `add_scanner<Ctx>` compiles to the same push.
+- **GC checks**: Python's and Prolog's `check.sh` (every test normally,
+  under `--gc-stress`, `--gc-verify` and a `--gc-check-roots` build
+  with stress, in the three dispatch modes) and their golden tests
+  under `--sanitize=address` with GC stress pass.
+- **Not ported**: Scheme's scanner marks `syms.all` but not
+  `syms.map` (the same symbols) or `gsyms`; `#[trace]` would mark both
+  again, extra work at each collection, so it stays hand-written (an
+  `#[untraced]` on a nested field would allow it). MiniJS, Lox, Mini
+  and Stack mark mostly stacks, frames and a few fields, so the
+  derived part would be a line or two.
+
 ### 10. `is` patterns and checked unwrap
 
 **Pattern.** Testing a variant without binding it takes a whole `match`
@@ -871,7 +940,46 @@ word candidate, so check for clashes in the examples.
 
 **Interactions.** None.
 
-### 11. Op selectors for `accumulate`, `variant .. wraps`, and `super` groups
+**As built** (2026-11-05), as `e is P` and `e as! V` ([language.md
+§1.2](../language.md#patterns-literals-and-match)). Refinements:
+- **`is` names a variant with fields alone** (`t is Ref`, not `t is
+  Ref(_)`), at the top of the pattern and of each alternative, and a
+  name that is not a variant or constant is an error rather than a
+  binding, so `t is Reff` cannot be always true. Its precedence is that
+  of `==`; `is` is not a reserved word (it is only an operator after an
+  operand), so no example needed renaming.
+- **`e is A | B` is one `=> true` arm per alternative**, `match e {
+  A(_) => true, B(_) => true, _ => false }`. The examples wrote both
+  that and `A(_) | B(_) => true`; the two give different block layouts
+  in LLVM, and the arm-per-alternative form is the one Prolog's ten
+  multi-variant predicates (in handlers among them) used, so those stay
+  identical. MiniJS's and Python's `|` sites also compile to
+  the same code; Mini's one (`v is Int | Num` in its bytecode
+  compiler) moves two compile-time functions, one instruction shorter.
+- **`as!` yields all the fields**: one field is its value, several a
+  tuple (`let (a, b) = p as! Pair;`); a variant without fields is an
+  error (test it with `is`).
+- **The trap.** `let p = e as! V;` is checked as `let V(p) = e else {
+  trap() };`, the TIR of the hand-written form, so the release code is
+  the same; elsewhere `as!` is a `match` with a `trap()` arm. In a
+  `--release` build the failure is `trap()` (an illegal instruction in
+  an executable, a panic in a library, as `trap()` is). In a debug
+  build it is a panic with the source location and the variant,
+  `main.lm:12:13: as! Str of another variant`, like `unwrap` of None,
+  which a bare `trap()` gave no hint of.
+
+**Ports, and what `ir-diff` showed** (`--release --asm`, tail-call
+dispatch, against the unported sources built by the same compiler):
+- **Python**: all 78 `let X(v) = e else { trap() }` (vm.lm 29,
+  builtins.lm 24, ops.lm 18, fmt.lm 4, value.lm 3), 6 predicates and 2
+  empty-arm `if let .. {} else` tests: 708 of 708 functions the same.
+- **Prolog**: 18 predicates and one empty-arm test: 445 of 445 the
+  same.
+- **MiniJS** (7 predicates), **Scheme** (4), **Regex** (1 unwrap):
+  all functions the same.
+- **Mini** (1 predicate): 624 of 626 the same in assembly; the two
+  bytecode-compiler functions above differ.
+ for `accumulate`, `variant .. wraps`, and `super` groups
 
 **Pattern.** Several vm declarations list ops by name, and the author
 keeps the lists in step with the op set.

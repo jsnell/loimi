@@ -1,0 +1,4 @@
+#[trace]
+struct Ctx { n: i64 }
+fn main() {}
+// error: `#[trace]` generates `S.trace(s, heap: *gc.Heap)`: add `import std.gc;`

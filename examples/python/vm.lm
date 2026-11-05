@@ -99,6 +99,9 @@ pub const T_NOTIMPL: u64 = 23;
 pub struct MCEnt { cls: u32, epoch: u32, name: u64, fnv: u64 }
 pub const MC_SIZE: u64 = 1024;
 
+/// Its GC references are marked by the generated `Ctx.trace` (`#[trace]`),
+/// called from `scan_roots`, which marks the stacks and code constants.
+#[trace]
 pub struct Ctx {
     heap: gc.Heap,
     stack: *Value,
@@ -165,8 +168,7 @@ pub fn intern(c: *Ctx, s: str) -> Gc<Str> {
     o
 }
 
-pub fn scan_roots(h: *gc.Heap, data: *u8) {
-    let c = data as *Ctx;
+pub fn scan_roots(h: *gc.Heap, c: *Ctx) {
     var p = c.stack;
     while p < c.hw { gc_mark(h, *p); p = p + 1; }
     var f = c.frames;
@@ -180,22 +182,7 @@ pub fn scan_roots(h: *gc.Heap, data: *u8) {
         for j in 0..pr.consts.len { gc_mark(h, pr.consts[j]); }
         for j in 0..pr.pnames.len { gc_mark(h, pr.pnames[j]); }
     }
-    gc_mark(h, c.globals);
-    gc_mark(h, c.builtins);
-    gc_mark(h, c.modules);
-    for i in 0..NTYPES { gc_mark(h, c.types[i]); }
-    for i in 0..32 { gc_mark(h, c.excs[i]); }
-    var it: u64 = 0;
-    while let Some(s) = c.strs.next(&it) { gc_mark(h, s.value); }
-    gc_mark(h, c.n_init);
-    gc_mark(h, c.n_str);
-    gc_mark(h, c.n_repr);
-    gc_mark(h, c.pre_list);
-    gc_mark(h, c.pre_via1);
-    gc_mark(h, c.pre_via2);
-    for i in 0..40 { gc_mark(h, c.dn[i]); }
-    for i in 0..65 { gc_mark(h, c.shape_roots[i]); }
-    gc_mark(h, c.shape_dict);
+    c.trace(h);
 }
 
 pub fn line_of(p: *Proto, pc: *u32) -> u32 {

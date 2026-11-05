@@ -1152,8 +1152,11 @@ into. Not built:
   variables, are rooted by the compiler at `uses gc` calls.
   Everything else (globals, VM stacks in memory, host tables) is
   marked by a root scanner, `heap.add_scanner(data, scan)`, where
-  `scan: fn(*Heap, *u8)` calls `gc_mark(h, v)` on each reference.
-  Scanners have no effects: they cannot collect.
+  `data: *T` is any pointer and `scan: fn(*Heap, *T)` calls `gc_mark(h,
+  v)` on each reference. Scanners have no effects: they cannot collect.
+  A context struct declared `#[trace]` gets `ctx.trace(h)`, which marks
+  its fields' references for the scanner (language.md section 8,
+  "Root scanners and `#[trace] struct`").
 - `heap.add_sweeper(data, sweep)`: runs after marking; with
   `h.is_marked(p)` (or the slower `gc.is_marked(p)`) it drops references
   to dead objects (weak tables).

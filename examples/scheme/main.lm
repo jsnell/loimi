@@ -76,7 +76,7 @@ fn main() -> i32 uses gc {
         return 0;
     }
     let main_closure = value.new_closure(&ctx.heap, proto);
-    ctx.heap.add_scanner(&ctx as *u8, rt.scan_roots);
+    ctx.heap.add_scanner(&ctx, rt.scan_roots);
     Scheme.run(&ctx, main_closure);
     ctx.flush();
     if ctx.error != value.unspec() {

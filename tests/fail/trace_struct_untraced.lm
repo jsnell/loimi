@@ -1,0 +1,5 @@
+import std.gc;
+object Box { v: i64 }
+struct Ctx { #[untraced] b: ?Gc<Box> }
+fn main() {}
+// error: `#[untraced]` is for fields of a `#[trace] struct`
