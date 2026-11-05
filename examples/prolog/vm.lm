@@ -827,7 +827,7 @@ pub vm Wam {
     }
 
     op UNDEF(p: pred) : A {
-        raise builtins.existence_error(ctx, p as u32)
+        cold { raise builtins.existence_error(ctx, p as u32) }
     }
 
     /// call/N: the goal in A1, N-1 extra arguments after it.

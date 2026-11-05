@@ -1,6 +1,6 @@
 # Design note: an ergonomics audit (zero run-time cost)
 
-Status: **proposal; items 1, 2, 4 (step 1), 7, 9 and 10, and part of section 2, built.** Written 2026-11-05
+Status: **proposal; items 1, 2, 4 (step 1), 5, 6, 7, 9 and 10, and part of section 2, built.** Written 2026-11-05
 against master at 627c1ca.
 - **Item 1** (declared polls, `new` in handlers, the `redo` check):
   built as `poll NAME { .. }`, `#[poll(NAME)]` and `poll NAME;`
@@ -14,6 +14,17 @@ against master at 627c1ca.
 - **Item 4, step 1** (`loimi ir-diff`): built
   ([status.md](../status.md#comparing-builds-loimi-ir-diff)). The
   examples' `#[cfg]` lines are not unpacked yet.
+- **Item 5** (cache layouts from structs): built as `cache X = S;`, with
+  `&cache` (and `&c` for a handle) a `*S` where the words hold an `S`
+  ([language.md §7.1](../language.md#71-inline-caches)); Lox, MiniJS and
+  Python are ported (see the item).
+- **Item 6** (errors and deoptimization cold by default): built, for
+  branches and for the rest of a block after a statement that leaves
+  it, with `#[hot]` to opt out
+  ([language.md §4](../language.md#4-slow-paths-cold-blocks)); 145
+  wrappers removed in nine interpreters. Raises and outlined cold blocks
+  no longer pass the instruction word where nothing reads it, which
+  made 300-odd handlers shorter (see the item).
 - **Item 7** (every error of a build): built; see its row below and section 2.
 - **Item 9** (derived root scanning, typed `add_scanner`): built as
   `#[trace] struct` and `add_scanner<T>`; Python and Prolog are ported
@@ -77,8 +88,8 @@ interpreters affected) against the compiler cost. Cost is S (days), M
 | 2 | **Built.** Names and data on enum variants (`#[name]`, generated `name`/`from_name`, per-variant constants) | ~650 rows of parallel tables: Scheme ~260 (5 copies of its 149 primitives), Python ~150, Prolog 90, Mini 84 (3 copies of 27 natives); 27 `E_*` + `enames`; Trap messages; 4 operator tables | M |
 | 3 | Op relations and per-op metadata in `inline for` rows | Wasm: 178 relation rows + 329 translator rows whose types repeat operand kinds; Mini's 24-arm `jump_op`/`negate_jump`; Python, Prolog, Lox op maps | M |
 | 4 | Panic locations out of the IR identity check (`loimi ir-diff`: **built**), then `extend vm` blocks | 97 `#[cfg(..)]` lines in Mini (71) and Python (26) packed onto existing lines; Python/Mini `on break` and variants on the line closing `on raise` | S, then M |
-| 5 | Cache layouts from structs; cache handles for plain functions | 31 `&cache.f` sites; `PropIC` copies `obj.Site` field by field in Lox and MiniJS, plus 22 `as *obj.Site` casts | S |
-| 6 | Terminal `raise`, `fail` and `become ..; redo` are cold by default | 119 `cold { raise .. }` in 8 vms; 21 `cold { become X; redo }` | S–M |
+| 5 | **Built.** Cache layouts from structs; cache handles for plain functions | 31 `&cache.f` sites; `PropIC` copies `obj.Site` field by field in Lox and MiniJS, plus 22 `as *obj.Site` casts | S |
+| 6 | **Built.** Terminal `raise`, `fail` and `become ..; redo` are cold by default | 119 `cold { raise .. }` in 8 vms; 21 `cold { become X; redo }` | S–M |
 | 7 | Report more than one error per build (**built**) | Python: ~15 fix-and-rebuild cycles for 10k lines (FRICTION 582) | S |
 | 8 | Infer effects of private functions | 136 `uses` on signatures (73 non-`pub`), 18 on fn types; Python `ops.lm` alone 43 | M |
 | 9 | **Built.** Derived root scanning for context structs; a typed `add_scanner` | 93 `gc_mark` calls in hand-written scanners, ~45 of them fixed fields or arrays; 10 `add_scanner(.. as *u8, ..)` with casts back | S–M |
@@ -649,6 +660,59 @@ let (r, st, d) = read_prop(ctx, &cache, obj.IcState.Generic, x, key(name));
   section 3.3), so they are unaffected.
 - **Debugger:** `deopt` zeroes the cache as before.
 
+**As built** (2026-11-05), as `cache X = S;` with `&cache` a `*S`
+([language.md §7.1](../language.md#71-inline-caches)). Refinements of
+the proposal:
+- **The words stay one field per word.** `cache X = S;` is the cache
+  `cache X { f: T, .. }` with `S`'s fields, filled in before the vm is
+  expanded (`vmexpand::cache_structs`, which finds `S` in the vm's
+  module, as `m.S` or through `import ..{S}`, and qualifies field types
+  of `S`'s module), so `op_size`, the emitters, the verifier, `deopt`,
+  the disassembler (fields by name) and `cache.f` are what the written-out
+  cache gives. The alternative, a cache that holds an `S` as laid out in
+  memory, would have changed the word layout of every cache with a
+  narrow field, and the generated code that computes it.
+- **`&cache` is a `*S` only where the two layouts agree**, which the
+  checker proves from the field offsets: every field at its word's byte
+  offset, `S` no more aligned than a code word, and no larger than the
+  words. The alignment risk the proposal raised is handled by that rule
+  (a `u64` or pointer field in a `u32` vm makes `&cache` an error that
+  names the field), not by `#[packed]` structs, which Loimi does not
+  have. `cache.f` works whatever the layout.
+- **`&cache` compiles to `&cache.f0 as *S`** (`TK::Cast` of the first
+  word's address, `vmcheck::cache_addr`), the form written by hand, so
+  the lifetimes, `objref` and `redo` checks see the same tree. In a vm
+  function, `&c` for a handle `c: cache X` is the handle's pointer cast
+  the same way. A cache with a field list has no struct type, so `&cache`
+  there is an error that says to take a field's address.
+- **Not built: array fields** (`ents: [Ent; 4]`). A struct field of array
+  type is still not a cache field; Python's four-way `MethIC` would need
+  them and has `u64` fields at 4-byte offsets anyway (below).
+
+**Ports, and what `ir-diff` showed** (`--release --asm`, the unported
+sources against the ported ones, both built by the new compiler, in
+tail-call, goto and switch dispatch):
+- **Lox**: `cache PropIC = obj.Site;` and 12 `&cache.sid as *obj.Site`
+  → `&cache`: 332 of 332 functions the same in every mode.
+- **MiniJS**: the same declaration and 10 casts; `prim_get`, the slow
+  path that caches an array or string method, takes the `*obj.Site`
+  instead of two `*u32` (`site.sid = ..; site.slot = ..`). 654 of 657
+  functions the same: `prim_get` (two instructions fewer: one argument
+  register less to save) and its two callers, the cold generic members
+  of GETPROP and GETMETHOD (one `leaq` fewer each).
+- **Python**: GETGLOBAL's cache is `cache GlobalIC = ops.GlobalSite;`
+  and `ops.get_global(ctx, func, s, &cache)` takes one pointer instead
+  of `&cache.idx, &cache.ver, &cache.builtin`. 707 of 710 functions the
+  same: `get_global` (322 assembly lines against 331, a pointer fewer
+  to keep), GETGLOBAL's generic member (two `leaq` fewer) and LOADNAME
+  (two fewer: one local struct for three locals).
+- **Not ported**: Python's `MethIC` and `SupIC` (`u64` method words at
+  4-byte offsets: not an `S` in memory; `loadmethod` keeps its five
+  pointers), `AttrIC`/`SetIC`/`SetGIC` (one field each, which
+  `&cache.idx` passes already), and Mini's one-field `FieldIC` (3 sites).
+  The `std.obj` documentation and `tests/run/std_obj_sites.lm` use the
+  new form.
+
 ### 6. Terminal `raise`, `fail` and `become ..; redo` are cold by default
 
 **Pattern.** A `raise` in a handler is the slow path by nature. Authors
@@ -714,6 +778,49 @@ only 3 cold raises, so it would want `#[hot]` on few sites, if any.
   useful.
 - **Stencils:** cold blocks are outlined functions, which the stencils
   already handle.
+
+**As built** (2026-11-05), as "errors and deoptimization are cold by
+default" ([language.md §4](../language.md#4-slow-paths-cold-blocks)).
+Refinements of the proposal:
+- **Tails as well as branches.** Most of the hand-written wrappers were
+  not branches but the end of an op after its fast path left it: `if let
+  (Num(x), Num(y)) = (a, b) { dst = Num(x - y); next } cold { raise ..
+  }` (Lox's arithmetic, Scheme's `car`, Mini's field ops, Stack's
+  words). The rule therefore also makes cold the rest of any block that
+  ends in the control word after a statement that can leave the block
+  (one with a control word outside a `cold` block, a call of a `->
+  never` vm function, `return`, `break` or `continue`). A control word
+  in a `cold` block does not count: what follows a poll is still the
+  op's path (Python's RAISE, whose poll ends in `redo`, would otherwise
+  have had its whole body outlined). An early version did not count
+  `redo` either, and the port diff caught it: MiniJS's string-method
+  member redoes on a rope that is already flat on its fast path ("no
+  cold call", says its comment), which would have gone cold. `?` does
+  not count. A `raise` the code always reaches stays as written (MiniJS's
+  THROW and THROWREF, Prolog's UNDEF keep their `cold`).
+- **A tree rewrite before checking** (`src/autocold.rs`, run by the vm
+  parser after polls are expanded): the rewritten tree is the one the
+  hand-written `cold { .. }` parses to (`{ cold { .. } }` for an `if`
+  block and a tail, `else cold { .. }` and `=> cold { .. }` for an `else`
+  and an arm), so the `redo` check (the block that ends in the `redo` is
+  still its fix-up), lifetimes, cold outlining, hot-handler ordering and
+  the cold section, `--vm-stats` (which counts the new blocks, at the
+  branch's location) and the debugger see the hand-written form.
+  `LOIMI_COLD_AUDIT=1` lists the branches made cold.
+- **`#[hot]` is on the control word** (`Err(ball) => { #[hot] raise ball
+  }`), and an unused one is an error. No example needed it: Prolog's
+  `throw/1` raises through CALLB, where cold costs the throw one more
+  jump and the hot path nothing (below).
+- **A codegen change the measurement asked for.** Making Prolog's CALLB
+  raise cold first cost its hot path an instruction: an outlined cold
+  block is passed the handler's instruction word, so the word had to
+  survive the call to the builtin (`pushq %rbp; movl %esi, %ebp` for
+  `pushq %rax`). Nothing in a raising cold block reads it, and `on
+  raise` reads it in none of the examples, so raises and outlined cold
+  blocks now pass `poison` where nothing reads the word
+  (`vmgen::reads_insn`, `on_raise_reads_insn`; lowering.md §3). That is
+  the change behind most of the differences below, in hand-written cold
+  blocks as much as in new ones.
 
 ### 7. Report more than one error per build
 

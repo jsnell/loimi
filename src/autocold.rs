@@ -281,11 +281,11 @@ fn stmt_span(s: &Stmt) -> Span {
     }
 }
 
-/// Whether a statement can leave the block it is in: a control word
-/// other than `redo`, a call of a `-> never` vm function, `return`,
-/// `break` or `continue` somewhere in it (outside closures). A `?` does
-/// not count: its error path is not a branch the author wrote
-/// (language.md §4).
+/// Whether a statement can leave the block it is in other than on a
+/// slow path: a control word, a call of a `-> never` vm function,
+/// `return`, `break` or `continue` somewhere in it, outside `cold` blocks
+/// and closures. A `?` does not count: its error path is not a branch
+/// the author wrote (language.md §4).
 fn leaves(s: &Stmt) -> bool {
     match s {
         Stmt::Let { init, els, .. } => init.as_ref().is_some_and(exits) || els.as_ref().is_some_and(|b| b.stmts.iter().any(leaves)),
@@ -335,11 +335,11 @@ fn exits(e: &Expr) -> bool {
         ExprKind::For(_, _, lo, hi, b) => exits(lo) || hi.as_ref().is_some_and(|x| exits(x)) || blk(b),
         ExprKind::Match(s, arms) => exits(s) || arms.iter().any(|a| exits(&a.body) || a.guard.as_ref().is_some_and(exits)),
         ExprKind::Vm(v) => match v {
-            VmExpr::Cold(b) => blk(b),
-            // `redo` runs the op again: what follows it is still the op's
-            // own path (a poll, a refill, a `become` that redoes).
-            VmExpr::Become(_) | VmExpr::UseVariant(_) | VmExpr::Redo => false,
-            VmExpr::Next | VmExpr::Jump(_) | VmExpr::Exit(_) | VmExpr::Raise(_) | VmExpr::Fail(_) => true,
+            // A control word in a `cold` block (a poll's `redo`, a slow
+            // path's `next`) is not a way out of the fast path: what
+            // follows the statement is still the op's own path.
+            VmExpr::Cold(_) | VmExpr::Become(_) | VmExpr::UseVariant(_) => false,
+            VmExpr::Next | VmExpr::Redo | VmExpr::Jump(_) | VmExpr::Exit(_) | VmExpr::Raise(_) | VmExpr::Fail(_) => true,
         },
     }
 }

@@ -440,7 +440,7 @@ pub vm JS {
     op GETGLOBAL(dst: reg, g: gl) : ABx { dst = ctx.gvals.ptr[g]; next }
     op SETGLOBAL(src: reg, g: gl) : ABx { ctx.gvals.ptr[g] = src; next }
     /// Reading an undeclared variable (k[name] is its name).
-    op THROWREF(pad: imm, name: kst) : ABx { raise ref_error(ctx, name) }
+    op THROWREF(pad: imm, name: kst) : ABx { cold { raise ref_error(ctx, name) } }
 
     /// R[dst] = the running function (named function expressions).
     op SELF(dst: reg) : ABC { dst = F(fp.cl); next }
@@ -607,7 +607,7 @@ pub vm JS {
                 // method of json's lexer): no cold call.
                 if let R(r) = obj and let Some(f) = r.flat { obj = S(f); redo }
                 if let R(r) = obj { cold { obj = S(value.flatten(r)); redo } }
-                become #fam; redo
+                cold { become #fam; redo }
             }
             // Up to eight (shape, own slot or prototype hit) pairs.
             #polym {
@@ -1461,7 +1461,7 @@ pub vm JS {
         jump fp.resume
     }
     op THROW(src: reg) : ABC {
-        raise src
+        cold { raise src }
     }
 
     /// R[dst] = the constructor `super(...)` calls.

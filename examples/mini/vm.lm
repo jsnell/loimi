@@ -1234,7 +1234,7 @@ pub vm Mini {
                 native_results(base as u64, nres as u64, v)
             }
         }
-        raise error(ctx, "attempt to call a ", f)
+        cold { raise error(ctx, "attempt to call a ", f) }
     }
     /// After a native returned `v` to CALL: store its results in
     /// R[base .. base+nres-1].

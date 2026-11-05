@@ -8,6 +8,33 @@ implementation; `git log` has the details.
 
 ### `vm` declarations and dispatch
 
+- **Errors and deoptimization are cold by default**: in an op handler or
+  a `-> never` vm function, a `raise`, `fail`, or `redo` after a
+  `become` that the code reaches on some paths only compiles as if it
+  were in `cold { }` (a branch that ends in one, or the rest of a block
+  after a statement that can leave it); `#[hot]` on the control word
+  opts out, and `LOIMI_COLD_AUDIT=1` lists what was made cold
+  ([language.md §4](docs/language.md#4-slow-paths-cold-blocks)). The
+  examples lost 145 `cold { }` wrappers with the same code. Raises and
+  outlined cold blocks no longer pass the instruction word when nothing
+  reads it, so handlers whose cold branch follows a call keep no
+  register for it, and others branch straight to the cold function: 300
+  or so handlers in Lox, Scheme, Python, Wasm, Prolog, Mini and Stack
+  are shorter ([lowering.md §3](docs/lowering.md#3-handlers-in-tailcall-mode);
+  [design/ergonomics-audit.md](docs/design/ergonomics-audit.md), item 6).
+- **Cache layouts from structs**: `cache PropIC = obj.Site;` takes a
+  cache's fields from a struct, and `&cache` (or `&c` for a cache
+  handle) is then a `*obj.Site` that plain functions take, where the
+  code words hold the struct as laid out in memory (checked). Lox and
+  MiniJS pass their property caches to `std.obj` without the 22 `&cache.sid
+  as *obj.Site` casts, and Python's `get_global` takes its cache as one
+  pointer instead of three
+  ([language.md §7.1](docs/language.md#71-inline-caches);
+  [design/ergonomics-audit.md](docs/design/ergonomics-audit.md), item 5).
+- **`loimi ir-diff` of `.ll` files from any compiler is exact** in every
+  dispatch mode: `--emit-llvm` output names the LLVM options its build
+  passes on its first line
+  ([status.md](docs/status.md#comparing-builds-loimi-ir-diff)).
 - **Declared polls, a checked `redo`, and `new` in handlers without a
   frame**: `poll gc { .. }` declares the check an op starts with once;
   `#[poll(gc)]` on an op or family puts it first, and `poll gil;` is a

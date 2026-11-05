@@ -801,7 +801,7 @@ pub vm Py {
                     gc_point();
                     if cl.n == 0 and let Some(iv) = ops.cached_init(ctx, cl) and let Func(init) = iv and ops.args_fast(init, n as u64 + 1) {
                         let w = regs + base.raw + 1;
-                        if !ensure(w + n as u64 + 1) { raise ops.exc(ctx, builtins.Exc.RecursionError, "maximum recursion depth exceeded") }
+                        if !ensure(w + n as u64 + 1) { cold { raise ops.exc(ctx, builtins.Exc.RecursionError, "maximum recursion depth exceeded") } }
                         let inst = ops.new_instance(ctx, cl);
                         var i = n as u64;
                         while i > 0 { w[i] = w[i - 1]; i -= 1; }

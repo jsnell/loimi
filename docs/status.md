@@ -114,9 +114,13 @@ function by function:
   ...) or a `.ll` file from `loimi build --emit-llvm`. Both go through
   clang with the options `loimi build` uses (`-O3` with `--release`,
   the vm's LLVM options), to optimized IR and, with `--asm`, to
-  assembly. Give `.lm` files to compare the assembly of goto and switch
-  dispatch exactly (a `.ll` file does not say which options its vm
-  wants).
+  assembly. A `.ll` file from `loimi build --emit-llvm` names the LLVM
+  options of its build on its first line (`; loimi-llvm-args: ..`), so
+  the outputs of two compilers compare exactly in every dispatch mode
+  (and the interpreter of a `--jit-stencils` build, which `.lm` inputs
+  do not support);
+  a `.ll` without that line (an older compiler's) gets the goto
+  options if it has an `indirectbr`, and no others.
 - **What it ignores.** Source locations in string constants
   (`dir/vm.lm:120:7: index out of bounds` becomes `vm.lm:L:C`, so the
   same file in two trees compares equal) and the message lengths passed

@@ -2455,9 +2455,9 @@ reaches only on some paths is compiled as if it were written in a
 - a branch that ends in one, the block of an `if` or an `else`, a
   `match` arm or the `else` of a `let .. else`, is cold as a whole;
 - a block that ends in one after a statement that can leave the block
-  (one with `next`, `jump`, `exit`, `raise` or `fail` in it, a call of a
-  `-> never` vm function, `return`, `break` or `continue`) is cold from
-  the statement after that one.
+  (one with `next`, `jump`, `redo`, `exit`, `raise` or `fail` in it
+  outside a `cold` block, a call of a `-> never` vm function, `return`,
+  `break` or `continue`) is cold from the statement after that one.
 
 <!-- snippet: check
 value Value repr nanbox { Num(f64) unboxed, Int(i32), Nil }
@@ -2497,9 +2497,10 @@ and weighted unlikely in every mode). The rule leaves alone:
 - `?`, whose error arm is part of every call of a function that returns
   a `Result` (Considered and rejected in the ergonomics audit,
   `docs/design/ergonomics-audit.md` section 3);
-- `redo` without a `become`, and a statement that only `redo`es (a poll,
-  a refill): they write their own `cold` block, and what follows them is
-  still the op's path, so they do not make the rest of a block cold;
+- `redo` without a `become` (a refill or a rope flattened in place
+  can be the op's own path), and control words in `cold` blocks, which
+  do not make the rest of a block cold (what follows a poll is still
+  the op's path);
 - `on raise`, entries and plain vm functions (which cannot use control
   words), and code already in a `cold` block.
 
