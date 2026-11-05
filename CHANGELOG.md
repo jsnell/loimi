@@ -8,6 +8,24 @@ implementation; `git log` has the details.
 
 ### `vm` declarations and dispatch
 
+- **Declared polls, a checked `redo`, and `new` in handlers without a
+  frame**: `poll gc { .. }` declares the check an op starts with once;
+  `#[poll(gc)]` on an op or family puts it first, and `poll gil;` is a
+  statement for a branch of a jump op. Every `redo` is checked: nothing
+  on a path before the block that ends in it may store to memory, an
+  operand or a state register, or call what may (`error[redo_effect]`,
+  `#[allow(redo_effect)]` where running it twice is harmless). `new` in
+  an op handler, where that holds and the size is a constant, compiles
+  to `try_new` with a cold `make_room` and `redo`, the form handlers
+  wrote by hand to keep the refill call off the fast path
+  ([language.md §4](docs/language.md#4-slow-paths-cold-blocks),
+  [lowering.md §10](docs/lowering.md#10-gc-barriers-and-allocation)).
+  Ported: Python (23 polls), Scheme, MiniJS, Stack and Mini (GC, GIL
+  and debugger-pause polls) with the same release code in every
+  dispatch mode; Prolog's 10 refills are `new` (handlers the same but
+  an equivalent compare). Python's `MAKECELL` lost its frame
+  ([design/ergonomics-audit.md](docs/design/ergonomics-audit.md), item 1).
+
 - **Debugging guest programs** (prototype): `on break { .. }` generates
   breakpoint ops and `Vm.set_break`/`clear_break`/`Break.rearm`, sound on
   verified code (size-preserving, supers split, caches kept);
@@ -419,7 +437,9 @@ implementation; `git log` has the details.
   the assembly) of two builds function by function, ignoring panic
   locations, constant and local names, metadata numbering and function
   order, so a refactor that moves lines can be shown to be zero-cost
-  ([status.md](docs/status.md#comparing-builds-loimi-ir-diff)).
+  ([status.md](docs/status.md#comparing-builds-loimi-ir-diff)). Outlined
+  cold blocks are numbered per handler, so a cold block added to one op
+  no longer shows as a change in every op after it.
 - **Every error of a build, not just the first**: function bodies, vm
   handlers and the statements of a body are checked past an error, with
   bindings of a failed statement poisoned so that one mistake gives one

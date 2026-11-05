@@ -1,7 +1,11 @@
 # Design note: an ergonomics audit (zero run-time cost)
 
-Status: **proposal; items 2, 4 (step 1), 7, 9 and 10, and part of section 2, built.** Written 2026-11-05
+Status: **proposal; items 1, 2, 4 (step 1), 7, 9 and 10, and part of section 2, built.** Written 2026-11-05
 against master at 627c1ca.
+- **Item 1** (declared polls, `new` in handlers, the `redo` check):
+  built as `poll NAME { .. }`, `#[poll(NAME)]` and `poll NAME;`
+  ([language.md §4](../language.md#4-slow-paths-cold-blocks)); six
+  interpreters are ported (see the item).
 - **Item 2** (names and data on enum variants): built as `#[name]`,
   `#[names]` and `#[data(key: Type = default)]`
   ([language.md §1.2](../language.md#variant-names-and-data)). Scheme's
@@ -69,7 +73,7 @@ interpreters affected) against the compiler cost. Cost is S (days), M
 
 | # | Proposal | Evidence | Cost |
 |---|---|---|---|
-| 1 | Declared safepoint polls, and handler-lowered allocation refills | 73 lines testing the heap threshold in 7 interpreters (46 the full poll), plus 29 `gc_point()` calls; 24 `else cold { make_room; redo }`; Mini's 9 GIL/pause polls and 6 barrier tails | M |
+| 1 | **Built.** Declared safepoint polls, and handler-lowered allocation refills | 73 lines testing the heap threshold in 7 interpreters (46 the full poll), plus 29 `gc_point()` calls; 24 `else cold { make_room; redo }`; Mini's 9 GIL/pause polls and 6 barrier tails | M |
 | 2 | **Built.** Names and data on enum variants (`#[name]`, generated `name`/`from_name`, per-variant constants) | ~650 rows of parallel tables: Scheme ~260 (5 copies of its 149 primitives), Python ~150, Prolog 90, Mini 84 (3 copies of 27 natives); 27 `E_*` + `enames`; Trap messages; 4 operator tables | M |
 | 3 | Op relations and per-op metadata in `inline for` rows | Wasm: 178 relation rows + 329 translator rows whose types repeat operand kinds; Mini's 24-arm `jump_op`/`negate_jump`; Python, Prolog, Lox op maps | M |
 | 4 | Panic locations out of the IR identity check (`loimi ir-diff`: **built**), then `extend vm` blocks | 97 `#[cfg(..)]` lines in Mini (71) and Python (26) packed onto existing lines; Python/Mini `on break` and variants on the line closing `on raise` | S, then M |
@@ -219,6 +223,70 @@ strictly better than a `new` left on the hot path.
   { .. }` in one place instead of six.
 - **Superinstructions:** a poll in a later part runs before that part,
   as the code does today.
+
+**As built** (2026-11-05). Refinements of the proposal:
+- **The poll is the author's text, with no `redo` appended.** A poll
+  that ends in `redo` (Python, Scheme) and one whose cold block falls
+  through and gets the rest of the op copied in (Mini, MiniJS, Stack,
+  Prolog's METACALL) are both what the examples write, and each gives
+  its own code; appending `redo` would have changed the second kind.
+  Polls are expanded by the parser, so everything after (checking,
+  lifetimes, cold outlining, stencils, `--vm-stats`) sees the written-out
+  form.
+- **A statement form, `poll NAME;`**, besides the attribute: Mini's GIL
+  and pause polls sit in the taken branch of conditional jumps, not at
+  the top. A poll under a `#[cfg]` that is off expands to nothing, so
+  `#[cfg(gil)] poll gil { .. }` is the only `#[cfg]` needed. Item 11's
+  selectors were not needed: an attribute per op is as short.
+- **The check covers every `redo`, not only polls** (`src/redocheck.rs`,
+  after type checking, on the typed tree): an effect on a path to the
+  `redo` before the block that ends in it is the error `redo_effect`.
+  The block that ends in the `redo` is its fix-up and is exempt: the
+  examples redo after collecting, `make_room`, `become` + `refuse`,
+  growing a stack (Mini, Scheme), closing upvalues, flattening a rope
+  into the operand (MiniJS); with the fix-up counted, those were the
+  only false positives. Function calls are summarized (a least fixpoint:
+  a store through a pointer, a call through a value, an extern that
+  takes a pointer); `std.gc` and `std.gil` are bookkeeping. One site in
+  the examples needs `#[allow(redo_effect)]`: Python's `CALL_NEW`
+  calls `ensure`, which stores only on the path that does not redo.
+  The check found no real bug in the examples.
+- **The other invariant**, that the refill makes room for the size
+  `try_new` asked for (a wrong size to `make_room` loops forever), is
+  what the `new` lowering makes impossible: it computes the size.
+- **`new` is lowered only at a constant size of at most 496 bytes,
+  outside loops and cold blocks.** With a variable trailing length or a
+  large object `try_new` is a call too (`memset`, `alloc_large`), so the
+  lowering bought nothing and would run the op twice on a refill; in a
+  loop a refill would restart the loop. A literal trailing length is
+  folded into one constant, as `size_of<T>() + size_of<E>()` is.
+
+**Ports** (`loimi ir-diff --release --asm` of the unported sources
+against the ported ones, both built by the new compiler):
+
+| Interpreter | Ported | Code |
+|---|---|---|
+| Python | 23 `#[poll(gc)]` | same, 3 modes, also `--cfg debug` |
+| Scheme | 9 polls (`gc`, `gc_fall`); CONS, MKBOX `new` | same, 3 modes |
+| MiniJS | 5 polls and a `poll gc;`; BOXNEW, REBOX `new` | same, 3 modes |
+| Stack | 2 polls | same, 3 modes |
+| Mini | 5 GC polls, 9 GIL, 6 pause (`#[poll]` and `poll ..;`) | same, 3 modes, `--cfg gil`, `--cfg debug`, `--jit-stencils` |
+| Prolog | 10 `try_cons`/`try_var` refills as `new`, METACALL's poll | handlers the same but an equivalent compare in PUT_LIST and PUT_VAR_X (`cmpq $31; jbe` for `cmpq $32; jb`); cold refills call `std.gc.make_room` directly; same with `--jit-stencils` |
+
+The compiler's own effect on unported code (the base compiler against
+the new one, same sources): one handler in the nine interpreters,
+Python's `MAKECELL` (`r = Cell(new(..))`), whose `new` is now lowered:
+its frame and inline refill call are gone (47 lines of assembly to 33).
+
+**Not ported**: Python's and Lox's `gc_point()` (a fall-through poll
+in a vm function, called from inside cold blocks, where a poll
+statement would nest one cold block in another); Prolog's `try_struct`
+(a constant length per case, in a vm function) and CALL/EXECUTE (their
+cold block copies a different tail by hand); Scheme's
+`try_closure`/`try_vect` and MiniJS's `try_obj` (variable lengths), and
+Scheme's REVERSE/APPEND2 refills (they fall back to a builtin, not
+`redo`); Mini's barrier tails (mid-op, after a store); the bare
+`if .. { gc.collect }` lines inside larger cold blocks.
 
 ### 2. Names and data on enum variants
 
