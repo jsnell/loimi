@@ -90,3 +90,18 @@ The timed builds print nothing; `check/NAME.wasm` are `SMALL_DATASET`
 builds with `POLYBENCH_DUMP_ARRAYS`, whose stderr `--check` compares
 with wasm3's. Results are in `examples/wasm/FRICTION.md`.
 
+## Measuring
+
+Changes to the interpreter are measured on both sets, interleaved
+(each benchmark runs once under every build in turn, best of 5 to 7),
+with `--align-functions=64` so that unrelated edits do not move the
+handlers, and on user+sys CPU time when the machine is shared. Even so,
+any change to a handler moves the ones after it, and on the i7-6700
+(Skylake) used for these numbers placement alone moved single programs
+by 3-4% either way, and before round three by 40%: a dispatch jump
+that ended on a 32-byte boundary (Intel's JCC erratum) made cholesky, lu
+and ludcmp take 1.4 times as long. `loimi build` now pads x86-64 vm
+branches off those boundaries (`--no-branch-align` to compare;
+`docs/lowering.md` §12). A change that moves a whole set's geometric
+mean by less than 1% is within this placement noise.
+

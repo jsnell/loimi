@@ -622,6 +622,17 @@ Geometric means of the times: wasm3 0.252 s, tail-call 0.226, goto
 
 Times in seconds.
 
+**2026-11-04, wasm round three** (after this run; tail-call only, best of
+7 interleaved, `--align-functions=64`): 0.838 of wasm3's time on
+PolyBench (0.932 for the build of this table in the same run) and 0.837
+on the seven `wasm` programs (0.850). Most of the PolyBench change is
+cholesky, lu and ludcmp (0.61–0.64 of their time): one handler's
+dispatch jump ended on a 32-byte boundary, which Intel's JCC erratum
+fix penalizes on this Skylake, and `loimi build` now pads vm branches
+off those boundaries; the rest is bounds checks against the end of the
+access and array-element loads as one op
+([examples/wasm/FRICTION.md](../examples/wasm/FRICTION.md), "Round three").
+
 ### stack
 
 | benchmark | tailcall | goto | switch |

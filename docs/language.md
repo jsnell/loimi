@@ -3078,8 +3078,8 @@ kind gets none, so an `inline for` may mark a whole table. The vm item
 `accumulate ADD, CVT, FMUL;` marks the ops it names, for picking a few
 ops out of `inline for` tables: every variant is an opcode and a
 handler, and in goto mode all handlers are one function (the wasm
-interpreter marks 90 ops, which gives 287 variants: 669 opcodes instead
-of 382; its goto build takes 17 s and 220 MB, `lowering.md` §5, where it
+interpreter marked 90 ops at first, which gave 287 variants: 669 opcodes
+instead of 382 (121 ops now); its goto build took 17 s and 220 MB, `lowering.md` §5, where it
 took 4 minutes and 1 GB before goto mode shared one dispatch block, and
 marking every op then no longer fit in 2.5 GB).
 

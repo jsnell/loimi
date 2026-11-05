@@ -588,6 +588,181 @@ one. Per kernel, wasm3 / round one / round two (seconds):
 at about 1.0 (short runs, 0.07–0.3 s, so start-up and noise weigh
 more), and fasta (0.97).
 
+### Round three: handler placement, the bounds check, array loads (2026-11-04)
+
+**Where it started.** The same build as round two measured worse on
+PolyBench in this session (0.935 of wasm3's time against 0.893): three
+kernels, cholesky, lu and ludcmp, took 1.2–1.3 times wasm3's time, where
+round two had 0.83–0.92. They share one loop (the initialization
+`B = A·Aᵀ`), and a build that differed only in an unrelated function of
+`rt.lm` ran cholesky in 0.62 s instead of 0.92 s. That build had every
+handler 128 bytes further on (`--align-functions=64` keeps them aligned,
+not in place); the sampling profiler put a third of the slow build's time
+in `F64_LOAD__AR`, 18% in the fast one, with the same code. Its dispatch
+`jmp *%rax` ended exactly at a 64-byte boundary. On this i7-6700
+(Skylake) the microcode fix for Intel's JCC erratum keeps every 32-byte
+block with a branch that crosses or ends at its end out of the uop
+cache, so the handler ran from the legacy decoders.
+
+1. *Branch alignment in the driver* (a compiler change, docs/lowering.md
+   §12): x86-64 programs with a vm are built with
+   `-x86-align-branch=fused+jcc+jmp+indirect` and prefix padding, so no
+   branch, dispatch jumps included, crosses or ends at a 32-byte boundary
+   (clang's `-mbranches-within-32B-boundaries` leaves indirect jumps
+   out). `--no-branch-align` drops it. Best of 5 interleaved, with
+   against without: PolyBench 0.963 (cholesky 0.67, lu 0.71, ludcmp
+   0.70, the rest ±3%), tuning set 1.003; Mini 0.99 and MiniJS 1.01,
+   per program ±4% both ways. Padding only the indirect jumps fixed the
+   three kernels too but measured 1.005 on the tuning set (coremark 1.03,
+   with nops or with prefixes); clang's option alone, tuning set 1.009
+   (binarytrees 1.06) and PolyBench 0.970. The kernels are back where round two had them;
+   what the option buys is that a handler can no longer land on a
+   boundary by accident.
+2. *The bounds check against the end of the access.* A load's 16-bit
+   field held the offset, and the handler computed `ea = a + off`,
+   `ea + size > msize`, and the address `mem + ea`: `lea`, `add`, `cmp`,
+   `ja` and another `add`. It now holds `offset + size` (operand kinds
+   `e1`..`e16`, verified to be at least the size, so the access cannot
+   start before `mem`): `top = a + end; if top > msize`, at
+   `mem + top - size`, whose `- size` is the displacement of the `mov`
+   (`F64_LOAD__AR` 17 instructions to 15; every scalar and vector load
+   and store with an offset, and `BR_I32_LOAD_NZ`). An offset whose end
+   does not fit takes the `ADDR` path as before. Tuning set 0.986,
+   PolyBench 0.966 (nbody 0.95, binarytrees 0.97, fannkuchredux 1.03).
+3. *Array-element loads.* `local.get p; local.get i; i32.add; f64.load`
+   (a row pointer plus a scaled index, offset 0) is the most frequent pattern
+   left in PolyBench: an `I32_ADD` followed by a load is 3–15% of the
+   dispatches in 25 of the 30 kernels (not every time the load of that
+   sum), and rare in the tuning set, whose C walks pointers instead. Like the K forms of round one, the load takes
+   the add: `F64_LOAD_R d, a, b` loads at `(a + b) mod 2^32`, and with
+   the sum `local.tee`'d first (as clang does when it reuses the
+   address for the store), `F64_LOAD_TR d, t, a, b` also writes it to
+   `t` (12-bit fields, like `_TK`). Eight loads each. The translator
+   replaces the `I32_ADD` that the load would read (the last op, written
+   to the address's home or to the tee'd local). gesummv's inner loop
+   went from 18 dispatches to 15.
+4. *Accumulator variants for loads with two results.* `_TK` and `_TR`
+   write the loaded value and the address, and `#[accumulate]` gave an op
+   with two only-assigned operands no result variant, so their loaded
+   value always went through a slot. The derivation now takes the first
+   such operand as the result (language.md §7.4), and five `_TK`, five
+   `_R` and five `_TR` loads are in the `accumulate` list
+   (`F64_LOAD_TR__ARR`: the value in `xmm0`, the address in its local).
+   Items 3 and 4 together, against item 2: PolyBench 0.964; tuning set
+   1.006 in the same run (with a load average of 4 from other agents;
+   coremark 1.03), and 0.984 on a rerun of the four programs that had
+   moved (coremark 0.995, fannkuchredux 0.94, where `I32_LOAD_TK` was
+   4.6% of the time, fasta and mandelbrot 1.00).
+
+**Results** (best of 7, interleaved, `--align-functions=64`, tail calls,
+user+sys seconds; load average 3–4 from other agents, so ±3% per
+program). "before" is the build this round started from (round two,
+built without branch alignment), "after" all four items:
+
+| benchmark | wasm3 | before | after | after / before | before / wasm3 | after / wasm3 |
+|---|---:|---:|---:|---:|---:|---:|
+| binarytrees | 1.451 | 1.341 | 1.295 | 0.97 | 0.92 | 0.89 |
+| coremark | 2.026 | 1.847 | 1.788 | 0.97 | 0.91 | 0.88 |
+| fannkuchredux | 1.659 | 1.402 | 1.426 | 1.02 | 0.85 | 0.86 |
+| fasta | 1.486 | 1.112 | 1.103 | 0.99 | 0.75 | 0.74 |
+| mandelbrot | 2.050 | 1.552 | 1.538 | 0.99 | 0.76 | 0.75 |
+| nbody | 2.094 | 1.937 | 1.855 | 0.96 | 0.93 | 0.89 |
+| spectralnorm | 2.040 | 1.753 | 1.764 | 1.01 | 0.86 | 0.86 |
+| **geomean** | 1.809 | 1.538 | 1.515 | **0.985** | 0.850 | **0.837** |
+
+| kernel | wasm3 | before | after | after / before | before / wasm3 | after / wasm3 |
+|---|---:|---:|---:|---:|---:|---:|
+| 2mm | 0.128 | 0.119 | 0.105 | 0.88 | 0.93 | 0.82 |
+| 3mm | 0.192 | 0.185 | 0.169 | 0.91 | 0.96 | 0.88 |
+| adi | 0.247 | 0.221 | 0.215 | 0.97 | 0.89 | 0.87 |
+| atax | 0.106 | 0.099 | 0.092 | 0.93 | 0.93 | 0.87 |
+| bicg | 0.104 | 0.101 | 0.094 | 0.93 | 0.97 | 0.90 |
+| cholesky | 0.763 | 0.991 | 0.637 | 0.64 | 1.30 | 0.83 |
+| correlation | 0.064 | 0.060 | 0.056 | 0.93 | 0.94 | 0.88 |
+| covariance | 0.062 | 0.060 | 0.051 | 0.85 | 0.97 | 0.82 |
+| deriche | 1.114 | 0.844 | 0.871 | 1.03 | 0.76 | 0.78 |
+| doitgen | 0.058 | 0.053 | 0.048 | 0.91 | 0.91 | 0.83 |
+| durbin | 0.153 | 0.138 | 0.127 | 0.92 | 0.90 | 0.83 |
+| fdtd-2d | 0.192 | 0.168 | 0.157 | 0.93 | 0.88 | 0.82 |
+| floyd-warshall | 1.544 | 1.453 | 1.350 | 0.93 | 0.94 | 0.87 |
+| gemm | 0.108 | 0.104 | 0.094 | 0.90 | 0.96 | 0.87 |
+| gemver | 0.893 | 0.732 | 0.717 | 0.98 | 0.82 | 0.80 |
+| gesummv | 0.287 | 0.293 | 0.272 | 0.93 | 1.02 | 0.95 |
+| gramschmidt | 0.115 | 0.111 | 0.106 | 0.95 | 0.97 | 0.92 |
+| heat-3d | 0.315 | 0.249 | 0.253 | 1.02 | 0.79 | 0.80 |
+| jacobi-1d | 0.088 | 0.076 | 0.068 | 0.89 | 0.86 | 0.77 |
+| jacobi-2d | 0.212 | 0.168 | 0.171 | 1.02 | 0.79 | 0.81 |
+| lu | 0.882 | 1.079 | 0.670 | 0.62 | 1.22 | 0.76 |
+| ludcmp | 0.871 | 1.059 | 0.651 | 0.61 | 1.22 | 0.75 |
+| mvt | 0.511 | 0.468 | 0.447 | 0.96 | 0.92 | 0.87 |
+| nussinov | 0.272 | 0.205 | 0.184 | 0.90 | 0.75 | 0.68 |
+| seidel-2d | 0.359 | 0.306 | 0.309 | 1.01 | 0.85 | 0.86 |
+| symm | 0.089 | 0.080 | 0.073 | 0.91 | 0.90 | 0.82 |
+| syr2k | 0.106 | 0.103 | 0.087 | 0.84 | 0.97 | 0.82 |
+| syrk | 0.060 | 0.057 | 0.053 | 0.93 | 0.95 | 0.88 |
+| trisolv | 0.123 | 0.117 | 0.115 | 0.98 | 0.95 | 0.93 |
+| trmm | 0.047 | 0.044 | 0.042 | 0.95 | 0.94 | 0.89 |
+| **geomean** | 0.202 | 0.188 | 0.169 | **0.899** | 0.932 | **0.838** |
+
+The tuning set: 0.850 to 0.837 of wasm3's time (0.985 of its own).
+PolyBench: 0.932 to 0.838 (0.899), of which the three erratum kernels
+are 0.61–0.64 and the rest 0.85–1.03; every kernel is now faster than
+under wasm3 (gesummv, the slowest, 0.95), where round two left four at
+about 1.0.
+
+**Evaluated and not built, or dropped:**
+
+- *Accumulator coverage of the round one and two ops.* Every op the
+  benchmarks execute that could have variants and has none was looked
+  at (`--vm-stats` over the 37 programs): `SELECT4`, the `SEL_*`
+  min/max ops and the `_TK` loads. With `SELECT4` and `SEL_*` in the
+  list nothing changed: their operands are locals or values used twice
+  (fasta's two selects share one compare; nussinov's max reads the
+  `local.tee`'d sum), never a single-use temporary. The `_TK` loads are
+  item 4. f32 ops (deriche only) cannot have variants (`facc` is f64,
+  and converting at each end would cost more than the slot), and i64
+  ops are rare in both sets.
+- *`BR_TABLE` jumping to its target directly* (reading the selected
+  JMP's offset instead of dispatching it): coremark, the only program
+  with a hot `br_table`, 1.796 s against 1.797. Not kept.
+- *Guard pages instead of bounds checks.* Reserving 4 GiB plus a guard
+  zone and `mprotect`ing the accessible part would need 8 GiB of
+  address space per memory; under the `ulimit -v 2500000` every build
+  and test here runs with, `mmap` of `PROT_NONE` memory counts against
+  the limit and fails. With item 2 the check is an `add`, a `cmp` and a
+  predicted `ja` (fused), so hoisting checks per basic block for
+  constant offsets on one base would save one compare per access at
+  the cost of a translator pass and of deferred traps that must still
+  happen in order. Not built.
+- *Loop-carried MOV rotations* (seidel-2d's three values per row,
+  mandelbrot's `zi`, coremark's list reversal `rev = list; list = next`).
+  Swapping slot assignments at the back edge removes the copies only if
+  the body is emitted once per rotation step (a cycle of k locals needs k
+  copies of the body with renamed slots, and every exit from copy j
+  needs the moves that restore the canonical slots): modulo variable
+  expansion, which is unrolling. seidel-2d is already 0.83 of wasm3 and
+  its MOVs 20% of its dispatches at one instruction of work each; not
+  built.
+- *Call-argument MOVs.* A callee's frame already starts at the caller's
+  first argument home, so arguments computed by an op are written there
+  directly; the MOVs left are `local.get` arguments (and `CONST32`s),
+  which copy a live local into the callee's parameter, as wasm3's slot
+  layout does too. Nothing to remove without changing the frame layout.
+- *Handlers with a stack frame* (`-W handler_frame`): the libm calls of
+  the f32/f64 `ceil`, `floor`, `trunc` and `nearest` (no `roundsd`
+  without SSE4.1), the bulk memory and table ops, and `I8X16_SHUFFLE`;
+  none of them runs in either set.
+
+**Next candidates.** Placement still moves single programs by 3–4%
+either way (fannkuchredux and coremark between builds that differ in
+other handlers), probably uop-cache set conflicts or branch predictor
+aliasing among the 40-odd hot handlers; ordering hot handlers together
+from a `--vm-stats` profile (docs/lowering.md §12 lists it as not
+implemented) would make that steadier. The R forms for stores need the
+sum pending (the store's address is computed before its value), like
+`Loc.AddK`. MOVs remain 7–20% of the dispatches of seidel-2d,
+floyd-warshall, fannkuchredux and coremark.
+
 ## Summary
 
 | File | Lines | What |

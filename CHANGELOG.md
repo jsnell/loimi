@@ -77,6 +77,15 @@ implementation; `git log` has the details.
 - **goto mode** emits one shared dispatch block that LLVM copies into
   every handler after register allocation: build time near linear in the
   op count ([lowering.md §5](docs/lowering.md#5-goto-mode)).
+- **Branch alignment on x86-64**: programs with a vm are built so that
+  no branch, the dispatch jumps included, crosses or ends at a 32-byte
+  boundary (Intel's JCC erratum keeps such code out of the uop cache on
+  Skylake-derived cores; one badly placed wasm handler made three
+  PolyBench kernels take 1.4 times as long). `--no-branch-align` turns it
+  off ([lowering.md §12](docs/lowering.md#12-driver-settings)).
+- **`#[accumulate]`** derives result variants for an op with several
+  only-assigned operands too: the first is the result, the others stay
+  slot writes ([language.md §7.4](docs/language.md#74-accumulators)).
 - **switch mode** builds with LLVM's tail merging off
   ([lowering.md §6](docs/lowering.md#6-switch-mode)).
 - **AArch64**: the tail-call dispatch table's address stays in a
@@ -417,6 +426,13 @@ implementation; `git log` has the details.
   one op, one MOV less for a tee over a pending read): 0.893 of wasm3 on
   PolyBench, 0.872 on the original seven
   ([`FRICTION.md`](examples/wasm/FRICTION.md), "A held-out set").
+- A third wasm round: branch alignment (above), bounds checks against
+  the end of the access (offset plus size in the code: one compare, the
+  address a displacement), `local.get p; local.get i; i32.add; load` as
+  one op (also with the sum `local.tee`'d), and accumulator variants for
+  the loads that write two slots: 0.84 of wasm3's time on the
+  seven programs, 0.84 (was 0.93 in the same run) on PolyBench
+  ([`FRICTION.md`](examples/wasm/FRICTION.md), "Round three").
 - The Scheme interpreter takes 0.894 of its previous time over the 43
   r7rs-benchmarks programs (0.40 of Guile's VM, was 0.45; 0.22 of
   Gauche, was 0.25): `list`, `vector`, record constructors, `memq` and
