@@ -1356,6 +1356,12 @@ fn Parser.statement_inner(p: *Parser) {
         }
         If => {
             p.advance();
+            var sw = true;
+            #[cfg(debug)] { sw = false; } // --cfg debug: each test is a line to stop at
+            if sw and let Some(plan) = p.switch_plan() {
+                p.if_switch(plan);
+                return;
+            }
             let done = p.fs.code.label();
             var f = p.cond();
             p.check(T.Then, "'then'");
@@ -1537,6 +1543,145 @@ fn Parser.statement_inner(p: *Parser) {
             targets.free();
         }
     }
+}
+
+/// An `if` whose conditions are all `x == K`, for one local `x` and
+/// integer constants K (numerals or constant locals): register `reg`,
+/// each arm's K in `keys`, the range `lo .. lo + n` they span.
+struct SwitchPlan { reg: u32, lo: i64, n: u64, keys: mem.Vec<i64> }
+
+/// Fewest arms for a jump table, and the largest table.
+const SWITCH_MIN: u64 = 4;
+const SWITCH_MAX: u64 = 64;
+
+/// The integer value of key token `t` (a numeral or a constant local).
+fn Parser.switch_key(p: *Parser, t: Token) -> ?i64 {
+    let v = match t.kind {
+        Number => t.num,
+        Name => match p.fs.resolve(p, t.text) {
+            Const(v) => v,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    if let Int(i) = v { return Some(i as i64); }
+    None
+}
+
+/// Look ahead (the parser is after `if`) for an if/elseif chain that
+/// `if_switch` can compile: at least SWITCH_MIN arms, keys in a range of
+/// at most SWITCH_MAX from 0 to 255.
+fn Parser.switch_plan(p: *Parser) -> ?SwitchPlan {
+    let t0 = p.tok;
+    if t0.kind != T.Name { return None; }
+    var lx = p.lx;
+    var keys: mem.Vec<i64> = mem.Vec.new();
+    var t = t0;
+    var ok = false;
+    loop {
+        // `x == K then`
+        if t.kind != T.Name or !t.text.eq(t0.text) { break; }
+        let Ok(e) = lx.next() else { break; };
+        if e.kind != T.Eq { break; }
+        let Ok(kt) = lx.next() else { break; };
+        let Some(key) = p.switch_key(kt) else { break; };
+        let Ok(th) = lx.next() else { break; };
+        if th.kind != T.Then { break; }
+        keys.push(key);
+        // The arm's block, to the next elseif, else or end at this level.
+        var depth: u64 = 0;
+        var arm_end = T.Eof;
+        loop {
+            let Ok(b) = lx.next() else { break; };
+            match b.kind {
+                If | Function | Do | Repeat => depth += 1,
+                End | Until => {
+                    if depth == 0 { arm_end = b.kind; break; }
+                    depth -= 1;
+                }
+                Elseif | Else => if depth == 0 { arm_end = b.kind; break; },
+                Eof => break,
+                _ => {}
+            }
+        }
+        if arm_end == T.Elseif {
+            let Ok(nt) = lx.next() else { break; };
+            t = nt;
+            continue;
+        }
+        ok = arm_end == T.Else or arm_end == T.End;
+        break;
+    }
+    if !ok or keys.len < SWITCH_MIN {
+        keys.free();
+        return None;
+    }
+    var lo = keys.at(0);
+    var hi = lo;
+    for i in 0..keys.len {
+        let k = keys.at(i);
+        if k < lo { lo = k; }
+        if k > hi { hi = k; }
+    }
+    let Loc(r) = p.fs.resolve(p, t0.text) else { keys.free(); return None; };
+    if lo < 0 or lo > 255 or (hi - lo + 1) as u64 > SWITCH_MAX {
+        keys.free();
+        return None;
+    }
+    Some(SwitchPlan { reg: r, lo: lo, n: (hi - lo + 1) as u64, keys: keys })
+}
+
+/// The if statement that `switch_plan` found: SWITCH and its table of
+/// JMPs to the arms (the first arm with a key wins, as the tests would),
+/// the arms' blocks as usual, the default to the else block or the end.
+fn Parser.if_switch(p: *Parser, plan: SwitchPlan) {
+    let done = p.fs.code.label();
+    p.emit(Mini.SWITCH(plan.reg as u8, plan.lo as u8, plan.n as u8));
+    let table = p.pc();
+    for i in 0..plan.n + 1 { p.emit(Mini.JMP(0)); }
+    var filled: mem.Vec<bool> = mem.Vec.new();
+    for i in 0..plan.n + 1 { filled.push(false); }
+    var arm: u64 = 0;
+    loop {
+        // `x == K then`, checked by switch_plan.
+        p.advance();
+        p.advance();
+        p.advance();
+        p.check(T.Then, "'then'");
+        p.fs.code.mark_target();
+        let slot = (plan.keys.at(arm) - plan.lo) as u64;
+        if !filled.at(slot) {
+            p.patch(table + slot, p.pc());
+            filled.set(slot, true);
+        }
+        arm += 1;
+        p.block();
+        if p.tok.kind == T.Elseif {
+            p.fs.code.jump(Mini.JMP(0), done);
+            p.advance();
+            continue;
+        }
+        if p.tok.kind == T.Else {
+            p.fs.code.jump(Mini.JMP(0), done);
+            p.advance();
+            p.fs.code.mark_target();
+            let here = p.pc();
+            for i in 0..plan.n + 1 {
+                if !filled.at(i) { p.patch(table + i, here); }
+            }
+            p.block();
+        } else {
+            for i in 0..plan.n + 1 {
+                if !filled.at(i) { p.fs.code.fixup(table + i, done); }
+            }
+        }
+        break;
+    }
+    filled.free();
+    var keys = plan.keys;
+    keys.free();
+    p.check(T.End, "'end'");
+    p.fs.code.bind(done);
 }
 
 fn Parser.numeric_for(p: *Parser, name: str, line: u32) {
