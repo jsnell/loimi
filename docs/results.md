@@ -377,6 +377,47 @@ tail-call properties 1.15. What changed, from `git log 95a227e..c7e94ae`:
   Python's `--cfg debug` builds. Regex, Stak, the wasm SIMD builds and
   the Prolog interpreter moved within ±3% relative to their references.
 
+## Hot-handler ordering and the two alignment losses (2026-11-05)
+
+A dated A/B after this run, not reflected in the tables below
+([lowering.md §12](lowering.md#12-driver-settings), "What the two
+alignment losses were" and "Handler order"). Both single-benchmark
+losses that branch alignment brought (Lox `properties` tail-call 1.13,
+PolyBench `gemm` goto 1.37) are placement draws rather than the
+padding: `gemm` is fast again when the whole text moves by any of 63
+other multiples of 64 bytes, and `properties` when its three hot
+handlers sit together. Lox, Mini, MiniJS, Stak, Python, the Prolog
+interpreter and the wasm interpreter now carry `#[profile]` (their
+`*.vmprofile`, from `--vm-stats` over their suites; wasm's over the
+seven programs, so PolyBench stays held out), which lays out tail-call
+and goto builds hottest handler first in a section of their own. Same
+machine, user+sys, minimum of two interleaved passes, ordered over
+`--vm-profile=none`:
+
+| suite | tailcall | goto |
+|---|---:|---:|
+| lox (9) | 0.982 | 0.996 |
+| mini (14) | 1.001 | 0.996 |
+| mini-coro (3) | 0.974 | 1.016 |
+| minijs (14) | 0.999 | 0.996 |
+| wasm (7) | 1.001 | 0.999 |
+| wasm-polybench (30) | 1.001 | 0.988 |
+| stack (5) | 1.003 | 0.999 |
+| python (11) | 1.002 | 1.000 |
+| prolog (30) | 0.999 | 0.997 |
+| scheme (43, not opted in) | 1.008 | 1.000 |
+
+Lox `properties` tail-call 0.212 s → 0.188 s, PolyBench `gemm` goto
+0.131 s → 0.094 s (cholesky, lu and ludcmp unchanged, keeping the gains
+alignment brought). Switch and `--jit-stencils` builds are not ordered.
+In goto builds, `--align-functions=128` moved single benchmarks 1.22% on
+average and up to 33% in declaration order, 0.47% and at most 3.1%
+ordered (between identical binaries: 0.55%); tail-call builds were as
+steady either way. The other two mode ratios that grew in this run are
+not placement: unaligned (`--no-branch-align`) builds give MiniJS
+switch/tail-call 1.198 against 1.215 aligned, Python goto/tail-call
+1.091 against 1.104.
+
 ## Per suite
 
 ### mini
@@ -503,6 +544,10 @@ Times in seconds.
 
 Times in seconds.
 
+Note (2026-11-05): with `#[profile]` (hot-handler ordering), tail-call
+`properties` takes 0.188 s instead of 0.212 s; see "Hot-handler ordering
+and the two alignment losses" above.
+
 ### regex
 
 | benchmark | tailcall | goto | switch | pcre2 | python-re | tailcall/pcre2 | tailcall/python-re |
@@ -589,6 +634,11 @@ Geometric means of the times: wasm3 0.193 s, tail-call 0.161, goto
 | **geomean** |  |  |  |  | **0.83** |
 
 Times in seconds.
+
+Note (2026-11-05): with `#[profile]` (hot-handler ordering), goto-mode
+`gemm` takes 0.094 s instead of 0.131 s and the goto column's geometric
+mean is 0.988 of this one's; see "Hot-handler ordering and the two
+alignment losses" above.
 
 ### stack
 

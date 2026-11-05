@@ -1112,7 +1112,7 @@ interleaved, `--align-functions=64`).
 | switch mode: `-mllvm -enable-tail-merge=false` when the program has a switch-mode vm (§6) | handlers branch straight back to the switch instead of through shared tails |
 | handlers `nounwind`; whole program `-fno-exceptions`-equivalent | no unwind tables in the hot path |
 | `cold` functions placed in `.text.unlikely` | i-cache locality for handlers |
-| optional handler ordering from `--vm-stats` profiles (not yet implemented) | hot handlers placed together |
+| a vm with `#[profile("file")]` (or `--vm-profile=FILE`): its handlers in profile order, the profiled ones in a page-aligned `.text.hot.<vm>` section, its outlined cold blocks in `.text.<vm>.cold` after it ("Handler order", below) | the hot handlers' layout depends only on their own code |
 | target check: `preserve_none` available? otherwise warn and fall back to `goto` (not implemented: both targets have it) | portability |
 | executables `-fno-pic -no-pie`; `--lib`/`--shared` `-fPIC` | absolute dispatch-table addresses; libraries link anywhere |
 | initial-exec TLS; local-dynamic for `--shared` (`--tls=`) | `dlopen`-safe shared objects (§4) |
@@ -1140,6 +1140,101 @@ without: wasm PolyBench 0.963 (geometric mean of 30; the three kernels
 0.67-0.70), wasm tuning set 1.003, Mini 0.99 (14 programs), MiniJS 1.01
 (14), per program within ±4% for the interpreters without such a
 handler, both ways: the padding moves code, so other placements change.
+
+**What the two alignment losses were** (2026-11-05; best of 3–5
+interleaved, user+sys). Neither is the padding itself; both are where
+the padding happened to leave hot code:
+
+- *PolyBench `gemm`, goto mode* (0.129 s aligned, 0.094 s not). Moving
+  the whole text by any multiple of 64 bytes from 64 to 4032 at link
+  time (a nop object in front: the same code, every offset between
+  handlers kept) gives 0.093 s; so do 15 of 16 page shifts from 4 KiB
+  to 64 KiB (32 KiB is slow again). Moving `.rodata`, `.data` or `.bss`
+  instead changes nothing. The cost depends
+  on the hot handlers' absolute addresses, with a period of more than
+  32 KiB: two hot branches meeting in a hashed branch-predictor index,
+  not a decoder or cache effect (those would follow the handlers'
+  offsets, which did not change). The unaligned build has the same
+  exposure at other addresses.
+- *Lox `properties`, tail-call mode* (0.210 s against 0.186). The three
+  handlers that run (GETGLOBAL_C, INVOKE_P, GETPROP_IN_RET, 95% of
+  dispatches) have the same code in the slow build and in one aligned
+  for `jcc` (no `indirect`) only, which is fast; they differ only in
+  INVOKE_P and GETPROP_IN_RET being 64 bytes further from GETGLOBAL_C,
+  because padding
+  elsewhere grew an unrelated function past a 64-byte boundary. Slow at
+  all 64 link-time shifts, so it is their relative placement; with prefix
+  padding replaced by nops (`-x86-pad-max-prefix-size=0`), as slow.
+  Placing the three next to each other gives 0.187 s aligned and
+  unaligned.
+
+Clang has no setting that avoids either: whether a layout has such a
+collision is not visible in the code, and every other layout change
+(an edit anywhere before the hot handlers) draws again. What can be
+controlled is that unrelated edits do not draw again, which is what
+the handler order below does.
+
+**Handler order.** A vm with `#[profile("file")]` (language.md §3.7;
+or any vm, with `--vm-profile=FILE`) has its handlers laid out by the
+profile: the ops it counts first, the most dispatched first, the rest
+after in declaration order. The file is `--vm-stats` output, any number
+of runs concatenated (each run's counts scaled to fractions of its own
+dispatches, so that a long run does not drown short ones), or a list
+of op names, hottest first. `src/hotorder.rs` reads it.
+
+- tail-call mode: the handler functions are emitted in that order; the
+  profiled ones get `section ".text.hot.<vm>"`, the first `align 4096`;
+- goto mode: the handler blocks are emitted in that order (block
+  placement keeps it, since only the indirect branch reaches them), and
+  the vm's entry function, which holds them, goes to the hot section;
+- switch mode and `--jit-stencils` builds: none of it. Switch-mode
+  timings hardly depend on placement, and the profile's order measured
+  slower in both (below);
+- the vm's outlined cold blocks get `section ".text.<vm>.cold"`.
+
+GNU ld's default script (the host linker here) places `.text.hot.*`
+after `.text.unlikely.*` and before the rest of `.text`, so what
+precedes the hot handlers is the C start-up code and the program's own
+`cold` functions. The vm's cold blocks, which change with every slow
+path, are moved behind them (by default they are `cold` functions in
+`.text.unlikely`, ahead of everything). The page alignment makes the
+hot handlers' addresses modulo 4096 depend only on their own code and
+the profile. A change to a handler outside the profile, or to any
+ordinary function, no longer moves them; `--vm-profile=none` builds as
+without the attribute (the A/B baseline).
+
+Measured (2026-11-05, `bench/run_all.py`'s builds and benchmarks, 166
+per mode over ten suites, `--align-functions=64`, user+sys, minimum of
+two interleaved passes of 3–5 runs; profiles from the suites' own
+benchmarks, wasm's from its seven programs only, so PolyBench is held
+out). Ordered against `--vm-profile=none`, geometric mean over all
+benchmarks: tail-call 1.001, goto 0.997 (PolyBench 0.988), switch 1.001
+(Python 1.027, hence switch mode is left out). Lox `properties`,
+tail-call: 0.212 s → 0.188 s; PolyBench `gemm`, goto: 0.131 s → 0.094 s.
+Stability: each build against itself perturbed, mean |log ratio| per
+benchmark, beside an identical copy of the binary (the noise):
+
+| mode | noise | `--align-functions=128` | 2 KiB in an unrun handler | text moved 1088 bytes |
+|---|---:|---:|---:|---:|
+| tail-call, declaration order | 0.53% | 1.19% | 0.68% | 0.60% |
+| tail-call, ordered | | 1.29% | 0.62% | 0.72% |
+| goto, declaration order | 0.55% | 1.22% (6 over 5%, gemm 33%) | | |
+| goto, ordered | | 0.47% (none over 3.1%) | | |
+| switch, declaration order | 0.47% | 0.65% | | |
+
+Goto mode is where layout moved timings, and ordering removes that.
+With `--align-functions=64` (as `run_all.py` builds) tail-call handlers
+each start on a 64-byte boundary, so their own layout never changes;
+what remains is their distance from one another, and the measurements
+do not tell ordered from unordered there. `gemm`'s recovery is itself a
+draw (its alias depends on absolute addresses, which ordering changes);
+what ordering adds is that the draw no longer changes with unrelated
+edits.
+Two follow-ups were dropped: moving the functions the hot handlers call
+into the hot section too (Python, whose handlers call its runtime: no
+difference) and ordering `--jit-stencils` builds (Mini 1.011,
+string_build 1.11 slower). Scheme is the one interpreter not opted in
+(tail-call 1.008 slower ordered).
 
 **`--cpu`.** The driver asks clang which extensions the CPU has
 (`clang -march=NAME -E -dM`: `__SSSE3__`, `__SSE4_1__`), so `native` and
