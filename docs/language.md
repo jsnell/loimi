@@ -207,6 +207,71 @@ enum Token { Num(f64), Ident(Symbol), Punct(u8), Eof }
   and their parameters take no bounds: the bounds of the aliased type
   are checked where it is instantiated. Aliases are imported like other
   items (`import m.{Name}`, `m.Name`).
+
+#### Variant names and data
+
+An interpreter's builtins, exception kinds and operators are enums
+with tables beside them: name to variant for registration, variant to
+message, arity or base class. The tables can live on the variants
+instead, and the compiler generates the lookups:
+
+<!-- snippet: run "car 1 1" "+ 0 -1" "Some" -->
+```loimi
+import std.io;
+
+/// Builtins by the id a value holds: the Scheme name, the argument
+/// counts (-1: any) and whether the compiler inlines it.
+#[data(min: i32 = 1, max: i32 = 1, inline: bool = false)]
+enum Prim: i32 {
+    #[name("+"), data(0, -1, inline = true)] Add,
+    #[name("car"), data(inline = true)] Car,
+    #[name("vector-ref"), data(2, 2)] VectorRef,
+    #[name("display"), data(max = 2)] Display,
+}
+
+fn main() {
+    for id: i32 in 0..Prim.COUNT {
+        let p = id as Prim;
+        io.print(p.name()); io.print(" ");
+        io.print_int(p.min() as i64); io.print(" ");
+        io.print_int(p.max() as i64); io.println("");
+    }
+    io.println(match Prim.from_name("car") { Some(_) => "Some", None => "None" });
+}
+```
+
+- **Names.** `#[name("..")]` on a variant, or `#[names]` on the enum,
+  generates `E.name(k) -> str` and, for an enum without payloads,
+  `E.from_name(s: str) -> ?E`. A variant without `#[name]` is named as
+  written (`#[names] enum Exc { TypeError, ValueError }` names them
+  `"TypeError"` and `"ValueError"`). Two variants may not have the same
+  name.
+- **Data.** `#[data(key: Type, key: Type = default, ..)]` on the enum
+  declares keys; `#[data(..)]` on a variant gives its values, by
+  position (in the keys' order), then as `key = value`. A key without a
+  default must be given by every variant. Each key generates an
+  accessor `E.key(k) -> Type` (`p.min()`). Values are constants:
+  literals, names of constants and variants, and constructors, tuples
+  and arrays of them (`Some(Op.Ge)`, `(4, true)`); a value of the wrong
+  type is reported at the value. `name`, `from_name` and `COUNT` cannot
+  be keys, a hand-written `fn E.name` (or `E.key`) is an error, and
+  generic enums take neither names nor data.
+- **Cost.** The functions are generated as source in the enum's module
+  and compiled only if something calls them: an enum with names and
+  data that nobody looks up compiles to the same IR as one without.
+  `name` and the accessors are `#[inline]` `match`es that return
+  constants, so LLVM turns a lookup of an unknown variant into a
+  constant-table load (or merges it into a `switch` already on the
+  same value) and folds it for a known one (`Prim.Car.min()` is `1`).
+  `from_name` is a string `match`: a `switch` on the length, then
+  word-sized compares.
+
+`LOIMI_DUMP_VM_EXPANSION=1` prints the generated functions (as `<enum
+E expansion>`). Scheme's 149 primitives (`examples/scheme/builtins.lm`,
+`enum Prim`, with the op that inlines a primitive as the data `op:
+?PO`) and Python's exception classes (`examples/python/builtins.lm`,
+`enum Exc`, with `parent: ?Exc`) are written this way.
+
 #### Patterns, literals and `match`
 
 - `match` is exhaustive. `if let`, `let ... else`, and `while let` are supported.

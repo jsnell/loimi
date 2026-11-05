@@ -122,6 +122,16 @@ implementation; `git log` has the details.
 
 ### Core language
 
+- **Names and constant data on enum variants**: `#[name("car")]` and
+  `#[names]` generate `E.name(k)` and `E.from_name(s)`; `#[data(min: i32
+  = 1, max: i32 = -1)]` on the enum and `#[data(2, 2)]` on its variants
+  generate one accessor per key (`p.min()`). Compiled only where
+  called; the lookups are `match`es LLVM turns into tables
+  ([language.md §1.2](docs/language.md#variant-names-and-data)).
+  Scheme's 149 primitives (five parallel copies: `prim_info`, `P_*`
+  ids, raw-number arms in `call_native`, `inline_prim`'s name chain)
+  and Python's exception kinds (`E_*`, `enames`, `eparents`) now use
+  them.
 - **Pointer stability** (prototype; `docs/design/lifetimes.md`): in
   `#![safe]` and `#![lifetimes]` modules, a pointer or slice into a
   container used after a call that may move or free it (`push`,
@@ -385,6 +395,11 @@ implementation; `git log` has the details.
 
 ### Tooling
 
+- **`loimi ir-diff A B`** compares the optimized IR (and with `--asm`
+  the assembly) of two builds function by function, ignoring panic
+  locations, constant and local names, metadata numbering and function
+  order, so a refactor that moves lines can be shown to be zero-cost
+  ([status.md](docs/status.md#comparing-builds-loimi-ir-diff)).
 - **`--vm-stats`** counts entries into each `cold` block, per op, with
   its source location ([status.md](docs/status.md), Instrumentation row).
 - **Doc-snippet test**: every `loimi` code block in the README and

@@ -1,7 +1,15 @@
 # Design note: an ergonomics audit (zero run-time cost)
 
-Status: **proposal, nothing built.** Written 2026-11-05 against master
-at 627c1ca.
+Status: **proposal; items 2 and 4 (step 1) built.** Written 2026-11-05
+against master at 627c1ca.
+- **Item 2** (names and data on enum variants): built as `#[name]`,
+  `#[names]` and `#[data(key: Type = default)]`
+  ([language.md §1.2](../language.md#variant-names-and-data)). Scheme's
+  primitives and Python's exception kinds are ported; the section below
+  records what changed from the proposal and what the IR diff showed.
+- **Item 4, step 1** (`loimi ir-diff`): built
+  ([status.md](../status.md#comparing-builds-loimi-ir-diff)). The
+  examples' `#[cfg]` lines are not unpacked yet.
 
 > Where could we give the user meaningfully better ergonomics at no
 > run-time cost, even if it makes the Loimi implementation itself more
@@ -56,9 +64,9 @@ interpreters affected) against the compiler cost. Cost is S (days), M
 | # | Proposal | Evidence | Cost |
 |---|---|---|---|
 | 1 | Declared safepoint polls, and handler-lowered allocation refills | 73 lines testing the heap threshold in 7 interpreters (46 the full poll), plus 29 `gc_point()` calls; 24 `else cold { make_room; redo }`; Mini's 9 GIL/pause polls and 6 barrier tails | M |
-| 2 | Names and data on enum variants (`#[name]`, generated `name`/`from_name`, per-variant constants) | ~650 rows of parallel tables: Scheme ~260 (5 copies of its 149 primitives), Python ~150, Prolog 90, Mini 84 (3 copies of 27 natives); 27 `E_*` + `enames`; Trap messages; 4 operator tables | M |
+| 2 | **Built.** Names and data on enum variants (`#[name]`, generated `name`/`from_name`, per-variant constants) | ~650 rows of parallel tables: Scheme ~260 (5 copies of its 149 primitives), Python ~150, Prolog 90, Mini 84 (3 copies of 27 natives); 27 `E_*` + `enames`; Trap messages; 4 operator tables | M |
 | 3 | Op relations and per-op metadata in `inline for` rows | Wasm: 178 relation rows + 329 translator rows whose types repeat operand kinds; Mini's 24-arm `jump_op`/`negate_jump`; Python, Prolog, Lox op maps | M |
-| 4 | Panic locations out of the IR identity check (`loimi ir-diff`), then `extend vm` blocks | 97 `#[cfg(..)]` lines in Mini (71) and Python (26) packed onto existing lines; Python/Mini `on break` and variants on the line closing `on raise` | S, then M |
+| 4 | Panic locations out of the IR identity check (`loimi ir-diff`: **built**), then `extend vm` blocks | 97 `#[cfg(..)]` lines in Mini (71) and Python (26) packed onto existing lines; Python/Mini `on break` and variants on the line closing `on raise` | S, then M |
 | 5 | Cache layouts from structs; cache handles for plain functions | 31 `&cache.f` sites; `PropIC` copies `obj.Site` field by field in Lox and MiniJS, plus 22 `as *obj.Site` casts | S |
 | 6 | Terminal `raise`, `fail` and `become ..; redo` are cold by default | 119 `cold { raise .. }` in 8 vms; 21 `cold { become X; redo }` | S–M |
 | 7 | Report more than one error per build | Python: ~15 fix-and-rebuild cycles for 10k lines (FRICTION 582) | S |
@@ -310,6 +318,53 @@ arguments differently.
 
 **Interactions.** None with handlers, lifetimes, stencils, dispatch or
 the debugger. The debugger's value printers may use `name`.
+
+**As built** (2026-11-05). Three refinements of the proposal:
+- **Keys are declared on the enum, with types and defaults**:
+  `#[data(min: i32 = 1, max: i32 = 1)]`. Inferring a key's type from
+  the first value cannot type `-1` as `i32` or `None` as `?Op`, and a
+  default makes the common row empty (most of Scheme's primitives take
+  one argument). Variants give values by position or by key.
+- **`name` is opt-in** (`#[name]` on some variant, or `#[names]`), so
+  existing `fn E.name` methods keep working, and a hand-written method
+  of a generated name is an error rather than a silent override.
+- **Data may be of enum and option type**, so a relation between two
+  enums is data rather than a third table: Scheme's `Prim` carries `op:
+  ?PO`, the op its compiler inlines it as, which replaced
+  `inline_prim`'s 41-line name chain; Python's `Exc` carries `parent:
+  ?Exc`, which replaced the `eparents` array of numbers.
+
+**Ports, and what `ir-diff` showed** (`--release --asm`, tail-call
+dispatch, against the sources at 3fc9376 built by the same compiler):
+- **Scheme** (`enum Prim: i32`, 149 variants; `enum PO` moved next to
+  it with `arity` data): 507 of 511 functions the same, every vm handler
+  among them. `inline_prim` is gone; `Comp.inl` and `Comp.build_inner`
+  (compile time) now use `from_name` and `op()`: a `switch` on the
+  length and word compares instead of up to 41 `str.eq` calls, so no
+  worse; LLVM inlines `from_name` there (+418 assembly lines in all).
+  `call_native` keeps its shape (a jump table of the arity rows, merged
+  with the dispatch `switch`), with the `name`/`min`/`max` constants
+  materialized in a different order: 3,286 instructions against 3,186,
+  at most one more `mov` on a builtin's path. Timing (r7rs, 8 programs,
+  user+sys, interleaved, `--align-functions=64`) was within the
+  machine's noise: geomean base/new 0.98 and 1.07 in two runs.
+- **Python** (`#[names] enum Exc: u64`, 27 variants): 707 of 708
+  functions the same. The one that differs is `main.main`, where the
+  start-up loop that creates the exception classes is inlined: it now
+  reads `name()` and `parent()` instead of two stack arrays (+160
+  assembly lines, run once). Every `exc(c, Exc.TypeError, ..)` site
+  passes the same constant as before. Timing (8 pyperformance
+  programs, user+sys, min of 5, interleaved): geomean new/base 1.00,
+  with single programs within the machine's noise (load 6 to 8 on 8
+  cores) either way.
+- **Not ported**: Python's `enum B` registration arrays (about 150
+  rows) would put one attribute on each of 190 variants now written
+  fifteen to a line, so the file would grow. Mini's natives have
+  explicit, gapped ids (0..5, 10..19, ..; `call` dispatches on them),
+  so a registration loop over the variants needs a way to enumerate
+  them (`i as E` is only valid for `0..E.COUNT` without explicit
+  discriminants); a generated `E.ALL` would be the next step. Prolog's
+  `B` and arithmetic codes are straightforward candidates.
 
 ### 3. Op relations and per-op metadata in `inline for` rows
 
