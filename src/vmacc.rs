@@ -321,7 +321,9 @@ pub fn desugar(v: &mut VmDecl) -> Res<()> {
             continue;
         }
         // Operands of accumulator kinds: the one the body only assigns is
-        // the result; the ones it never assigns are sources.
+        // the result (the first of several: an op that also writes a
+        // second slot, like a load that writes its address back, keeps
+        // that write); the ones it never assigns are sources.
         let mut dsts = Vec::new();
         let mut srcs = Vec::new();
         for (i, p) in op.params.iter().enumerate() {
@@ -333,7 +335,7 @@ pub fn desugar(v: &mut VmDecl) -> Res<()> {
                 srcs.push((i, *ai));
             }
         }
-        let dst = if dsts.len() == 1 { Some(dsts[0]) } else { None };
+        let dst = dsts.first().copied();
         if dst.is_none() && srcs.is_empty() {
             // (An `inline for` may mark ops of other kinds too.)
             continue;

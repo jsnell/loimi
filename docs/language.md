@@ -3059,8 +3059,10 @@ a float one (the value is converted with `as`, so an `i32` view of a
 only: no GC references, so a value in one needs no rooting.
 
 `#[accumulate]` on an op derives its **variants**: the operand of an
-accumulator's kind that the body only assigns (`d = ..`) is the result,
-and those it never assigns are sources. There is one variant per choice
+accumulator's kind that the body only assigns (`d = ..`) is the result
+(of several such operands the first; the others stay slot writes, as in a
+load that also writes its address back to a slot), and those it never
+assigns are sources. There is one variant per choice
 of result (slot or accumulator) and of at most one source taken from an
 accumulator, except the op itself: `ADD` gets `ADD__ARR` (`iacc = a +% b`),
 `ADD__AAR` (`iacc = iacc +% b`), `ADD__ARA`, `ADD__RAR` (`d = iacc +% b`)

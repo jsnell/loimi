@@ -37,6 +37,9 @@ vm V {
     // Reads its destination: only source variants.
     #[accumulate] op FACC(d: rd, a: rd) : RRR { d = d + a; next }
     #[accumulate] op BRNZ(a: ri, t: label) : RI { if a != 0 { jump t } next }
+    // Two results (d = a * 2, and t = a + 1 written back): the first one,
+    // d, is the one an accumulator can take; t stays a slot write.
+    #[accumulate] op DBL(d: ri, t: ri, a: ri) : RRR { t = a +% 1; d = a *% 2; next }
     op RETF(a: rd) : RRR { exit (a * 10.0) as i64 }
     op RETI(a: ri) : RRR { exit a as i64 }
 
@@ -114,8 +117,15 @@ fn main() {
     code[2] = V.ADD(5, 4, 9);       // r9 is out of range
     code[3] = V.RETI(5);
     go(code[0..4], 4);
+    // DBL's d in the accumulator, its t still in r1: (2 * 7) + (7 + 1).
+    code[0] = V.LOADI(0, 7);
+    code[1] = V.DBL(4, 1, 0);
+    code[2] = V.ADD(5, 4, 1);
+    code[3] = V.RETI(5);
+    go(code[0..4], 4);
 }
 // expect: LOADI LOADI LOADI ADD__ARR SUB__AAR ADDK__AA CVT__RA LOADI CVT FMUL__ARR FMUL__RRA RETF 990
 // expect: LOADI LOADI LOADI ADD SUB ADDK CVT LOADI CVT FMUL FMUL RETF 990
 // expect: LOADI ADDK ADD ADDK ADDK__AR BRNZ__A CVT FACC RETF 160
 // expect: LOADI ADD__ARR ADD__RAR RETI word 2 (ADD__RAR): operand `b` (ri) fails `it < f.nregs`
+// expect: LOADI DBL__AR ADD__RAR RETI 22
