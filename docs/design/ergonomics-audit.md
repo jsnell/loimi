@@ -593,20 +593,25 @@ only 3 cold raises, so it would want `#[hot]` on few sites, if any.
 variant `before` blocks and the statements of every body are checked
 past an error. A failed statement's bindings are poisoned: they have
 type `never`, and errors in statements that read them are dropped, as
-are errors of the statements enclosing the failed one. The `objref`
-and lifetimes passes report the first error of each function. Output is
-in source order, one error per place, capped by `--max-errors N`
-(default 20). Parsing, expansion, imports, type definitions,
-signatures, impls and module-level `var`s stay fatal, as proposed. The
-speculative checks (probes, `if`/`match` retried with a guessed type, a
-local closure retried with effects) run without recovery or discard
-what the first attempt recorded. The release IR of Lox, Python, Wasm,
-Stack and Prolog in the three dispatch modes, and of Mini with and
-without `--cfg debug`, is byte-identical to master's. Tests:
+are errors of the statements enclosing the failed one. After an error in
+an `if`/`while` condition or a `match` scrutinee, the branches are still
+checked. The `objref` and lifetimes passes report the first error of
+each function. Output is in source order, one error per place, capped by
+`--max-errors N` (default 20). Parsing, expansion, imports, type
+definitions, signatures, impls and module-level `var`s stay fatal, as
+proposed. The speculative checks (probes, a local closure retried with
+effects) run without recovery; an `if`/`match` without an expected type
+is checked first exactly as before, and again with recovery only after
+an error, so a program that compiles keeps the same locals. The release
+IR of Lox, Python, Wasm, Stack and Prolog in the three dispatch modes,
+of Mini with and without `--cfg debug`, and of the 216 programs of
+`tests/run`, is byte-identical to master's. Tests:
 `tests/fail/multi_errors*.lm` (the `// errors: N` directive checks the
-exact count); mutation trials on seven examples (6 to 8 statements
-broken in different functions) gave one error per break, with no
-cascades. `status.md`'s Compiler row lists what continues.
+exact count). Mutation trials on eight examples, 6 to 8 statements or
+conditions broken in different functions, gave one error per break and
+no cascades (the other trials broke a file outside the build, or a
+line into one that did not parse).
+`status.md`'s Compiler row lists what continues.
 
 **Pattern.** The checker returns at the first `Diag`, so getting a new
 interpreter to build is one compile per error. Python's author needed
