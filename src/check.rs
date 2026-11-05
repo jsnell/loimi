@@ -282,6 +282,19 @@ fn is_literal_expr(e: &Expr) -> bool {
     }
 }
 
+/// A literal-only expression (`is_literal_expr`), or an `if`, `match` or
+/// block whose every result is one: `(if c { 1 } else { 0 }) == y` types
+/// its left operand from `y`, as `1 == y` does.
+fn literal_valued(e: &Expr) -> bool {
+    let tail = |b: &Block| matches!(b.stmts.last(), Some(Stmt::Expr { expr, semi: false }) if literal_valued(expr));
+    match &e.kind {
+        ExprKind::If(_, then, Some(els)) => tail(then) && literal_valued(els),
+        ExprKind::Block(b) => tail(b),
+        ExprKind::Match(_, arms) => !arms.is_empty() && arms.iter().all(|a| literal_valued(&a.body)),
+        _ => is_literal_expr(e),
+    }
+}
+
 impl<'a> Checker<'a> {
     pub fn new(modules: &'a [Module]) -> Checker<'a> {
         Checker {
@@ -4640,6 +4653,13 @@ impl<'a> Checker<'a> {
             let b = self.expr_coerce(cx, r, &Ty::Bool)?;
             return Ok(mk(Ty::Bool, TK::Binary(op, Box::new(a), Box::new(b)), span));
         }
+        let operand_exp = if op.is_cmp() { None } else { exp };
+        if !matches!(op, Shl | Shr) {
+            if let Some(ab) = self.literal_branches(cx, l, r, operand_exp) {
+                let (a, b) = ab?;
+                return self.binary_typed(op, a, b, span);
+            }
+        }
         if matches!(op, Add | Sub) {
             // Pointer arithmetic: `p + n`, `p - n` (in elements).
             let a = self.expr(cx, l, exp)?;
@@ -4655,7 +4675,7 @@ impl<'a> Checker<'a> {
                 return Ok(mk(t, TK::Intrinsic(Intr::PtrOffset, vec![a, n]), span));
             }
             let operand_exp = exp;
-            let (a, b) = if is_literal_expr(l) && !is_literal_expr(r) {
+            let (a, b) = if literal_valued(l) && !literal_valued(r) {
                 let b = self.expr(cx, r, operand_exp)?;
                 let a = self.expr_coerce(cx, l, &b.ty.clone())?;
                 (a, b)
@@ -4671,7 +4691,6 @@ impl<'a> Checker<'a> {
             let t = a.ty.clone();
             return Ok(mk(t, TK::Binary(op, Box::new(a), Box::new(b)), span));
         }
-        let operand_exp = if op.is_cmp() { None } else { exp };
         let (a, b) = if matches!(op, Shl | Shr) {
             // The result has the left operand's type (a literal takes it
             // from the context, or is i64); the amount may be any integer.
@@ -4688,7 +4707,7 @@ impl<'a> Checker<'a> {
                 return Err(Diag::new(r.span, format!("shift amount must be an integer, found `{}`", self.ty_name(&b.ty))));
             }
             (a, b)
-        } else if is_literal_expr(l) && !is_literal_expr(r) {
+        } else if literal_valued(l) && !literal_valued(r) {
             let b = self.expr(cx, r, operand_exp)?;
             let a = self.expr_coerce(cx, l, &b.ty.clone())?;
             (a, b)
@@ -4699,6 +4718,49 @@ impl<'a> Checker<'a> {
             let b = if a.ty == Ty::Never { b } else { self.coerce(b, &at)? };
             (a, b)
         };
+        self.binary_typed(op, a, b, span)
+    }
+
+    /// `(if c { 1 } else { 0 }) == y`: the left operand's results are all
+    /// literals, the right's are not, so the left is typed from the
+    /// right as a plain literal is (`literal_valued`). The right is
+    /// checked first, expecting what the left would be alone (the
+    /// context's type, or the literals' default), so a program that
+    /// compiled without this is typed as before. None: not that case.
+    fn literal_branches(&mut self, cx: &mut FnCx, l: &Expr, r: &Expr, operand_exp: Option<&Ty>) -> Option<Res<(TExpr, TExpr)>> {
+        if is_literal_expr(l) || !literal_valued(l) || literal_valued(r) {
+            return None;
+        }
+        fn leaf(e: &Expr) -> Option<Ty> {
+            match &e.kind {
+                ExprKind::Int(_) => Some(Ty::i64()),
+                ExprKind::Float(_) => Some(Ty::F64),
+                ExprKind::Unary(UnOp::Neg, x) => leaf(x),
+                ExprKind::Binary(_, a, b) => leaf(a).or_else(|| leaf(b)),
+                ExprKind::If(_, then, Some(els)) => match then.stmts.last() {
+                    Some(Stmt::Expr { expr, .. }) => leaf(expr).or_else(|| leaf(els)),
+                    _ => None,
+                },
+                ExprKind::Block(b) => match b.stmts.last() {
+                    Some(Stmt::Expr { expr, .. }) => leaf(expr),
+                    _ => None,
+                },
+                ExprKind::Match(_, arms) => arms.iter().find_map(|a| leaf(&a.body)),
+                _ => None,
+            }
+        }
+        let alone = operand_exp.cloned().or_else(|| leaf(l))?;
+        Some((|| {
+            let b = self.expr(cx, r, Some(&alone))?;
+            let want = if b.ty == Ty::Never { alone.clone() } else { b.ty.clone() };
+            let a = self.expr_coerce(cx, l, &want)?;
+            Ok((a, b))
+        })())
+    }
+
+    /// A binary operator's result, its operands checked.
+    fn binary_typed(&mut self, op: BinOp, a: TExpr, b: TExpr, span: Span) -> Res<TExpr> {
+        use BinOp::*;
         let t = a.ty.clone();
         if let Ty::Vector(l, n) = &t {
             // Lane-wise; comparisons give a mask of signed integers of the

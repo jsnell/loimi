@@ -168,7 +168,9 @@ enum Token { Num(f64), Ident(Symbol), Punct(u8), Eof }
   error says so.
 - **Literal arithmetic** takes its type from the other operand: in
   `(16 + 8 + 8 * n) >> 4` with `n: u64`, `16 + 8` is `u64` (without
-  another operand or an annotation it is `i64`).
+  another operand or an annotation it is `i64`). So does an `if`,
+  `match` or block whose every result is a literal:
+  `(if c { 1 } else { 0 }) == y` with `y: i32` compares `i32`s.
 - **Array lengths from the literal.** `let t: [(str, u32); _] = [..];`
   takes the length from the array literal, so a table's annotation need
   not count its rows.
@@ -304,6 +306,25 @@ enum Token { Num(f64), Ident(Symbol), Punct(u8), Eof }
   falling out of the `match` is then the same as trying the rest.
 #### Warnings, attributes and tests
 
+- **Errors.** A build reports every independent error it finds, in
+  source order, at most `--max-errors N` (default 20, `0` for all).
+  Checking goes on past an error in a function body, a vm handler or a
+  statement; a binding whose initializer failed is not reported again
+  where it is used. Errors in imports, types and signatures stop the
+  build, since what follows depends on them ([status.md](status.md),
+  Compiler row). This program gets two errors, `p.z` and the `str`
+  assigned to `n`, and none for `a`, which is poisoned:
+
+<!-- snippet: fail "error: 2 errors" -->
+```loimi
+struct P { x: i64 }
+fn f(p: P) -> i64 {
+    let a = p.z;
+    let n: i64 = "one";
+    a + n
+}
+fn main() {}
+```
 - **Warnings** are named (`warning[match_fallout]: ..`). `#[allow(name)]`
   silences one on a match arm, an item (function, `vm`, ...) or a vm item
   (`op`, `family`, vm function, entry), covering everything inside it;
