@@ -1,0 +1,14 @@
+// `#[poll(..)]` names a poll the vm declared before it.
+// error: unknown poll `gx` (declared before this point: `gc`)
+import std.gc;
+struct Ctx { heap: gc.Heap }
+vm V {
+    context ctx: *Ctx;
+    state { pc: *u32 }
+    encoding fixed(u32) { format A { op: 8, a: 24 } }
+    poll gc { if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } } }
+    #[poll(gx)] op TICK() : A { next }
+    op HALT() : A { exit 0 }
+    entry run(c: *Ctx, code: *u32) -> i64 uses gc { ctx = c; jump code }
+}
+fn main() {}

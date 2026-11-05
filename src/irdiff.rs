@@ -166,8 +166,8 @@ fn compare(opts: &Opts, d: &DiffOpts, a: &Input, b: &Input, tmp: &Path) -> Resul
     let [oa, ob] = optimize(opts, [a, b], tmp, true)?;
     let ma = Module::parse(&oa);
     let mb = Module::parse(&ob);
-    let fa = ma.functions();
-    let fb = mb.functions();
+    let fa = cold_ordinals(ma.functions(), false);
+    let fb = cold_ordinals(mb.functions(), false);
     let mut out = String::new();
     let _ = writeln!(out, "ir-diff: A = {}\n         B = {}", a.label, b.label);
     let same_ir = report(&mut out, "IR", &fa, &fb, d);
@@ -175,8 +175,8 @@ fn compare(opts: &Opts, d: &DiffOpts, a: &Input, b: &Input, tmp: &Path) -> Resul
     let mut asm_texts = None;
     if d.asm {
         let [sa, sb] = optimize(opts, [a, b], tmp, false)?;
-        let ga = asm_functions(&sa, &ma);
-        let gb = asm_functions(&sb, &mb);
+        let ga = cold_ordinals(asm_functions(&sa, &ma), true);
+        let gb = cold_ordinals(asm_functions(&sb, &mb), true);
         same &= report(&mut out, "asm", &ga, &gb, d);
         asm_texts = Some((sa, sb, ga, gb));
     }
@@ -207,6 +207,46 @@ fn compare(opts: &Opts, d: &DiffOpts, a: &Input, b: &Input, tmp: &Path) -> Resul
         }
     }
     Ok(same)
+}
+
+/// Outlined cold blocks are numbered across the program
+/// (`vm.Py.op.BOR.cold132`), so a cold block added to one handler would
+/// rename those of every handler after it: number them per handler
+/// instead, in order (`vm.Py.op.BOR.cold#0`, ..).
+fn cold_ordinals(f: BTreeMap<String, Vec<String>>, asm: bool) -> BTreeMap<String, Vec<String>> {
+    let mut groups: BTreeMap<String, Vec<(u64, String)>> = BTreeMap::new();
+    for k in f.keys() {
+        if let Some(i) = k.rfind(".cold") {
+            if let Ok(n) = k[i + 5..].parse::<u64>() {
+                groups.entry(k[..i].to_string()).or_default().push((n, k.clone()));
+            }
+        }
+    }
+    let mut map = HashMap::new();
+    for (p, mut v) in groups {
+        v.sort();
+        for (j, (_, k)) in v.into_iter().enumerate() {
+            map.insert(k, format!("{}.cold#{}", p, j));
+        }
+    }
+    if map.is_empty() {
+        return f;
+    }
+    // Also the globals named after them (`X.cold260.c10`, the slots a
+    // cold block's captures go through).
+    let dotted: Vec<(String, String)> = map.iter().map(|(k, v)| (format!("{}.", k), format!("{}.", v))).collect();
+    let line = |l: &String| {
+        let mut s = rename_symbols(l, &map, asm);
+        if s.contains(".cold") {
+            for (k, v) in &dotted {
+                if s.contains(k.as_str()) {
+                    s = s.replace(k.as_str(), v);
+                }
+            }
+        }
+        s
+    };
+    f.into_iter().map(|(k, v)| (map.get(&k).cloned().unwrap_or(k), v.iter().map(line).collect())).collect()
 }
 
 /// Compare two sets of normalized functions; print the summary and the

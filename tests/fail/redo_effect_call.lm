@@ -1,0 +1,20 @@
+// What a call may store counts too: `bump` stores through its argument,
+// so the poll after it would run it twice.
+// error: on the way here the op may already have made a call of `bump`, which may store to memory
+import std.gc;
+struct Ctx { heap: gc.Heap, n: i64 }
+fn bump(c: *Ctx) { c.n += 1; }
+vm V {
+    context ctx: *Ctx;
+    state { pc: *u32 }
+    encoding fixed(u32) { format A { op: 8, a: 24 } }
+    poll gc { if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } } }
+    op TICK() : A {
+        bump(ctx);
+        poll gc;
+        next
+    }
+    op HALT() : A { exit 0 }
+    entry run(c: *Ctx, code: *u32) -> i64 uses gc { ctx = c; jump code }
+}
+fn main() {}

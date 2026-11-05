@@ -1,0 +1,21 @@
+// A `redo` runs the op again from its start, so nothing before it may
+// have an effect the second run would repeat: here the store to `dst`
+// comes before the GC poll, and the op would add twice.
+// error: `redo` runs `ADD` again from its start, but on the way here the op may already have made a store to memory
+import std.gc;
+struct Ctx { heap: gc.Heap }
+vm V {
+    context ctx: *Ctx;
+    state { pc: *u32, regs: *i64 }
+    operand reg = regs[it];
+    encoding fixed(u32) { format ABC { op: 8, a: 8, b: 8, c: 8 } }
+    poll gc { if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } } }
+    op ADD(dst: reg, a: reg, b: reg) : ABC {
+        dst = a + b;
+        poll gc;
+        next
+    }
+    op HALT() : ABC { exit 0 }
+    entry run(c: *Ctx, code: *u32, r: *i64) -> i64 uses gc { ctx = c; regs = r; jump code }
+}
+fn main() {}

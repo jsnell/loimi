@@ -1,0 +1,20 @@
+// The refill of `try_new` runs the op again: a counter bumped before it
+// would count twice.
+// error: `redo` runs `CONS` again from its start, but on the way here the op may already have made a store to memory
+import std.gc;
+object Pair { a: i64 }
+struct Ctx { heap: gc.Heap, n: i64, last: ?Gc<Pair> }
+vm V {
+    context ctx: *Ctx;
+    state { pc: *u32 }
+    encoding fixed(u32) { format A { op: 8, a: 24 } }
+    op CONS() : A {
+        ctx.n += 1;
+        let Some(p) = try_new(&ctx.heap, Pair { a: ctx.n }) else cold { gc.make_room(&ctx.heap, size_of<Pair>()); redo };
+        ctx.last = Some(p);
+        next
+    }
+    op HALT() : A { exit 0 }
+    entry run(c: *Ctx, code: *u32) -> i64 { ctx = c; jump code }
+}
+fn main() {}

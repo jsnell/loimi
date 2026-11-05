@@ -1,0 +1,94 @@
+// matrix: dispatch
+// Declared polls: `poll NAME { .. }` in a vm, `#[poll(NAME)]` on an op or
+// family (the poll's statements run first), `poll NAME;` as a statement
+// anywhere in the vm's code; a poll dropped by `#[cfg]` expands to
+// nothing. `new` in a handler, where nothing before it on the path has
+// an effect, is lowered to `try_new` with a cold `make_room` and `redo`.
+import std.io;
+import std.gc;
+
+object Pair { a: i64, b: ?Gc<Pair> }
+object Arr { n: u64, items: [i64] }
+
+struct Ctx { heap: gc.Heap, list: ?Gc<Pair>, made: i64, arrs: i64, ticks: i64, gcs: i64 }
+
+vm V {
+    context ctx: *Ctx;
+    state { pc: *u32 }
+    encoding fixed(u32) { format A { op: 8, a: 24 } }
+    operand imm = it;
+
+    /// Collect at the start of an op, then run it again.
+    poll gc {
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { ctx.gcs += 1; gc.collect(&ctx.heap); redo } }
+    }
+    /// A poll that falls through: the rest of the op is copied into its
+    /// cold block.
+    poll tick { if unlikely(ctx.made % 1000 == 999) { cold { ctx.ticks += 1; } } }
+    #[cfg(not_enabled)] poll extra { ctx.ticks += 1000; }
+
+    // `new` lowered: the path to it has no effect.
+    #[poll(gc)] op CONS(n: imm) : A {
+        let p = new(&ctx.heap, Pair { a: n as i64, b: ctx.list });
+        ctx.list = Some(p);
+        ctx.made += 1;
+        next
+    }
+    // A trailing array of constant length, the `new` inside an expression.
+    #[poll(gc, extra)] family ARR(n: imm) : A {
+        generic {
+            ctx.arrs += unsafe { new(&ctx.heap, Arr { n: n as u64 }, 3) }.n as i64;
+            next
+        }
+    }
+    op LOOP(n: imm) : A {
+        poll extra;
+        if ctx.made < n as i64 { poll tick; jump pc - 2 }
+        next
+    }
+    // Not lowered (an effect before it): the plain `new`.
+    op LATE() : A {
+        ctx.made += 1;
+        let p = new(&ctx.heap, Pair { a: 1, b: ctx.list });
+        ctx.list = Some(p);
+        next
+    }
+    // An effect before a `redo` that is harmless here.
+    #[allow(redo_effect)] op RETRY(n: imm) : A {
+        ctx.ticks += 0;
+        if ctx.made < 0 { redo }
+        let _ = n;
+        next
+    }
+    op HALT() : A { exit 0 }
+    entry run(c: *Ctx, code: *u32) -> i64 uses gc { ctx = c; jump code }
+}
+
+fn scan(h: *gc.Heap, c: *Ctx) { gc_mark(h, c.list); }
+
+fn main() uses gc {
+    var c = Ctx { heap: gc.Heap.new(), list: None, made: 0, arrs: 0, ticks: 0, gcs: 0 };
+    c.heap.add_scanner(&c, scan);
+    var code: [u32; 6] = [0; 6];
+    var at: u64 = 0;
+    at = V.emit.CONS(code[..], at, 2);
+    at = V.emit.ARR(code[..], at, 3);
+    at = V.emit.LOOP(code[..], at, 20000);
+    at = V.emit.LATE(code[..], at);
+    at = V.emit.RETRY(code[..], at, 0);
+    at = V.emit.HALT(code[..], at);
+    let _ = at;
+    let _ = V.run(&c, &code[0]);
+    var n = 0;
+    var cur = c.list;
+    while let Some(p) = cur { n += p.a; cur = p.b; }
+    io.print("sum ");
+    io.print_int(n);
+    io.print(", arrays ");
+    io.print_int(c.arrs);
+    io.print(", ticks ");
+    io.print_int(c.ticks);
+    io.println(if c.gcs > 0 { ", collected" } else { ", no collection?" });
+}
+
+// expect: sum 40001, arrays 60000, ticks 20, collected

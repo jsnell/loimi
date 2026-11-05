@@ -37,6 +37,10 @@ use crate::tir::*;
 /// store found, or call of one that may.
 type Why = Option<(Span, String)>;
 
+/// The largest object (without its header) that `std.gc.try_alloc`
+/// allocates inline (`HEADER` 16, `NCLASS` 33 size classes of 16 bytes).
+const MAX_SMALL: u64 = 496;
+
 /// Functions whose calls are not side effects for `redo`: the runtime's
 /// collector and lock.
 fn runtime_fn(f: &FnDef) -> bool {
@@ -177,10 +181,9 @@ impl Cx<'_> {
                 span,
                 format!("`redo` runs `{}` again from its start, but on the way here the op may already have made {}, and the second run would make it again", self.op, what),
             )
-            .note(*at, "this runs before the `redo`")
             .note(
-                span,
-                "put the poll or the allocation first, or end this path with `next` or `jump`; if running it twice is harmless, `#[allow(redo_effect)]` on the op says so",
+                *at,
+                "this runs before the `redo`: put the poll or the allocation before it, or end the path with `next` or `jump`; if running it twice is harmless, `#[allow(redo_effect)]` on the op says so",
             );
             if !self.errs.iter().any(|e| e.span == d.span && e.notes[0].0 == d.notes[0].0) {
                 self.errs.push(d);
@@ -481,12 +484,35 @@ impl Cx<'_> {
         (self.f, self.pc, self.tbl, self.lower) = saved;
     }
 
-    /// Whether `x`, the initializer of a `let`, is a `new` to lower:
-    /// in the handler itself, on the hot path, outside loops, of a heap
-    /// and length the refill can evaluate again.
+    /// Whether `x` is a `new` to lower: in the handler itself, on the
+    /// hot path, outside loops, of a heap the refill can evaluate again,
+    /// and of a constant size the allocator's inline path covers (a
+    /// large object, or a trailing array of a length not constant, is a
+    /// call in `try_new` too: the handler keeps its frame, and the plain
+    /// `new` does not run the op twice on a refill).
     fn can_lower(&self, x: &TExpr) -> bool {
         let TK::New { heap, len, fast: false, uninit: false, .. } = &x.kind else { return false };
-        self.lower && !self.cold && self.loops.is_empty() && self.probe == 0 && self.make_room.is_some() && pure(heap) && len.as_ref().is_none_or(|l| pure(l))
+        if !(self.lower && !self.cold && self.loops.is_empty() && self.probe == 0 && self.make_room.is_some() && pure(heap)) {
+            return false;
+        }
+        let Ty::Gc(inner) = &x.ty else { return false };
+        let Ty::Struct(sid) = **inner else { return false };
+        let mut size = crate::layout::size_of(self.p, inner);
+        if let (Some(l), Some((_, et))) = (len, &self.p.structs[sid as usize].trailing) {
+            let n = match &l.kind {
+                TK::Int(n) => *n,
+                TK::Cast(a) => match a.kind {
+                    TK::Int(n) => n,
+                    _ => return false,
+                },
+                _ => return false,
+            };
+            if !(0..=MAX_SMALL as i128).contains(&n) {
+                return false;
+            }
+            size += n as u64 * crate::layout::size_of(self.p, et);
+        }
+        size <= MAX_SMALL
     }
 
     /// The `make_room` call and `redo` that refill for the `new` `x`,
