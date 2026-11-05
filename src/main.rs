@@ -531,6 +531,12 @@ fn order_handlers(prog: &mut tir::Program, sm: &SourceMap, opts: &Opts) -> Resul
         if vd.dispatch == tir::Dispatch::Switch {
             continue;
         }
+        // `--jit-stencils` builds too: they run the handlers' counting
+        // copies, emitted last, and Mini's measured slower ordered (1.011,
+        // string_build 1.11).
+        if opts.jit {
+            continue;
+        }
         let (path, span) = match (&opts.vm_profile, &vd.profile) {
             (Some(p), _) if p == "none" => continue,
             (Some(p), _) => (PathBuf::from(p), nowhere),
