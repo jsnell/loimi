@@ -293,7 +293,7 @@ pub vm Rx {
     variant budget wraps all {
         before {
             ctx.steps -= 1;
-            if ctx.steps < 0 { fail "step limit exceeded" }
+            if ctx.steps < 0 { cold { fail "step limit exceeded" } }
         }
     }
 

@@ -2501,8 +2501,8 @@ and weighted unlikely in every mode). The rule leaves alone:
   can be the op's own path), and control words in `cold` blocks, which
   do not make the rest of a block cold (what follows a poll is still
   the op's path);
-- `on raise`, entries and plain vm functions (which cannot use control
-  words), and code already in a `cold` block.
+- variant `before` blocks, `on raise` and entries, plain vm functions
+  (which cannot use control words), and code already in a `cold` block.
 
 `#[hot]` on the `raise`, `fail` or `redo` keeps its branch inline, for an
 interpreter that raises on a path it expects to be common (a guest
