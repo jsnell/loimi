@@ -1,0 +1,11 @@
+// `&cache` has a type only for a cache declared from a struct.
+fn get(p: *u32) -> u32 { *p }
+vm V {
+    state { pc: *u32 }
+    encoding fixed(u32) { format A { op: 8 } }
+    cache IC { n: u32, m: u32 }
+    op NOP() : A + IC { let x = get(&cache); next }
+    entry run(c: *u32) -> i64 { pc = c; jump pc }
+}
+fn main() {}
+// error: `&cache` is the address of the whole cache, which has a type only for a cache declared from a struct (`cache IC = S;`

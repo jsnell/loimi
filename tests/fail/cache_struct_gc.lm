@@ -1,0 +1,12 @@
+// The struct's fields are cache fields: no GC references.
+object Obj { x: i64 }
+struct Site { n: u32, o: ?Gc<Obj> }
+vm V {
+    state { pc: *u32 }
+    encoding fixed(u32) { format A { op: 8 } }
+    cache IC = Site;
+    op NOP() : A + IC { next }
+    entry run(c: *u32) -> i64 { pc = c; jump pc }
+}
+fn main() {}
+// error: cache field `o` has type `?Gc<Obj>`: inline caches cannot hold GC references

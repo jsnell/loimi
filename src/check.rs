@@ -5099,6 +5099,13 @@ impl<'a> Checker<'a> {
                 Ok(mk(*t, TK::Deref(Box::new(v)), span))
             }
             UnOp::AddrOf => {
+                // `&cache`: the whole inline cache, as a `*S` for a cache
+                // declared `cache X = S;`.
+                if let ExprKind::Ident(n) = &inner.kind && cx.vm.is_some() {
+                    if let Some(e) = crate::vmcheck::cache_addr(self, cx, n, span)? {
+                        return Ok(e);
+                    }
+                }
                 let inner_exp = match exp {
                     Some(Ty::Ptr(t)) => Some((**t).clone()),
                     _ => None,

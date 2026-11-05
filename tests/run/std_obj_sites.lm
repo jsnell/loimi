@@ -52,12 +52,12 @@ vm P {
         format ABC { op: 8, a: 8, b: 8, c: 8 }
         format AsBx { op: 8, a: 8, sbx: s16 }
     }
-    // The first six words are an obj.Site.
-    cache PropIC { sid: u32, slot: u32, cell: u32, depth: u32, ent: u32, miss: u32 }
+    // The words of an obj.Site, which `&cache` passes to std.obj.
+    cache PropIC = obj.Site;
 
     family GETPROP(dst: reg, o: reg, key: imm) : ABC + PropIC {
         generic {
-            let (v, st) = read(ctx, &cache.sid as *obj.Site, obj.IcState.Generic, o, key as u64);
+            let (v, st) = read(ctx, &cache, obj.IcState.Generic, o, key as u64);
             dst = v;
             if st == obj.IcState.OwnIn { become GETPROP_IN; }
             if st == obj.IcState.OwnOut { become GETPROP_OUT; }
@@ -82,7 +82,7 @@ vm P {
         // A monomorphic member missed: refill, or go polymorphic.
         GETPROP_MISS {
             cold {
-                let (v, st) = read(ctx, &cache.sid as *obj.Site, obj.IcState.OwnIn, o, key as u64);
+                let (v, st) = read(ctx, &cache, obj.IcState.OwnIn, o, key as u64);
                 dst = v;
                 if st == obj.IcState.OwnIn { become GETPROP_IN; }
                 if st == obj.IcState.OwnOut { become GETPROP_OUT; }
@@ -95,7 +95,7 @@ vm P {
         GETPROP_POLY {
             if let O(x) = o and let Some(v) = ctx.m.poly_get(x, cache.ent) { dst = v; next }
             cold {
-                let (v, st) = read(ctx, &cache.sid as *obj.Site, obj.IcState.Poly, o, key as u64);
+                let (v, st) = read(ctx, &cache, obj.IcState.Poly, o, key as u64);
                 dst = v;
                 if st == obj.IcState.Mega { become GETPROP_MEGA; }
                 next
@@ -104,7 +104,7 @@ vm P {
         GETPROP_MEGA {
             if let O(x) = o and let Some(v) = ctx.m.mega_get(x, key as u64) { dst = v; next }
             cold {
-                let (v, st) = read(ctx, &cache.sid as *obj.Site, obj.IcState.Mega, o, key as u64);
+                let (v, st) = read(ctx, &cache, obj.IcState.Mega, o, key as u64);
                 dst = v;
                 next
             }
@@ -113,7 +113,7 @@ vm P {
 
     family SETPROP(o: reg, key: imm, v: reg) : ABC + PropIC {
         generic {
-            let st = write(ctx, &cache.sid as *obj.Site, o, key as u64, v);
+            let st = write(ctx, &cache, o, key as u64, v);
             if st == obj.IcState.OwnIn { become SETPROP_IN; }
             if st == obj.IcState.Add { become SETPROP_ADD; }
             next

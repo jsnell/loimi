@@ -2133,7 +2133,9 @@ them exactly as `cache.field` does in the op, with the same types and
 unaligned access for wide fields. The argument must be `cache` in an op
 whose cache has that layout, or another handle of the same layout (a vm
 function passing its `c` on); the handle is not a value otherwise
-(`c` alone, `let`, return types are errors). At run time it is the
+(`c` alone, `let`, return types are errors), except that for a cache
+declared from a struct, `cache X = S;`, `&c` is a `*S` that any function
+takes (section 7.1). At run time the handle is the
 address of the instruction's first cache word, `pc + 1`:
 
 - in an inlined copy (hot call sites of `-> never` functions, and every
@@ -2983,6 +2985,63 @@ between threads.
 emits an op with its cache's integer, `bool` and pointer fields set (in
 declaration order; other fields zero). It is generated for ops whose
 cache has such fields, in programs that name one.
+
+**Layouts from structs: `cache X = S;`.** A cache may take its fields
+from a struct, `cache PropIC = obj.Site;`: the fields are `S`'s, in
+order, with the rules above (each starts a word; no GC references), and
+`cache.f` reads and writes them as before. What the struct adds is a
+type for the whole cache: in an op, `&cache` is a `*S`, and in a vm
+function, `&c` for a handle `c: cache X` (section 3.5) is too, so the
+slow path that fills a cache can be a plain function, written once and
+called from any op, vm function or host code that has an `S`:
+
+<!-- snippet: run "miss 110, hit 10"
+import std.io;
+struct Site { shape: u32, slot: u32 }
+fn fill(s: *Site, shape: u32) { s.shape = shape; s.slot = shape * 2; }
+vm V {
+    state { pc: *u32, regs: *i64 }
+    operand reg = regs[it];
+    operand imm = it;
+    encoding fixed(u32) { format ABC { op: 8, a: 8, b: 8, c: 8 } }
+{snippet}
+    op RET(a: reg) : ABC { exit a }
+    entry run(code: *u32, r: *i64) -> i64 { regs = r; pc = code; jump pc }
+}
+fn main() {
+    var code: [u32; 16] = [0; 16];
+    var at = V.emit.GET(code[..], 0, 0, 5);
+    at = V.emit.RET(code[..], at, 0);
+    var r: [i64; 2] = [0, 0];
+    io.print("miss "); io.print_int(V.run(&code[0], &r[0]));
+    io.print(", hit "); io.print_int(V.run(&code[0], &r[0])); io.println("");
+}
+-->
+```loimi
+cache SiteIC = Site;       // struct Site { shape: u32, slot: u32 }
+op GET(dst: reg, shape: imm) : ABC + SiteIC {
+    if cache.shape == shape as u32 { dst = cache.slot as i64; next }
+    cold { fill(&cache, shape as u32); dst = 100 + cache.slot as i64; next }
+}
+```
+
+Here `fill(s: *Site, shape: u32)` is an ordinary function outside the
+vm. `&cache` is the address of the first cache word, the pointer that
+`&cache.shape as *Site` gives, so it compiles to the same code; the
+Lox and MiniJS property caches are `cache PropIC = obj.Site;` passed to
+`std.obj`'s cache state machine this way. It is a `*S` only where the
+words hold an `S` as laid out in memory: every field must be at the
+byte offset of its word, and `S` no more aligned than a word. So in a
+`u32` vm a struct of `u32`, `i32`, `f32` (and `u8` or `bool` fields
+followed by nothing narrower) works, while one with a `u64` or a pointer
+does not (it would be read at a 4-byte boundary); in a `u64` vm a
+struct of 8-byte fields works. Elsewhere `&cache` is an error that says
+which field is out of place, and the fields stay usable one by one. A
+cache declared with a field list has no struct type, so `&cache` there
+is an error too (take a field's address). `&cache` points into code,
+which does not move while it runs, but the pointer is only good while
+that code is alive: pass it down to the functions that fill the cache,
+do not keep it.
 
 **Code addresses: `Vm.Resume` fields.** A cache field of type
 `Vm.Resume` holds a resume point (section 6, "Resume points"), an

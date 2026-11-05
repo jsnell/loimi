@@ -200,20 +200,28 @@ impl Parser {
                 "cache" => {
                     self.bump();
                     let n = self.ident()?;
-                    self.expect("{")?;
-                    let mut fields = Vec::new();
-                    while !self.is("}") {
-                        let f = self.ident()?;
-                        self.expect(":")?;
-                        let weak = self.eat_kw("weak");
+                    if self.eat("=") {
+                        // `cache X = S;`: the fields of struct `S`
+                        // (vmexpand::cache_structs fills them in).
                         let t = self.parse_type()?;
-                        fields.push((f, t, weak));
-                        if !self.eat(",") {
-                            break;
+                        self.expect(";")?;
+                        vm.caches.push(CacheDecl { name: n, fields: vec![], from: Some(t) });
+                    } else {
+                        self.expect("{")?;
+                        let mut fields = Vec::new();
+                        while !self.is("}") {
+                            let f = self.ident()?;
+                            self.expect(":")?;
+                            let weak = self.eat_kw("weak");
+                            let t = self.parse_type()?;
+                            fields.push((f, t, weak));
+                            if !self.eat(",") {
+                                break;
+                            }
                         }
+                        self.expect("}")?;
+                        vm.caches.push(CacheDecl { name: n, fields, from: None });
                     }
-                    self.expect("}")?;
-                    vm.caches.push(CacheDecl { name: n, fields });
                 }
                 "poll" => {
                     // `poll gc { .. }`: statements that `#[poll(gc)]` on

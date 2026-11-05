@@ -510,9 +510,9 @@ pub vm Lox {
     }
 
     // ── properties ───────────────────────────────────────────────────
-    // The six words of an obj.Site; std.obj runs the cache state machine
+    // The words of an obj.Site; std.obj runs the cache state machine
     // (monomorphic, polymorphic, megamorphic) in the slow paths.
-    cache PropIC { sid: u32, slot: u32, cell: u32, depth: u32, ent: u32, miss: u32 }
+    cache PropIC = obj.Site;
 
     /// R[dst] = property value `v` read from `o`, found `depth`
     /// prototype links up: a method (depth 1, the class's method table)
@@ -535,7 +535,7 @@ pub vm Lox {
     family GETPROP(dst: reg, o: reg, name: kst) : ABC + PropIC {
         generic {
             let Inst(x) = o else { cold { raise "Only instances have properties." } };
-            let (r, st, d) = read_prop(ctx, &cache.sid as *obj.Site, obj.IcState.Generic, x, key(name));
+            let (r, st, d) = read_prop(ctx, &cache, obj.IcState.Generic, x, key(name));
             let Some(v) = r else { cold { raise undefined_prop(ctx, name) } };
             if st == obj.IcState.OwnIn { become GETPROP_IN; }
             if st == obj.IcState.OwnOut { become GETPROP_OUT; }
@@ -562,7 +562,7 @@ pub vm Lox {
         GETPROP_MISS {
             cold {
                 let Inst(x) = o else { raise "Only instances have properties." };
-                let (r, st, d) = read_prop(ctx, &cache.sid as *obj.Site, obj.IcState.OwnIn, x, key(name));
+                let (r, st, d) = read_prop(ctx, &cache, obj.IcState.OwnIn, x, key(name));
                 let Some(v) = r else { raise undefined_prop(ctx, name) };
                 if st == obj.IcState.OwnIn { become GETPROP_IN; }
                 if st == obj.IcState.OwnOut { become GETPROP_OUT; }
@@ -577,7 +577,7 @@ pub vm Lox {
             if let Inst(x) = o and let Some((v, d)) = ctx.m.poly_get_at(x, cache.ent) { found(dst.raw, o, v, d) }
             cold {
                 let Inst(x) = o else { raise "Only instances have properties." };
-                let (r, st, d) = read_prop(ctx, &cache.sid as *obj.Site, obj.IcState.Poly, x, key(name));
+                let (r, st, d) = read_prop(ctx, &cache, obj.IcState.Poly, x, key(name));
                 let Some(v) = r else { raise undefined_prop(ctx, name) };
                 if st == obj.IcState.Mega { become GETPROP_MEGA; }
                 dst = found_slow(o, v, d);
@@ -588,7 +588,7 @@ pub vm Lox {
             if let Inst(x) = o and let Some((v, d)) = ctx.m.mega_get_at(x, key(name)) { found(dst.raw, o, v, d) }
             cold {
                 let Inst(x) = o else { raise "Only instances have properties." };
-                let (r, _, d) = read_prop(ctx, &cache.sid as *obj.Site, obj.IcState.Mega, x, key(name));
+                let (r, _, d) = read_prop(ctx, &cache, obj.IcState.Mega, x, key(name));
                 let Some(v) = r else { raise undefined_prop(ctx, name) };
                 dst = found_slow(o, v, d);
                 next
@@ -599,7 +599,7 @@ pub vm Lox {
     family SETPROP(o: reg, name: kst, v: reg) : ABC + PropIC {
         generic {
             let Inst(x) = o else { cold { raise "Only instances have fields." } };
-            let st = write_prop(ctx, &cache.sid as *obj.Site, obj.IcState.Generic, x, key(name), v);
+            let st = write_prop(ctx, &cache, obj.IcState.Generic, x, key(name), v);
             if st == obj.IcState.OwnIn { become SETPROP_IN; }
             if st == obj.IcState.OwnOut { become SETPROP_OUT; }
             if st == obj.IcState.Add { become SETPROP_ADD; }
@@ -620,7 +620,7 @@ pub vm Lox {
         SETPROP_MISS {
             cold {
                 let Inst(x) = o else { raise "Only instances have fields." };
-                let st = write_prop(ctx, &cache.sid as *obj.Site, obj.IcState.OwnIn, x, key(name), v);
+                let st = write_prop(ctx, &cache, obj.IcState.OwnIn, x, key(name), v);
                 if st == obj.IcState.OwnIn { become SETPROP_IN; }
                 if st == obj.IcState.OwnOut { become SETPROP_OUT; }
                 if st == obj.IcState.Add { become SETPROP_ADD; }
@@ -634,7 +634,7 @@ pub vm Lox {
             if let Inst(x) = o and ctx.m.poly_set(x, cache.ent, v) { next }
             cold {
                 let Inst(x) = o else { raise "Only instances have fields." };
-                let st = write_prop(ctx, &cache.sid as *obj.Site, obj.IcState.Poly, x, key(name), v);
+                let st = write_prop(ctx, &cache, obj.IcState.Poly, x, key(name), v);
                 if st == obj.IcState.Mega { become SETPROP_MEGA; }
                 next
             }
@@ -643,7 +643,7 @@ pub vm Lox {
             if let Inst(x) = o and ctx.m.mega_set(x, key(name), v) { next }
             cold {
                 let Inst(x) = o else { raise "Only instances have fields." };
-                write_prop(ctx, &cache.sid as *obj.Site, obj.IcState.Mega, x, key(name), v);
+                write_prop(ctx, &cache, obj.IcState.Mega, x, key(name), v);
                 next
             }
         }
@@ -661,7 +661,7 @@ pub vm Lox {
     family INVOKE(base: reg, n: nargs, name: kst) : ABC + PropIC {
         generic {
             let Inst(x) = base else { cold { raise "Only instances have methods." } };
-            let (r, st, d) = read_prop(ctx, &cache.sid as *obj.Site, obj.IcState.Generic, x, key(name));
+            let (r, st, d) = read_prop(ctx, &cache, obj.IcState.Generic, x, key(name));
             let Some(v) = r else { cold { raise undefined_prop(ctx, name) } };
             if st == obj.IcState.Proto { become INVOKE_P; }
             if st == obj.IcState.Poly { become INVOKE_POLY; }
@@ -676,7 +676,7 @@ pub vm Lox {
         INVOKE_MISS {
             cold {
                 let Inst(x) = base else { raise "Only instances have methods." };
-                let (r, st, d) = read_prop(ctx, &cache.sid as *obj.Site, obj.IcState.Proto, x, key(name));
+                let (r, st, d) = read_prop(ctx, &cache, obj.IcState.Proto, x, key(name));
                 let Some(v) = r else { raise undefined_prop(ctx, name) };
                 if st == obj.IcState.Proto { become INVOKE_P; }
                 if st == obj.IcState.Poly { become INVOKE_POLY; }
@@ -688,7 +688,7 @@ pub vm Lox {
             if let Inst(x) = base and let Some((v, d)) = ctx.m.poly_get_at(x, cache.ent) { invoke_found(v, d, base.raw, n) }
             cold {
                 let Inst(x) = base else { raise "Only instances have methods." };
-                let (r, st, d) = read_prop(ctx, &cache.sid as *obj.Site, obj.IcState.Poly, x, key(name));
+                let (r, st, d) = read_prop(ctx, &cache, obj.IcState.Poly, x, key(name));
                 let Some(v) = r else { raise undefined_prop(ctx, name) };
                 if st == obj.IcState.Mega { become INVOKE_MEGA; }
                 invoke_found(v, d, base.raw, n)
@@ -698,7 +698,7 @@ pub vm Lox {
             if let Inst(x) = base and let Some((v, d)) = ctx.m.mega_get_at(x, key(name)) { invoke_found(v, d, base.raw, n) }
             cold {
                 let Inst(x) = base else { raise "Only instances have methods." };
-                let (r, _, d) = read_prop(ctx, &cache.sid as *obj.Site, obj.IcState.Mega, x, key(name));
+                let (r, _, d) = read_prop(ctx, &cache, obj.IcState.Mega, x, key(name));
                 let Some(v) = r else { raise undefined_prop(ctx, name) };
                 invoke_found(v, d, base.raw, n)
             }

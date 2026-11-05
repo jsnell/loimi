@@ -227,7 +227,7 @@ pub vm Py {
         format sJ   { op: 8, sj: s24 }
     }
 
-    cache GlobalIC { idx: u32, ver: u32, builtin: u32 }
+    cache GlobalIC = ops.GlobalSite;
     cache SetGIC { idx: u32 }
     /// Two entry numbers: attribute reads see instances of two layouts.
     cache AttrIC { idx: u32, idx2: u32 }
@@ -484,7 +484,7 @@ pub vm Py {
     family GETGLOBAL(dst: reg, name: kst) : ABx + GlobalIC {
         generic {
             let s = name as! Str;
-            dst = ops.get_global(ctx, fp.func, s, &cache.idx, &cache.ver, &cache.builtin)?;
+            dst = ops.get_global(ctx, fp.func, s, &cache)?;
             if cache.builtin != 0 { become GETGLOBAL_B; next }
             become GETGLOBAL_C;
             next
@@ -542,8 +542,8 @@ pub vm Py {
         let s = name as! Str;
         let d = ns as! Dict;
         if let Some(v) = value.dict_get_str(d, s) { dst = v; next }
-        var a: u32 = 0; var b: u32 = 0; var c2: u32 = 0;
-        dst = ops.get_global(ctx, fp.func, s, &a, &b, &c2)?;
+        var g = ops.GlobalSite { idx: 0, ver: 0, builtin: 0 };
+        dst = ops.get_global(ctx, fp.func, s, &g)?;
         next
     }
     op STORENAME(src: reg, ns: reg, name: kst) : ABC {

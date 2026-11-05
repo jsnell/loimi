@@ -214,14 +214,16 @@ into a fast one; `m.to_dict(o)` forces dictionary mode.
 
 The vm declares the cache words and does the check itself, so the hit
 path stays in the handler. std.obj runs the state machine of design section 5
-in its slow paths, over six cache words laid out as an `obj.Site`:
+in its slow paths, over the six cache words of an `obj.Site`:
+`cache PropIC = obj.Site;` declares them (language.md §7.1), and
+`&cache` is the `*obj.Site` its functions take:
 
 <!-- snippet: skip excerpt of a vm with members elided; full version in tests/run/std_obj_sites.lm -->
 ```loimi
-cache PropIC { sid: u32, slot: u32, cell: u32, depth: u32, ent: u32, miss: u32 }
+cache PropIC = obj.Site;
 family GETPROP(dst: reg, o: reg, key: kst) : ABC + PropIC {
     generic {
-        let (v, st) = ctx.m.read_miss(&cache.sid as *obj.Site, obj.IcState.Generic, x, k);
+        let (v, st) = ctx.m.read_miss(&cache, obj.IcState.Generic, x, k);
         ..   // become the member for `st`
     }
     GETPROP_IN {

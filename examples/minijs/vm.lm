@@ -183,7 +183,7 @@ fn read_miss(c: *Ctx, o: Gc<Obj>, kv: V, site: *obj.Site, st: obj.IcState) -> (V
 /// found on their builtin prototype are cached as (prototype shape, slot
 /// index); returns the value and true if the site should become the
 /// array (or string) prototype member.
-fn prim_get(c: *Ctx, v: V, kv: V, shape_w: *u32, slot_w: *u32) -> Result<(V, bool), V> {
+fn prim_get(c: *Ctx, v: V, kv: V, site: *obj.Site) -> Result<(V, bool), V> {
     let key = key_of_const(c, kv);
     let is_arr = v is A;
     let is_str = v is S;
@@ -191,8 +191,8 @@ fn prim_get(c: *Ctx, v: V, kv: V, shape_w: *u32, slot_w: *u32) -> Result<(V, boo
         let p = if is_arr { c.arr_proto() } else { c.str_proto() };
         if c.key_index(key) < 0 and p.dict.is_none() {
             if let Some(i) = c.m.find(p, key) {
-                *shape_w = p.shape.id;
-                *slot_w = i;
+                site.sid = p.shape.id;
+                site.slot = i;
                 return Ok((c.m.load(p, i), true));
             }
         }
@@ -504,14 +504,14 @@ pub vm JS {
         next
     }
 
-    // Property sites. The first six words are a std.obj Site: in the
+    // Property sites: the words of a std.obj Site, which holds in the
     // monomorphic members the receiver's shape id, a SlotRef and, for
     // prototype hits, the validity cell and depth; the index of the
     // site's polymorphic entry or add target; and its miss count. std.obj
     // runs the state machine (`read_miss`, `write_miss`); the members
     // here are its states, plus array and string methods (`_AP`, `_SP`:
     // the builtin prototype's shape id and slot index).
-    cache PropIC { sid: u32, slot: u32, cell: u32, depth: u32, ent: u32, miss: u32 }
+    cache PropIC = obj.Site;
 
     inline for (fam, own_in, own_out, protom, aprotom, sprotom, polym, megam, missm, dkind, pre) in [
         ("GETPROP", "GETPROP_IN", "GETPROP_OUT", "GETPROP_P", "GETPROP_AP", "GETPROP_SP", "GETPROP_POLY", "GETPROP_MEGA", "GETPROP_MISS", reg, {}),
@@ -522,7 +522,7 @@ pub vm JS {
                 if let R(r) = obj { obj = S(value.flatten(r)); }
                 pre
                 if let O(o) = obj {
-                    let (v, st) = read_miss(ctx, o, key, &cache.sid as *obj.Site, obj.IcState.Generic);
+                    let (v, st) = read_miss(ctx, o, key, &cache, obj.IcState.Generic);
                     regs[dst.raw] = v;
                     if st == obj.IcState.OwnIn { become #own_in; }
                     if st == obj.IcState.OwnOut { become #own_out; }
@@ -530,7 +530,7 @@ pub vm JS {
                     if st == obj.IcState.Poly { become #polym; }
                     next
                 }
-                let (v, p) = prim_get(ctx, obj, key, &cache.sid, &cache.slot)?;
+                let (v, p) = prim_get(ctx, obj, key, &cache)?;
                 regs[dst.raw] = v;
                 if p {
                     if let A(_) = obj { become #aprotom; } else { become #sprotom; }
@@ -567,7 +567,7 @@ pub vm JS {
                 cold {
                     if let O(o) = obj {
                         pre
-                        let (v, st) = read_miss(ctx, o, key, &cache.sid as *obj.Site, obj.IcState.OwnIn);
+                        let (v, st) = read_miss(ctx, o, key, &cache, obj.IcState.OwnIn);
                         regs[dst.raw] = v;
                         if st == obj.IcState.OwnIn { become #own_in; }
                         if st == obj.IcState.OwnOut { become #own_out; }
@@ -620,7 +620,7 @@ pub vm JS {
                     if let R(r) = obj { obj = S(value.flatten(r)); }
                     pre
                     if let O(o) = obj {
-                        let (v, st) = read_miss(ctx, o, key, &cache.sid as *obj.Site, obj.IcState.Poly);
+                        let (v, st) = read_miss(ctx, o, key, &cache, obj.IcState.Poly);
                         regs[dst.raw] = v;
                         if st == obj.IcState.Mega { become #megam; }
                         next
@@ -640,7 +640,7 @@ pub vm JS {
                     if let R(r) = obj { obj = S(value.flatten(r)); }
                     pre
                     if let O(o) = obj {
-                        let (v, _) = read_miss(ctx, o, key, &cache.sid as *obj.Site, obj.IcState.Mega);
+                        let (v, _) = read_miss(ctx, o, key, &cache, obj.IcState.Mega);
                         regs[dst.raw] = v;
                         next
                     }
@@ -658,7 +658,7 @@ pub vm JS {
     family SETPROP(obj: reg, key: kst, val: reg) : ABC + PropIC {
         generic {
             if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
-            let st = write_miss(ctx, obj, key, val, &cache.sid as *obj.Site, obj.IcState.Generic)?;
+            let st = write_miss(ctx, obj, key, val, &cache, obj.IcState.Generic)?;
             if st == obj.IcState.OwnIn { become SETPROP_IN; }
             if st == obj.IcState.OwnOut { become SETPROP_OUT; }
             if st == obj.IcState.Add { become SETPROP_ADD; }
@@ -672,7 +672,7 @@ pub vm JS {
             }
             cold {
                 if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
-                let st = write_miss(ctx, obj, key, val, &cache.sid as *obj.Site, obj.IcState.OwnIn)?;
+                let st = write_miss(ctx, obj, key, val, &cache, obj.IcState.OwnIn)?;
                 if st == obj.IcState.OwnOut { become SETPROP_OUT; }
                 if st == obj.IcState.Add { become SETPROP_ADD; }
                 if st == obj.IcState.Poly { become SETPROP_POLY; }
@@ -688,7 +688,7 @@ pub vm JS {
             }
             cold {
                 if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
-                let st = write_miss(ctx, obj, key, val, &cache.sid as *obj.Site, obj.IcState.OwnOut)?;
+                let st = write_miss(ctx, obj, key, val, &cache, obj.IcState.OwnOut)?;
                 if st == obj.IcState.OwnIn { become SETPROP_IN; }
                 if st == obj.IcState.Add { become SETPROP_ADD; }
                 if st == obj.IcState.Poly { become SETPROP_POLY; }
@@ -709,7 +709,7 @@ pub vm JS {
             if let O(o) = obj and ctx.m.poly_set(o, cache.ent, val) { next }
             cold {
                 if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
-                let st = write_miss(ctx, obj, key, val, &cache.sid as *obj.Site, obj.IcState.Poly)?;
+                let st = write_miss(ctx, obj, key, val, &cache, obj.IcState.Poly)?;
                 if st == obj.IcState.Mega { become SETPROP_MEGA; }
                 next
             }
@@ -718,7 +718,7 @@ pub vm JS {
             if let (O(o), S(ks)) = (obj, key) and ctx.m.mega_set(o, ks.key as u64, val) { next }
             cold {
                 if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
-                write_miss(ctx, obj, key, val, &cache.sid as *obj.Site, obj.IcState.Mega)?;
+                write_miss(ctx, obj, key, val, &cache, obj.IcState.Mega)?;
                 next
             }
         }

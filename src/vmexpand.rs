@@ -2328,8 +2328,132 @@ fn c_externs(items: &mut [Item]) {
     }
 }
 
+/// `cache X = S;`: fill in each such cache's fields from struct `S`'s, so
+/// that everything after (layout, emitters, the disassembler, the checker)
+/// sees the same cache as one written out field by field. `S` is found by
+/// name, as the vm's module sees it: a struct of that module, `m.S`
+/// through `import a.m;`, or `S` through `import a.m.{S};`. A field type
+/// declared in `S`'s module is qualified with that module's name (`m.T`),
+/// so that it means the same in the vm's module.
+fn cache_structs(modules: &mut [Module]) -> Res<()> {
+    for mi in 0..modules.len() {
+        let mut todo = Vec::new();
+        for (ii, it) in modules[mi].items.iter().enumerate() {
+            if let Item::Vm(v) = it {
+                for (ci, c) in v.caches.iter().enumerate() {
+                    if let Some(t) = &c.from {
+                        todo.push((ii, ci, t.clone()));
+                    }
+                }
+            }
+        }
+        for (ii, ci, t) in todo {
+            let fields = cache_struct_fields(modules, mi, &t)?;
+            if let Item::Vm(v) = &mut modules[mi].items[ii] {
+                v.caches[ci].fields = fields;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The type names a module declares.
+fn declares_type(m: &Module, n: &str) -> bool {
+    m.items.iter().any(|it| match it {
+        Item::Struct(d) => d.name.name == n,
+        Item::Enum(d) => d.name.name == n,
+        Item::TypeAlias(d) => d.name.name == n,
+        Item::Value(d) => d.name.name == n,
+        Item::Vm(d) => d.name.name == n,
+        _ => false,
+    })
+}
+
+fn cache_struct_fields(modules: &[Module], mi: usize, t: &TypeExpr) -> Res<Vec<(Ident, TypeExpr, bool)>> {
+    let bad = |msg: String| Err(Diag::new(t.span, msg));
+    let TypeKind::Named(path, args) = &t.kind else {
+        return bad("a cache layout `cache X = S;` names a struct".into());
+    };
+    if !args.is_empty() {
+        return bad("a cache layout cannot be a generic struct".into());
+    }
+    let name = &path.last().unwrap().name;
+    let imports = || {
+        modules[mi].items.iter().filter_map(|it| match it {
+            Item::Import(imp) => Some(imp),
+            _ => None,
+        })
+    };
+    let module_of = |imp: &Import| {
+        let p: Vec<String> = imp.path.iter().map(|i| i.name.clone()).collect();
+        modules.iter().position(|m| m.path == p)
+    };
+    // The struct's module, and the name the vm's module calls it by.
+    let (target, alias) = match path.len() {
+        1 if declares_type(&modules[mi], name) => (mi, None),
+        1 => match imports().find(|imp| imp.names.as_ref().is_some_and(|ns| ns.iter().any(|n| n.name == *name))).and_then(module_of) {
+            Some(tm) => (tm, None),
+            None => return bad(format!("unknown struct `{}` for cache layout", name)),
+        },
+        2 => match imports().find(|imp| imp.names.is_none() && imp.path.last().is_some_and(|l| l.name == path[0].name)).and_then(module_of) {
+            Some(tm) => (tm, Some(path[0].clone())),
+            None => return bad(format!("unknown module `{}`", path[0].name)),
+        },
+        _ => return bad("a cache layout names a struct as `S` or `module.S`".into()),
+    };
+    let Some(s) = modules[target].items.iter().find_map(|it| match it {
+        Item::Struct(d) if d.name.name == *name => Some(d),
+        _ => None,
+    }) else {
+        return bad(format!("`{}` is not a struct: a cache layout `cache X = S;` names a struct", name));
+    };
+    if !s.generics.is_empty() {
+        return bad(format!("`{}` is generic: a cache layout cannot be a generic struct", name));
+    }
+    if s.is_object {
+        return bad(format!("`{}` is an `object`: a cache layout is a plain struct (inline caches cannot hold GC objects)", name));
+    }
+    if s.fields.is_empty() {
+        return bad(format!("struct `{}` has no fields", name));
+    }
+    fn qualify(te: &TypeExpr, m: &Module, local: bool, alias: &Option<Ident>, field: &str, s: &str) -> Res<TypeExpr> {
+        let kind = match &te.kind {
+            TypeKind::Named(p, args) => {
+                let args = args.iter().map(|a| qualify(a, m, local, alias, field, s)).collect::<Res<Vec<_>>>()?;
+                let p = if local || (p.len() == 1 && !declares_type(m, &p[0].name)) {
+                    p.clone()
+                } else if let (1, Some(a)) = (p.len(), alias) {
+                    vec![a.clone(), p[0].clone()]
+                } else {
+                    let n: Vec<&str> = p.iter().map(|i| i.name.as_str()).collect();
+                    return Err(Diag::new(
+                        te.span,
+                        format!("field `{}` of `{}` has type `{}`, which names a type of `{}`'s module that the cache's module cannot name this way; import that module (`import ..;`) and write the layout as `module.{}`", field, s, n.join("."), s, s),
+                    ));
+                };
+                TypeKind::Named(p, args)
+            }
+            TypeKind::Ptr(a) => TypeKind::Ptr(Box::new(qualify(a, m, local, alias, field, s)?)),
+            TypeKind::Option(a) => TypeKind::Option(Box::new(qualify(a, m, local, alias, field, s)?)),
+            TypeKind::Slice(a) => TypeKind::Slice(Box::new(qualify(a, m, local, alias, field, s)?)),
+            TypeKind::Array(a, n) => TypeKind::Array(Box::new(qualify(a, m, local, alias, field, s)?), n.clone()),
+            TypeKind::Tuple(xs) => TypeKind::Tuple(xs.iter().map(|x| qualify(x, m, local, alias, field, s)).collect::<Res<Vec<_>>>()?),
+            TypeKind::Fn(ps, r, e) => TypeKind::Fn(
+                ps.iter().map(|x| qualify(x, m, local, alias, field, s)).collect::<Res<Vec<_>>>()?,
+                Box::new(qualify(r, m, local, alias, field, s)?),
+                e.clone(),
+            ),
+            k => k.clone(),
+        };
+        Ok(TypeExpr { kind, span: te.span })
+    }
+    let local = target == mi;
+    s.fields.iter().map(|(f, ft)| Ok((f.clone(), qualify(ft, &modules[target], local, &alias, &f.name, name)?, false))).collect()
+}
+
 /// Expand every vm in every module: append generated items.
 pub fn expand(sm: &mut SourceMap, modules: &mut [Module], jit: bool) -> Res<()> {
+    cache_structs(modules)?;
     let resume = uses_resume(sm);
     let cached = uses_cached_emitters(sm);
     for m in modules.iter_mut() {

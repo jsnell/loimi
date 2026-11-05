@@ -1,0 +1,13 @@
+// In a vm function the cache is a handle parameter: `&c`, not `&cache`.
+struct Site { n: u32 }
+fn get(p: *Site) -> u32 { p.n }
+vm V {
+    state { pc: *u32 }
+    encoding fixed(u32) { format A { op: 8 } }
+    cache IC = Site;
+    fn f() -> u32 { get(&cache) }
+    op NOP() : A + IC { let x = f(); next }
+    entry run(c: *u32) -> i64 { pc = c; jump pc }
+}
+fn main() {}
+// error: a vm function can declare a parameter `c: cache Name`, take `cache` from the op and use `&c`

@@ -33,8 +33,13 @@ pub struct FormatDecl {
 #[derive(Clone, Debug)]
 pub struct CacheDecl {
     pub name: Ident,
-    /// Each field occupies one code word.
+    /// Each field starts a code word (and takes as many as its type
+    /// needs). For `cache X = S;` these are `S`'s fields, filled in by
+    /// `vmexpand::cache_structs` before the vm is expanded.
     pub fields: Vec<(Ident, TypeExpr, bool)>,
+    /// `cache X = S;`: the layout is struct `S`'s fields, and `&cache`
+    /// is a `*S` (language.md §7.1).
+    pub from: Option<TypeExpr>,
 }
 
 #[derive(Clone, Debug)]

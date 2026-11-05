@@ -469,19 +469,24 @@ fn bound(c: *Ctx, selfv: Value, f: Value) -> Value {
 
 // ── globals ─────────────────────────────────────────────────────────
 
-pub fn get_global(c: *Ctx, func: Value, s: Gc<Str>, idx: *u32, ver: *u32, builtin: *u32) -> Result<Value, Value> {
+/// A GETGLOBAL site's cache (the vm's `cache GlobalIC = ops.GlobalSite`):
+/// the entry number, the globals' version when the name was a builtin, and
+/// whether it was.
+pub struct GlobalSite { idx: u32, ver: u32, builtin: u32 }
+
+pub fn get_global(c: *Ctx, func: Value, s: Gc<Str>, ic: *GlobalSite) -> Result<Value, Value> {
     let f = func as! Func;
     let d = f.globals;
     if let Some(e) = value.dict_find_str(d, s) {
-        *idx = e as u32;
-        *builtin = 0;
+        ic.idx = e as u32;
+        ic.builtin = 0;
         return Ok(value.dict_val(d, e));
     }
     let bd = c.builtins.unwrap();
     if let Some(e) = value.dict_find_str(bd, s) {
-        *idx = e as u32;
-        *ver = d.version as u32;
-        *builtin = 1;
+        ic.idx = e as u32;
+        ic.ver = d.version as u32;
+        ic.builtin = 1;
         return Ok(value.dict_val(bd, e));
     }
     Err(name_error(c, Value.Str(s)))

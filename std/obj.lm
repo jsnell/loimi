@@ -574,8 +574,8 @@ pub fn MegaCache.free(c: *MegaCache) { mem.release(c.e); }
 ///   Add      write sites: a cached property add (`m.add_hit(o, site.ent, site.slot, v)`)
 pub enum IcState { Generic, OwnIn, OwnOut, Proto, Poly, Mega, Add }
 
-/// A site's cache words, in this order (declare the vm's cache with the
-/// same six u32 fields first and pass `&cache.sid as *obj.Site`). `sid`,
+/// A site's cache words, in this order (declare the vm's cache as
+/// `cache PropIC = obj.Site;` and pass `&cache`). `sid`,
 /// `slot`, `cell` and `depth` are a `Hit` in the monomorphic states; `ent`
 /// is the index + 1 of the site's Poly entry, or of its add target; `miss`
 /// counts monomorphic misses.
@@ -1131,9 +1131,9 @@ pub fn Model<O, S, V>.optimize(m: *Model<O, S, V>, o: O) {
 // A vm declares the cache words and does the fast check itself, where the
 // compiler can keep everything in registers:
 //
-//     cache PropIC { sid: u32, slot: u32, cell: u32, depth: u32, ent: u32, miss: u32 }
+//     cache PropIC = obj.Site;
 //     family GETPROP(dst: reg, obj: reg, name: kst) : ABC + PropIC {
-//         generic { .. m.read_miss(&cache.sid as *obj.Site, IcState.Generic, o, key) .. }
+//         generic { .. m.read_miss(&cache, IcState.Generic, o, key) .. }
 //         GETPROP_IN {
 //             if let Obj(o) = obj and o.shape.id == cache.sid {
 //                 dst = o.inline.ptr[cache.slot]; next

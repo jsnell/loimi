@@ -1,0 +1,11 @@
+// A cache layout names a struct.
+enum E { A, B }
+vm V {
+    state { pc: *u32 }
+    encoding fixed(u32) { format A { op: 8 } }
+    cache IC = E;
+    op NOP() : A + IC { next }
+    entry run(c: *u32) -> i64 { pc = c; jump pc }
+}
+fn main() {}
+// error: `E` is not a struct: a cache layout `cache X = S;` names a struct

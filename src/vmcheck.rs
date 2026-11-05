@@ -81,6 +81,9 @@ pub struct VmInfo {
 pub struct CacheInfo {
     pub name: String,
     pub fields: Vec<(String, Ty, u32)>,
+    /// `cache X = S;`: the struct, and why `&cache` cannot be a `*S` if
+    /// the words do not hold an `S` as it is laid out in memory.
+    pub from: Option<(Ty, Option<String>)>,
 }
 
 /// A vm function returning `never`. Its body is checked again at each
@@ -434,9 +437,53 @@ fn cache_infos(c: &mut Checker, m: usize, d: &VmDecl, l: &mut crate::vmexpand::V
             off += words;
         }
         l.cache_words[ci] = off;
-        caches.push(CacheInfo { name: cd.name.name.clone(), fields });
+        let from = match &cd.from {
+            None => None,
+            Some(t) => {
+                let st = c.resolve_type(m, t)?;
+                let Ty::Struct(sid) = st else {
+                    return Err(Diag::new(t.span, format!("a cache layout `cache X = S;` names a struct, not `{}`", c.ty_name(&st))));
+                };
+                let why = whole_cache_mismatch(c, sid, &fields, off as u64 * wb, wb);
+                Some((st, why))
+            }
+        };
+        caches.push(CacheInfo { name: cd.name.name.clone(), fields, from });
     }
     Ok(caches)
+}
+
+/// Why the words of a cache declared `cache X = S;` are not an `S` as it
+/// is laid out in memory, if they are not: each field starts a code word,
+/// so `&cache` is a valid `*S` only if every field of `S` sits at the
+/// byte offset of its word and `S` needs no more than the words' alignment.
+fn whole_cache_mismatch(c: &Checker, sid: u32, fields: &[(String, Ty, u32)], bytes: u64, wb: u64) -> Option<String> {
+    let p = &c.prog;
+    let st = Ty::Struct(sid);
+    let align = crate::layout::align_of(p, &st);
+    if align > wb {
+        return Some(format!("`{}` is {}-byte aligned and code words only {}-byte", c.ty_name(&st), align, wb));
+    }
+    let mut off = 0;
+    for (n, t, w) in fields {
+        off = crate::layout::round_up(off, crate::layout::align_of(p, t));
+        if off != *w as u64 * wb {
+            return Some(format!(
+                "field `{}` is at byte {} of `{}` but starts cache word {} (byte {}): every field starts a {}-byte code word",
+                n,
+                off,
+                c.ty_name(&st),
+                w,
+                *w as u64 * wb,
+                wb
+            ));
+        }
+        off += crate::layout::size_of(p, t);
+    }
+    if crate::layout::size_of(p, &st) > bytes {
+        return Some(format!("`{}` is larger than the cache's {} bytes", c.ty_name(&st), bytes));
+    }
+    None
 }
 
 /// The vm's operand kinds; `const` kinds must all index the same state
@@ -1692,6 +1739,7 @@ fn bad_cache_type(t: &Ty) -> Option<&'static str> {
         Ty::Gc(_) | Ty::Value(_) | Ty::Option(_) => Some(
             "inline caches cannot hold GC references, since the collector does not scan bytecode; cache a pointer to a non-moving structure, an id or a version number, and validate it on use",
         ),
+        Ty::Struct(_) => Some("cache fields must be integers, floats, `bool`, pointers, function pointers or the vm's `Resume`; a cache whose words are a struct's fields is declared `cache X = S;`"),
         _ => Some("cache fields must be integers, floats, `bool`, pointers, function pointers or the vm's `Resume`"),
     }
 }
@@ -1817,6 +1865,52 @@ fn then_next_pc(c: &mut Checker, h: &HandlerCx, span: Span) -> Res<TExpr> {
     let pc = mk(pc_ty.clone(), TK::Local(h.state[c.vms[vmi].pc_idx]), span);
     let n = mk(Ty::i64(), TK::Int(size as i128), span);
     Ok(mk(pc_ty, TK::Intrinsic(Intr::PtrOffset, vec![pc, n]), span))
+}
+
+/// `&cache` in an op (or `&c` for a cache handle `c`) with a cache
+/// declared `cache X = S;`: the address of its first word, as a `*S`.
+/// It is the pointer `&cache.f as *S` gives for the first field `f`, so
+/// it compiles to the same code. Elsewhere `&cache` is an error that says
+/// what to write.
+pub fn cache_addr(c: &mut Checker, cx: &mut FnCx, n: &str, span: Span) -> Res<Option<TExpr>> {
+    let Some(h) = cx.vm.clone() else { return Ok(None) };
+    if cx.lookup(n).is_some() {
+        return Ok(None);
+    }
+    let info = &c.vms[h.vm as usize];
+    let (ci, base) = if let Some((_, l, ci)) = h.cache_params.iter().find(|(x, _, _)| x == n) {
+        let ht = cx.locals[*l as usize].ty.clone();
+        (*ci, mk(ht, TK::Local(*l), span))
+    } else if n == "cache" {
+        if h.in_fn {
+            return Err(Diag::new(span, "`cache` is not available in vm functions; declare a parameter `c: cache Name`, pass `cache` to it and use `&c`"));
+        }
+        let Some(op) = h.op else {
+            return Err(Diag::new(span, "`cache` is only available in op handlers; a vm function can declare a parameter `c: cache Name`, take `cache` from the op and use `&c`"));
+        };
+        let Some(ci) = info.ops[op].cache else {
+            return Err(Diag::new(span, format!("op `{}` has no inline cache", info.ops[op].name)));
+        };
+        let Some((_, ft, off)) = info.caches[ci].fields.first() else {
+            return Err(Diag::new(span, format!("cache `{}` has no fields", info.caches[ci].name)));
+        };
+        let w = mk(ft.clone(), TK::Vm(TVm::Word(1 + off)), span);
+        (ci, mk(Ty::Ptr(Box::new(ft.clone())), TK::AddrOf(Box::new(w)), span))
+    } else {
+        return Ok(None);
+    };
+    let cache = &info.caches[ci];
+    match &cache.from {
+        None => Err(Diag::new(
+            span,
+            format!(
+                "`&{}` is the address of the whole cache, which has a type only for a cache declared from a struct (`cache {} = S;`, language.md §7.1); take a field's address instead (`&{}.field`)",
+                n, cache.name, n
+            ),
+        )),
+        Some((st, Some(why))) => Err(Diag::new(span, format!("`&{}` cannot be a `*{}`: {}", n, c.ty_name(st), why))),
+        Some((st, None)) => Ok(Some(mk(Ty::Ptr(Box::new(st.clone())), TK::Cast(Box::new(base)), span))),
+    }
 }
 
 pub fn vm_field(c: &mut Checker, cx: &mut FnCx, base: &Expr, name: &Ident, span: Span) -> Res<Option<TExpr>> {

@@ -1,0 +1,12 @@
+// Every field starts a code word, so small fields do not pack as in memory.
+struct Site { a: u8, b: u8, n: u32 }
+fn get(p: *Site) -> u32 { p.n }
+vm V {
+    state { pc: *u32 }
+    encoding fixed(u32) { format A { op: 8 } }
+    cache IC = Site;
+    op NOP() : A + IC { let x = get(&cache); next }
+    entry run(c: *u32) -> i64 { pc = c; jump pc }
+}
+fn main() {}
+// error: `&cache` cannot be a `*Site`: field `b` is at byte 1 of `Site` but starts cache word 1 (byte 4)
