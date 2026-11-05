@@ -520,6 +520,17 @@ pub vm Mini {
     operand retn = it verify Mini.ABC_a(*pc) + it <= proto.nregs as u64;
     /// CONCAT joins R[b .. b+n-1], at least two.
     operand catn = it verify it >= 2 and Mini.ABC_b(*pc) + it <= proto.nregs as u64;
+    /// SWITCH's case count n: it jumps to `pc + 1 + i` for some i <= n,
+    /// so the n + 1 words after it must be JMP instructions.
+    operand ncases = it verify {
+        var ok = true;
+        var j: u64 = 0;
+        while ok and j <= it {
+            ok = is_insn_boundary(pc + 1 + j) and Mini.opcode(*(pc + 1 + j)) == Mini.OP_JMP;
+            j += 1;
+        }
+        ok
+    };
     /// GETINDEXI's constant index, 1..255.
     operand index1 = it verify it >= 1;
     /// SELF writes R[a] and R[a+1].
@@ -1006,6 +1017,24 @@ pub vm Mini {
                 cold { branch(value.raw_equal(a, b) == want, then.target) }
             }
         }
+    }
+
+    /// A jump table (`if x == 1 then .. elseif x == 2 ..`, compile.lm
+    /// `if_switch`; MiniJS's SWITCHI): followed by n + 1 JMPs. R[a] equal
+    /// to lo + i (an Int, or a float of that value) for 0 <= i < n
+    /// continues at JMP i, anything else at JMP n.
+    op SWITCH(a: reg, lo: imm, n: ncases) : ABC {
+        var i = n as u64;
+        if let Int(x) = a {
+            let d = (x as i64) - (lo as i64);
+            if d >= 0 and d < (n as i64) { i = d as u64; }
+        } else if let Num(f) = a and f >= (lo as f64) and f < ((lo + n) as f64) {
+            let t = f as i64;
+            if (t as f64) == f { i = (t - (lo as i64)) as u64; }
+        }
+        // To the JMP, not its target: the JIT (`--jit-stencils`) supports
+        // jumps to a computed instruction, not into its operands.
+        jump pc + 1 + i
     }
 
     op JMP(target: label) : sJ { #[cfg(gil)] if unlikely(ctx.gil.waiting()) { cold { ctx.gil.yield_now(); } } #[cfg(debug)] if unlikely((&ctx.pause).atomic_load_relaxed() != 0) { use_variant step; } jump target }

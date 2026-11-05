@@ -424,6 +424,106 @@ Tried and dropped:
   Doing it safely needs MiniJS's high-water mark across coroutine
   stacks, nested runs and the debugger; not attempted.
 
+### Fourth phase (2026-11-05)
+
+From the third phase's next candidates. A/B numbers are user+sys CPU
+time, minimum of 5-7 interleaved runs, `--align-functions=64`, against
+the build before (5cb7048); the host was loaded (load average 1-5), and
+moving the handlers by a few KB (a compiler change elsewhere in the
+binary) moved single benchmarks by up to 4-5% either way, so suspects
+were rerun with `--align-functions=128`.
+
+At the end (02087de), minimum of 7 interleaved runs, load average about
+4; "before" is 5cb7048:
+
+| Benchmark | Mini | Mini (before) | LuaJIT -joff | PUC-Lua 5.4 | Mini/Lua | Mini/-joff | before/-joff | Mini/before |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| binary_trees | 0.771 | 0.763 | 1.444 | 2.981 | 0.26 | 0.53 | 0.53 | 1.010 |
+| closures | 0.437 | 0.463 | 0.939 | 1.232 | 0.35 | 0.47 | 0.49 | 0.944 |
+| fannkuch | 1.152 | 1.155 | 1.430 | 1.716 | 0.67 | 0.81 | 0.81 | 0.997 |
+| fib | 0.938 | 0.934 | 1.122 | 1.602 | 0.59 | 0.84 | 0.83 | 1.004 |
+| hash_strings | 0.986 | 0.983 | 1.029 | 1.619 | 0.61 | 0.96 | 0.96 | 1.003 |
+| interp | 0.746 | 0.907 | 1.085 | 2.004 | 0.37 | 0.69 | 0.84 | 0.822 |
+| mandelbrot | 0.641 | 0.641 | 0.783 | 1.200 | 0.53 | 0.82 | 0.82 | 1.000 |
+| nbody | 0.447 | 0.446 | 0.520 | 1.168 | 0.38 | 0.86 | 0.86 | 1.002 |
+| oo_methods | 0.691 | 0.691 | 1.035 | 1.397 | 0.49 | 0.67 | 0.67 | 1.000 |
+| queens | 0.886 | 0.878 | 0.994 | 1.392 | 0.64 | 0.89 | 0.88 | 1.009 |
+| sieve | 0.626 | 0.618 | 0.930 | 1.405 | 0.45 | 0.67 | 0.66 | 1.013 |
+| sort | 0.755 | 0.753 | 0.870 | 1.133 | 0.67 | 0.87 | 0.87 | 1.003 |
+| spectral_norm | 1.077 | 1.077 | 1.163 | 1.744 | 0.62 | 0.93 | 0.93 | 1.000 |
+| string_build | 0.652 | 0.666 | 0.903 | 2.335 | 0.28 | 0.72 | 0.74 | 0.979 |
+| **geomean** | | | | | **0.47** | **0.75** | 0.76 | **0.984** |
+| coro chameneos | 0.376 | 0.380 | 0.383 | 1.016 | 0.37 | 0.98 | 0.99 | 0.989 |
+| coro coroutine_ring | 0.363 | 0.348 | 0.381 | 1.008 | 0.36 | 0.95 | 0.91 | 1.043 |
+| coro sieve | 0.362 | 0.366 | 0.390 | 1.094 | 0.33 | 0.93 | 0.94 | 0.989 |
+| **coro geomean** | | | | | **0.35** | **0.95** | 0.95 | **1.007** |
+
+Both changes are in the compiler; only interp's code changed among the
+benchmarks (closures, coroutine_ring: noise; their bytecode is the same).
+The ratios to the references moved from the third phase's table because
+the references ran faster under this load (Mini 0.49 → 0.47 of Lua).
+
+41. **Constant locals** (2c8b317, compile.lm). A local declared with a
+    constant (`local PUSH, LOAD = 1, 2`) that no statement assigns is
+    read as the constant by the functions nested in its scope: no
+    upvalue, and `op == PUSH` is one JEQKN instead of GETUPVAL and JEQN.
+    Whether a local is assigned is known only at the end of its scope,
+    so `compile` runs the parser twice: the first pass records the
+    assigned locals (`store_var` through a register or an upvalue
+    chain, by declaration number) and its code is dropped. Not under
+    `--cfg debug` (the debugger lists upvalues and can assign). interp
+    0.92 at both alignments; no other benchmark reads such an upvalue
+    in a loop.
+42. **Jump tables for if/elseif chains** (02087de). `if x == K1 then ..
+    elseif x == K2 ..` with at least four arms, `x` a local and the
+    keys integer numerals or constant locals (41) spanning at most 64
+    values in 0..255, compiles to `SWITCH` and n + 1 JMPs (MiniJS's
+    SWITCHI): an Int, or a float of integer value, in range goes to its
+    arm's JMP, anything else to the else block or out; a repeated key
+    goes to the first arm, as the tests would. At `if`, the parser
+    looks ahead over the tokens (block depth counted by
+    `if/function/do/repeat` against `end/until`) for the conditions.
+    interp's dispatch loop is such a chain of 15 arms (JEQKN was 35% of
+    its samples after 41): 0.84 on top of 41. `SWITCH` jumps to the
+    JMP, one dispatch more than jumping to its target: decoding the
+    target in SWITCH was 4% faster on interp but crashes the
+    `--jit-stencils` build, whose runtime handles jumps to computed
+    instructions, not to their targets. Not under `--cfg debug`.
+
+Tried and dropped:
+
+- **Lazy register clearing, safely** (third attempt). `Ctx.hw` per
+  thread (in `Coro` and `CtxThread` while a thread is not running,
+  relocated by `grow`), raised by every window creation (CALL's
+  overflow compare against `hw` instead of `stack_end`, its slow path
+  out of line; `call_value`, coroutine starts, `run`); `scan_stack`
+  marks the frames, clears from the highest window up to the mark and
+  lowers it, for the running thread, its resumers, suspended coroutines
+  (`trace_coro`: a suspend logs the coroutine, so the next collection
+  traces it) and saved `--cfg gil` threads; CALL clears only the missing
+  parameters. Running all tests and benchmarks with a poison value in
+  the uncleared registers changed no output (the compiler writes every
+  register before reading it; the debugger shows locals only in their
+  live ranges). Result: fib 0.955, closures 0.95 (1.00 at
+  `--align-functions=128`), but oo_methods 1.04-1.05 and coroutine_ring
+  1.03-1.04 in every run, at both alignments and with the stack's data
+  offset moved by 2 KB; overall 0.995-1.003. The same build clearing
+  the whole window again had oo_methods at 1.00: the clearing stores
+  themselves make its GETFIELD and SELF faster (their register loads;
+  Skylake, not explained). Not committed (the patch is described here).
+- **A balanced compare tree** for if chains, considered instead of 42:
+  interp orders its hot opcodes first, so a tree's ~4 compares would
+  not beat the chain's average.
+
+Next candidates:
+
+- `SWITCH` straight to the target, if the JIT runtime learns to exit to
+  (or compile) a JMP's target from a computed jump.
+- GETINDEX_GETINDEX is now 20% of interp and keeps its stack frame
+  (register pressure from two inlined hash probes).
+- Coroutine resume/yield cold blocks (31% of chameneos), the intern
+  table's probe miss (string_build), LEN and CONCAT frames: as before.
+
 ## Int(i48): measured, not adopted
 
 Mini keeps 32-bit integers (SPEC §2.1). Switching the payload to `i48`

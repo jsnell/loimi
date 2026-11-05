@@ -107,11 +107,16 @@ fn Lexer.next(lx: *Lexer) -> Result<Token, lex.Error> {
 
 // ── function state and expression descriptors ───────────────────────
 
-struct Local { name: str, reg: u32 }
+/// A local variable. `id` numbers the chunk's locals in the order of
+/// their declarations (the same in both passes of `compile`). `konst`:
+/// declared with a constant value `kv` and never assigned, so that the
+/// functions nested in its scope read the constant instead of an upvalue.
+struct Local { name: str, reg: u32, id: u32, konst: bool, kv: V }
 
 /// An upvalue of the function being compiled: register `idx` of the
-/// enclosing function (instack) or upvalue `idx` of the enclosing closure.
-struct UpDesc { name: str, instack: bool, idx: u32 }
+/// enclosing function (instack) or upvalue `idx` of the enclosing closure;
+/// `lid` is the id of the local it refers to.
+struct UpDesc { name: str, instack: bool, idx: u32, lid: u32 }
 
 /// A lexical block. `upval` is set when a nested function captures one of
 /// the block's locals, so that leaving the block must close upvalues.
@@ -135,7 +140,7 @@ struct FuncState {
     blocks: mem.Vec<Block>,
 }
 
-enum VarRef { Loc(u32), Up(u32), Glob }
+enum VarRef { Loc(u32), Up(u32), Glob, Const(V) }
 
 enum E {
     Nil,
@@ -171,7 +176,17 @@ struct Parser {
     exprs: parse.Pratt<Parser, T, E, ()>,
     sm: *diag.SourceMap,
     file: u32,
+    /// Constant locals (`compile`): FOLD_NONE, or the first pass, which
+    /// records in `assigned` (by local id) which locals some statement
+    /// assigns, or the second, which folds the others.
+    fold: u32,
+    nlocals: u32,
+    assigned: *mem.Vec<bool>,
 }
+
+const FOLD_NONE: u32 = 0;
+const FOLD_SCAN: u32 = 1;
+const FOLD_APPLY: u32 = 2;
 
 // ── errors ──────────────────────────────────────────────────────────
 
@@ -295,18 +310,26 @@ fn FuncState.resolve(fs: *FuncState, p: *Parser, name: str) -> VarRef {
     let Some(parent) = fs.parent else { return VarRef.Glob; };
     var instack = false;
     var idx: u32 = 0;
+    var lid: u32 = 0;
     if let Some(li) = parent.find_local(name) {
+        let l = parent.locals.at(li);
+        if l.konst { return VarRef.Const(l.kv); }
         parent.mark_captured(li);
         instack = true;
-        idx = parent.locals.at(li).reg;
+        idx = l.reg;
+        lid = l.id;
     } else {
         match parent.resolve(p, name) {
-            Up(i) => idx = i,
+            Up(i) => {
+                idx = i;
+                lid = parent.upvals.at(i as u64).lid;
+            }
+            Const(v) => return VarRef.Const(v),
             _ => return VarRef.Glob,
         }
     }
     if fs.upvals.len >= 255 { p.fail_prev("too many upvalues"); }
-    fs.upvals.push(UpDesc { name: name, instack: instack, idx: idx });
+    fs.upvals.push(UpDesc { name: name, instack: instack, idx: idx, lid: lid });
     VarRef.Up((fs.upvals.len - 1) as u32)
 }
 
@@ -415,6 +438,7 @@ fn reg_of(e: E) -> u32 {
 /// Assign the value of `v` to the variable `target`. Temporaries are
 /// not freed: statements reset the free register at their end.
 fn Parser.store_var(p: *Parser, target: E, v: E) {
+    if p.fold == FOLD_SCAN { p.note_assigned(target); }
     match target {
         Local(r) => p.discharge(v, r),
         Upval(i) => {
@@ -447,13 +471,46 @@ fn Parser.store_var(p: *Parser, target: E, v: E) {
     }
 }
 
+/// The first pass of `compile`: record that the local behind `target`
+/// (a register of this function or an upvalue) is assigned.
+fn Parser.note_assigned(p: *Parser, target: E) {
+    var id: u32 = 0;
+    match target {
+        Local(r) => {
+            var i = p.fs.locals.len;
+            loop {
+                if i == 0 { return; }
+                i -= 1;
+                if p.fs.locals.at(i).reg == r { break; }
+            }
+            id = p.fs.locals.at(i).id;
+        }
+        Upval(u) => id = p.fs.upvals.at(u as u64).lid,
+        _ => return,
+    }
+    p.assigned.set(id as u64, true);
+}
+
 // ── expressions ─────────────────────────────────────────────────────
+
+/// The constant expression for value `v` (of a constant local).
+fn Parser.const_exp(p: *Parser, v: V) -> E {
+    match v {
+        Nil => E.Nil,
+        Bool(b) => if b { E.True } else { E.False },
+        _ => {
+            if let Some(i) = small_int(v) { return E.I(i); }
+            E.K(p.constant(v))
+        }
+    }
+}
 
 fn Parser.singlevar(p: *Parser, name: str) -> E {
     match p.fs.resolve(p, name) {
         Loc(r) => E.Local(r),
         Up(i) => E.Upval(i),
         Glob => E.Global(p.str_const(name)),
+        Const(v) => p.const_exp(v),
     }
 }
 
@@ -994,7 +1051,9 @@ fn Parser.block(p: *Parser) {
 
 /// Make register `r` (already reserved) the local `name`.
 fn Parser.add_local(p: *Parser, name: str, r: u32) {
-    #[cfg(debug)] debugger.open_local(p.fs as *u8, name, r, p.fs.code.len()); p.fs.locals.push(Local { name: name, reg: r });
+    #[cfg(debug)] debugger.open_local(p.fs as *u8, name, r, p.fs.code.len()); p.fs.locals.push(Local { name: name, reg: r, id: p.nlocals, konst: false, kv: V.Nil });
+    if p.fold == FOLD_SCAN { p.assigned.push(false); }
+    p.nlocals += 1;
     p.fs.regs.activate(r + 1 - p.fs.regs.nactive);
 }
 
@@ -1237,6 +1296,34 @@ fn Parser.statement_inner(p: *Parser) {
             }
             let base = p.fs.regs.top;
             let n = names.len as u32;
+            if p.fold == FOLD_APPLY and p.accept(T.Assign) {
+                // Constants that are never assigned become constant
+                // locals; they are still stored in their registers.
+                var vals = p.explist_vals(n);
+                for i in 0..n {
+                    let e = vals.at(i as u64);
+                    let id = p.nlocals;
+                    p.add_local(names.at(i as u64), base + i);
+                    if is_const(e) {
+                        p.discharge(e, base + i);
+                        if !p.assigned.at(id as u64) {
+                            let l = p.fs.locals.ptr_at(p.fs.locals.len - 1);
+                            l.konst = true;
+                            l.kv = match e {
+                                Nil => V.Nil,
+                                True => V.Bool(true),
+                                False => V.Bool(false),
+                                I(k) => V.Int(k),
+                                K(k) => p.fs.consts.get(k),
+                                _ => V.Nil,
+                            };
+                        }
+                    }
+                }
+                vals.free();
+                names.free();
+                return;
+            }
             if p.accept(T.Assign) {
                 p.explist_to(n);
             } else {
@@ -1269,6 +1356,12 @@ fn Parser.statement_inner(p: *Parser) {
         }
         If => {
             p.advance();
+            var sw = true;
+            #[cfg(debug)] { sw = false; } // --cfg debug: each test is a line to stop at
+            if sw and let Some(plan) = p.switch_plan() {
+                p.if_switch(plan);
+                return;
+            }
             let done = p.fs.code.label();
             var f = p.cond();
             p.check(T.Then, "'then'");
@@ -1450,6 +1543,145 @@ fn Parser.statement_inner(p: *Parser) {
             targets.free();
         }
     }
+}
+
+/// An `if` whose conditions are all `x == K`, for one local `x` and
+/// integer constants K (numerals or constant locals): register `reg`,
+/// each arm's K in `keys`, the range `lo .. lo + n` they span.
+struct SwitchPlan { reg: u32, lo: i64, n: u64, keys: mem.Vec<i64> }
+
+/// Fewest arms for a jump table, and the largest table.
+const SWITCH_MIN: u64 = 4;
+const SWITCH_MAX: u64 = 64;
+
+/// The integer value of key token `t` (a numeral or a constant local).
+fn Parser.switch_key(p: *Parser, t: Token) -> ?i64 {
+    let v = match t.kind {
+        Number => t.num,
+        Name => match p.fs.resolve(p, t.text) {
+            Const(v) => v,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    if let Int(i) = v { return Some(i as i64); }
+    None
+}
+
+/// Look ahead (the parser is after `if`) for an if/elseif chain that
+/// `if_switch` can compile: at least SWITCH_MIN arms, keys in a range of
+/// at most SWITCH_MAX from 0 to 255.
+fn Parser.switch_plan(p: *Parser) -> ?SwitchPlan {
+    let t0 = p.tok;
+    if t0.kind != T.Name { return None; }
+    var lx = p.lx;
+    var keys: mem.Vec<i64> = mem.Vec.new();
+    var t = t0;
+    var ok = false;
+    loop {
+        // `x == K then`
+        if t.kind != T.Name or !t.text.eq(t0.text) { break; }
+        let Ok(e) = lx.next() else { break; };
+        if e.kind != T.Eq { break; }
+        let Ok(kt) = lx.next() else { break; };
+        let Some(key) = p.switch_key(kt) else { break; };
+        let Ok(th) = lx.next() else { break; };
+        if th.kind != T.Then { break; }
+        keys.push(key);
+        // The arm's block, to the next elseif, else or end at this level.
+        var depth: u64 = 0;
+        var arm_end = T.Eof;
+        loop {
+            let Ok(b) = lx.next() else { break; };
+            match b.kind {
+                If | Function | Do | Repeat => depth += 1,
+                End | Until => {
+                    if depth == 0 { arm_end = b.kind; break; }
+                    depth -= 1;
+                }
+                Elseif | Else => if depth == 0 { arm_end = b.kind; break; },
+                Eof => break,
+                _ => {}
+            }
+        }
+        if arm_end == T.Elseif {
+            let Ok(nt) = lx.next() else { break; };
+            t = nt;
+            continue;
+        }
+        ok = arm_end == T.Else or arm_end == T.End;
+        break;
+    }
+    if !ok or keys.len < SWITCH_MIN {
+        keys.free();
+        return None;
+    }
+    var lo = keys.at(0);
+    var hi = lo;
+    for i in 0..keys.len {
+        let k = keys.at(i);
+        if k < lo { lo = k; }
+        if k > hi { hi = k; }
+    }
+    let Loc(r) = p.fs.resolve(p, t0.text) else { keys.free(); return None; };
+    if lo < 0 or lo > 255 or (hi - lo + 1) as u64 > SWITCH_MAX {
+        keys.free();
+        return None;
+    }
+    Some(SwitchPlan { reg: r, lo: lo, n: (hi - lo + 1) as u64, keys: keys })
+}
+
+/// The if statement that `switch_plan` found: SWITCH and its table of
+/// JMPs to the arms (the first arm with a key wins, as the tests would),
+/// the arms' blocks as usual, the default to the else block or the end.
+fn Parser.if_switch(p: *Parser, plan: SwitchPlan) {
+    let done = p.fs.code.label();
+    p.emit(Mini.SWITCH(plan.reg as u8, plan.lo as u8, plan.n as u8));
+    let table = p.pc();
+    for i in 0..plan.n + 1 { p.emit(Mini.JMP(0)); }
+    var filled: mem.Vec<bool> = mem.Vec.new();
+    for i in 0..plan.n + 1 { filled.push(false); }
+    var arm: u64 = 0;
+    loop {
+        // `x == K then`, checked by switch_plan.
+        p.advance();
+        p.advance();
+        p.advance();
+        p.check(T.Then, "'then'");
+        p.fs.code.mark_target();
+        let slot = (plan.keys.at(arm) - plan.lo) as u64;
+        if !filled.at(slot) {
+            p.patch(table + slot, p.pc());
+            filled.set(slot, true);
+        }
+        arm += 1;
+        p.block();
+        if p.tok.kind == T.Elseif {
+            p.fs.code.jump(Mini.JMP(0), done);
+            p.advance();
+            continue;
+        }
+        if p.tok.kind == T.Else {
+            p.fs.code.jump(Mini.JMP(0), done);
+            p.advance();
+            p.fs.code.mark_target();
+            let here = p.pc();
+            for i in 0..plan.n + 1 {
+                if !filled.at(i) { p.patch(table + i, here); }
+            }
+            p.block();
+        } else {
+            for i in 0..plan.n + 1 {
+                if !filled.at(i) { p.fs.code.fixup(table + i, done); }
+            }
+        }
+        break;
+    }
+    filled.free();
+    var keys = plan.keys;
+    keys.free();
+    p.check(T.End, "'end'");
+    p.fs.code.bind(done);
 }
 
 fn Parser.numeric_for(p: *Parser, name: str, line: u32) {
@@ -1637,7 +1869,24 @@ fn Parser.function_body(p: *Parser, name: str, is_method: bool) -> u32 {
 
 /// Compile the chunk `src` (read from file `name`). Allocates in `h` but
 /// never collects. Syntax errors are reported on stderr and exit.
+///
+/// Locals declared with a constant (`local N, K = 10, "x"`) that nothing
+/// assigns read as that constant in the functions nested in their scope
+/// (no upvalue: `op == ADD` compiles as a compare with a constant). A
+/// first pass finds the assigned locals (the code it compiles is
+/// dropped). Not under `--cfg debug`, whose debugger shows upvalues and
+/// may assign variables.
 pub fn compile(h: *gc.Heap, name: str, src: str) -> Gc<Proto> {
+    var assigned: mem.Vec<bool> = mem.Vec.new();
+    var fold = FOLD_SCAN;
+    #[cfg(debug)] fold = FOLD_NONE;
+    if fold == FOLD_SCAN { compile_pass(h, name, src, FOLD_SCAN, &assigned); fold = FOLD_APPLY; }
+    let proto = compile_pass(h, name, src, fold, &assigned);
+    assigned.free();
+    proto
+}
+
+fn compile_pass(h: *gc.Heap, name: str, src: str, fold: u32, assigned: *mem.Vec<bool>) -> Gc<Proto> {
     var sm = diag.SourceMap.new();
     let file = sm.add(name, src);
     var tables = LexTables.new();
@@ -1652,6 +1901,9 @@ pub fn compile(h: *gc.Heap, name: str, src: str) -> Gc<Proto> {
         exprs: operators(),
         sm: &sm,
         file: file,
+        fold: fold,
+        nlocals: 0,
+        assigned: assigned,
     };
     p.advance();
     p.enter_block();
