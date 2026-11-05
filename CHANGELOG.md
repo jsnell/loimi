@@ -484,6 +484,14 @@ implementation; `git log` has the details.
   math.sqrt/floor without the native call, constants in multiple
   assignment stored directly, four supers
   ([bench/mini/RESULTS.md](bench/mini/RESULTS.md#third-phase-2026-11-04)).
+- Mini takes 0.47 of PUC-Lua's time and 0.75 of LuaJIT -joff's
+  (0.984 of the time before; interp 0.82) (2026-11-05, fourth pass):
+  never-assigned constant locals read as constants in nested functions
+  (a first compiler pass finds the assigned ones), and if/elseif chains
+  comparing a local with integer constants compile to a jump table
+  (`SWITCH`). Lazy register clearing with a high-water mark was measured
+  again and dropped (fib 0.955, oo_methods 1.05)
+  ([bench/mini/RESULTS.md](bench/mini/RESULTS.md#fourth-phase-2026-11-05)).
 - Mini has Lua 5.4 coroutines that switch threads inside the vm run
   ([`examples/mini/COROUTINES.md`](examples/mini/COROUTINES.md)).
 - The Prolog takes 0.53x SWI-Prolog's time and 0.13x Trealla's (0.92

@@ -414,6 +414,15 @@ handlers, young-only sweeps of the string table
 ([bench/mini/RESULTS.md](../bench/mini/RESULTS.md#third-phase-2026-11-04)).
 Other dispatch modes and the JIT build were not rerun.
 
+**2026-11-05, fourth Mini pass** (same method, 5cb7048 as the column):
+0.984 by geometric mean, 0.47 of PUC-Lua's time and 0.75 of LuaJIT
+-joff's (0.76 for the old build in the same run; the references ran
+faster under this run's load). interp 0.82 (constant locals read
+without upvalues, its opcode elseif chain as a `SWITCH` jump table);
+the others' bytecode is unchanged and their times within noise
+(0.94-1.04). Coroutines 1.007 (noise)
+([bench/mini/RESULTS.md](../bench/mini/RESULTS.md#fourth-phase-2026-11-05)).
+
 ### mini-coro
 
 | benchmark | tailcall | goto | switch | jit | lua | luajit-joff | tailcall/lua | tailcall/luajit-joff | jit/lua | jit/luajit-joff |
