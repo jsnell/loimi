@@ -193,7 +193,9 @@ impl Cx<'_> {
     }
 
     fn walk(&mut self, e: &mut TExpr, st: St) -> St {
-        if st == St::Dead {
+        // (A superinstruction's parts follow each other in a block, each
+        // reached from the one before through its `next`.)
+        if st == St::Dead && !matches!(e.kind, TK::Vm(TVm::Part(..))) {
             return St::Dead;
         }
         let lower = st == St::Clean && self.can_lower(e);
