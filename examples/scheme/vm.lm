@@ -936,57 +936,54 @@ pub vm Scheme {
     // wrote, `optimize` picks a variant that keeps the value in a machine
     // register (no run-time test; it costs opcodes and code size).
     // Compare-and-branch pairs produced by every `if`:
-    #[forward] super LTI_TEST = LTI; TEST;
-    #[forward] super LEI_TEST = LEI; TEST;
-    #[forward] super GTI_TEST = GTI; TEST;
-    #[forward] super GEI_TEST = GEI; TEST;
-    #[forward] super NUMEQI_TEST = NUMEQI; TEST;
-    #[forward] super LT_TEST = LT; TEST;
-    #[forward] super LT_TESTT = LT; TESTT;
-    #[forward] super LE_TEST = LE; TEST;
-    #[forward] super GT_TEST = GT; TEST;
-    #[forward] super GE_TEST = GE; TEST;
-    #[forward] super NUMEQ_TEST = NUMEQ; TEST;
-    #[forward] super NULLP_TEST = NULLP; TEST;
-    #[forward] super PAIRP_TEST = PAIRP; TEST;
-    #[forward] super EQ_TEST = EQ; TEST;
-    #[forward] super NOT_TEST = NOT; TEST;
-    #[forward] super ZEROP_TEST = ZEROP; TEST;
-    #[forward] super NUMEQ_TESTT = NUMEQ; TESTT;
-    #[forward] super EQ_TESTT = EQ; TESTT;
-    #[forward] super EQV_TEST = EQV; TEST;
-    // Overlaps another super, but runs outside TESTT; RET: 4% of nboyer's ops.
-    #[allow(super_overlap)]
-    #[forward] super PAIRP_TESTT = PAIRP; TESTT;
+    #[forward] supers {
+        LTI, TEST;
+        LEI, TEST;
+        GTI, TEST;
+        GEI, TEST;
+        NUMEQI, TEST;
+        LT, TEST;
+        LT, TESTT;
+        LE, TEST;
+        GT, TEST;
+        GE, TEST;
+        NUMEQ, TEST;
+        NULLP, TEST;
+        PAIRP, TEST;
+        EQ, TEST;
+        NOT, TEST;
+        ZEROP, TEST;
+        NUMEQ, TESTT;
+        EQ, TESTT;
+        EQV, TEST;
+        // Overlaps another super, but runs outside TESTT; RET: 4% of nboyer's ops.
+        #[allow(super_overlap)] PAIRP, TESTT;
+    }
     // Returning a constant ('(), #t, #f): 13 of the programs.
     super LOADK_RET = LOADK; RET;
-    #[forward] super CAR_CAR = CAR; CAR;
-    // Overlaps CAR_CAR, but runs outside it: (cadr x), (caddr x).
-    #[allow(super_overlap)]
-    #[forward] super CDR_CAR = CDR; CAR;
-    // Loops, argument set-up and list walking.
-    #[forward] super MOVE_MOVE = MOVE; MOVE;
-    // Overlaps another super, but runs outside MOVE; MOVE: 25% of sum's ops, 6.5% of diviter's.
-    #[allow(super_overlap)]
-    #[forward] super MOVE_JMP = MOVE; JMP;
-    #[forward] super ADDI_JMP = ADDI; JMP;
-    #[forward] super CDR_JMP = CDR; JMP;
-    // Overlaps another super, but runs outside CDR; JMP: 13-18% of takl's and ntakl's ops.
-    #[allow(super_overlap)]
-    #[forward] super CDR_CDR = CDR; CDR;
-    #[forward] super GETFREE_GETFREE = GETFREE; GETFREE;
-    #[forward] super ADD_RET = ADD; RET;
-    #[forward] super CONS_RET = CONS; RET;
-    // Overlaps another super, but runs outside LT; TESTT: 2-2.8% of takl's, ntakl's and nboyer's ops.
-    #[allow(super_overlap)]
-    #[forward] super TESTT_RET = TESTT; RET;
-    #[forward] super ADDI_CALL = ADDI; CALL;
-    // Overlaps another super, but runs outside MOVE; MOVE: 4.4% of conform's ops, 1-2% of several others.
-    #[allow(super_overlap)]
-    #[forward] super MOVE_CALL = MOVE; CALL;
-    // Overlaps another super, but runs outside MOVE; MOVE: 7% of fibc's ops, 4% of graphs'.
-    #[allow(super_overlap)]
-    #[forward] super MOVE_TAILCALL = MOVE; TAILCALL;
+    #[forward] supers {
+        CAR, CAR;
+        // Overlaps CAR_CAR, but runs outside it: (cadr x), (caddr x).
+        #[allow(super_overlap)] CDR, CAR;
+        // Loops, argument set-up and list walking.
+        MOVE, MOVE;
+        // Overlaps another super, but runs outside MOVE; MOVE: 25% of sum's ops, 6.5% of diviter's.
+        #[allow(super_overlap)] MOVE, JMP;
+        ADDI, JMP;
+        CDR, JMP;
+        // Overlaps another super, but runs outside CDR; JMP: 13-18% of takl's and ntakl's ops.
+        #[allow(super_overlap)] CDR, CDR;
+        GETFREE, GETFREE;
+        ADD, RET;
+        CONS, RET;
+        // Overlaps another super, but runs outside LT; TESTT: 2-2.8% of takl's, ntakl's and nboyer's ops.
+        #[allow(super_overlap)] TESTT, RET;
+        ADDI, CALL;
+        // Overlaps another super, but runs outside MOVE; MOVE: 4.4% of conform's ops, 1-2% of several others.
+        #[allow(super_overlap)] MOVE, CALL;
+        // Overlaps another super, but runs outside MOVE; MOVE: 7% of fibc's ops, 4% of graphs'.
+        #[allow(super_overlap)] MOVE, TAILCALL;
+    }
 
     entry run(c: *Ctx, cl: Gc<Closure>) -> V uses gc {
         ctx = c;

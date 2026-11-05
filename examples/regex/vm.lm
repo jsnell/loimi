@@ -272,10 +272,12 @@ pub vm Rx {
 
     // Superinstructions, from `--vm-stats` on the benchmark patterns
     // (stats.lm). `Rx.optimize` fuses them after verification.
-    super SAVE_SPLIT_CPLUS_LIT = SAVE; SPLIT; CPLUS; LIT;
-    super SAVE_CPLUS = SAVE; CPLUS;
-    super SAVE_MATCH = SAVE; MATCH;
-    super SPLIT_LIT = SPLIT; LIT;
+    supers {
+        SAVE, SPLIT, CPLUS, LIT;
+        SAVE, CPLUS;
+        SAVE, MATCH;
+        SPLIT, LIT;
+    }
 
     entry exec(r: *Regex, code: Verified<Rx>, input: *u8, n: u64, at: u64) -> Result<bool, str> {
         ctx = r;

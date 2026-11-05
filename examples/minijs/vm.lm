@@ -1513,32 +1513,30 @@ pub vm JS {
     // All `#[forward]`: where a part reads the register the previous part
     // wrote, `optimize` picks a variant that keeps the value in a machine
     // register (no run-time test; it costs opcodes and code size).
-    #[forward] super MOVE_MOVE = MOVE; MOVE;
-    #[forward] super GETPROP_IN_GETPROP_IN = GETPROP_IN; GETPROP_IN;
-    #[forward] super GETLEN_JLT = GETLEN; JLT;
-    #[forward] super ADDI_JLT = ADDI; JLT;
-    // Overlaps another super, but runs outside MOVE; MOVE: 5% of binary_trees' ops, 4% of deltablue's.
-    #[allow(super_overlap)]
-    #[forward] super MOVE_CALL = MOVE; CALL;
-    #[forward] super GETMETHOD_P_CALL = GETMETHOD_P; CALL;
-    #[forward] super GETGLOBAL_LOADU = GETGLOBAL; LOADU;
-    // Overlaps another super, but runs outside the MOVE pairs: 6.6% of closures' ops.
-    #[allow(super_overlap)]
-    #[forward] super LOADU_MOVE = LOADU; MOVE;
-    #[forward] super GETINDEX_SETINDEX = GETINDEX; SETINDEX;
-    // Overlaps another super, but runs outside GETPROP_IN; GETPROP_IN: 1.7% of raytrace's ops.
-    #[allow(super_overlap)]
-    #[forward] super GETPROP_IN_GETMETHOD_P = GETPROP_IN; GETMETHOD_P;
-    #[forward] super MUL_F_ADD_F = MUL_F; ADD_F;
-    // Overlaps another super, but runs where no ADD_F follows: 14% of nbody's ops.
-    #[allow(super_overlap)]
-    #[forward] super MUL_F_MUL_F = MUL_F; MUL_F;
-    // Loop tails against constants (JLTK/JLEK) and `if (a[i])`; supers
-    // for returns, constructors' adds and POLY calls measured within
-    // noise and were not kept.
-    #[forward] super ADDI_JLTK = ADDI; JLTK;
-    #[forward] super ADDI_JLEK = ADDI; JLEK;
-    #[forward] super GETINDEX_TEST = GETINDEX; TEST;
+    #[forward] supers {
+        MOVE, MOVE;
+        GETPROP_IN, GETPROP_IN;
+        GETLEN, JLT;
+        ADDI, JLT;
+        // Overlaps another super, but runs outside MOVE; MOVE: 5% of binary_trees' ops, 4% of deltablue's.
+        #[allow(super_overlap)] MOVE, CALL;
+        GETMETHOD_P, CALL;
+        GETGLOBAL, LOADU;
+        // Overlaps another super, but runs outside the MOVE pairs: 6.6% of closures' ops.
+        #[allow(super_overlap)] LOADU, MOVE;
+        GETINDEX, SETINDEX;
+        // Overlaps another super, but runs outside GETPROP_IN; GETPROP_IN: 1.7% of raytrace's ops.
+        #[allow(super_overlap)] GETPROP_IN, GETMETHOD_P;
+        MUL_F, ADD_F;
+        // Overlaps another super, but runs where no ADD_F follows: 14% of nbody's ops.
+        #[allow(super_overlap)] MUL_F, MUL_F;
+        // Loop tails against constants (JLTK/JLEK) and `if (a[i])`; supers
+        // for returns, constructors' adds and POLY calls measured within
+        // noise and were not kept.
+        ADDI, JLTK;
+        ADDI, JLEK;
+        GETINDEX, TEST;
+    }
 
     entry run(c: *Ctx, cl: Gc<Fn>) -> V uses gc {
         ctx = c;

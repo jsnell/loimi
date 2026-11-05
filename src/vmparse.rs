@@ -77,6 +77,10 @@ impl Parser {
             stack_entry: None,
             accs: vec![],
             acc_list: vec![],
+            acc_sel: vec![],
+            rels: vec![],
+            data_keys: vec![],
+            data_vals: vec![],
             acc_ops: vec![],
             auto_cold: vec![],
             is_pub,
@@ -103,7 +107,7 @@ impl Parser {
             };
             let (what, known): (String, &[&str]) = match kw.as_str() {
                 "fn" => ("a vm function".into(), crate::parser::FN_ATTRS),
-                "super" => ("a `super`".into(), &["forward"]),
+                "super" | "supers" => (format!("a `{}`", kw), &["forward"]),
                 "on" => ("`on raise` or `on break`".into(), &[]),
                 "op" => ("an `op`".into(), &["accumulate", "poll"]),
                 "family" => ("a `family`".into(), &["poll"]),
@@ -284,6 +288,76 @@ impl Parser {
                     }
                     vm.supers.push(SuperDecl { name: n, parts, forward: item_attrs.has("forward") });
                 }
+                "supers" => {
+                    // `supers { A, B; NAME = C, D, E; }`: one super per
+                    // `;`, each with the group's attributes (and its own),
+                    // named by its parts joined with `_` unless named.
+                    self.bump();
+                    self.expect("{")?;
+                    while !self.eat("}") {
+                        let mark = self.allow_mark();
+                        let attrs = self.parse_attrs()?;
+                        crate::parser::check_attrs(&attrs, "a super of a `supers` group", &["forward"])?;
+                        let name = if matches!(self.peek(), Tok::Ident(_)) && self.is_at(1, "=") {
+                            let n = self.ident()?;
+                            self.bump();
+                            Some(n)
+                        } else {
+                            None
+                        };
+                        let mut parts = vec![self.ident()?];
+                        while self.eat(",") {
+                            parts.push(self.ident()?);
+                        }
+                        if parts.len() < 2 {
+                            return Err(Diag::new(parts[0].span, "a super has at least two parts: `A, B;`"));
+                        }
+                        self.expect(";")?;
+                        let name = name.unwrap_or_else(|| Ident {
+                            name: parts.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join("_"),
+                            span: parts[0].span.to(parts[parts.len() - 1].span),
+                        });
+                        vm.supers.push(SuperDecl { name, parts, forward: item_attrs.has("forward") || attrs.has("forward") });
+                        self.close_allows(mark);
+                    }
+                }
+                "rel" => {
+                    // `rel kform(I32_ADD) = I32_ADDK;`: `Vm.kform(op)`.
+                    // `_` for either op declares nothing (an `inline for`
+                    // row without the relation).
+                    self.bump();
+                    let name = self.ident()?;
+                    self.expect("(")?;
+                    let from = self.ident()?;
+                    self.expect(")")?;
+                    self.expect("=")?;
+                    let to = self.ident()?;
+                    self.expect(";")?;
+                    if from.name != "_" && to.name != "_" {
+                        vm.rels.push(RelDecl { name, from, to });
+                    }
+                }
+                "data" => {
+                    // `data comm: bool = false;` declares a key, and
+                    // `data comm(I32_ADD) = true;` gives an op its value.
+                    self.bump();
+                    let name = self.ident()?;
+                    if self.eat(":") {
+                        let ty = self.parse_type()?;
+                        self.expect("=")?;
+                        let default = self.parse_expr()?;
+                        self.expect(";")?;
+                        vm.data_keys.push(DataKeyDecl { name, ty, default });
+                    } else {
+                        self.expect("(")?;
+                        let op = self.ident()?;
+                        self.expect(")")?;
+                        self.expect("=")?;
+                        let value = self.parse_expr()?;
+                        self.expect(";")?;
+                        vm.data_vals.push(DataValDecl { key: name, op, value });
+                    }
+                }
                 "fn" => {
                     self.in_vm = true;
                     let f = self.parse_fn(item_attrs, Linkage::Internal, false);
@@ -415,10 +489,11 @@ impl Parser {
                 }
                 "accumulate" => {
                     // `accumulate ADD, SUB;`: as `#[accumulate]` on each.
+                    // Op selectors: `A..B`, `I32_*K`, `with KIND`.
                     self.bump();
-                    vm.acc_list.push(self.ident()?);
+                    vm.acc_sel.push(self.parse_selector()?);
                     while self.eat(",") {
-                        vm.acc_list.push(self.ident()?);
+                        vm.acc_sel.push(self.parse_selector()?);
                     }
                     self.expect(";")?;
                 }
@@ -443,7 +518,7 @@ impl Parser {
                         self.expect("[")?;
                         let mut list = Vec::new();
                         while !self.is("]") {
-                            list.push(self.ident()?);
+                            list.push(self.parse_selector()?);
                             if !self.eat(",") {
                                 break;
                             }
@@ -455,7 +530,7 @@ impl Parser {
                     self.expect_kw("before")?;
                     let before = self.vm_block()?;
                     self.expect("}")?;
-                    vm.variants.push(VariantDecl { name: n, wraps, before, unfused: item_attrs.has("unfused") });
+                    vm.variants.push(VariantDecl { name: n, wraps: None, wraps_sel: wraps, before, unfused: item_attrs.has("unfused") });
                 }
                 _ => return self.err(format!("unknown vm item `{}`", kw)),
             }
@@ -467,6 +542,7 @@ impl Parser {
             }
         }
         loop_vars.append(&mut self.vm_loop_vars);
+        resolve_selectors(&mut vm)?;
         vm.auto_cold = crate::autocold::run(&mut vm, &self.vm_hot)?;
         desugar_break(&mut vm)?;
         crate::vmacc::desugar(&mut vm)?;
@@ -501,6 +577,37 @@ impl Parser {
             body.stmts = pre;
         }
         Ok(())
+    }
+
+    /// An op selector: `NAME`, `A..B`, a glob (`BR_I32_*`, `*_TK`; no
+    /// spaces inside) or `with KIND`.
+    fn parse_selector(&mut self) -> Res<Selector> {
+        if self.is_kw("with") && matches!(self.peek_at(1), Tok::Ident(_)) {
+            self.bump();
+            return Ok(Selector::With(self.ident()?));
+        }
+        let glob = self.is("*") || (matches!(self.peek(), Tok::Ident(_)) && self.is_at(1, "*") && self.adjacent(1));
+        if glob {
+            let lo = self.span();
+            let mut pat = String::new();
+            loop {
+                match self.peek().clone() {
+                    Tok::Ident(s) => pat.push_str(&s),
+                    Tok::Punct("*") => pat.push('*'),
+                    _ => break,
+                }
+                self.bump();
+                if !self.adjacent(0) {
+                    break;
+                }
+            }
+            return Ok(Selector::Glob(pat, lo.to(self.prev_span())));
+        }
+        let a = self.ident()?;
+        if self.eat("..") {
+            return Ok(Selector::Range(a, self.ident()?));
+        }
+        Ok(Selector::Name(a))
     }
 
     fn vm_block(&mut self) -> Res<Block> {
@@ -613,4 +720,115 @@ impl Parser {
         self.expect("}")?;
         Ok(ValueDecl { name, repr, variants, is_pub, scan_raw: None })
     }
+}
+
+/// Does op name `n` match glob `pat` (`*`: any run of characters)?
+fn glob_match(pat: &str, n: &str) -> bool {
+    let parts: Vec<&str> = pat.split('*').collect();
+    if parts.len() == 1 {
+        return pat == n;
+    }
+    let (first, last) = (parts[0], parts[parts.len() - 1]);
+    if n.len() < first.len() + last.len() || !n.starts_with(first) || !n.ends_with(last) {
+        return false;
+    }
+    let mut rest = &n[first.len()..n.len() - last.len()];
+    for p in &parts[1..parts.len() - 1] {
+        match rest.find(p) {
+            Some(i) => rest = &rest[i + p.len()..],
+            None => return false,
+        }
+    }
+    true
+}
+
+/// The ops (indices into `vm.ops`, in declaration order) that selectors
+/// name, each once; supers named by name are left to the caller. Ranges,
+/// globs and `with` leave out family members (name those). A selector
+/// that names no op is an error.
+fn select_ops(vm: &VmDecl, sels: &[Selector], what: &str) -> Res<Vec<usize>> {
+    let pos = |id: &Ident| -> Res<usize> {
+        vm.ops.iter().position(|o| o.name.name == id.name).ok_or_else(|| Diag::new(id.span, format!("unknown op `{}`", id.name)))
+    };
+    let plain = |k: usize| vm.ops[k].family.is_none();
+    let mut out: Vec<usize> = Vec::new();
+    for s in sels {
+        let (found, span): (Vec<usize>, crate::diag::Span) = match s {
+            Selector::Name(id) if vm.supers.iter().any(|x| x.name.name == id.name) => continue,
+            Selector::Name(id) => (vec![pos(id)?], id.span),
+            Selector::Range(a, b) => {
+                let (i, j) = (pos(a)?, pos(b)?);
+                if i > j {
+                    return Err(Diag::new(
+                        a.span.to(b.span),
+                        format!("`{}` is declared before `{}`: `A..B` names the ops declared from A to B", b.name, a.name),
+                    ));
+                }
+                ((i..=j).filter(|&k| plain(k)).collect(), a.span.to(b.span))
+            }
+            Selector::Glob(p, sp) => ((0..vm.ops.len()).filter(|&k| plain(k) && glob_match(p, &vm.ops[k].name.name)).collect(), *sp),
+            Selector::With(kind) => {
+                if !vm.operands.iter().any(|o| o.name.name == kind.name) {
+                    return Err(Diag::new(kind.span, format!("unknown operand kind `{}`", kind.name)));
+                }
+                let has = |k: usize| vm.ops[k].params.iter().any(|p| p.kind.name == kind.name);
+                ((0..vm.ops.len()).filter(|&k| plain(k) && has(k)).collect(), kind.span)
+            }
+        };
+        if found.is_empty() {
+            return Err(Diag::new(span, format!("this selector names no op of the vm (in `{what}`)")));
+        }
+        for i in found {
+            if !out.contains(&i) {
+                out.push(i);
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// `accumulate` and `variant .. wraps [..]` selectors into op names. A
+/// variant that wraps an op also wraps every super with it as a part, so
+/// that a super declared later is not silently left out.
+/// `LOIMI_DUMP_VM_EXPANSION=1` prints the lists.
+fn resolve_selectors(vm: &mut VmDecl) -> Res<()> {
+    let dump = std::env::var_os("LOIMI_DUMP_VM_EXPANSION").is_some();
+    if !vm.acc_sel.is_empty() {
+        let sels = std::mem::take(&mut vm.acc_sel);
+        for s in &sels {
+            if let Selector::Name(id) = s {
+                if vm.supers.iter().any(|x| x.name.name == id.name) {
+                    return Err(Diag::new(id.span, format!("`{}` is a super: `accumulate` takes plain ops", id.name)));
+                }
+            }
+        }
+        let ops = select_ops(vm, &sels, "accumulate")?;
+        for &i in &ops {
+            vm.acc_list.push(vm.ops[i].name.clone());
+        }
+        if dump {
+            let list: Vec<&str> = ops.iter().map(|&i| vm.ops[i].name.name.as_str()).collect();
+            eprintln!("// vm {}: accumulate {}", vm.name.name, list.join(", "));
+        }
+    }
+    for vi in 0..vm.variants.len() {
+        let Some(sels) = vm.variants[vi].wraps_sel.take() else { continue };
+        let ops = select_ops(vm, &sels, "wraps")?;
+        let mut names: Vec<Ident> = ops.iter().map(|&i| vm.ops[i].name.clone()).collect();
+        // Supers named in the list, and those with a wrapped part.
+        for sup in &vm.supers {
+            let named = sels.iter().any(|s| matches!(s, Selector::Name(id) if id.name == sup.name.name));
+            let has_part = sup.parts.iter().any(|p| ops.iter().any(|&i| vm.ops[i].name.name == p.name));
+            if named || has_part {
+                names.push(sup.name.clone());
+            }
+        }
+        if dump {
+            let list: Vec<&str> = names.iter().map(|n| n.name.as_str()).collect();
+            eprintln!("// vm {}: variant {} wraps {}", vm.name.name, vm.variants[vi].name.name, list.join(", "));
+        }
+        vm.variants[vi].wraps = Some(names);
+    }
+    Ok(())
 }

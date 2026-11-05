@@ -1601,17 +1601,7 @@ fn C.first_param_name(c: *C) -> str {
 // ── conditions ──────────────────────────────────────────────────────
 
 fn branch_ops(op: CmpOp, k: bool) -> ?u32 {
-    if k {
-        match op {
-            Lt => Some(Py.OP_JNLTK), Le => Some(Py.OP_JNLEK), Gt => Some(Py.OP_JNGTK), Ge => Some(Py.OP_JNGEK),
-            Eq => Some(Py.OP_JNEQK), Ne => Some(Py.OP_JNNEK), _ => None,
-        }
-    } else {
-        match op {
-            Lt => Some(Py.OP_JNLT), Le => Some(Py.OP_JNLE), Gt => Some(Py.OP_JNGT), Ge => Some(Py.OP_JNGE),
-            Eq => Some(Py.OP_JNEQ), Ne => Some(Py.OP_JNNE), _ => None,
-        }
-    }
+    if k { Py.jnk(cmp_opcode(op)) } else { Py.jn(cmp_opcode(op)) }
 }
 
 fn negate(op: CmpOp) -> ?CmpOp {

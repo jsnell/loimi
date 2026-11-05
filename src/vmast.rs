@@ -114,6 +114,45 @@ pub struct SuperDecl {
     pub forward: bool,
 }
 
+/// An op selector, in `accumulate` and `variant .. wraps [..]` lists
+/// (resolved by `vmparse::resolve_selectors` to the ops it names).
+#[derive(Clone, Debug)]
+pub enum Selector {
+    /// `ADD`: the op.
+    Name(Ident),
+    /// `I32_ADD..I32_ROTL`: the ops declared from the first to the last.
+    Range(Ident, Ident),
+    /// `BR_I32_*`, `*_TK`: the ops whose names match (`*` is any run of
+    /// characters).
+    Glob(String, crate::diag::Span),
+    /// `with label`: the ops with an operand of the kind.
+    With(Ident),
+}
+
+/// `rel NAME(A) = B;`: `Vm.NAME(OP_A)` is `Some(OP_B)`.
+#[derive(Clone, Debug)]
+pub struct RelDecl {
+    pub name: Ident,
+    pub from: Ident,
+    pub to: Ident,
+}
+
+/// `data NAME: T = DEFAULT;` declares per-op data; `data NAME(OP) =
+/// VALUE;` gives an op its value. `Vm.NAME(op) -> T`.
+#[derive(Clone, Debug)]
+pub struct DataKeyDecl {
+    pub name: Ident,
+    pub ty: TypeExpr,
+    pub default: Expr,
+}
+
+#[derive(Clone, Debug)]
+pub struct DataValDecl {
+    pub key: Ident,
+    pub op: Ident,
+    pub value: Expr,
+}
+
 #[derive(Clone, Debug)]
 pub struct EntryDecl {
     pub name: Ident,
@@ -128,8 +167,10 @@ pub struct EntryDecl {
 #[derive(Clone, Debug)]
 pub struct VariantDecl {
     pub name: Ident,
-    /// None = all ops.
+    /// None = all ops. Resolved from `wraps_sel` by the parser (with the
+    /// supers that contain a selected op).
     pub wraps: Option<Vec<Ident>>,
+    pub wraps_sel: Option<Vec<Selector>>,
     pub before: Block,
     /// `#[unfused]`: superinstructions run as their parts under this
     /// variant (each part's word is dispatched, and wrapped, on its own).
@@ -178,8 +219,14 @@ pub struct VmDecl {
     pub stack_entry: Option<Expr>,
     /// `accumulator` declarations, and the `#[accumulate]` ops' variants.
     pub accs: Vec<AccDecl>,
-    /// `accumulate OP, OP;`: more ops to derive variants of.
+    /// `accumulate OP, OP;`: more ops to derive variants of (selectors,
+    /// resolved by the parser into `acc_list`).
     pub acc_list: Vec<Ident>,
+    pub acc_sel: Vec<Selector>,
+    /// `rel` and `data` declarations: generated host lookups.
+    pub rels: Vec<RelDecl>,
+    pub data_keys: Vec<DataKeyDecl>,
+    pub data_vals: Vec<DataValDecl>,
     pub acc_ops: Vec<AccOp>,
     /// The branches made cold by default (src/autocold.rs), for
     /// `LOIMI_COLD_AUDIT=1`.

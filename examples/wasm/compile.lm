@@ -296,7 +296,7 @@ fn T.reads_local(t: *T, x: u64) -> bool {
 fn T.flush_before_last(t: *T, x: u64) {
     let Some(last) = t.code.last() else { t.flush_local(x); return; };
     // (Not under an op that writes a second slot, x itself maybe.)
-    if last != t.last_def_pc or is_tk(W.opcode(t.code.at(last))) { t.flush_local(x); return; }
+    if last != t.last_def_pc or W.tee(W.opcode(t.code.at(last))) { t.flush_local(x); return; }
     let slot = t.last_def_slot;
     let n = W.op_size(t.code.at(last));
     var ws: mem.Vec<u64> = mem.Vec.new();
@@ -714,87 +714,50 @@ fn simd_numeric(op: u32) -> ?Numeric {
     }
 }
 
-/// Loads and stores: (vm op, vm op with a 64-bit address, value type,
-/// natural alignment as a power of two, is a store).
-fn memop(op: u32) -> ?(u64, u64, u8, u32, bool) {
+/// Loads and stores: (vm op, value type, natural alignment as a power of
+/// two, is a store). `W.xform(op)` is the op with a 64-bit address.
+fn memop(op: u32) -> ?(u64, u8, u32, bool) {
     let (i, l, f, d) = (T_I32, T_I64, T_F32, T_F64);
     match op {
-        0x28 => Some((W.OP_I32_LOAD, W.OP_I32_LOAD_X, i, 2, false)),
-        0x29 => Some((W.OP_I64_LOAD, W.OP_I64_LOAD_X, l, 3, false)),
-        0x2A => Some((W.OP_F32_LOAD, W.OP_F32_LOAD_X, f, 2, false)),
-        0x2B => Some((W.OP_F64_LOAD, W.OP_F64_LOAD_X, d, 3, false)),
-        0x2C => Some((W.OP_I32_LOAD8_S, W.OP_I32_LOAD8_S_X, i, 0, false)),
-        0x2D => Some((W.OP_I32_LOAD8_U, W.OP_I32_LOAD8_U_X, i, 0, false)),
-        0x2E => Some((W.OP_I32_LOAD16_S, W.OP_I32_LOAD16_S_X, i, 1, false)),
-        0x2F => Some((W.OP_I32_LOAD16_U, W.OP_I32_LOAD16_U_X, i, 1, false)),
-        0x30 => Some((W.OP_I64_LOAD8_S, W.OP_I64_LOAD8_S_X, l, 0, false)),
-        0x31 => Some((W.OP_I64_LOAD8_U, W.OP_I64_LOAD8_U_X, l, 0, false)),
-        0x32 => Some((W.OP_I64_LOAD16_S, W.OP_I64_LOAD16_S_X, l, 1, false)),
-        0x33 => Some((W.OP_I64_LOAD16_U, W.OP_I64_LOAD16_U_X, l, 1, false)),
-        0x34 => Some((W.OP_I64_LOAD32_S, W.OP_I64_LOAD32_S_X, l, 2, false)),
-        0x35 => Some((W.OP_I64_LOAD32_U, W.OP_I64_LOAD32_U_X, l, 2, false)),
-        0x36 => Some((W.OP_I32_STORE, W.OP_I32_STORE_X, i, 2, true)),
-        0x37 => Some((W.OP_I64_STORE, W.OP_I64_STORE_X, l, 3, true)),
-        0x38 => Some((W.OP_F32_STORE, W.OP_F32_STORE_X, f, 2, true)),
-        0x39 => Some((W.OP_F64_STORE, W.OP_F64_STORE_X, d, 3, true)),
-        0x3A => Some((W.OP_I32_STORE8, W.OP_I32_STORE8_X, i, 0, true)),
-        0x3B => Some((W.OP_I32_STORE16, W.OP_I32_STORE16_X, i, 1, true)),
-        0x3C => Some((W.OP_I64_STORE8, W.OP_I64_STORE8_X, l, 0, true)),
-        0x3D => Some((W.OP_I64_STORE16, W.OP_I64_STORE16_X, l, 1, true)),
-        0x3E => Some((W.OP_I64_STORE32, W.OP_I64_STORE32_X, l, 2, true)),
-        0xFD00 => Some((W.OP_V128_LOAD, W.OP_V128_LOAD_X, T_V128, 4, false)),
-        0xFD01 => Some((W.OP_V128_LOAD8X8_S, W.OP_V128_LOAD8X8_S_X, T_V128, 3, false)),
-        0xFD02 => Some((W.OP_V128_LOAD8X8_U, W.OP_V128_LOAD8X8_U_X, T_V128, 3, false)),
-        0xFD03 => Some((W.OP_V128_LOAD16X4_S, W.OP_V128_LOAD16X4_S_X, T_V128, 3, false)),
-        0xFD04 => Some((W.OP_V128_LOAD16X4_U, W.OP_V128_LOAD16X4_U_X, T_V128, 3, false)),
-        0xFD05 => Some((W.OP_V128_LOAD32X2_S, W.OP_V128_LOAD32X2_S_X, T_V128, 3, false)),
-        0xFD06 => Some((W.OP_V128_LOAD32X2_U, W.OP_V128_LOAD32X2_U_X, T_V128, 3, false)),
-        0xFD07 => Some((W.OP_V128_LOAD8_SPLAT, W.OP_V128_LOAD8_SPLAT_X, T_V128, 0, false)),
-        0xFD08 => Some((W.OP_V128_LOAD16_SPLAT, W.OP_V128_LOAD16_SPLAT_X, T_V128, 1, false)),
-        0xFD09 => Some((W.OP_V128_LOAD32_SPLAT, W.OP_V128_LOAD32_SPLAT_X, T_V128, 2, false)),
-        0xFD0A => Some((W.OP_V128_LOAD64_SPLAT, W.OP_V128_LOAD64_SPLAT_X, T_V128, 3, false)),
-        0xFD0B => Some((W.OP_V128_STORE, W.OP_V128_STORE_X, T_V128, 4, true)),
-        0xFD5C => Some((W.OP_V128_LOAD32_ZERO, W.OP_V128_LOAD32_ZERO_X, T_V128, 2, false)),
-        0xFD5D => Some((W.OP_V128_LOAD64_ZERO, W.OP_V128_LOAD64_ZERO_X, T_V128, 3, false)),
+        0x28 => Some((W.OP_I32_LOAD, i, 2, false)),
+        0x29 => Some((W.OP_I64_LOAD, l, 3, false)),
+        0x2A => Some((W.OP_F32_LOAD, f, 2, false)),
+        0x2B => Some((W.OP_F64_LOAD, d, 3, false)),
+        0x2C => Some((W.OP_I32_LOAD8_S, i, 0, false)),
+        0x2D => Some((W.OP_I32_LOAD8_U, i, 0, false)),
+        0x2E => Some((W.OP_I32_LOAD16_S, i, 1, false)),
+        0x2F => Some((W.OP_I32_LOAD16_U, i, 1, false)),
+        0x30 => Some((W.OP_I64_LOAD8_S, l, 0, false)),
+        0x31 => Some((W.OP_I64_LOAD8_U, l, 0, false)),
+        0x32 => Some((W.OP_I64_LOAD16_S, l, 1, false)),
+        0x33 => Some((W.OP_I64_LOAD16_U, l, 1, false)),
+        0x34 => Some((W.OP_I64_LOAD32_S, l, 2, false)),
+        0x35 => Some((W.OP_I64_LOAD32_U, l, 2, false)),
+        0x36 => Some((W.OP_I32_STORE, i, 2, true)),
+        0x37 => Some((W.OP_I64_STORE, l, 3, true)),
+        0x38 => Some((W.OP_F32_STORE, f, 2, true)),
+        0x39 => Some((W.OP_F64_STORE, d, 3, true)),
+        0x3A => Some((W.OP_I32_STORE8, i, 0, true)),
+        0x3B => Some((W.OP_I32_STORE16, i, 1, true)),
+        0x3C => Some((W.OP_I64_STORE8, l, 0, true)),
+        0x3D => Some((W.OP_I64_STORE16, l, 1, true)),
+        0x3E => Some((W.OP_I64_STORE32, l, 2, true)),
+        0xFD00 => Some((W.OP_V128_LOAD, T_V128, 4, false)),
+        0xFD01 => Some((W.OP_V128_LOAD8X8_S, T_V128, 3, false)),
+        0xFD02 => Some((W.OP_V128_LOAD8X8_U, T_V128, 3, false)),
+        0xFD03 => Some((W.OP_V128_LOAD16X4_S, T_V128, 3, false)),
+        0xFD04 => Some((W.OP_V128_LOAD16X4_U, T_V128, 3, false)),
+        0xFD05 => Some((W.OP_V128_LOAD32X2_S, T_V128, 3, false)),
+        0xFD06 => Some((W.OP_V128_LOAD32X2_U, T_V128, 3, false)),
+        0xFD07 => Some((W.OP_V128_LOAD8_SPLAT, T_V128, 0, false)),
+        0xFD08 => Some((W.OP_V128_LOAD16_SPLAT, T_V128, 1, false)),
+        0xFD09 => Some((W.OP_V128_LOAD32_SPLAT, T_V128, 2, false)),
+        0xFD0A => Some((W.OP_V128_LOAD64_SPLAT, T_V128, 3, false)),
+        0xFD0B => Some((W.OP_V128_STORE, T_V128, 4, true)),
+        0xFD5C => Some((W.OP_V128_LOAD32_ZERO, T_V128, 2, false)),
+        0xFD5D => Some((W.OP_V128_LOAD64_ZERO, T_V128, 3, false)),
         _ => None,
     }
-}
-
-/// The form of a scalar load or store that adds a 16-bit constant to the
-/// address (i32.add, wrapping) instead of an offset: (op, K op).
-fn kmems() -> [(u64, u64); 23] {
-    [
-        (W.OP_I32_LOAD, W.OP_I32_LOADK), (W.OP_I64_LOAD, W.OP_I64_LOADK),
-        (W.OP_F32_LOAD, W.OP_F32_LOADK), (W.OP_F64_LOAD, W.OP_F64_LOADK),
-        (W.OP_I32_LOAD8_S, W.OP_I32_LOAD8_SK), (W.OP_I32_LOAD8_U, W.OP_I32_LOAD8_UK),
-        (W.OP_I32_LOAD16_S, W.OP_I32_LOAD16_SK), (W.OP_I32_LOAD16_U, W.OP_I32_LOAD16_UK),
-        (W.OP_I64_LOAD8_S, W.OP_I64_LOAD8_SK), (W.OP_I64_LOAD8_U, W.OP_I64_LOAD8_UK),
-        (W.OP_I64_LOAD16_S, W.OP_I64_LOAD16_SK), (W.OP_I64_LOAD16_U, W.OP_I64_LOAD16_UK),
-        (W.OP_I64_LOAD32_S, W.OP_I64_LOAD32_SK), (W.OP_I64_LOAD32_U, W.OP_I64_LOAD32_UK),
-        (W.OP_I32_STORE, W.OP_I32_STOREK), (W.OP_I64_STORE, W.OP_I64_STOREK),
-        (W.OP_F32_STORE, W.OP_F32_STOREK), (W.OP_F64_STORE, W.OP_F64_STOREK),
-        (W.OP_I32_STORE8, W.OP_I32_STORE8K), (W.OP_I32_STORE16, W.OP_I32_STORE16K),
-        (W.OP_I64_STORE8, W.OP_I64_STORE8K), (W.OP_I64_STORE16, W.OP_I64_STORE16K),
-        (W.OP_I64_STORE32, W.OP_I64_STORE32K),
-    ]
-}
-
-/// Whether `op` is a load that also writes its address to a second slot
-/// (R4 format, the load's result in field a).
-fn is_tk(op: u64) -> bool {
-    for row in tkloads() { let (_, tk) = row; if tk == op { return true; } }
-    for row in rloads() { let (_, _, tr) = row; if tr == op { return true; } }
-    false
-}
-
-/// (load, its _R form (address a + b), its _TR form (also t = a + b))
-fn rloads() -> [(u64, u64, u64); 8] {
-    [
-        (W.OP_I32_LOAD, W.OP_I32_LOAD_R, W.OP_I32_LOAD_TR), (W.OP_I64_LOAD, W.OP_I64_LOAD_R, W.OP_I64_LOAD_TR),
-        (W.OP_F32_LOAD, W.OP_F32_LOAD_R, W.OP_F32_LOAD_TR), (W.OP_F64_LOAD, W.OP_F64_LOAD_R, W.OP_F64_LOAD_TR),
-        (W.OP_I32_LOAD8_U, W.OP_I32_LOAD8_U_R, W.OP_I32_LOAD8_U_TR), (W.OP_I32_LOAD8_S, W.OP_I32_LOAD8_S_R, W.OP_I32_LOAD8_S_TR),
-        (W.OP_I32_LOAD16_U, W.OP_I32_LOAD16_U_R, W.OP_I32_LOAD16_U_TR), (W.OP_I32_LOAD16_S, W.OP_I32_LOAD16_S_R, W.OP_I32_LOAD16_S_TR),
-    ]
 }
 
 /// A load at offset 0 from the sum of two slots that the last op computed
@@ -812,24 +775,10 @@ fn T.add_load(t: *T, vop: u64, a: Val, offset: u64, p: u64, d: u64) -> ?u64 {
     let tee = a.loc == Loc.Local and s == a.x;
     if !home and !tee { return None; }
     if tee and (d >= 4096 or s >= 4096 or x >= 4096 or y >= 4096) { return None; }
-    for row in rloads() {
-        let (o, r, tr) = row;
-        if o != vop { continue; }
-        t.code.truncate(last);
-        if home { return Some(rrr(r, d, x, y)); }
-        return Some(W.encode.R4(tr, d as u16, s as u16, x as u16, y as u16));
-    }
-    None
-}
-
-/// (load, its _TK form)
-fn tkloads() -> [(u64, u64); 8] {
-    [
-        (W.OP_I32_LOAD, W.OP_I32_LOAD_TK), (W.OP_I64_LOAD, W.OP_I64_LOAD_TK),
-        (W.OP_F32_LOAD, W.OP_F32_LOAD_TK), (W.OP_F64_LOAD, W.OP_F64_LOAD_TK),
-        (W.OP_I32_LOAD8_U, W.OP_I32_LOAD8_U_TK), (W.OP_I32_LOAD8_S, W.OP_I32_LOAD8_S_TK),
-        (W.OP_I32_LOAD16_U, W.OP_I32_LOAD16_U_TK), (W.OP_I32_LOAD16_S, W.OP_I32_LOAD16_S_TK),
-    ]
+    let (Some(r), Some(tr)) = (W.rload(vop), W.trload(vop)) else { return None; };
+    t.code.truncate(last);
+    if home { return Some(rrr(r, d, x, y)); }
+    Some(W.encode.R4(tr, d as u16, s as u16, x as u16, y as u16))
 }
 
 /// A load at offset 0 from local `a`, which the last op set to a local
@@ -843,21 +792,16 @@ fn T.tee_load(t: *T, vop: u64, a: Val, offset: u64, h: u64) -> ?u64 {
     let src = W.RRK_b(w);
     let k = W.RRK_k(w) as i64;
     if h >= 4096 or a.x >= 4096 or src >= 4096 or k < -2048 or k > 2047 { return None; }
-    for row in tkloads() {
-        let (o, tk) = row;
-        if o != vop { continue; }
-        t.code.truncate(last);
-        return Some(W.encode.R4(tk, h as u16, a.x as u16, src as u16, (k as u64 & 0xFFF) as u16));
-    }
-    None
+    let Some(tk) = W.tkload(vop) else { return None; };
+    t.code.truncate(last);
+    Some(W.encode.R4(tk, h as u16, a.x as u16, src as u16, (k as u64 & 0xFFF) as u16))
 }
 
 /// The K form of memory op `vop` for an address `a` pending as an AddK
 /// and offset 0.
 fn kmem(vop: u64, a: Val, offset: u64) -> ?u64 {
     if a.loc != Loc.AddK or offset != 0 { return None; }
-    for row in kmems() { let (o, k) = row; if o == vop { return Some(k); } }
-    None
+    W.kmem(vop)
 }
 
 fn is_num(t: u8) -> bool { t == T_I32 or t == T_I64 or t == T_F32 or t == T_F64 }
@@ -880,31 +824,6 @@ fn const_value(v: Val) -> i64 {
 }
 
 fn fits16(x: i64) -> bool { x >= -32768 and x <= 32767 }
-
-/// (reg op, K op, commutative)
-fn kforms() -> [(u64, u64, bool); 38] {
-    [
-        (W.OP_I32_ADD, W.OP_I32_ADDK, true), (W.OP_I32_MUL, W.OP_I32_MULK, true),
-        (W.OP_I32_AND, W.OP_I32_ANDK, true), (W.OP_I32_OR, W.OP_I32_ORK, true),
-        (W.OP_I32_XOR, W.OP_I32_XORK, true), (W.OP_I32_SHL, W.OP_I32_SHLK, false),
-        (W.OP_I32_SHR_S, W.OP_I32_SHR_SK, false), (W.OP_I32_SHR_U, W.OP_I32_SHR_UK, false),
-        (W.OP_I32_EQ, W.OP_I32_EQK, true), (W.OP_I32_NE, W.OP_I32_NEK, true),
-        (W.OP_I32_LT_S, W.OP_I32_LT_SK, false), (W.OP_I32_LT_U, W.OP_I32_LT_UK, false),
-        (W.OP_I32_GT_S, W.OP_I32_GT_SK, false), (W.OP_I32_GT_U, W.OP_I32_GT_UK, false),
-        (W.OP_I32_LE_S, W.OP_I32_LE_SK, false), (W.OP_I32_LE_U, W.OP_I32_LE_UK, false),
-        (W.OP_I32_GE_S, W.OP_I32_GE_SK, false), (W.OP_I32_GE_U, W.OP_I32_GE_UK, false),
-        (W.OP_I64_ADD, W.OP_I64_ADDK, true), (W.OP_I64_MUL, W.OP_I64_MULK, true),
-        (W.OP_I64_AND, W.OP_I64_ANDK, true), (W.OP_I64_OR, W.OP_I64_ORK, true),
-        (W.OP_I64_XOR, W.OP_I64_XORK, true), (W.OP_I64_SHL, W.OP_I64_SHLK, false),
-        (W.OP_I64_SHR_S, W.OP_I64_SHR_SK, false), (W.OP_I64_SHR_U, W.OP_I64_SHR_UK, false),
-        (W.OP_I64_EQ, W.OP_I64_EQK, true), (W.OP_I64_NE, W.OP_I64_NEK, true),
-        (W.OP_I64_LT_S, W.OP_I64_LT_SK, false), (W.OP_I64_LT_U, W.OP_I64_LT_UK, false),
-        (W.OP_I64_GT_S, W.OP_I64_GT_SK, false), (W.OP_I64_GT_U, W.OP_I64_GT_UK, false),
-        (W.OP_I64_LE_S, W.OP_I64_LE_SK, false), (W.OP_I64_LE_U, W.OP_I64_LE_UK, false),
-        (W.OP_I64_GE_S, W.OP_I64_GE_SK, false), (W.OP_I64_GE_U, W.OP_I64_GE_UK, false),
-        (W.OP_I32_SUB, W.OP_I32_ADDK, false), (W.OP_I64_SUB, W.OP_I64_ADDK, false),
-    ]
-}
 
 /// `x + k` (or `x - k`) for an i32 `x` in a local or in the home slot of
 /// position `p` (where the sum goes) and a constant `k` of 16 bits stays
@@ -931,9 +850,7 @@ fn T.pending_add(t: *T, op: u64, a: Val, b: Val, p: u64) -> ?u64 {
 
 fn T.binop(t: *T, op: u64, a: Val, b: Val, p: u64) {
     let h = t.home(p);
-    for row in kforms() {
-        let (rop, kop, comm) = row;
-        if rop != op { continue; }
+    if let Some(kop) = W.kform(op) {
         let sub = op == W.OP_I32_SUB or op == W.OP_I64_SUB;
         if b.loc == Loc.Const {
             var k = const_value(b);
@@ -944,61 +861,23 @@ fn T.binop(t: *T, op: u64, a: Val, b: Val, p: u64) {
                 return;
             }
         }
-        if comm and a.loc == Loc.Const and fits16(const_value(a)) {
+        if W.commutative(op) and a.loc == Loc.Const and fits16(const_value(a)) {
             let rb = t.reg(b);
             t.emit_def(W.encode.RRK(kop, h as u16, rb as u16, const_value(a) as i16), h);
             return;
         }
-        break;
     }
     let ra = t.reg(a);
     let rb = t.reg(b);
     t.emit_def(rrr(op, h, ra, rb), h);
 }
 
-/// Compare ops that fuse with a following branch:
-/// (compare op, branch if true, branch if false, compare is a K form).
-fn fusions() -> [(u64, u64, u64, bool); 52] {
-    [
-        (W.OP_F32_EQ, W.OP_BR_F32_EQ, W.OP_BR_F32_NE, false), (W.OP_F32_NE, W.OP_BR_F32_NE, W.OP_BR_F32_EQ, false),
-        (W.OP_F32_LT, W.OP_BR_F32_LT, W.OP_BR_F32_NLT, false), (W.OP_F32_GT, W.OP_BR_F32_GT, W.OP_BR_F32_NGT, false),
-        (W.OP_F32_LE, W.OP_BR_F32_LE, W.OP_BR_F32_NLE, false), (W.OP_F32_GE, W.OP_BR_F32_GE, W.OP_BR_F32_NGE, false),
-        (W.OP_F64_EQ, W.OP_BR_F64_EQ, W.OP_BR_F64_NE, false), (W.OP_F64_NE, W.OP_BR_F64_NE, W.OP_BR_F64_EQ, false),
-        (W.OP_F64_LT, W.OP_BR_F64_LT, W.OP_BR_F64_NLT, false), (W.OP_F64_GT, W.OP_BR_F64_GT, W.OP_BR_F64_NGT, false),
-        (W.OP_F64_LE, W.OP_BR_F64_LE, W.OP_BR_F64_NLE, false), (W.OP_F64_GE, W.OP_BR_F64_GE, W.OP_BR_F64_NGE, false),
-        (W.OP_I32_EQ, W.OP_BR_I32_EQ, W.OP_BR_I32_NE, false), (W.OP_I32_NE, W.OP_BR_I32_NE, W.OP_BR_I32_EQ, false),
-        (W.OP_I32_LT_S, W.OP_BR_I32_LT_S, W.OP_BR_I32_GE_S, false), (W.OP_I32_GE_S, W.OP_BR_I32_GE_S, W.OP_BR_I32_LT_S, false),
-        (W.OP_I32_GT_S, W.OP_BR_I32_GT_S, W.OP_BR_I32_LE_S, false), (W.OP_I32_LE_S, W.OP_BR_I32_LE_S, W.OP_BR_I32_GT_S, false),
-        (W.OP_I32_LT_U, W.OP_BR_I32_LT_U, W.OP_BR_I32_GE_U, false), (W.OP_I32_GE_U, W.OP_BR_I32_GE_U, W.OP_BR_I32_LT_U, false),
-        (W.OP_I32_GT_U, W.OP_BR_I32_GT_U, W.OP_BR_I32_LE_U, false), (W.OP_I32_LE_U, W.OP_BR_I32_LE_U, W.OP_BR_I32_GT_U, false),
-        (W.OP_I64_EQ, W.OP_BR_I64_EQ, W.OP_BR_I64_NE, false), (W.OP_I64_NE, W.OP_BR_I64_NE, W.OP_BR_I64_EQ, false),
-        (W.OP_I64_LT_S, W.OP_BR_I64_LT_S, W.OP_BR_I64_GE_S, false), (W.OP_I64_GE_S, W.OP_BR_I64_GE_S, W.OP_BR_I64_LT_S, false),
-        (W.OP_I64_GT_S, W.OP_BR_I64_GT_S, W.OP_BR_I64_LE_S, false), (W.OP_I64_LE_S, W.OP_BR_I64_LE_S, W.OP_BR_I64_GT_S, false),
-        (W.OP_I64_LT_U, W.OP_BR_I64_LT_U, W.OP_BR_I64_GE_U, false), (W.OP_I64_GE_U, W.OP_BR_I64_GE_U, W.OP_BR_I64_LT_U, false),
-        (W.OP_I64_GT_U, W.OP_BR_I64_GT_U, W.OP_BR_I64_LE_U, false), (W.OP_I64_LE_U, W.OP_BR_I64_LE_U, W.OP_BR_I64_GT_U, false),
-        (W.OP_I32_EQK, W.OP_BR_I32_EQK, W.OP_BR_I32_NEK, true), (W.OP_I32_NEK, W.OP_BR_I32_NEK, W.OP_BR_I32_EQK, true),
-        (W.OP_I32_LT_SK, W.OP_BR_I32_LT_SK, W.OP_BR_I32_GE_SK, true), (W.OP_I32_GE_SK, W.OP_BR_I32_GE_SK, W.OP_BR_I32_LT_SK, true),
-        (W.OP_I32_GT_SK, W.OP_BR_I32_GT_SK, W.OP_BR_I32_LE_SK, true), (W.OP_I32_LE_SK, W.OP_BR_I32_LE_SK, W.OP_BR_I32_GT_SK, true),
-        (W.OP_I32_LT_UK, W.OP_BR_I32_LT_UK, W.OP_BR_I32_GE_UK, true), (W.OP_I32_GE_UK, W.OP_BR_I32_GE_UK, W.OP_BR_I32_LT_UK, true),
-        (W.OP_I32_GT_UK, W.OP_BR_I32_GT_UK, W.OP_BR_I32_LE_UK, true), (W.OP_I32_LE_UK, W.OP_BR_I32_LE_UK, W.OP_BR_I32_GT_UK, true),
-        (W.OP_I64_EQK, W.OP_BR_I64_EQK, W.OP_BR_I64_NEK, true), (W.OP_I64_NEK, W.OP_BR_I64_NEK, W.OP_BR_I64_EQK, true),
-        (W.OP_I64_LT_SK, W.OP_BR_I64_LT_SK, W.OP_BR_I64_GE_SK, true), (W.OP_I64_GE_SK, W.OP_BR_I64_GE_SK, W.OP_BR_I64_LT_SK, true),
-        (W.OP_I64_GT_SK, W.OP_BR_I64_GT_SK, W.OP_BR_I64_LE_SK, true), (W.OP_I64_LE_SK, W.OP_BR_I64_LE_SK, W.OP_BR_I64_GT_SK, true),
-        (W.OP_I64_LT_UK, W.OP_BR_I64_LT_UK, W.OP_BR_I64_GE_UK, true), (W.OP_I64_GE_UK, W.OP_BR_I64_GE_UK, W.OP_BR_I64_LT_UK, true),
-        (W.OP_I64_GT_UK, W.OP_BR_I64_GT_UK, W.OP_BR_I64_LE_UK, true), (W.OP_I64_LE_UK, W.OP_BR_I64_LE_UK, W.OP_BR_I64_GT_UK, true),
-    ]
-}
-
-/// (compare op, SEL op, SEL op with the operands swapped)
-fn selects() -> [(u64, u64, u64); 12] {
-    [
-        (W.OP_I32_LT_S, W.OP_SEL_I32_LT_S, W.OP_SEL_I32_GT_S), (W.OP_I32_GT_S, W.OP_SEL_I32_GT_S, W.OP_SEL_I32_LT_S),
-        (W.OP_I32_LE_S, W.OP_SEL_I32_LE_S, W.OP_SEL_I32_GE_S), (W.OP_I32_GE_S, W.OP_SEL_I32_GE_S, W.OP_SEL_I32_LE_S),
-        (W.OP_I32_LT_U, W.OP_SEL_I32_LT_U, W.OP_SEL_I32_GT_U), (W.OP_I32_GT_U, W.OP_SEL_I32_GT_U, W.OP_SEL_I32_LT_U),
-        (W.OP_I32_LE_U, W.OP_SEL_I32_LE_U, W.OP_SEL_I32_GE_U), (W.OP_I32_GE_U, W.OP_SEL_I32_GE_U, W.OP_SEL_I32_LE_U),
-        (W.OP_F64_LT, W.OP_SEL_F64_LT, W.OP_SEL_F64_GT), (W.OP_F64_GT, W.OP_SEL_F64_GT, W.OP_SEL_F64_LT),
-        (W.OP_F64_LE, W.OP_SEL_F64_LE, W.OP_SEL_F64_GE), (W.OP_F64_GE, W.OP_SEL_F64_GE, W.OP_SEL_F64_LE),
-    ]
+/// The compare-and-branch ops a compare `op` fuses into with a following
+/// branch: (branch if true, branch if false, compare is a K form).
+fn fusion(op: u64) -> ?(u64, u64, bool) {
+    if let (Some(bt), Some(bf)) = (W.br(op), W.br_not(op)) { return Some((bt, bf, false)); }
+    if let (Some(bt), Some(bf)) = (W.brk(op), W.brk_not(op)) { return Some((bt, bf, true)); }
+    None
 }
 
 /// The slot of `v` if reading it emits nothing (a local or a home).
@@ -1018,15 +897,11 @@ fn T.min_max(t: *T, a: Val, b: Val, c: Val, p: u64) -> ?u64 {
     let w = t.code.at(last);
     let op = W.opcode(w);
     let (x, y) = (W.RRR_b(w), W.RRR_c(w));
-    for row in selects() {
-        let (cop, sel, swapped) = row;
-        if cop != op { continue; }
-        var f: u64 = 0;
-        if x == ra and y == rb { f = sel; } else if x == rb and y == ra { f = swapped; } else { return None; }
-        t.code.truncate(last);
-        return Some(rrr(f, t.home(p), ra, rb));
-    }
-    None
+    let (Some(sel), Some(swapped)) = (W.sel(op), W.sel_swapped(op)) else { return None; };
+    var f: u64 = 0;
+    if x == ra and y == rb { f = sel; } else if x == rb and y == ra { f = swapped; } else { return None; }
+    t.code.truncate(last);
+    Some(rrr(f, t.home(p), ra, rb))
 }
 
 /// Jumps to `l` if `cond` (just popped, at position p) is nonzero
@@ -1057,9 +932,7 @@ fn T.cond_jump(t: *T, cond: Val, p: u64, when: bool, l: bc.Label) {
                     t.fuse_load_branch(last, w, when, l);
                     return;
                 }
-                for row in fusions() {
-                    let (cop, bt, bf, k) = row;
-                    if cop != op { continue; }
+                if let Some((bt, bf, k)) = fusion(op) {
                     t.code.truncate(last);
                     let bop = if when { bt } else { bf };
                     let x = W.RRR_b(w);
@@ -1129,7 +1002,7 @@ fn T.instr(t: *T) -> Result<bool, str> {
         t.push_home(n.r);
         return Ok(true);
     }
-    if let Some((vop, xop, ty, natural, store)) = memop(op) {
+    if let Some((vop, ty, natural, store)) = memop(op) {
         let align = r.u32()?;
         let offset = r.u32()? as u64;
         t.need_memory()?;
@@ -1154,7 +1027,7 @@ fn T.instr(t: *T) -> Result<bool, str> {
                     let h = t.home(p);
                     let pc = t.emit(W.ADDR(h as u16, ra as u16));
                     t.code.set(pc + 1, offset);
-                    t.emit(rrr(xop, h, rv, 0));
+                    t.emit(rrr(W.xform(vop).unwrap(), h, rv, 0));
                 }
             }
         } else {
@@ -1185,7 +1058,7 @@ fn T.instr(t: *T) -> Result<bool, str> {
                 } else {
                     let pc = t.emit(W.ADDR(h as u16, ra as u16));
                     t.code.set(pc + 1, offset);
-                    t.emit_def(rrr(xop, h, h, 0), h);
+                    t.emit_def(rrr(W.xform(vop).unwrap(), h, h, 0), h);
                 }
             }
             t.push_home(ty);
@@ -1461,7 +1334,7 @@ fn T.instr(t: *T) -> Result<bool, str> {
                             let w = t.code.at(last);
                             // The destination is field `a`: 12 bits in SELECT4's
                             // format, 16 in the others.
-                            if W.opcode(w) == W.OP_SELECT4 or is_tk(W.opcode(w)) {
+                            if W.opcode(w) == W.OP_SELECT4 or W.tee(W.opcode(w)) {
                                 match W.set_R4_a(w, x) {
                                     Some(w2) => t.code.set(last, w2),
                                     None => { t.emit(mov(ty, x, t.home(p))); }

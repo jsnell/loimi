@@ -761,12 +761,14 @@ pub vm Lox {
 
     // Superinstructions, from `--vm-stats` on the benchmarks. A super
     // whose first part quickens becomes the super of the quickened part.
-    super GETGLOBAL_SUBK = GETGLOBAL; SUBK;
-    super GETGLOBAL_C_SUBK = GETGLOBAL_C; SUBK;
-    super ADD_RET = ADD; RET;
-    super GETPROP_RET = GETPROP; RET;
-    super GETPROP_IN_RET = GETPROP_IN; RET;
-    super GETPROP_OUT_RET = GETPROP_OUT; RET;
+    supers {
+        GETGLOBAL, SUBK;
+        GETGLOBAL_C, SUBK;
+        ADD, RET;
+        GETPROP, RET;
+        GETPROP_IN, RET;
+        GETPROP_OUT, RET;
+    }
 
     on raise(msg: str) {
         traceback(ctx, msg, fp, pc);

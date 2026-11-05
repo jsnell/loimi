@@ -793,8 +793,10 @@ pub vm Wam {
     // nothing and whose arithmetic guards come before its neck cut runs
     // its guards without a choicepoint; a failed guard jumps to the
     // other clauses' code, a passed one into the clause after the guards.
-    inline for (name, test) in [("JLT", c < 0), ("JLE", c <= 0), ("JGT", c > 0), ("JGE", c >= 0), ("JNEQ", c == 0), ("JNNE", c != 0)] {
-        op #name(a0: xr, b0: xr) : R3 + Target {
+    // `Wam.jump_form(cmp)` is the guard form of a comparison.
+    inline for (cmp, test) in [("LT", c < 0), ("LE", c <= 0), ("GT", c > 0), ("GE", c >= 0), ("NEQ", c == 0), ("NNE", c != 0)] {
+        rel jump_form(#cmp) = #("J" ++ cmp);
+        op #("J" ++ cmp)(a0: xr, b0: xr) : R3 + Target {
             let a = deref(a0);
             let b = deref(b0);
             if let (Int(x), Int(y)) = (a, b) {

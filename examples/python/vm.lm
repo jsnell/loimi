@@ -1120,15 +1120,18 @@ pub vm Py {
         if holds { jump pc + 2 }
         jump target
     }
-    inline for (name, test, opn, bkind) in [
-        ("JNLT", x < y, ops.C_LT, reg), ("JNLE", x <= y, ops.C_LE, reg),
-        ("JNGT", x > y, ops.C_GT, reg), ("JNGE", x >= y, ops.C_GE, reg),
-        ("JNEQ", x == y, ops.C_EQ, reg), ("JNNE", x != y, ops.C_NE, reg),
-        ("JNLTK", x < y, ops.C_LT, kst), ("JNLEK", x <= y, ops.C_LE, kst),
-        ("JNGTK", x > y, ops.C_GT, kst), ("JNGEK", x >= y, ops.C_GE, kst),
-        ("JNEQK", x == y, ops.C_EQ, kst), ("JNNEK", x != y, ops.C_NE, kst),
+    // `Py.jn(cmp)` and `Py.jnk(cmp)`: the op that jumps unless compare
+    // `cmp` holds, with a register or constant right operand (compile.lm).
+    inline for (cmp, kf, test, opn, bkind, rn) in [
+        ("LT", "", x < y, ops.C_LT, reg, jn), ("LE", "", x <= y, ops.C_LE, reg, jn),
+        ("GT", "", x > y, ops.C_GT, reg, jn), ("GE", "", x >= y, ops.C_GE, reg, jn),
+        ("EQ", "", x == y, ops.C_EQ, reg, jn), ("NE", "", x != y, ops.C_NE, reg, jn),
+        ("LT", "K", x < y, ops.C_LT, kst, jnk), ("LE", "K", x <= y, ops.C_LE, kst, jnk),
+        ("GT", "K", x > y, ops.C_GT, kst, jnk), ("GE", "K", x >= y, ops.C_GE, kst, jnk),
+        ("EQ", "K", x == y, ops.C_EQ, kst, jnk), ("NE", "K", x != y, ops.C_NE, kst, jnk),
     ] {
-        op #name(a: reg, b: bkind) : ABC then JMP {
+        rel rn(#cmp) = #("JN" ++ cmp ++ kf);
+        op #("JN" ++ cmp ++ kf)(a: reg, b: bkind) : ABC then JMP {
             match (a, b) {
                 (Int(x), Int(y)) => branch(test, then.target),
                 (Float(x), Float(y)) => branch(test, then.target),
@@ -1152,11 +1155,12 @@ pub vm Py {
     op JNSOME(a: reg) : ABC then JMP { branch(a != Nil, then.target) }
 
     // ── superinstructions (from --vm-stats on the benchmarks) ───────
-    super LOADMETHOD_CALLMETHOD = LOADMETHOD; CALLMETHOD;
-    super GETATTR_GETATTR = GETATTR; GETATTR;
-    #[allow(super_overlap)]
-    super GETATTR_GETATTR_MUL = GETATTR; GETATTR; MUL;
-    super MOVE_MOVE_MOVE = MOVE; MOVE; MOVE;
+    supers {
+        LOADMETHOD, CALLMETHOD;
+        GETATTR, GETATTR;
+        #[allow(super_overlap)] GETATTR, GETATTR, MUL;
+        MOVE, MOVE, MOVE;
+    }
 
     // ── containers ──────────────────────────────────────────────────
 

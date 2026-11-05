@@ -222,6 +222,17 @@ impl Parser {
     pub fn span(&self) -> Span {
         self.toks[self.pos].span
     }
+    /// Whether token `n` ahead is an identifier or `*` that starts where
+    /// the token before it ends (no space between: an op selector's glob
+    /// goes on, `BR_I32_*`).
+    pub fn adjacent(&self, n: usize) -> bool {
+        let i = (self.pos + n).min(self.toks.len() - 1);
+        if i == 0 || !matches!(self.toks[i].tok, Tok::Ident(_) | Tok::Punct("*")) {
+            return false;
+        }
+        let (a, b) = (self.toks[i - 1].span, self.toks[i].span);
+        a.file == b.file && a.hi == b.lo
+    }
     pub fn prev_span(&self) -> Span {
         self.toks[self.pos.saturating_sub(1)].span
     }

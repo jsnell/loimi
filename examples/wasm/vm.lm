@@ -275,30 +275,22 @@ pub vm W {
     // The ops that get variants (each variant is an opcode and a handler:
     // marking every op would about double the vm's code). The ones
     // executed by the benchmarks,
-    // and their neighbours in the tables.
+    // and their neighbours in the tables (`A..B`: the ops declared from A
+    // to B; `BR_I32_*`: every op whose name matches).
     accumulate
-        I32_ADD, I32_SUB, I32_MUL, I32_AND, I32_OR, I32_XOR, I32_SHL, I32_SHR_S, I32_SHR_U,
-        I32_ROTL, I32_EQ, I32_NE, I32_LT_S, I32_LT_U,
-        I64_ADD, I64_SUB, I64_MUL, I64_AND, I64_OR, I64_XOR, I64_SHL, I64_SHR_U,
-        F64_ADD, F64_SUB, F64_MUL, F64_DIV, F64_LT, F64_LE,
-        I32_ADDK, I32_MULK, I32_ANDK, I32_ORK, I32_XORK, I32_SHLK, I32_SHR_SK, I32_SHR_UK,
-        I64_ADDK, I64_ANDK, I64_SHLK, I64_SHR_UK,
+        I32_ADD..I32_ROTL, I32_EQ..I32_LT_U, I64_ADD..I64_SHL, I64_SHR_U,
+        F64_ADD..F64_DIV, F64_LT, F64_LE,
+        I32_ADDK..I32_SHR_UK, I64_ADDK, I64_ANDK, I64_SHLK, I64_SHR_UK,
         I32_EQZ, I32_CLZ, F64_SQRT, F64_NEG, F64_ABS, F64_CONVERT_I32_S, F64_CONVERT_I32_U,
-        I32_WRAP_I64, I64_EXTEND_I32_S, I64_EXTEND_I32_U, I32_DIV_U, I32_REM_U,
-        I32_LOAD, I64_LOAD, F64_LOAD, I32_LOAD8_U, I32_LOAD8_S, I32_LOAD16_U, I32_LOAD16_S,
+        I32_WRAP_I64..I64_EXTEND_I32_U, I32_DIV_U, I32_REM_U,
+        I32_LOAD, I64_LOAD, F64_LOAD, I32_LOAD8_S..I32_LOAD16_U,
         I32_STORE, I64_STORE, F64_STORE, I32_STORE8, I32_STORE16,
-        I32_LOADK, I64_LOADK, F64_LOADK, I32_LOAD8_UK, I32_LOAD8_SK, I32_LOAD16_UK, I32_LOAD16_SK,
+        I32_LOADK, I64_LOADK, F64_LOADK, I32_LOAD8_SK..I32_LOAD16_UK,
         I32_STOREK, I64_STOREK, F64_STOREK, I32_STORE8K, I32_STORE16K,
-        BR_I32_ANDK_NZ, BR_I32_ANDK_Z, BR_I32_LOAD_NZ, BR_I32_LOAD_Z,
-        BR_I32_EQ, BR_I32_NE, BR_I32_LT_S, BR_I32_LT_U, BR_I32_GT_S, BR_I32_GT_U,
-        BR_I32_LE_S, BR_I32_LE_U, BR_I32_GE_S, BR_I32_GE_U,
-        BR_F64_LT, BR_F64_LE, BR_F64_GT, BR_F64_GE,
-        BR_I32_EQK, BR_I32_NEK, BR_I32_LT_SK, BR_I32_LT_UK, BR_I32_GT_SK, BR_I32_GT_UK,
-        BR_I32_LE_SK, BR_I32_LE_UK, BR_I32_GE_SK, BR_I32_GE_UK,
-        BRZ, BRNZ,
+        BR_I32_*, BR_F64_LT..BR_F64_GE, BRZ, BRNZ,
         I32_LOAD_TK, I64_LOAD_TK, F64_LOAD_TK, I32_LOAD8_U_TK, I32_LOAD16_U_TK,
-        I32_LOAD_R, I64_LOAD_R, F64_LOAD_R, I32_LOAD8_U_R, I32_LOAD16_U_R,
-        I32_LOAD_TR, I64_LOAD_TR, F64_LOAD_TR, I32_LOAD8_U_TR, I32_LOAD16_U_TR;
+        I32_LOAD_R..I64_LOAD_TR, F64_LOAD_R, F64_LOAD_TR, I32_LOAD8_U_R, I32_LOAD8_U_TR,
+        I32_LOAD16_U_R, I32_LOAD16_U_TR;
     operand label = pc + it verify is_insn_boundary(pc + it);
     // The base of a callee's window: anywhere in the frame.
     operand base = it verify it <= (f.nslots as u64) display "r{}";
@@ -370,28 +362,35 @@ pub vm W {
         op #name(d: dk, a: ak, b: bk) : RRR { d = expr; next }
     }
 
-    // Constant right operands (a 16-bit immediate, sign-extended).
-    inline for (name, dk, ak, expr) in [
-        ("I32_ADDK", ri, ri, a +% (k as i32)), ("I32_MULK", ri, ri, a *% (k as i32)),
-        ("I32_ANDK", ri, ri, a & (k as i32)), ("I32_ORK", ri, ri, a | (k as i32)),
-        ("I32_XORK", ri, ri, a ^ (k as i32)),
-        ("I32_SHLK", ri, ri, a << k), ("I32_SHR_SK", ri, ri, a >> k), ("I32_SHR_UK", ru, ru, a >> k),
-        ("I32_EQK", ri, ri, b2i(a == (k as i32))), ("I32_NEK", ri, ri, b2i(a != (k as i32))),
-        ("I32_LT_SK", ri, ri, b2i(a < (k as i32))), ("I32_LT_UK", ri, ru, b2i(a < (k as u32))),
-        ("I32_GT_SK", ri, ri, b2i(a > (k as i32))), ("I32_GT_UK", ri, ru, b2i(a > (k as u32))),
-        ("I32_LE_SK", ri, ri, b2i(a <= (k as i32))), ("I32_LE_UK", ri, ru, b2i(a <= (k as u32))),
-        ("I32_GE_SK", ri, ri, b2i(a >= (k as i32))), ("I32_GE_UK", ri, ru, b2i(a >= (k as u32))),
-        ("I64_ADDK", rl, rl, a +% k), ("I64_MULK", rl, rl, a *% k),
-        ("I64_ANDK", rl, rl, a & k), ("I64_ORK", rl, rl, a | k), ("I64_XORK", rl, rl, a ^ k),
-        ("I64_SHLK", rl, rl, a << k), ("I64_SHR_SK", rl, rl, a >> k), ("I64_SHR_UK", rq, rq, a >> k),
-        ("I64_EQK", ri, rl, b2i(a == k)), ("I64_NEK", ri, rl, b2i(a != k)),
-        ("I64_LT_SK", ri, rl, b2i(a < k)), ("I64_LT_UK", ri, rq, b2i(a < (k as u64))),
-        ("I64_GT_SK", ri, rl, b2i(a > k)), ("I64_GT_UK", ri, rq, b2i(a > (k as u64))),
-        ("I64_LE_SK", ri, rl, b2i(a <= k)), ("I64_LE_UK", ri, rq, b2i(a <= (k as u64))),
-        ("I64_GE_SK", ri, rl, b2i(a >= k)), ("I64_GE_UK", ri, rq, b2i(a >= (k as u64))),
+    // Constant right operands (a 16-bit immediate, sign-extended): the K
+    // form of each op, `W.kform(op)` (compile.lm), and whether a constant
+    // left operand may use it too (`W.commutative(op)`). x - k is x + -k.
+    data commutative: bool = false;
+    inline for (name, dk, ak, cm, expr) in [
+        ("I32_ADD", ri, ri, true, a +% (k as i32)), ("I32_MUL", ri, ri, true, a *% (k as i32)),
+        ("I32_AND", ri, ri, true, a & (k as i32)), ("I32_OR", ri, ri, true, a | (k as i32)),
+        ("I32_XOR", ri, ri, true, a ^ (k as i32)),
+        ("I32_SHL", ri, ri, false, a << k), ("I32_SHR_S", ri, ri, false, a >> k), ("I32_SHR_U", ru, ru, false, a >> k),
+        ("I32_EQ", ri, ri, true, b2i(a == (k as i32))), ("I32_NE", ri, ri, true, b2i(a != (k as i32))),
+        ("I32_LT_S", ri, ri, false, b2i(a < (k as i32))), ("I32_LT_U", ri, ru, false, b2i(a < (k as u32))),
+        ("I32_GT_S", ri, ri, false, b2i(a > (k as i32))), ("I32_GT_U", ri, ru, false, b2i(a > (k as u32))),
+        ("I32_LE_S", ri, ri, false, b2i(a <= (k as i32))), ("I32_LE_U", ri, ru, false, b2i(a <= (k as u32))),
+        ("I32_GE_S", ri, ri, false, b2i(a >= (k as i32))), ("I32_GE_U", ri, ru, false, b2i(a >= (k as u32))),
+        ("I64_ADD", rl, rl, true, a +% k), ("I64_MUL", rl, rl, true, a *% k),
+        ("I64_AND", rl, rl, true, a & k), ("I64_OR", rl, rl, true, a | k), ("I64_XOR", rl, rl, true, a ^ k),
+        ("I64_SHL", rl, rl, false, a << k), ("I64_SHR_S", rl, rl, false, a >> k), ("I64_SHR_U", rq, rq, false, a >> k),
+        ("I64_EQ", ri, rl, true, b2i(a == k)), ("I64_NE", ri, rl, true, b2i(a != k)),
+        ("I64_LT_S", ri, rl, false, b2i(a < k)), ("I64_LT_U", ri, rq, false, b2i(a < (k as u64))),
+        ("I64_GT_S", ri, rl, false, b2i(a > k)), ("I64_GT_U", ri, rq, false, b2i(a > (k as u64))),
+        ("I64_LE_S", ri, rl, false, b2i(a <= k)), ("I64_LE_U", ri, rq, false, b2i(a <= (k as u64))),
+        ("I64_GE_S", ri, rl, false, b2i(a >= k)), ("I64_GE_U", ri, rq, false, b2i(a >= (k as u64))),
     ] {
-        op #name(d: dk, a: ak, k: imm) : RRK { d = expr; next }
+        op #(name ++ "K")(d: dk, a: ak, k: imm) : RRK { d = expr; next }
+        rel kform(#name) = #(name ++ "K");
+        data commutative(#name) = cm;
     }
+    rel kform(I32_SUB) = I32_ADDK;
+    rel kform(I64_SUB) = I64_ADDK;
 
     // Division: traps on a zero divisor and on MIN / -1; x rem -1 is 0.
     inline for (name, k, min) in [("I32_DIV_S", ri, (-2147483647 - 1)), ("I64_DIV_S", rl, (-9223372036854775807 - 1))] {
@@ -513,35 +512,37 @@ pub vm W {
     // d (a scratch slot) = a + off, read by the access as a 64-bit address.
     op ADDR(d: rq, a: ru) : RRR + Imm64 { d = (a as u64) + cache.v; next }
     inline for (name, dk, ty, conv, size) in [
-        ("I32_LOAD_X", ri, i32, x, 4), ("I64_LOAD_X", rl, i64, x, 8),
-        ("F32_LOAD_X", rf, f32, x, 4), ("F64_LOAD_X", rd, f64, x, 8),
-        ("I32_LOAD8_S_X", ri, i8, x as i32, 1), ("I32_LOAD8_U_X", ri, u8, x as i32, 1),
-        ("I32_LOAD16_S_X", ri, i16, x as i32, 2), ("I32_LOAD16_U_X", ri, u16, x as i32, 2),
-        ("I64_LOAD8_S_X", rl, i8, x as i64, 1), ("I64_LOAD8_U_X", rl, u8, x as i64, 1),
-        ("I64_LOAD16_S_X", rl, i16, x as i64, 2), ("I64_LOAD16_U_X", rl, u16, x as i64, 2),
-        ("I64_LOAD32_S_X", rl, i32, x as i64, 4), ("I64_LOAD32_U_X", rl, u32, x as i64, 4),
+        ("I32_LOAD", ri, i32, x, 4), ("I64_LOAD", rl, i64, x, 8),
+        ("F32_LOAD", rf, f32, x, 4), ("F64_LOAD", rd, f64, x, 8),
+        ("I32_LOAD8_S", ri, i8, x as i32, 1), ("I32_LOAD8_U", ri, u8, x as i32, 1),
+        ("I32_LOAD16_S", ri, i16, x as i32, 2), ("I32_LOAD16_U", ri, u16, x as i32, 2),
+        ("I64_LOAD8_S", rl, i8, x as i64, 1), ("I64_LOAD8_U", rl, u8, x as i64, 1),
+        ("I64_LOAD16_S", rl, i16, x as i64, 2), ("I64_LOAD16_U", rl, u16, x as i64, 2),
+        ("I64_LOAD32_S", rl, i32, x as i64, 4), ("I64_LOAD32_U", rl, u32, x as i64, 4),
     ] {
-        op #name(d: dk, a: rq) : RRR {
+        op #(name ++ "_X")(d: dk, a: rq) : RRR {
             let ea = a;
             if ea + size > msize { raise Trap.MemOOB }
             let x = ((mem + ea) as *ty).read_unaligned();
             d = conv;
             next
         }
+        rel xform(#name) = #(name ++ "_X");
     }
     inline for (name, vk, ty, conv, size) in [
-        ("I32_STORE_X", ri, i32, v, 4), ("I64_STORE_X", rl, i64, v, 8),
-        ("F32_STORE_X", ru, u32, v, 4), ("F64_STORE_X", rq, u64, v, 8),
-        ("I32_STORE8_X", ri, u8, v as u8, 1), ("I32_STORE16_X", ri, u16, v as u16, 2),
-        ("I64_STORE8_X", rl, u8, v as u8, 1), ("I64_STORE16_X", rl, u16, v as u16, 2),
-        ("I64_STORE32_X", rl, u32, v as u32, 4),
+        ("I32_STORE", ri, i32, v, 4), ("I64_STORE", rl, i64, v, 8),
+        ("F32_STORE", ru, u32, v, 4), ("F64_STORE", rq, u64, v, 8),
+        ("I32_STORE8", ri, u8, v as u8, 1), ("I32_STORE16", ri, u16, v as u16, 2),
+        ("I64_STORE8", rl, u8, v as u8, 1), ("I64_STORE16", rl, u16, v as u16, 2),
+        ("I64_STORE32", rl, u32, v as u32, 4),
     ] {
-        op #name(a: rq, v: vk) : RRR {
+        op #(name ++ "_X")(a: rq, v: vk) : RRR {
             let ea = a;
             if ea + size > msize { raise Trap.MemOOB }
             ((mem + ea) as *ty).write_unaligned(conv);
             next
         }
+        rel xform(#name) = #(name ++ "_X");
     }
 
     op MEM_SIZE(d: ri) : RRR { d = (msize >> 16) as i32; next }
@@ -572,49 +573,60 @@ pub vm W {
     op BRZ(a: ri, t: label) : RI { if a == 0 { jump t } next }
     op BRNZ(a: ri, t: label) : RI { if a != 0 { jump t } next }
     // Compare and branch: a fused compare and br_if/if. The JMP after it
-    // holds the target (`then JMP`): taken if the comparison holds.
-    inline for (name, k, test) in [
-        ("BR_I32_EQ", ri, a == b), ("BR_I32_NE", ri, a != b),
-        ("BR_I32_LT_S", ri, a < b), ("BR_I32_LT_U", ru, a < b),
-        ("BR_I32_GT_S", ri, a > b), ("BR_I32_GT_U", ru, a > b),
-        ("BR_I32_LE_S", ri, a <= b), ("BR_I32_LE_U", ru, a <= b),
-        ("BR_I32_GE_S", ri, a >= b), ("BR_I32_GE_U", ru, a >= b),
-        ("BR_I64_EQ", rl, a == b), ("BR_I64_NE", rl, a != b),
-        ("BR_I64_LT_S", rl, a < b), ("BR_I64_LT_U", rq, a < b),
-        ("BR_I64_GT_S", rl, a > b), ("BR_I64_GT_U", rq, a > b),
-        ("BR_I64_LE_S", rl, a <= b), ("BR_I64_LE_U", rq, a <= b),
-        ("BR_I64_GE_S", rl, a >= b), ("BR_I64_GE_U", rq, a >= b),
+    // holds the target (`then JMP`): taken if the comparison holds. A
+    // compare followed by a branch fuses into the op that branches if it
+    // holds, `W.br(cmp)`, or into the one that branches if it does not,
+    // `W.br_not(cmp)` (compile.lm); each row names its two compares (`_`:
+    // none).
+    inline for (name, k, test, of, not_of) in [
+        ("BR_I32_EQ", ri, a == b, I32_EQ, I32_NE), ("BR_I32_NE", ri, a != b, I32_NE, I32_EQ),
+        ("BR_I32_LT_S", ri, a < b, I32_LT_S, I32_GE_S), ("BR_I32_LT_U", ru, a < b, I32_LT_U, I32_GE_U),
+        ("BR_I32_GT_S", ri, a > b, I32_GT_S, I32_LE_S), ("BR_I32_GT_U", ru, a > b, I32_GT_U, I32_LE_U),
+        ("BR_I32_LE_S", ri, a <= b, I32_LE_S, I32_GT_S), ("BR_I32_LE_U", ru, a <= b, I32_LE_U, I32_GT_U),
+        ("BR_I32_GE_S", ri, a >= b, I32_GE_S, I32_LT_S), ("BR_I32_GE_U", ru, a >= b, I32_GE_U, I32_LT_U),
+        ("BR_I64_EQ", rl, a == b, I64_EQ, I64_NE), ("BR_I64_NE", rl, a != b, I64_NE, I64_EQ),
+        ("BR_I64_LT_S", rl, a < b, I64_LT_S, I64_GE_S), ("BR_I64_LT_U", rq, a < b, I64_LT_U, I64_GE_U),
+        ("BR_I64_GT_S", rl, a > b, I64_GT_S, I64_LE_S), ("BR_I64_GT_U", rq, a > b, I64_GT_U, I64_LE_U),
+        ("BR_I64_LE_S", rl, a <= b, I64_LE_S, I64_GT_S), ("BR_I64_LE_U", rq, a <= b, I64_LE_U, I64_GT_U),
+        ("BR_I64_GE_S", rl, a >= b, I64_GE_S, I64_LT_S), ("BR_I64_GE_U", rq, a >= b, I64_GE_U, I64_LT_U),
         // floats: the negated forms are separate ops (NaN compares false)
-        ("BR_F32_EQ", rf, a == b), ("BR_F32_NE", rf, a != b),
-        ("BR_F32_LT", rf, a < b), ("BR_F32_GT", rf, a > b), ("BR_F32_LE", rf, a <= b), ("BR_F32_GE", rf, a >= b),
-        ("BR_F32_NLT", rf, !(a < b)), ("BR_F32_NGT", rf, !(a > b)),
-        ("BR_F32_NLE", rf, !(a <= b)), ("BR_F32_NGE", rf, !(a >= b)),
-        ("BR_F64_EQ", rd, a == b), ("BR_F64_NE", rd, a != b),
-        ("BR_F64_LT", rd, a < b), ("BR_F64_GT", rd, a > b), ("BR_F64_LE", rd, a <= b), ("BR_F64_GE", rd, a >= b),
-        ("BR_F64_NLT", rd, !(a < b)), ("BR_F64_NGT", rd, !(a > b)),
-        ("BR_F64_NLE", rd, !(a <= b)), ("BR_F64_NGE", rd, !(a >= b)),
+        ("BR_F32_EQ", rf, a == b, F32_EQ, F32_NE), ("BR_F32_NE", rf, a != b, F32_NE, F32_EQ),
+        ("BR_F32_LT", rf, a < b, F32_LT, _), ("BR_F32_GT", rf, a > b, F32_GT, _),
+        ("BR_F32_LE", rf, a <= b, F32_LE, _), ("BR_F32_GE", rf, a >= b, F32_GE, _),
+        ("BR_F32_NLT", rf, !(a < b), _, F32_LT), ("BR_F32_NGT", rf, !(a > b), _, F32_GT),
+        ("BR_F32_NLE", rf, !(a <= b), _, F32_LE), ("BR_F32_NGE", rf, !(a >= b), _, F32_GE),
+        ("BR_F64_EQ", rd, a == b, F64_EQ, F64_NE), ("BR_F64_NE", rd, a != b, F64_NE, F64_EQ),
+        ("BR_F64_LT", rd, a < b, F64_LT, _), ("BR_F64_GT", rd, a > b, F64_GT, _),
+        ("BR_F64_LE", rd, a <= b, F64_LE, _), ("BR_F64_GE", rd, a >= b, F64_GE, _),
+        ("BR_F64_NLT", rd, !(a < b), _, F64_LT), ("BR_F64_NGT", rd, !(a > b), _, F64_GT),
+        ("BR_F64_NLE", rd, !(a <= b), _, F64_LE), ("BR_F64_NGE", rd, !(a >= b), _, F64_GE),
     ] {
         op #name(a: k, b: k) : RRR then JMP {
             if test { jump then.t }
             jump pc + 2
         }
+        rel br(#of) = #name;
+        rel br_not(#not_of) = #name;
     }
-    inline for (name, k, test) in [
-        ("BR_I32_EQK", ri, a == (c as i32)), ("BR_I32_NEK", ri, a != (c as i32)),
-        ("BR_I32_LT_SK", ri, a < (c as i32)), ("BR_I32_LT_UK", ru, a < (c as u32)),
-        ("BR_I32_GT_SK", ri, a > (c as i32)), ("BR_I32_GT_UK", ru, a > (c as u32)),
-        ("BR_I32_LE_SK", ri, a <= (c as i32)), ("BR_I32_LE_UK", ru, a <= (c as u32)),
-        ("BR_I32_GE_SK", ri, a >= (c as i32)), ("BR_I32_GE_UK", ru, a >= (c as u32)),
-        ("BR_I64_EQK", rl, a == c), ("BR_I64_NEK", rl, a != c),
-        ("BR_I64_LT_SK", rl, a < c), ("BR_I64_LT_UK", rq, a < (c as u64)),
-        ("BR_I64_GT_SK", rl, a > c), ("BR_I64_GT_UK", rq, a > (c as u64)),
-        ("BR_I64_LE_SK", rl, a <= c), ("BR_I64_LE_UK", rq, a <= (c as u64)),
-        ("BR_I64_GE_SK", rl, a >= c), ("BR_I64_GE_UK", rq, a >= (c as u64)),
+    // The same for the K compares (`W.brk`, `W.brk_not`).
+    inline for (cmp, not_cmp, k, test) in [
+        ("I32_EQK", I32_NEK, ri, a == (c as i32)), ("I32_NEK", I32_EQK, ri, a != (c as i32)),
+        ("I32_LT_SK", I32_GE_SK, ri, a < (c as i32)), ("I32_LT_UK", I32_GE_UK, ru, a < (c as u32)),
+        ("I32_GT_SK", I32_LE_SK, ri, a > (c as i32)), ("I32_GT_UK", I32_LE_UK, ru, a > (c as u32)),
+        ("I32_LE_SK", I32_GT_SK, ri, a <= (c as i32)), ("I32_LE_UK", I32_GT_UK, ru, a <= (c as u32)),
+        ("I32_GE_SK", I32_LT_SK, ri, a >= (c as i32)), ("I32_GE_UK", I32_LT_UK, ru, a >= (c as u32)),
+        ("I64_EQK", I64_NEK, rl, a == c), ("I64_NEK", I64_EQK, rl, a != c),
+        ("I64_LT_SK", I64_GE_SK, rl, a < c), ("I64_LT_UK", I64_GE_UK, rq, a < (c as u64)),
+        ("I64_GT_SK", I64_LE_SK, rl, a > c), ("I64_GT_UK", I64_LE_UK, rq, a > (c as u64)),
+        ("I64_LE_SK", I64_GT_SK, rl, a <= c), ("I64_LE_UK", I64_GT_UK, rq, a <= (c as u64)),
+        ("I64_GE_SK", I64_LT_SK, rl, a >= c), ("I64_GE_UK", I64_LT_UK, rq, a >= (c as u64)),
     ] {
-        op #name(a: k, c: imm) : RI then JMP {
+        op #("BR_" ++ cmp)(a: k, c: imm) : RI then JMP {
             if test { jump then.t }
             jump pc + 2
         }
+        rel brk(#cmp) = #("BR_" ++ cmp);
+        rel brk_not(not_cmp) = #("BR_" ++ cmp);
     }
     // Followed by n + 1 JMPs (checked by `verify brtable` below).
     op BR_TABLE(a: ru, n: imm) : RU {
@@ -959,6 +971,7 @@ pub vm W {
             d = conv;
             next
         }
+        rel xform(#name) = #(name ++ "_X");
     }
     op V128_STORE(a: ru, v: vul, end: e16) : RRR {
         let top = (a as u64) + end;
@@ -966,6 +979,7 @@ pub vm W {
         ((mem + top - 16) as *u64x2).write_unaligned(v);
         next
     }
+    rel xform(V128_STORE) = V128_STORE_X;
     op V128_STORE_X(a: rq, v: vul) : RRR {
         let ea = a;
         if ea + 16 > msize { raise Trap.MemOOB }
@@ -1004,35 +1018,37 @@ pub vm W {
     // which does not wrap): the add and the access in one op, with offset
     // 0. The add wraps at 32 bits as i32.add does.
     inline for (name, dk, ty, conv, size) in [
-        ("I32_LOADK", ri, i32, x, 4), ("I64_LOADK", rl, i64, x, 8),
-        ("F32_LOADK", rf, f32, x, 4), ("F64_LOADK", rd, f64, x, 8),
-        ("I32_LOAD8_SK", ri, i8, x as i32, 1), ("I32_LOAD8_UK", ri, u8, x as i32, 1),
-        ("I32_LOAD16_SK", ri, i16, x as i32, 2), ("I32_LOAD16_UK", ri, u16, x as i32, 2),
-        ("I64_LOAD8_SK", rl, i8, x as i64, 1), ("I64_LOAD8_UK", rl, u8, x as i64, 1),
-        ("I64_LOAD16_SK", rl, i16, x as i64, 2), ("I64_LOAD16_UK", rl, u16, x as i64, 2),
-        ("I64_LOAD32_SK", rl, i32, x as i64, 4), ("I64_LOAD32_UK", rl, u32, x as i64, 4),
+        ("I32_LOAD", ri, i32, x, 4), ("I64_LOAD", rl, i64, x, 8),
+        ("F32_LOAD", rf, f32, x, 4), ("F64_LOAD", rd, f64, x, 8),
+        ("I32_LOAD8_S", ri, i8, x as i32, 1), ("I32_LOAD8_U", ri, u8, x as i32, 1),
+        ("I32_LOAD16_S", ri, i16, x as i32, 2), ("I32_LOAD16_U", ri, u16, x as i32, 2),
+        ("I64_LOAD8_S", rl, i8, x as i64, 1), ("I64_LOAD8_U", rl, u8, x as i64, 1),
+        ("I64_LOAD16_S", rl, i16, x as i64, 2), ("I64_LOAD16_U", rl, u16, x as i64, 2),
+        ("I64_LOAD32_S", rl, i32, x as i64, 4), ("I64_LOAD32_U", rl, u32, x as i64, 4),
     ] {
-        op #name(d: dk, a: ru, k: imm) : RRK {
+        op #(name ++ "K")(d: dk, a: ru, k: imm) : RRK {
             let ea = (a +% (k as u32)) as u64;
             if ea + size > msize { raise Trap.MemOOB }
             let x = ((mem + ea) as *ty).read_unaligned();
             d = conv;
             next
         }
+        rel kmem(#name) = #(name ++ "K");
     }
     inline for (name, vk, ty, conv, size) in [
-        ("I32_STOREK", ri, i32, v, 4), ("I64_STOREK", rl, i64, v, 8),
-        ("F32_STOREK", ru, u32, v, 4), ("F64_STOREK", rd, f64, v, 8),
-        ("I32_STORE8K", ri, u8, v as u8, 1), ("I32_STORE16K", ri, u16, v as u16, 2),
-        ("I64_STORE8K", rl, u8, v as u8, 1), ("I64_STORE16K", rl, u16, v as u16, 2),
-        ("I64_STORE32K", rl, u32, v as u32, 4),
+        ("I32_STORE", ri, i32, v, 4), ("I64_STORE", rl, i64, v, 8),
+        ("F32_STORE", ru, u32, v, 4), ("F64_STORE", rd, f64, v, 8),
+        ("I32_STORE8", ri, u8, v as u8, 1), ("I32_STORE16", ri, u16, v as u16, 2),
+        ("I64_STORE8", rl, u8, v as u8, 1), ("I64_STORE16", rl, u16, v as u16, 2),
+        ("I64_STORE32", rl, u32, v as u32, 4),
     ] {
-        op #name(a: ru, v: vk, k: imm) : RRK {
+        op #(name ++ "K")(a: ru, v: vk, k: imm) : RRK {
             let ea = (a +% (k as u32)) as u64;
             if ea + size > msize { raise Trap.MemOOB }
             ((mem + ea) as *ty).write_unaligned(conv);
             next
         }
+        rel kmem(#name) = #(name ++ "K");
     }
 
     // A call of a function the module defines (compile.lm).
@@ -1041,27 +1057,33 @@ pub vm W {
     // select(a, b, a OP b) (C's min and max, `x < y ? x : y`): the
     // compare and the select in one op (compile.lm). Exactly select's
     // result, NaNs included, since it is the same expression.
-    inline for (name, k, test) in [
-        ("SEL_I32_LT_S", ri, a < b), ("SEL_I32_GT_S", ri, a > b),
-        ("SEL_I32_LE_S", ri, a <= b), ("SEL_I32_GE_S", ri, a >= b),
-        ("SEL_I32_LT_U", ru, a < b), ("SEL_I32_GT_U", ru, a > b),
-        ("SEL_I32_LE_U", ru, a <= b), ("SEL_I32_GE_U", ru, a >= b),
-        ("SEL_F64_LT", rd, a < b), ("SEL_F64_GT", rd, a > b),
-        ("SEL_F64_LE", rd, a <= b), ("SEL_F64_GE", rd, a >= b),
+    // `W.sel(cmp)` for select(a, b, cmp(a, b)), `W.sel_swapped(cmp)` for
+    // select(a, b, cmp(b, a)) (the op of the mirrored compare).
+    inline for (cmp, mirror, k, test) in [
+        ("I32_LT_S", I32_GT_S, ri, a < b), ("I32_GT_S", I32_LT_S, ri, a > b),
+        ("I32_LE_S", I32_GE_S, ri, a <= b), ("I32_GE_S", I32_LE_S, ri, a >= b),
+        ("I32_LT_U", I32_GT_U, ru, a < b), ("I32_GT_U", I32_LT_U, ru, a > b),
+        ("I32_LE_U", I32_GE_U, ru, a <= b), ("I32_GE_U", I32_LE_U, ru, a >= b),
+        ("F64_LT", F64_GT, rd, a < b), ("F64_GT", F64_LT, rd, a > b),
+        ("F64_LE", F64_GE, rd, a <= b), ("F64_GE", F64_LE, rd, a >= b),
     ] {
-        op #name(d: k, a: k, b: k) : RRR { d = if test { a } else { b }; next }
+        op #("SEL_" ++ cmp)(d: k, a: k, b: k) : RRR { d = if test { a } else { b }; next }
+        rel sel(#cmp) = #("SEL_" ++ cmp);
+        rel sel_swapped(mirror) = #("SEL_" ++ cmp);
     }
 
     // `local.get p; i32.const 4; i32.add; local.tee q; i32.load`: the add
     // (t = a + k, wrapping) and the load at t, offset 0, in one op (12-bit
-    // fields; compile.lm).
+    // fields; compile.lm: `W.tkload(load)`). `W.tee(op)`: the op also
+    // writes a second slot (field b), here and in `_TR` below.
+    data tee: bool = false;
     inline for (name, dk, ty, conv, size) in [
-        ("I32_LOAD_TK", ri, i32, x, 4), ("I64_LOAD_TK", rl, i64, x, 8),
-        ("F32_LOAD_TK", rf, f32, x, 4), ("F64_LOAD_TK", rd, f64, x, 8),
-        ("I32_LOAD8_U_TK", ri, u8, x as i32, 1), ("I32_LOAD8_S_TK", ri, i8, x as i32, 1),
-        ("I32_LOAD16_U_TK", ri, u16, x as i32, 2), ("I32_LOAD16_S_TK", ri, i16, x as i32, 2),
+        ("I32_LOAD", ri, i32, x, 4), ("I64_LOAD", rl, i64, x, 8),
+        ("F32_LOAD", rf, f32, x, 4), ("F64_LOAD", rd, f64, x, 8),
+        ("I32_LOAD8_U", ri, u8, x as i32, 1), ("I32_LOAD8_S", ri, i8, x as i32, 1),
+        ("I32_LOAD16_U", ri, u16, x as i32, 2), ("I32_LOAD16_S", ri, i16, x as i32, 2),
     ] {
-        op #name(d: dk, t: ru, a: ru, k: imm) : R4 {
+        op #(name ++ "_TK")(d: dk, t: ru, a: ru, k: imm) : R4 {
             let v = a +% (((k << 52) as i64 >> 52) as u32);
             t = v;
             let ea = v as u64;
@@ -1070,26 +1092,28 @@ pub vm W {
             d = conv;
             next
         }
+        rel tkload(#name) = #(name ++ "_TK");
+        data tee(#(name ++ "_TK")) = true;
     }
 
     // `local.get p; local.get i; i32.add; f64.load` (an array element at a
     // base plus a scaled index): the add (wrapping, as i32.add) and the
     // load at offset 0 in one op; `_TR` also writes the sum to t
     // (`local.tee`, 12-bit fields). compile.lm.
-    inline for (name, tname, dk, ty, conv, size) in [
-        ("I32_LOAD_R", "I32_LOAD_TR", ri, i32, x, 4), ("I64_LOAD_R", "I64_LOAD_TR", rl, i64, x, 8),
-        ("F32_LOAD_R", "F32_LOAD_TR", rf, f32, x, 4), ("F64_LOAD_R", "F64_LOAD_TR", rd, f64, x, 8),
-        ("I32_LOAD8_U_R", "I32_LOAD8_U_TR", ri, u8, x as i32, 1), ("I32_LOAD8_S_R", "I32_LOAD8_S_TR", ri, i8, x as i32, 1),
-        ("I32_LOAD16_U_R", "I32_LOAD16_U_TR", ri, u16, x as i32, 2), ("I32_LOAD16_S_R", "I32_LOAD16_S_TR", ri, i16, x as i32, 2),
+    inline for (name, dk, ty, conv, size) in [
+        ("I32_LOAD", ri, i32, x, 4), ("I64_LOAD", rl, i64, x, 8),
+        ("F32_LOAD", rf, f32, x, 4), ("F64_LOAD", rd, f64, x, 8),
+        ("I32_LOAD8_U", ri, u8, x as i32, 1), ("I32_LOAD8_S", ri, i8, x as i32, 1),
+        ("I32_LOAD16_U", ri, u16, x as i32, 2), ("I32_LOAD16_S", ri, i16, x as i32, 2),
     ] {
-        op #name(d: dk, a: ru, b: ru) : RRR {
+        op #(name ++ "_R")(d: dk, a: ru, b: ru) : RRR {
             let ea = (a +% b) as u64;
             if ea + size > msize { raise Trap.MemOOB }
             let x = ((mem + ea) as *ty).read_unaligned();
             d = conv;
             next
         }
-        op #tname(d: dk, t: ru, a: ru, b: ru) : R4 {
+        op #(name ++ "_TR")(d: dk, t: ru, a: ru, b: ru) : R4 {
             let v = a +% b;
             t = v;
             let ea = v as u64;
@@ -1098,6 +1122,9 @@ pub vm W {
             d = conv;
             next
         }
+        rel rload(#name) = #(name ++ "_R");
+        rel trload(#name) = #(name ++ "_TR");
+        data tee(#(name ++ "_TR")) = true;
     }
 
     // ── more compare-and-branch ──────────────────────────────────────
@@ -1148,26 +1175,16 @@ pub vm W {
     // benchmarks against wasm3"). `#[forward]`: where a part reads the slot
     // the previous part wrote, the value stays in a machine register (the
     // job wasm3's `fp0` does); `W.optimize` picks them after verification.
-    #[forward] super F64_MUL_F64_ADD = F64_MUL; F64_ADD;
-    #[allow(super_overlap)] #[forward] super F64_MUL_F64_SUB = F64_MUL; F64_SUB;
-    #[allow(super_overlap)] #[forward] super F64_MUL_F64_MUL = F64_MUL; F64_MUL;
-    #[allow(super_overlap)] #[forward] super F64_SUB_F64_MUL = F64_SUB; F64_MUL;
-    #[allow(super_overlap)] #[forward] super F64_ADD_F64_ADD = F64_ADD; F64_ADD;
-    #[allow(super_overlap)] #[forward] super F64_LOAD_F64_MUL = F64_LOAD; F64_MUL;
-    #[allow(super_overlap)] #[forward] super F64_LOAD_F64_ADD = F64_LOAD; F64_ADD;
-    #[allow(super_overlap)] #[forward] super F64_LOAD_F64_SUB = F64_LOAD; F64_SUB;
-    #[allow(super_overlap)] #[forward] super F64_ADD_F64_STORE = F64_ADD; F64_STORE;
-    #[allow(super_overlap)] #[forward] super F64_SUB_F64_STORE = F64_SUB; F64_STORE;
-    #[allow(super_overlap)] #[forward] super F64_MUL_F64_DIV = F64_MUL; F64_DIV;
-    #[allow(super_overlap)] #[forward] super I32_ADDK_F64_LOAD = I32_ADDK; F64_LOAD;
-    #[allow(super_overlap)] #[forward] super CONST64_F64_DIV = CONST64; F64_DIV;
-    #[allow(super_overlap)] #[forward] super F64_DIV_F64_MUL = F64_DIV; F64_MUL;
-    #[allow(super_overlap)] #[forward] super F64_LOAD_F64_MUL_F64_ADD = F64_LOAD; F64_MUL; F64_ADD;
-    #[allow(super_overlap)] #[forward] super I32_ADD_I32_ADDK = I32_ADD; I32_ADDK;
-    #[allow(super_overlap)] #[forward] super I32_ADDK_BR_I32_NE = I32_ADDK; BR_I32_NE;
-    #[allow(super_overlap)] #[forward] super I32_ADDK_BRNZ = I32_ADDK; BRNZ;
-    // Two counters or pointers stepped together (loops, unrolled ones).
-    #[allow(super_overlap)] #[forward] super I32_ADDK_I32_ADDK = I32_ADDK; I32_ADDK;
+    // Each is named by its parts joined with `_` (F64_MUL_F64_ADD).
+    #[forward] #[allow(super_overlap)] supers {
+        F64_MUL, F64_ADD;  F64_MUL, F64_SUB;  F64_MUL, F64_MUL;  F64_SUB, F64_MUL;  F64_ADD, F64_ADD;
+        F64_LOAD, F64_MUL;  F64_LOAD, F64_ADD;  F64_LOAD, F64_SUB;
+        F64_ADD, F64_STORE;  F64_SUB, F64_STORE;  F64_MUL, F64_DIV;
+        I32_ADDK, F64_LOAD;  CONST64, F64_DIV;  F64_DIV, F64_MUL;  F64_LOAD, F64_MUL, F64_ADD;
+        I32_ADD, I32_ADDK;  I32_ADDK, BR_I32_NE;  I32_ADDK, BRNZ;
+        // Two counters or pointers stepped together (loops, unrolled ones).
+        I32_ADDK, I32_ADDK;
+    }
 
     on raise(t: Trap) { fail t }
 

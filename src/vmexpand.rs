@@ -359,6 +359,72 @@ fn match_fn(s: &mut String, sig: &str, body: &str, arms: impl Iterator<Item = (u
     let _ = writeln!(s, "  {default}, }} }}");
 }
 
+/// `rel NAME(A) = B;` and `data NAME: T = D;` / `data NAME(A) = V;`:
+/// host lookups by opcode, `Vm.NAME(op: W) -> ?W` (`Some(OP_B)` for
+/// `OP_A`, None for any other op) and `Vm.NAME(op: W) -> T` (V for
+/// `OP_A`, D for any other op), each a `match` on the opcode like
+/// `op_name`. Nothing in the handlers reads them.
+fn generate_rels(sm: &SourceMap, v: &VmDecl, l: &VmLayout) -> Res<String> {
+    let n = &v.name.name;
+    let w = format!("u{}", l.word_bits);
+    let vis = if v.is_pub { "pub " } else { "" };
+    let mut s = String::new();
+    let opcode = |id: &Ident, what: &str| -> Res<u32> {
+        l.ops.iter().find(|o| o.name == id.name).map(|o| o.opcode).ok_or_else(|| Diag::new(id.span, format!("unknown op `{}` in {what}", id.name)))
+    };
+    // Each name once, in order of first declaration.
+    let mut names: Vec<&Ident> = Vec::new();
+    for r in &v.rels {
+        if !names.iter().any(|x| x.name == r.name.name) {
+            names.push(&r.name);
+        }
+    }
+    for (i, k) in v.data_keys.iter().enumerate() {
+        if let Some(x) = names.iter().find(|x| x.name == k.name.name) {
+            return Err(Diag::new(k.name.span, format!("`{}` is declared both as a relation and as data", k.name.name)).note(x.span, "the relation"));
+        }
+        if let Some(x) = v.data_keys[..i].iter().find(|x| x.name.name == k.name.name) {
+            return Err(Diag::new(k.name.span, format!("data `{}` is declared twice", k.name.name)).note(x.name.span, "first declared here"));
+        }
+    }
+    for rn in names {
+        let mut arms: Vec<(u32, String)> = Vec::new();
+        let mut seen: Vec<(u32, crate::diag::Span)> = Vec::new();
+        for r in v.rels.iter().filter(|r| r.name.name == rn.name) {
+            let what = format!("relation `{}`", rn.name);
+            let (a, b) = (opcode(&r.from, &what)?, opcode(&r.to, &what)?);
+            if let Some((_, sp)) = seen.iter().find(|(x, _)| *x == a) {
+                return Err(Diag::new(r.from.span, format!("`{}({})` is declared twice", rn.name, r.from.name)).note(*sp, "first declared here"));
+            }
+            seen.push((a, r.from.span));
+            arms.push((a, format!("Some({b})")));
+        }
+        arms.sort_by_key(|x| x.0);
+        match_fn(&mut s, &format!("{vis}fn {n}__{}(op: {w}) -> ?{w}", rn.name), "match op", arms.into_iter(), "_ => None");
+    }
+    for k in &v.data_keys {
+        let ctx = format!("data `{}` of vm `{n}`", k.name.name);
+        let mut arms: Vec<(u32, String)> = Vec::new();
+        let mut seen: Vec<(u32, crate::diag::Span)> = Vec::new();
+        for d in v.data_vals.iter().filter(|d| d.key.name == k.name.name) {
+            let a = opcode(&d.op, &format!("data `{}`", k.name.name))?;
+            if let Some((_, sp)) = seen.iter().find(|(x, _)| *x == a) {
+                return Err(Diag::new(d.op.span, format!("`{}({})` is declared twice", k.name.name, d.op.name)).note(*sp, "first declared here"));
+            }
+            seen.push((a, d.op.span));
+            arms.push((a, format!("({})", splice(sm, d.value.span, &ctx))));
+        }
+        arms.sort_by_key(|x| x.0);
+        let default = format!("_ => ({})", splice(sm, k.default.span, &ctx));
+        let sig = format!("{vis}fn {n}__{}(op: {w}) -> {}", k.name.name, splice(sm, k.ty.span, &ctx));
+        match_fn(&mut s, &sig, "match op", arms.into_iter(), &default);
+    }
+    if let Some(d) = v.data_vals.iter().find(|d| !v.data_keys.iter().any(|k| k.name.name == d.key.name)) {
+        return Err(Diag::new(d.key.span, format!("unknown data `{}`: declare it in the vm with its type and default, `data {}: T = D;`", d.key.name, d.key.name)));
+    }
+    Ok(s)
+}
+
 /// Source expression decoding field (bits, shift, signed) of word `__w`.
 fn decode_src(word_bits: u32, bits: u32, shift: u32, signed: bool) -> String {
     // As in handlers: operand fields are 64-bit.
@@ -2270,6 +2336,10 @@ fn check_generated_names(v: &VmDecl, items: &[Item]) -> Res<()> {
             if same.len() > 1 {
                 return Err(Diag::new(same[1].name.span, format!("op `{short}` is declared twice")));
             }
+            let rel = v.rels.iter().map(|r| &r.name).chain(v.data_keys.iter().map(|k| &k.name)).find(|x| x.name == short);
+            if let Some(r) = rel {
+                return Err(Diag::new(r.span, format!("`{n}.{short}` is generated twice: a `rel` or `data` cannot be named like a generated vm item or an op; rename it")));
+            }
             let span = same.first().map(|o| o.name.span).unwrap_or(v.name.span);
             return Err(Diag::new(
                 span,
@@ -2510,6 +2580,9 @@ pub fn expand(sm: &mut SourceMap, modules: &mut [Module], jit: bool) -> Res<()> 
                 src.push_str(&generate_labels(v, &l, jit));
                 src.push_str(&generate_disasm(v, &l, jit));
                 src.push_str(&generate_format_api(v, &l, jit));
+                // Last, so that a `rel` or `data` moves no line of the
+                // rest (panic locations in the expansion).
+                src.push_str(&generate_rels(sm, v, &l)?);
                 let (src, origins) = strip_marks(&src);
                 if std::env::var_os("LOIMI_DUMP_VM_EXPANSION").is_some() {
                     eprintln!("// <vm {} expansion>\n{}", v.name.name, src);

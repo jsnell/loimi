@@ -990,16 +990,21 @@ pub vm Mini {
     // the branch offset (so the verifier and the compiler's jump
     // patching treat it as a jump). Jump if the comparison holds (or,
     // for the N forms, if it does not); otherwise skip the JMP. The A
-    // field is unused.
-    inline for (name, nname, bkind, isub, fsub, slow) in [
-        ("JLT", "JLTN", reg, x < y, x < y, less(ctx, a, b, false)),
-        ("JLE", "JLEN", reg, x <= y, x <= y, less(ctx, a, b, true)),
-        ("JLTK", "JLTKN", kst, x < y, x < y, less(ctx, a, b, false)),
-        ("JLEK", "JLEKN", kst, x <= y, x <= y, less(ctx, a, b, true)),
-        ("JGTK", "JGTKN", kst, x > y, x > y, less(ctx, b, a, false)),
-        ("JGEK", "JGEKN", kst, x >= y, x >= y, less(ctx, b, a, true)),
+    // field is unused. `Mini.jump(cmp)` is the compare-and-branch of a
+    // comparison, `Mini.negate(j)` the one that jumps when j does not
+    // (compile.lm).
+    inline for (cmp, bkind, isub, fsub, slow) in [
+        ("LT", reg, x < y, x < y, less(ctx, a, b, false)),
+        ("LE", reg, x <= y, x <= y, less(ctx, a, b, true)),
+        ("LTK", kst, x < y, x < y, less(ctx, a, b, false)),
+        ("LEK", kst, x <= y, x <= y, less(ctx, a, b, true)),
+        ("GTK", kst, x > y, x > y, less(ctx, b, a, false)),
+        ("GEK", kst, x >= y, x >= y, less(ctx, b, a, true)),
     ] {
-        inline for (opname, want) in [(name, true), (nname, false)] {
+        rel jump(#cmp) = #("J" ++ cmp);
+        rel negate(#("J" ++ cmp)) = #("J" ++ cmp ++ "N");
+        rel negate(#("J" ++ cmp ++ "N")) = #("J" ++ cmp);
+        inline for (opname, want) in [(#("J" ++ cmp), true), (#("J" ++ cmp ++ "N"), false)] {
             op #opname(unused: imm, a: reg, b: bkind) : ABC then JMP {
                 let (x, y) = ((a as u64) ^ value.int_bias(), (b as u64) ^ value.int_bias());
                 if ((x | y) & V.Int.mask) == 0 { branch((isub) == want, then.target) }
@@ -1008,8 +1013,11 @@ pub vm Mini {
             }
         }
     }
-    inline for (name, nname, bkind) in [("JEQ", "JEQN", reg), ("JEQK", "JEQKN", kst)] {
-        inline for (opname, want) in [(name, true), (nname, false)] {
+    inline for (cmp, bkind) in [("EQ", reg), ("EQK", kst)] {
+        rel jump(#cmp) = #("J" ++ cmp);
+        rel negate(#("J" ++ cmp)) = #("J" ++ cmp ++ "N");
+        rel negate(#("J" ++ cmp ++ "N")) = #("J" ++ cmp);
+        inline for (opname, want) in [(#("J" ++ cmp), true), (#("J" ++ cmp ++ "N"), false)] {
             op #opname(unused: imm, a: reg, b: bkind) : ABC then JMP {
                 if let (Int(x), Int(y)) = (a, b) { branch((x == y) == want, then.target) }
                 // Same bits means equal, except for NaN; strings are interned.
@@ -1415,65 +1423,50 @@ pub vm Mini {
     // All `#[forward]`: where a part reads the register the previous part
     // wrote, `optimize` picks a variant that keeps the value in a machine
     // register (no run-time test; it costs opcodes and code size).
-    #[forward] super LOADI_SUB = LOADI; SUB;
-    #[forward] super ADD_RET1 = ADD; RET1;
-    #[forward] super MUL_F_ADD_F = MUL_F; ADD_F;
-    // Overlaps another super, but runs where no ADD_F follows: 2.8% of nbody's ops.
-    #[allow(super_overlap)]
-    #[forward] super MUL_F_MUL_F = MUL_F; MUL_F;
-    // Overlaps another super, but runs outside MUL_F; ADD_F: 15% of mandelbrot's ops, 2.8% of nbody's.
-    #[allow(super_overlap)]
-    #[forward] super ADD_F_MUL_F = ADD_F; MUL_F;
-    // Overlaps another super, but runs outside MUL_F; MUL_F: 8.3% of nbody's ops.
-    #[allow(super_overlap)]
-    #[forward] super MUL_F_SUB_F = MUL_F; SUB_F;
-    // Overlaps another super, but runs outside MUL_F; ADD_F: 15% of mandelbrot's ops.
-    #[allow(super_overlap)]
-    #[forward] super ADD_F_SUB_F = ADD_F; SUB_F;
-    // Overlaps another super, but runs outside the MUL_F pairs: 15% of mandelbrot's ops.
-    #[allow(super_overlap)]
-    #[forward] super MULK_F_MUL_F = MULK_F; MUL_F;
-    // Overlaps another super, but runs outside the MUL_F pairs: 11% of nbody's ops.
-    #[allow(super_overlap)]
-    #[forward] super GETFIELD_MUL_F = GETFIELD; MUL_F;
-    #[forward] super GETFIELD_SUB_F = GETFIELD; SUB_F;
-    // Overlaps another super, but runs outside MUL_F; ADD_F: 8.3% of nbody's ops.
-    #[allow(super_overlap)]
-    #[forward] super ADD_F_SETFIELD = ADD_F; SETFIELD;
-    #[forward] super MOVE_CALL = MOVE; CALL;
-    // Overlaps another super, but runs outside MOVE; CALL: 2% of closures' ops.
-    #[allow(super_overlap)]
-    #[forward] super MOVE_MOVE = MOVE; MOVE;
-    // Overlaps another super, but runs outside MOVE; MOVE: 6% of string_build's ops.
-    #[allow(super_overlap)]
-    #[forward] super MOVE_MOVE_CALL = MOVE; MOVE; CALL;
-    #[forward] super GETINDEX_GETINDEX = GETINDEX; GETINDEX;
-    // Overlaps another super, but runs outside GETINDEX; GETINDEX: 14% of queens' and sort's ops.
-    #[allow(super_overlap)]
-    #[forward] super GETUPVAL_GETINDEX = GETUPVAL; GETINDEX;
-    // Overlaps GETUPVAL; GETINDEX: `if not up[i]` in queens (14% of its ops).
-    #[allow(super_overlap)]
-    #[forward] super GETUPVAL_GETINDEX_TESTT = GETUPVAL; GETINDEX; TESTT;
-    // Overlap GETINDEX; GETINDEX and GETINDEX; ADDI: a lookup tested at
-    // once and a count stored back (`local c = t[k]; if c then t[k] = c + 1`),
-    // 15% of hash_strings' ops each.
-    #[allow(super_overlap)]
-    #[forward] super GETINDEX_GETINDEX_TEST = GETINDEX; GETINDEX; TEST;
-    #[allow(super_overlap)]
-    #[forward] super ADDI_SETINDEX = ADDI; SETINDEX;
-    // `f(n - 1)` for a function in an upvalue: fib 40%, coroutine_ring 17%.
-    #[allow(super_overlap)]
-    #[forward] super GETUPVAL_ADDI_CALL = GETUPVAL; ADDI; CALL;
-    // Overlaps another super, but runs outside the MOVE supers: 8% of binary_trees' and spectral_norm's ops.
-    #[allow(super_overlap)]
-    #[forward] super GETUPVAL_MOVE = GETUPVAL; MOVE;
-    // Overlaps ADDI; SETINDEX, which runs where no second ADDI precedes.
-    #[allow(super_overlap)]
-    #[forward] super ADDI_ADDI = ADDI; ADDI;
-    #[forward] super GETUPVAL_JEQN = GETUPVAL; JEQN;
-    // Overlaps another super, but runs outside GETINDEX; GETINDEX: 2.3% of interp's ops.
-    #[allow(super_overlap)]
-    #[forward] super GETINDEX_ADDI = GETINDEX; ADDI;
+    #[forward] #[allow(super_overlap)] supers {
+        LOADI, SUB;
+        ADD, RET1;
+        MUL_F, ADD_F;
+        // Overlaps another super, but runs where no ADD_F follows: 2.8% of nbody's ops.
+        MUL_F, MUL_F;
+        // Overlaps another super, but runs outside MUL_F; ADD_F: 15% of mandelbrot's ops, 2.8% of nbody's.
+        ADD_F, MUL_F;
+        // Overlaps another super, but runs outside MUL_F; MUL_F: 8.3% of nbody's ops.
+        MUL_F, SUB_F;
+        // Overlaps another super, but runs outside MUL_F; ADD_F: 15% of mandelbrot's ops.
+        ADD_F, SUB_F;
+        // Overlaps another super, but runs outside the MUL_F pairs: 15% of mandelbrot's ops.
+        MULK_F, MUL_F;
+        // Overlaps another super, but runs outside the MUL_F pairs: 11% of nbody's ops.
+        GETFIELD, MUL_F;
+        GETFIELD, SUB_F;
+        // Overlaps another super, but runs outside MUL_F; ADD_F: 8.3% of nbody's ops.
+        ADD_F, SETFIELD;
+        MOVE, CALL;
+        // Overlaps another super, but runs outside MOVE; CALL: 2% of closures' ops.
+        MOVE, MOVE;
+        // Overlaps another super, but runs outside MOVE; MOVE: 6% of string_build's ops.
+        MOVE, MOVE, CALL;
+        GETINDEX, GETINDEX;
+        // Overlaps another super, but runs outside GETINDEX; GETINDEX: 14% of queens' and sort's ops.
+        GETUPVAL, GETINDEX;
+        // Overlaps GETUPVAL; GETINDEX: `if not up[i]` in queens (14% of its ops).
+        GETUPVAL, GETINDEX, TESTT;
+        // Overlap GETINDEX; GETINDEX and GETINDEX; ADDI: a lookup tested at
+        // once and a count stored back (`local c = t[k]; if c then t[k] = c + 1`),
+        // 15% of hash_strings' ops each.
+        GETINDEX, GETINDEX, TEST;
+        ADDI, SETINDEX;
+        // `f(n - 1)` for a function in an upvalue: fib 40%, coroutine_ring 17%.
+        GETUPVAL, ADDI, CALL;
+        // Overlaps another super, but runs outside the MOVE supers: 8% of binary_trees' and spectral_norm's ops.
+        GETUPVAL, MOVE;
+        // Overlaps ADDI; SETINDEX, which runs where no second ADDI precedes.
+        ADDI, ADDI;
+        GETUPVAL, JEQN;
+        // Overlaps another super, but runs outside GETINDEX; GETINDEX: 2.3% of interp's ops.
+        GETINDEX, ADDI;
+    }
 
     /// A top-level run of `cl` from the bottom of the stack (the
     /// standalone interpreter).

@@ -461,34 +461,31 @@ pub vm Stak {
     }
 
     // Superinstructions, from `--vm-stats` on the benchmarks.
-    super PUSHI_ADD = PUSHI; ADD;
-    super PUSHI_SUB = PUSHI; SUB;
-    super PUSHI_MOD = PUSHI; MOD;
-    super PUSHI_AT = PUSHI; AT;
-    super PUSHI_LT_JZ = PUSHI; LT; JZ;
-    super PUSHK_MUL = PUSHK; MUL;
-    super PUSHK_ADD = PUSHK; ADD;
-    super LT_JZ = LT; JZ;
-    super LE_JZ = LE; JZ;
-    super GT_JZ = GT; JZ;
-    super LGET_LGET = LGET; LGET;
+    supers {
+        PUSHI, ADD;
+        PUSHI, SUB;
+        PUSHI, MOD;
+        PUSHI, AT;
+        PUSHI, LT, JZ;
+        PUSHK, MUL;
+        PUSHK, ADD;
+        LT, JZ;
+        LE, JZ;
+        GT, JZ;
+        LGET, LGET;
+    }
     // Longer sequences that start with a shared op. `optimize` fuses the
     // longest match left to right, so these take precedence over the
     // pairs above where they apply.
-    #[allow(super_overlap)]
-    super DUP_PUSHI_LT_JZ = DUP; PUSHI; LT; JZ;
-    #[allow(super_overlap)]
-    super DUP_PUSHI_SUB = DUP; PUSHI; SUB;
-    #[allow(super_overlap)]
-    super SWAP_PUSHI_SUB = SWAP; PUSHI; SUB;
-    #[allow(super_overlap)]
-    super LGET_PUSHI_ADD = LGET; PUSHI; ADD;
-    #[allow(super_overlap)]
-    super LGET_LGET_AT = LGET; LGET; AT;
-    #[allow(super_overlap)]
-    super LGET_LGET_ADD_LSET = LGET; LGET; ADD; LSET;
-    #[allow(super_overlap)]
-    super LGET_LGET_STORE = LGET; LGET; STORE;
+    #[allow(super_overlap)] supers {
+        DUP, PUSHI, LT, JZ;
+        DUP, PUSHI, SUB;
+        SWAP, PUSHI, SUB;
+        LGET, PUSHI, ADD;
+        LGET, LGET, AT;
+        LGET, LGET, ADD, LSET;
+        LGET, LGET, STORE;
+    }
 
     fn start(m: *Machine, main: *Word) -> never {
         ctx = m;
@@ -508,8 +505,9 @@ pub vm Stak {
     entry run(m: *Machine, main: *Word) -> Result<(), str> uses gc { start(m, main) }
 
     // For the fuzzer: a second dispatch table whose jumping ops count down
-    // `ctx.steps` first, so that random programs cannot loop forever.
-    variant budget wraps [JMP, JZ, LOOP, CALL, PUSHI_LT_JZ, LT_JZ, LE_JZ, GT_JZ, DUP_PUSHI_LT_JZ] {
+    // `ctx.steps` first, so that random programs cannot loop forever (and
+    // every super with one of them as a part).
+    variant budget wraps [JMP, JZ, LOOP, CALL] {
         before {
             ctx.steps -= 1;
             if ctx.steps < 0 { raise "step budget exhausted" }
