@@ -1,6 +1,6 @@
 # Design note: an ergonomics audit (zero run-time cost)
 
-Status: **proposal; items 1, 2, 4 (step 1), 5, 6, 7, 9 and 10, and part of section 2, built.** Written 2026-11-05
+Status: **proposal; items 1, 2, 3, 4 (step 1), 5, 6, 7, 9, 10 and 11, and part of section 2, built.** Written 2026-11-05
 against master at 627c1ca.
 - **Item 1** (declared polls, `new` in handlers, the `redo` check):
   built as `poll NAME { .. }`, `#[poll(NAME)]` and `poll NAME;`
@@ -11,6 +11,11 @@ against master at 627c1ca.
   ([language.md §1.2](../language.md#variant-names-and-data)). Scheme's
   primitives and Python's exception kinds are ported; the section below
   records what changed from the proposal and what the IR diff showed.
+- **Item 3** (op relations and per-op data): built as the vm items
+  `rel kform(A) = B;` and `data NAME(A) = V;`, generating `W.kform(op)`
+  ([language.md §7.5](../language.md#75-relations-and-data-on-ops-rel-and-data));
+  Wasm's 178 relation rows, Mini's `jump_op`/`negate_jump`, Prolog's
+  `jump_form` and Python's `branch_ops` are ported (see the item).
 - **Item 4, step 1** (`loimi ir-diff`): built
   ([status.md](../status.md#comparing-builds-loimi-ir-diff)). The
   examples' `#[cfg]` lines are not unpacked yet.
@@ -31,6 +36,11 @@ against master at 627c1ca.
   (see the item for what changed and what the IR diff showed).
 - **Item 10** (`is` and checked unwrap): built as `e is P` and `e as!
   V`; ports in six interpreters, release code unchanged (see the item).
+- **Item 11** (op selectors, `supers` groups): built as `A..B`, globs
+  and `with KIND` in `accumulate` and `wraps`, a wrapped op wrapping the
+  supers that contain it, and `supers { A, B; .. }`
+  ([language.md §7.3, §7.4, §9](../language.md#73-superinstructions));
+  every example with supers is ported (see the item).
 
 > Where could we give the user meaningfully better ergonomics at no
 > run-time cost, even if it makes the Loimi implementation itself more
@@ -86,7 +96,7 @@ interpreters affected) against the compiler cost. Cost is S (days), M
 |---|---|---|---|
 | 1 | **Built.** Declared safepoint polls, and handler-lowered allocation refills | 73 lines testing the heap threshold in 7 interpreters (46 the full poll), plus 29 `gc_point()` calls; 24 `else cold { make_room; redo }`; Mini's 9 GIL/pause polls and 6 barrier tails | M |
 | 2 | **Built.** Names and data on enum variants (`#[name]`, generated `name`/`from_name`, per-variant constants) | ~650 rows of parallel tables: Scheme ~260 (5 copies of its 149 primitives), Python ~150, Prolog 90, Mini 84 (3 copies of 27 natives); 27 `E_*` + `enames`; Trap messages; 4 operator tables | M |
-| 3 | Op relations and per-op metadata in `inline for` rows | Wasm: 178 relation rows + 329 translator rows whose types repeat operand kinds; Mini's 24-arm `jump_op`/`negate_jump`; Python, Prolog, Lox op maps | M |
+| 3 | **Built.** Op relations and per-op metadata in `inline for` rows | Wasm: 178 relation rows + 329 translator rows whose types repeat operand kinds; Mini's 24-arm `jump_op`/`negate_jump`; Python, Prolog, Lox op maps | M |
 | 4 | Panic locations out of the IR identity check (`loimi ir-diff`: **built**), then `extend vm` blocks | 97 `#[cfg(..)]` lines in Mini (71) and Python (26) packed onto existing lines; Python/Mini `on break` and variants on the line closing `on raise` | S, then M |
 | 5 | **Built.** Cache layouts from structs; cache handles for plain functions | 31 `&cache.f` sites; `PropIC` copies `obj.Site` field by field in Lox and MiniJS, plus 22 `as *obj.Site` casts | S |
 | 6 | **Built.** Terminal `raise`, `fail` and `become ..; redo` are cold by default | 119 `cold { raise .. }` in 8 vms; 21 `cold { become X; redo }` | S–M |
@@ -94,7 +104,7 @@ interpreters affected) against the compiler cost. Cost is S (days), M
 | 8 | Infer effects of private functions | 136 `uses` on signatures (73 non-`pub`), 18 on fn types; Python `ops.lm` alone 43 | M |
 | 9 | **Built.** Derived root scanning for context structs; a typed `add_scanner` | 93 `gc_mark` calls in hand-written scanners, ~45 of them fixed fields or arrays; 10 `add_scanner(.. as *u8, ..)` with casts back | S–M |
 | 10 | **Built.** `is` patterns and checked unwrap | 36 `=> true, _ => false` predicates; 79 `let X(v) = e else { trap() }` | S |
-| 11 | Op selectors for `accumulate`, `variant .. wraps`; defaults and derived names for `super` groups | Wasm's 140-name `accumulate` list; Stack's hand list of jumping ops for `wraps`; ~140 supers, nearly all named as their parts joined, ~100 `#[forward]`, 54 `#[allow(super_overlap)]` | S |
+| 11 | **Built.** Op selectors for `accumulate`, `variant .. wraps`; defaults and derived names for `super` groups | Wasm's 140-name `accumulate` list; Stack's hand list of jumping ops for `wraps`; ~140 supers, nearly all named as their parts joined, ~100 `#[forward]`, 54 `#[allow(super_overlap)]` | S |
 | 12 | A typed host-side decoder `Vm.decode(w)`, and encoders that take any integer with checked ranges | 42 `Vm.FMT_field(w)` calls with the format chosen by hand; ~300 `as u8` casts at encoder calls; silent masking (regex FRICTION 241); 12 hand decodes in Mini and Prolog compilers | M |
 
 **Build first: 1, 2 and 7.**
@@ -532,6 +542,56 @@ inline for (name, k, expr) in [("I32_ADD", ri, a +% b), ("I32_SUB", ri, a -% b),
 
 **Interactions.** Relations name ops, so `Vm.deopt` and supers are
 unaffected. The JIT, dispatch and the debugger do not see tags.
+
+**As built** (2026-11-05), as the vm items `rel NAME(A) = B;`, `data
+NAME: T = D;` and `data NAME(A) = V;`
+([language.md §7.5](../language.md#75-relations-and-data-on-ops-rel-and-data)).
+Refinements of the proposal:
+- **Items, not attributes on ops.** `#[rel(kform = #name)]` on the op
+  reads backwards (the K op names its base), and a row without the
+  relation needs a second syntax. A `rel` item is the generated function
+  written as an equation, `rel kform(#name) = #(name ++ "K");`, and sits
+  in the `inline for` body next to the op, so one line declares the
+  relation for every row. `_` for either op declares nothing (Wasm's
+  float compares, whose branch-if-false op is a separate `N` op).
+- **Relations across tables.** The proposal restricted relations to ops
+  of one `inline for` body. Wasm's K ops, `_X` loads and fused branches
+  are separate tables, declared after the plain ops, and moving them into
+  one body would renumber every opcode (and the profile and the
+  accumulator variants with them). Names are resolved after expansion,
+  against every op of the vm, so a relation may name ops of any table;
+  the two that fit no table (`kform(I32_SUB) = I32_ADDK`) are plain items.
+- **Data keys are declared with a type and default**, as item 2's
+  `#[data]` on enums: `data commutative: bool = false;`. Values are
+  checked as written (a value of another type is an error at the value,
+  through the expansion's splice markers).
+- **Generated as host code after the vm's other generated items**, so
+  that a `rel` moves no line of the expansion (panic locations in
+  `<vm W expansion>` strings are not normalized by `ir-diff`; the first
+  version put them earlier and changed `W.disasm_op`'s panic constants).
+- **Not built: tags read by the translator's type columns.** Wasm's
+  `numeric()` (329 rows `0x6A => num(W.OP_I32_ADD, i, i, i)`) maps the
+  wasm opcode to the op and its wasm value types. The types do not follow
+  from operand kinds (`F32_NEG` and the float stores work on `ru`), so a
+  port would move the 329 rows into the vm as `data wasm(..)` and type
+  columns, not remove them; and the opcode-to-op direction would need a
+  generated inverse lookup. Left as is.
+
+**Ports** (rows of hand-kept tables replaced, lines net):
+
+| Interpreter | Replaced | Now | Lines |
+|---|---|---|---|
+| Wasm | `kforms` 38, `fusions` 52, `selects` 12, `kmems` 23, `rloads` 8, `tkloads` 8 (and `is_tk`), `memop`'s `_X` column 37: 178 rows | 23 `rel`/`data` lines in `vm.lm` (`kform`, `commutative`, `br`, `br_not`, `brk`, `brk_not`, `sel`, `sel_swapped`, `kmem`, `tkload`, `rload`, `trload`, `tee`, `xform`) | compile.lm −127, vm.lm +17 (the BR and SEL rows gained columns naming their compares; both items) |
+| Mini | `jump_op` 8 arms, `negate_jump` 16 | `Mini.jump`, `Mini.negate`: 6 `rel` lines | −44 (both items) |
+| Prolog | `jump_form` (6) | `rel jump_form(#cmp) = #("J" ++ cmp);` | −5 |
+| Python | `branch_ops` (12) | `Py.jn`, `Py.jnk`: one `rel` line | −6 |
+
+Every relation was checked against the table it replaced, opcode by
+opcode, from the expansion (`LOIMI_DUMP_VM_EXPANSION=1`): equal. Not
+ported: Lox's `invert` (two words with their operands rebuilt), Stack's
+word table (names to encoders), and Python's and Scheme's AST-to-op maps,
+which are maps from a compiler enum (item 2's `#[data]` on that enum is
+the tool).
 
 ### 4. Panic locations out of the IR identity check, then `extend vm`
 
@@ -1224,7 +1284,8 @@ dispatch, against the unported sources built by the same compiler):
   all functions the same.
 - **Mini** (1 predicate): 624 of 626 the same in assembly; the two
   bytecode-compiler functions above differ.
- for `accumulate`, `variant .. wraps`, and `super` groups
+
+### 11. Op selectors for `accumulate`, `variant .. wraps`, and `super` groups
 
 **Pattern.** Several vm declarations list ops by name, and the author
 keeps the lists in step with the op set.
@@ -1280,6 +1341,47 @@ ops are known.
   supers behave.
 - **Stencils:** accumulator variants are ops, so a stencil is built per
   variant as today.
+
+**As built** (2026-11-05)
+([language.md §7.3, §7.4, §9](../language.md#73-superinstructions)).
+Refinements of the proposal:
+- **Selectors:** a name, `A..B` (the ops declared from A to B), a glob
+  (`BR_I32_*`, `*_TK`) and `with KIND`, in `accumulate` and in `wraps
+  [..]`; the list is their union. Ranges were not proposed and do most of
+  the work: Wasm's list is "the ops the benchmarks execute and their
+  neighbours in the tables", which is runs of declaration order, not a
+  predicate (no glob or kind gives `I32_ADD..I32_ROTL` without
+  `I32_ROTR`). `ops that jump` was not built: Stack's budget wraps
+  `JMP, JZ, LOOP, CALL` but not `DO`, which jumps (forward only), so the
+  list is a judgement, and four names say it. Differences (`A - B`) were
+  not needed. A selector that names no op is an error, and
+  `LOIMI_DUMP_VM_EXPANSION=1` prints each resolved list (the role the
+  proposed `--explain-selectors` had).
+- **A wrapped op wraps the supers that contain it** (for every list, not
+  only selectors), and a wrapped super its `#[forward]` variants. The
+  second was a latent bug: a `wraps` list naming a forward super left
+  out the forwarding variant that runs in its place (found by the test,
+  `tests/run/vm_rel_data.lm`; no example had one).
+- **Groups:** `supers { A, B; NAME = C, D; }`, with `,` between parts
+  (`;` ends a super, as it ends each part of a `super` item). Attributes
+  on the group apply to every entry, an entry may add its own, and
+  comments stay between entries. An `allow` on the group covers the whole
+  group (lint allows are regions), so groups where most entries overlap
+  carry it once, and the others keep it per entry. The order of
+  declaration, and with it every opcode, is unchanged.
+
+**Ports:**
+- **Wasm's `accumulate` list** (121 names, 23 lines) is 14 lines of 56
+  selectors (`I32_ADD..I32_ROTL, I32_EQ..I32_LT_U, .., BR_I32_*,
+  BR_F64_LT..BR_F64_GE, ..`); the resolved set is the hand list's.
+- **Supers:** 124 of the 137 `super` items are in groups (Prolog's 12,
+  named by hand, and Scheme's one super without `#[forward]` among 35
+  stay `super` items): `#[allow(super_overlap)]`
+  54 → 15, and `#[forward]` written once per group. Every super keeps its
+  name (only Prolog's differ from their parts), so the `--vm-stats` op
+  names and the checked-in `.vmprofile` files are unchanged.
+- **Stack's budget** is `wraps [JMP, JZ, LOOP, CALL]`; the five supers
+  are added by the rule, in the same order.
 
 ### 12. A typed host-side decoder and checked encoders
 

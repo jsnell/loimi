@@ -8,6 +8,28 @@ implementation; `git log` has the details.
 
 ### `vm` declarations and dispatch
 
+- **Relations and data on ops**: `rel kform(I32_ADD) = I32_ADDK;` and
+  `data cost(MUL) = 3;` (with `data cost: u32 = 1;`) generate host
+  lookups by opcode, `W.kform(op) -> ?W` and `W.cost(op) -> u32`, and
+  can be written in an `inline for` next to the ops a row defines, so a
+  translator's tables of related ops come from the declarations. Wasm's
+  seven relation tables (178 rows searched in loops), Mini's `jump_op`
+  and `negate_jump`, Prolog's `jump_form` and Python's `branch_ops` are
+  gone, with every handler unchanged
+  ([language.md §7.5](docs/language.md#75-relations-and-data-on-ops-rel-and-data);
+  [design/ergonomics-audit.md](docs/design/ergonomics-audit.md), item 3).
+- **Op selectors and `supers` groups**: `accumulate` and `variant ..
+  wraps [..]` take `A..B` (ops in declaration order), globs (`BR_I32_*`)
+  and `with KIND`; a variant that wraps an op also wraps every super
+  containing it (and a `#[forward]` super's forwarding variants, which a
+  list naming the super used to leave out); `supers { A, B; NAME = C, D; }`
+  declares supers named by their parts with shared attributes. Wasm's
+  121-name `accumulate` list is 56 selectors, and the examples' supers
+  carry 15 `#[allow(super_overlap)]` instead of 54, with the same ops
+  and opcodes ([language.md §7.3](docs/language.md#73-superinstructions),
+  [§7.4](docs/language.md#74-accumulators),
+  [§9](docs/language.md#9-instrumentation-variants);
+  [design/ergonomics-audit.md](docs/design/ergonomics-audit.md), item 11).
 - **Errors and deoptimization are cold by default**: in an op handler or
   a `-> never` vm function, a `raise`, `fail`, or `redo` after a
   `become` that the code reaches on some paths only compiles as if it

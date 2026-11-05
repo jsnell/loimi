@@ -44,8 +44,9 @@ between this design and the compiler.
   [7.1 Inline caches](#71-inline-caches),
   [7.1a The following instruction: `then`](#71a-the-following-instruction-then),
   [7.2 Families and `become`](#72-families-and-become),
-  [7.3 Superinstructions](#73-superinstructions) (`#[forward]`, `--vm-stats`),
-  [7.4 Accumulators](#74-accumulators)
+  [7.3 Superinstructions](#73-superinstructions) (`supers` groups, `#[forward]`, `--vm-stats`),
+  [7.4 Accumulators](#74-accumulators) (op selectors),
+  [7.5 Relations and data on ops](#75-relations-and-data-on-ops-rel-and-data) (`rel`, `data`)
 - [8. GC integration](#8-gc-integration) (objects, trace hooks, barriers, rooting of traced state)
 - [9. Instrumentation variants](#9-instrumentation-variants)
 - [10. Calls, reentrancy, coroutines, embedding](#10-calls-reentrancy-coroutines-embedding):
@@ -3253,6 +3254,39 @@ super MOVE_RETURN = MOVE; RETURN;
 super LOADI_ADD_F_RET = LOADI; ADD_F; RET1;   // any number of parts; family members too
 ```
 
+**Groups.** `supers { .. }` declares one super per `A, B, ..;`, named
+by its parts joined with `_` unless a name is given (`NAME = A, B;`).
+Attributes before `supers` apply to every super in the group, and an
+entry may add its own (`#[forward]`, `#[allow(super_overlap)]`); a
+comment may sit between entries. The names, opcodes and code are those
+of the `super` declarations written out:
+
+<!-- snippet: check
+vm V {
+    state { pc: *u32, regs: *f64, k: *f64 }
+    operand reg = regs[it];
+    operand kst = k[it];
+    operand imm = it;
+    encoding fixed(u32) { format ABC { op: 8, a: 8, b: 8, c: 8 } }
+    op LOADK(dst: reg, c: kst) : ABC { dst = c; next }
+    op LOADI(dst: reg, v: imm) : ABC { dst = v as f64; next }
+    op MOVE(dst: reg, src: reg) : ABC { dst = src; next }
+    op MUL(dst: reg, a: reg, b: reg) : ABC { dst = a * b; next }
+    op ADD(dst: reg, a: reg, b: reg) : ABC { dst = a + b; next }
+    op RET1(a: reg) : ABC { exit a }
+{snippet}
+    entry run(code: *u32, r: *f64) -> f64 { regs = r; k = r; jump code }
+}
+-->
+```loimi
+#[forward] #[allow(super_overlap)] supers {
+    MUL, ADD;               // MUL_ADD
+    MUL, MUL;
+    LOADK, MUL, ADD;        // LOADK_MUL_ADD
+    LMA = LOADI, MUL, ADD;  // named
+}
+```
+
 The compiler builds the handler by inlining the component bodies in order.
 Paths of a component that end in `next` fall through into the next one.
 Other control words (`jump`, `raise`, ...) keep their meaning; `redo` in a
@@ -3337,7 +3371,7 @@ something jumps to it.) With `A_B` and `B_C_D`, `A; B; C; D` becomes
 `A; B_C_D`. Declared supers where a proper suffix of one is a proper
 prefix of another get a warning, `super_overlap`, at the later declared
 one; declare the longer super if the whole sequence is hot, drop one of
-the two, or silence it with `#[allow(super_overlap)]` on that super or
+the two, or silence it with `#[allow(super_overlap)]` on that super (or its `supers` group) or
 on the vm.
 
 **Supers of quickened members.** `optimize` usually runs on freshly
@@ -3462,7 +3496,7 @@ can be parts of supers. An op whose result is also read (`d = d + a`)
 gets source variants only; an op without operands of an accumulator's
 kind gets none, so an `inline for` may mark a whole table. The vm item
 `accumulate ADD, CVT, FMUL;` marks the ops it names, for picking a few
-ops out of `inline for` tables: every variant is an opcode and a
+ops out of `inline for` tables (by *op selectors*, below): every variant is an opcode and a
 handler, and in goto mode all handlers are one function (the wasm
 interpreter marked 90 ops at first, which gave 287 variants: 669 opcodes
 instead of 382 (121 ops now); its goto build took 17 s and 220 MB, `lowering.md` §5, where it
@@ -3489,6 +3523,90 @@ like any other.
 What it gains (wasm interpreter, `examples/wasm/FRICTION.md`): a variant
 reading or writing the accumulator is 7 to 11 instructions where the slot
 form is 13 or 14, and a chain's values never touch memory.
+
+**Op selectors.** The ops of an `accumulate` list, and of a variant's
+`wraps [..]` (section 9), are given by selectors, each naming one or
+more ops; the list names their union:
+
+- `ADD`: the op;
+- `I32_ADD..I32_ROTL`: the ops declared from the first to the last, in
+  declaration order (the order of opcodes, and of `inline for` rows);
+- `BR_I32_*`, `*_TK`, `I64_*K`: the ops whose names match, `*` standing
+  for any run of characters (written without spaces);
+- `with label`: the ops with an operand of that kind.
+
+Ranges, globs and `with` leave out family members, which are named. A
+selector that names no op is an error. The wasm interpreter's list of
+121 ops reads `I32_ADD..I32_ROTL, I32_EQ..I32_LT_U, .., BR_I32_*,
+BR_F64_LT..BR_F64_GE, ..` (`examples/wasm/vm.lm`).
+`LOIMI_DUMP_VM_EXPANSION=1` prints each resolved list.
+
+### 7.5 Relations and data on ops: `rel` and `data`
+
+A translator that quickens or fuses needs to know how ops relate: the
+constant-operand form of an op, the branch an op fuses with, the
+negation of a compare. `rel NAME(A) = B;` declares that `NAME` takes op
+`A` to op `B`, and the vm gets `Vm.NAME(op) -> ?W` (`W` its word type),
+a `match` on the opcode that gives `Some(OP_B)` for `OP_A` and None for
+any other op. `data NAME: T = D;` declares a constant of type `T` per op
+with the default `D`, `data NAME(A) = V;` gives op `A` its value, and
+the vm gets `Vm.NAME(op) -> T`. Both may be written in an `inline for`
+next to the ops a row defines, so each relation is declared once, where
+its ops are; `_` for either op of a `rel` declares nothing (a row without
+the relation):
+
+<!-- snippet: run "ADDK 1 true - false" "LT_B _ LT_BN"
+import std.io;
+vm V {
+    state { pc: *u32, regs: *i64 }
+    operand reg = regs[it];
+    operand imm = it;
+    encoding fixed(u32) { format ABC { op: 8, a: 8, b: 8, c: 8 } }
+{snippet}
+    op RET(a: reg) : ABC { exit a }
+    entry run(code: *u32, r: *i64) -> i64 { regs = r; jump code }
+}
+fn show(o: ?u32) { match o { Some(x) => io.print(V.op_name(x)), None => io.print("-") } io.print(" "); }
+fn main() {
+    show(V.kform(V.OP_ADD)); io.print_int(V.cost(V.OP_ADD) as i64); io.print(" "); io.print_bool(V.commutative(V.OP_ADD)); io.print(" ");
+    show(V.kform(V.OP_MULK)); io.print_bool(V.commutative(V.OP_SUB)); io.println("");
+    show(V.branch(V.OP_LT)); io.print("_ "); show(V.negate(V.OP_LT_B)); io.println("");
+}
+-->
+```loimi
+data commutative: bool = false;
+data cost: u32 = 1;
+inline for (name, comm, expr, kexpr) in [
+    ("ADD", true, a + b, a + (k as i64)), ("SUB", false, a - b, a - (k as i64)),
+    ("MUL", true, a * b, a * (k as i64)),
+] {
+    op #name(d: reg, a: reg, b: reg) : ABC { d = expr; next }
+    op #(name ++ "K")(d: reg, a: reg, k: imm) : ABC { d = kexpr; next }
+    rel kform(#name) = #(name ++ "K");     // V.kform(V.OP_ADD) == Some(V.OP_ADDK)
+    data commutative(#name) = comm;
+}
+data cost(MUL) = 3;
+inline for (cmp, test) in [("LT", a < b), ("LE", a <= b)] {
+    op #cmp(d: reg, a: reg, b: reg) : ABC { d = if test { 1 } else { 0 }; next }
+    op #(cmp ++ "_B")(a: reg, b: reg) : ABC { if test { jump pc + 2 } next }
+    op #(cmp ++ "_BN")(a: reg, b: reg) : ABC { if !(test) { jump pc + 2 } next }
+    rel branch(#cmp) = #(cmp ++ "_B");
+    rel negate(#(cmp ++ "_B")) = #(cmp ++ "_BN");
+    rel negate(#(cmp ++ "_BN")) = #(cmp ++ "_B");
+}
+```
+
+The ops of a relation are named after `inline for` expansion, so they
+may be declared anywhere in the vm, in any table; a name that is not an
+op, and a second `NAME(A)`, are errors, as is a `data` value of
+another type (reported at the value). A relation or data key may not
+have the name of a generated vm item (`op_name`, `encode`, ..). The
+functions are generated after the vm's other items and are host code:
+no handler reads them, and declaring them changes no handler, opcode or
+word. The wasm translator's seven relation tables (178 rows searched in
+loops: `kforms`, `fusions`, `selects`, ...) became `W.kform(op)`,
+`W.br(op)`, `W.sel(op)` and so on (`examples/wasm/vm.lm`); Mini's
+`jump_op` and `negate_jump` became `Mini.jump` and `Mini.negate`.
 
 ---
 
@@ -3797,6 +3915,15 @@ the new table takes effect at the next dispatch. (**Not built:**
 `set_dispatch(Mini.tables.debug)` from outside the vm.) **Normal execution pays nothing**: no flag check in any handler, and
 no second copy of the interpreter to maintain. This is how debuggers, profilers,
 coverage, and `sys.settrace`-style hooks are implemented.
+
+**Which ops a list wraps.** `wraps [..]` takes op selectors (section
+7.4: `JMP`, `A..B`, `BR_*`, `with label`). A variant that wraps an op
+also wraps every superinstruction with that op as a part, and a super's
+`#[forward]` variants with it: a super runs in place of its parts, so a
+budget or a line hook on `JMP` must see `LT_JMP` too, and a super
+declared later is not silently left out. (Stack's step budget is
+`wraps [JMP, JZ, LOOP, CALL]`, which covers its five supers that jump.)
+A super may still be named in the list.
 
 `loimi build --vm-stats` does not need a variant: it compiles op and
 op-pair counters, and a counter per `cold` block, into the handlers and
