@@ -77,6 +77,12 @@ pub vm Wam {
         if c < ctx.b { ctx.b = c; }
     }
 
+    /// Collect before an op that may allocate much (its cold block gets a
+    /// copy of the rest of the op). Ops that make a cell or a structure
+    /// write `new` directly: in an op it takes the allocator's inline path,
+    /// and refills in a cold block that runs the op again.
+    poll gc { if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } } }
+
     // ---- head: get ----------------------------------------------------
 
     op GET_VAR_X(r: xr, a: xr) : RR { r = a; next }
@@ -238,7 +244,7 @@ pub vm Wam {
     ] {
     op #name(r: kind) : RR {
         if pending {
-            let Some(c) = ctx.try_cons() else cold { ctx.make_room(); redo };
+            let c = new(&ctx.heap, Cons { head: Term.Unb, tail: Term.Unb });
             *slot = Term.Lst(c);
             s = c as *Term;
             wm = true;
@@ -248,7 +254,7 @@ pub vm Wam {
         if let Lst(c) = t { s = c as *Term; wm = false; next }
         if let Ref(v) = t {
             if can_bind(v) {
-                let Some(c) = ctx.try_cons() else cold { ctx.make_room(); redo };
+                let c = new(&ctx.heap, Cons { head: Term.Unb, tail: Term.Unb });
                 bind_now(v, Term.Lst(c));
                 s = c as *Term;
                 wm = true;
@@ -271,7 +277,7 @@ pub vm Wam {
     /// (write mode, or binding a variable found there).
     op UNIFY_LIST() : A {
         if wm {
-            let Some(c) = ctx.try_cons() else cold { ctx.make_room(); redo };
+            let c = new(&ctx.heap, Cons { head: Term.Unb, tail: Term.Unb });
             *s = Term.Lst(c);
             s = c as *Term;
             next
@@ -280,7 +286,7 @@ pub vm Wam {
         if let Lst(c) = t { s = c as *Term; next }
         if let Ref(v) = t {
             if can_bind(v) {
-                let Some(c) = ctx.try_cons() else cold { ctx.make_room(); redo };
+                let c = new(&ctx.heap, Cons { head: Term.Unb, tail: Term.Unb });
                 bind_now(v, Term.Lst(c));
                 s = c as *Term;
                 wm = true;
@@ -315,7 +321,7 @@ pub vm Wam {
     inline for (name, kind) in [("UNIFY_VAR_X", xr), ("UNIFY_VAR_Y", yr)] {
         op #name(r: kind) : RR {
             if wm {
-                let Some(v) = ctx.try_var() else cold { ctx.make_room(); redo };
+                let g = new(&ctx.heap, Var { val: Term.Unb, stamp: ctx.cstamp }); let v = Term.Ref(g);
                 *s = v;
                 r = v;
                 s = s + 1;
@@ -371,7 +377,7 @@ pub vm Wam {
     op UNIFY_VOID(n: imm) : A {
         if wm {
             if n == 1 {
-                let Some(v) = ctx.try_var() else cold { ctx.make_room(); redo };
+                let g = new(&ctx.heap, Var { val: Term.Unb, stamp: ctx.cstamp }); let v = Term.Ref(g);
                 *s = v;
                 s = s + 1;
                 next
@@ -389,7 +395,7 @@ pub vm Wam {
 
     inline for (name, kind) in [("PUT_VAR_X", xr), ("PUT_VAR_Y", yr)] {
         op #name(r: kind, a: xr) : RR {
-            let Some(v) = ctx.try_var() else cold { ctx.make_room(); redo };
+            let g = new(&ctx.heap, Var { val: Term.Unb, stamp: ctx.cstamp }); let v = Term.Ref(g);
             r = v;
             a = v;
             next
@@ -417,14 +423,14 @@ pub vm Wam {
         }
     }
     op PUT_LIST(r: xr) : RR {
-        let Some(c) = ctx.try_cons() else cold { ctx.make_room(); redo };
+        let c = new(&ctx.heap, Cons { head: Term.Unb, tail: Term.Unb });
         r = Term.Lst(c);
         s = c as *Term;
         next
     }
     inline for (name, kind) in [("SET_VAR_X", xr), ("SET_VAR_Y", yr)] {
         op #name(r: kind) : RR {
-            let Some(v) = ctx.try_var() else cold { ctx.make_room(); redo };
+            let g = new(&ctx.heap, Var { val: Term.Unb, stamp: ctx.cstamp }); let v = Term.Ref(g);
             *s = v;
             r = v;
             s = s + 1;
@@ -438,7 +444,7 @@ pub vm Wam {
     op SET_CONST(k: kst) : A { *s = k; s = s + 1; next }
     op SET_VOID(n: imm) : A {
         if n == 1 {
-            let Some(v) = ctx.try_var() else cold { ctx.make_room(); redo };
+            let g = new(&ctx.heap, Var { val: Term.Unb, stamp: ctx.cstamp }); let v = Term.Ref(g);
             *s = v;
             s = s + 1;
             next
@@ -825,8 +831,7 @@ pub vm Wam {
     }
 
     /// call/N: the goal in A1, N-1 extra arguments after it.
-    op METACALL(n: imm) : A {
-        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
+    #[poll(gc)] op METACALL(n: imm) : A {
         match compile.prepare_call(ctx, n) {
             Ok(code) => jump code,
             Err(ball) => raise ball,

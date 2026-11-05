@@ -489,6 +489,16 @@ pub vm Mini {
     context ctx: *Ctx;
     state { pc: *u32, regs: *V, k: *V, fp: *Frame }
 
+    // Safepoints. Each falls through: its cold block gets a copy of the
+    // rest of the op. `gc` collects at the start of an op that allocates;
+    // `gil` hands the lock over on backward jumps (`--cfg gil`); `pause`
+    // switches to the stepping variant when the debugger asks for a pause
+    // (`--cfg debug`). Without the cfg, `poll gil;` and `poll pause;` are
+    // nothing.
+    poll gc { if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } } }
+    #[cfg(gil)] poll gil { if unlikely(ctx.gil.waiting()) { cold { ctx.gil.yield_now(); } } }
+    #[cfg(debug)] poll pause { if unlikely((&ctx.pause).atomic_load_relaxed() != 0) { use_variant step; } }
+
     // The generated verifier checks these against the prototype that
     // holds the code: Mini.build_verified (compile.lm, `finish`) creates
     // the Proto, copies the words into its `code` and verifies them there,
@@ -593,8 +603,7 @@ pub vm Mini {
             cold { become GETGLOBAL; redo }
         }
     }
-    op SETGLOBAL(src: reg, name: kst) : ABx {
-        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
+    #[poll(gc)] op SETGLOBAL(src: reg, name: kst) : ABx {
         value.table_set(&ctx.heap, ctx.globals, name, src);
         next
     }
@@ -609,8 +618,7 @@ pub vm Mini {
     }
     /// R[dst] = a new closure of child prototype `i`, capturing upvalues
     /// as its descriptors say.
-    op CLOSURE(dst: reg, i: child) : ABx {
-        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
+    #[poll(gc)] op CLOSURE(dst: reg, i: child) : ABx {
         let parent = fp.cl;
         let p = parent.proto.protos.data.ptr[i];
         let n = p.nupvals as u64;
@@ -635,15 +643,14 @@ pub vm Mini {
     }
 
     /// R[dst] = a table with room for `narr` array items and `nhash` fields.
-    op NEWTABLE(dst: reg, narr: imm, nhash: imm) : ABC {
-        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
+    #[poll(gc)] op NEWTABLE(dst: reg, narr: imm, nhash: imm) : ABC {
         dst = T(value.new_table_sized(&ctx.heap, narr as u64, nhash as u64));
         next
     }
     /// R[a][batch*50 + i] = R[a + i] for i in 1..n.
     op SETLIST(a: callbase, n: listn, batch: imm) : ABC {
         if let T(t) = regs[a] {
-            if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
+            poll gc;
             value.table_setlist(&ctx.heap, t, regs + a + 1, n as u64, batch as u64 * 50);
         }
         next
@@ -918,8 +925,7 @@ pub vm Mini {
         next
     }
     /// R[dst] = R[base] .. ... .. R[base + n - 1], as one string.
-    op CONCAT(dst: reg, base: callbase, n: catn) : ABC {
-        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
+    #[poll(gc)] op CONCAT(dst: reg, base: callbase, n: catn) : ABC {
         dst = concat(ctx, regs + base, n as u64)?;
         next
     }
@@ -976,7 +982,7 @@ pub vm Mini {
     /// The end of a compare-and-branch: jump to the following JMP's
     /// target, or skip the JMP.
     fn branch(take: bool, target: *u32) -> never {
-        if take { #[cfg(gil)] if unlikely(ctx.gil.waiting()) { cold { ctx.gil.yield_now(); } } jump target }
+        if take { poll gil; jump target }
         jump pc + 2
     }
 
@@ -1037,15 +1043,15 @@ pub vm Mini {
         jump pc + 1 + i
     }
 
-    op JMP(target: label) : sJ { #[cfg(gil)] if unlikely(ctx.gil.waiting()) { cold { ctx.gil.yield_now(); } } #[cfg(debug)] if unlikely((&ctx.pause).atomic_load_relaxed() != 0) { use_variant step; } jump target }
+    #[poll(gil, pause)] op JMP(target: label) : sJ { jump target }
     /// Jump if falsy.
     op TEST(a: reg, target: label) : AsBx {
-        if !value.truthy(a) { #[cfg(gil)] if unlikely(ctx.gil.waiting()) { cold { ctx.gil.yield_now(); } } jump target }
+        if !value.truthy(a) { poll gil; jump target }
         next
     }
     /// Jump if truthy.
     op TESTT(a: reg, target: label) : AsBx {
-        if value.truthy(a) { #[cfg(gil)] if unlikely(ctx.gil.waiting()) { cold { ctx.gil.yield_now(); } } jump target }
+        if value.truthy(a) { poll gil; jump target }
         next
     }
 
@@ -1110,7 +1116,7 @@ pub vm Mini {
                 let n = V.Int(i +% s);
                 regs[a] = n;
                 regs[a + 3] = n;
-                #[cfg(gil)] if unlikely(ctx.gil.waiting()) { cold { ctx.gil.yield_now(); } } #[cfg(debug)] if unlikely((&ctx.pause).atomic_load_relaxed() != 0) { use_variant step; } jump target
+                poll gil; poll pause; jump target
             }
             next
         }
@@ -1120,7 +1126,7 @@ pub vm Mini {
                 if (s > 0.0 and n <= l) or (s < 0.0 and n >= l) {
                     regs[a] = Num(n);
                     regs[a + 3] = Num(n);
-                    #[cfg(gil)] if unlikely(ctx.gil.waiting()) { cold { ctx.gil.yield_now(); } } #[cfg(debug)] if unlikely((&ctx.pause).atomic_load_relaxed() != 0) { use_variant step; } jump target
+                    poll gil; poll pause; jump target
                 }
                 next
             }
@@ -1135,7 +1141,7 @@ pub vm Mini {
             let n = value.table_iter(t, i as u64, regs + a + 2);
             if n != 0 {
                 regs[a + 1] = Int(n as i32);
-                #[cfg(gil)] if unlikely(ctx.gil.waiting()) { cold { ctx.gil.yield_now(); } } #[cfg(debug)] if unlikely((&ctx.pause).atomic_load_relaxed() != 0) { use_variant step; } jump target
+                poll gil; poll pause; jump target
             }
             next
         }
@@ -1150,7 +1156,7 @@ pub vm Mini {
             regs[a + 1] = Int(i + 1);
             regs[a + 2] = Int(i + 1);
             regs[a + 3] = v;
-            #[cfg(gil)] if unlikely(ctx.gil.waiting()) { cold { ctx.gil.yield_now(); } } #[cfg(debug)] if unlikely((&ctx.pause).atomic_load_relaxed() != 0) { use_variant step; } jump target
+            poll gil; poll pause; jump target
         }
         cold { raise iter_error(ctx, regs[a]) }
     }
@@ -1185,7 +1191,7 @@ pub vm Mini {
             k = p.consts.data.ptr;
             fp.k = k;
             regs = callee;
-            #[cfg(gil)] if unlikely(ctx.gil.waiting()) { cold { ctx.gil.yield_now(); } } #[cfg(debug)] if unlikely((&ctx.pause).atomic_load_relaxed() != 0) { use_variant step; } jump p.code
+            poll gil; poll pause; jump p.code
         }
         if let Native(id) = f {
             cold {
