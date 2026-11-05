@@ -524,6 +524,13 @@ fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, O
 fn order_handlers(prog: &mut tir::Program, sm: &SourceMap, opts: &Opts) -> Result<(), Diag> {
     let nowhere = Span { file: u32::MAX, lo: 0, hi: 0 };
     for vd in prog.vms.iter_mut() {
+        // Switch mode keeps declaration order: its timings hardly depend
+        // on placement (one dispatch branch for every handler), and the
+        // profile's order measured slower there (Python: 1.027 by
+        // geometric mean; docs/lowering.md §12, "Handler order").
+        if vd.dispatch == tir::Dispatch::Switch {
+            continue;
+        }
         let (path, span) = match (&opts.vm_profile, &vd.profile) {
             (Some(p), _) if p == "none" => continue,
             (Some(p), _) => (PathBuf::from(p), nowhere),

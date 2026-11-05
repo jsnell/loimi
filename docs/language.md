@@ -2086,7 +2086,8 @@ and in tail-call mode on AArch64, where a global's address would take
 table's address").
 
 **Handler order.** `#[profile("file")]` on a vm lays its handlers out by
-a dispatch profile: the ops the profile counts first, the most
+a dispatch profile in `tailcall` and `goto` builds (`switch` builds keep
+declaration order): the ops the profile counts first, the most
 dispatched first, together in a section of their own that starts on a
 page; the rest after them in declaration order. The path is relative
 to the file declaring the vm. The file is the standard error of a

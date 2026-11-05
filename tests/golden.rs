@@ -1169,6 +1169,11 @@ fn vm_profile_layout() {
     let labels: Vec<&str> = g.lines().filter(|l| l.starts_with("op.") && l.ends_with(':')).map(|l| l.split('.').nth(1).unwrap()).collect();
     assert_eq!(labels, ["MUL", "ADD", "SUB", "HALT"]);
     assert!(g.lines().any(|l| l.starts_with("define ") && l.contains("@\"main.V.run\"") && l.contains("section \".text.hot.main.V\" align 4096")));
+    // Switch mode keeps declaration order and no section.
+    let s = ir(&["--dispatch=switch"]);
+    let labels: Vec<&str> = s.lines().filter(|l| l.starts_with("op.") && l.ends_with(':')).map(|l| l.split('.').nth(1).unwrap()).collect();
+    assert_eq!(labels, ["ADD", "SUB", "MUL", "HALT"]);
+    assert!(!s.contains(".text.hot."));
 }
 
 /// Build `lib` as a static archive and as a shared object (with the C
