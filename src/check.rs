@@ -180,6 +180,9 @@ pub struct Checker<'a> {
     /// handlers, statements: `run_all`). Errors of the passes that later
     /// ones depend on (names, types, signatures) are returned instead.
     pub errors: Vec<Diag>,
+    /// Inside an `if`/`match` checked again, with recovery, after an
+    /// error (`branches_inferred`).
+    pub rechecking: u32,
     /// Declaring a signature-only function (an instance over opaque type
     /// parameters, or a trait method without a default): no body needed.
     pub sig_only: bool,
@@ -317,6 +320,7 @@ impl<'a> Checker<'a> {
             aliases: vec![],
             warnings: vec![],
             errors: vec![],
+            rechecking: 0,
             sig_only: false,
             closure_count: 0,
             unsafe_fns: Default::default(),
@@ -2389,7 +2393,11 @@ impl<'a> Checker<'a> {
                 let id = self.push_loop(cx, false);
                 cx.scopes.push(vec![]);
                 let r = (|| -> Res<TExpr> {
-                    let tconds = self.conds(cx, conds)?;
+                    let tconds = match self.conds(cx, conds) {
+                        Ok(t) => t,
+                        Err(d) if cx.recover => return Ok(self.salvage(cx, d, vec![(conds_pats(conds), None, Branch::Block(body))], span)),
+                        Err(d) => return Err(d),
+                    };
                     let b = self.block(cx, body, Some(&Ty::Unit))?;
                     let b = if b.ty == Ty::Never { b } else { self.coerce(b, &Ty::Unit)? };
                     let brk = mk(Ty::Never, TK::Break(id, None), span);
@@ -2673,6 +2681,55 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// With recovery, after error `d` in the condition of an `if` or a
+    /// `while` or in the scrutinee of a `match`: check the branches
+    /// anyway, for their own errors, with what the condition or pattern
+    /// binds poisoned. The result has type `never`, and the statement is
+    /// marked as following from an error.
+    fn salvage(&mut self, cx: &mut FnCx, d: Diag, branches: Vec<(Vec<&Pat>, Option<&Expr>, Branch)>, span: Span) -> TExpr {
+        if !cx.tainted.get() {
+            self.errors.push(d);
+        }
+        let after_d = self.errors.len();
+        for (pats, guard, body) in branches {
+            let mark = CxMark::new(cx);
+            cx.scopes.push(vec![]);
+            let mut names = Vec::new();
+            for p in pats {
+                pat_names(p, &mut names);
+            }
+            for n in names {
+                let id = cx.declare(&n, Ty::Never, true);
+                cx.poison.push(id);
+            }
+            for e in guard.map(Branch::Expr).into_iter().chain(std::iter::once(body)) {
+                cx.tainted.set(false);
+                let r = match e {
+                    Branch::Block(b) => self.block(cx, b, None),
+                    Branch::Expr(x) => self.expr(cx, x, None),
+                };
+                if let Err(e) = r {
+                    if !cx.tainted.get() {
+                        self.errors.push(e);
+                    }
+                }
+            }
+            mark.restore(cx);
+        }
+        // A branch checked without the type the context expects may not
+        // be typed alone (`Ok(x)`): that is not the user's error.
+        let mut i = after_d;
+        while i < self.errors.len() {
+            if self.errors[i].msg.starts_with("cannot infer") {
+                self.errors.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+        cx.tainted.set(true);
+        mk(Ty::Never, TK::Block(vec![], None), span)
+    }
+
     /// `if`/`match` without an expected type. When a branch cannot be
     /// typed on its own (`Ok(e)`, `None`), guess the type from all branches
     /// together and check again with that as the expected type, so
@@ -2684,13 +2741,75 @@ impl<'a> Checker<'a> {
             ExprKind::Match(scrut, arms) => c.match_expr(cx, scrut, arms, exp, e.span),
             _ => unreachable!(),
         };
-        // With recovery, a branch's error is recorded rather than returned:
-        // a recorded "cannot infer" is a reason to check again too. The
-        // errors of the first check are dropped if the second succeeds.
+        let infer = |d: &Diag| d.msg.starts_with("cannot infer");
+        if !cx.recover {
+            let err = match check(self, cx, None) {
+                Ok(v) => return Ok(v),
+                Err(d) => d,
+            };
+            if !infer(&err) {
+                return Err(err);
+            }
+            cx.scopes.truncate(nscopes);
+            cx.loops.truncate(nloops);
+            let guess = self.guess_ty(cx, e);
+            if has_hole(&guess) {
+                return Err(err);
+            }
+            return match check(self, cx, Some(&guess)) {
+                Ok(v) => Ok(v),
+                Err(_) => {
+                    cx.scopes.truncate(nscopes);
+                    cx.loops.truncate(nloops);
+                    Err(err)
+                }
+            };
+        }
+        if self.rechecking == 0 {
+            // A program that compiles is checked as without recovery (the
+            // same locals, so the same code): first without it. Only after
+            // an error is it checked again with recovery, for the rest.
+            cx.recover = false;
+            let r = self.branches_inferred(cx, e);
+            cx.recover = true;
+            let err = match r {
+                Ok(v) => return Ok(v),
+                Err(d) => d,
+            };
+            cx.scopes.truncate(nscopes);
+            cx.loops.truncate(nloops);
+            let before = self.errors.len();
+            self.rechecking += 1;
+            let r = self.branches_inferred(cx, e);
+            self.rechecking -= 1;
+            // One "cannot infer" for the whole `if`/`match`: the others
+            // are the same missing annotation.
+            let mut seen = false;
+            let mut i = before;
+            while i < self.errors.len() {
+                if infer(&self.errors[i]) && std::mem::replace(&mut seen, true) {
+                    self.errors.remove(i);
+                } else {
+                    i += 1;
+                }
+            }
+            return match r {
+                Ok(_) if self.errors.len() == before => Err(err),
+                Err(d) if seen && infer(&d) => {
+                    // Reported already; the result's type is unknown.
+                    cx.tainted.set(true);
+                    Ok(mk(Ty::Never, TK::Block(vec![], None), e.span))
+                }
+                r => r,
+            };
+        }
+        // Checking again after an error (so nested `if`s are not checked
+        // twice each): a branch's error is recorded rather than returned,
+        // and a recorded "cannot infer" is a reason to check again too.
+        // The errors of the first check are dropped if the second succeeds.
         let before = self.errors.len();
         let taint = cx.tainted.get();
         let first = check(self, cx, None);
-        let infer = |d: &Diag| d.msg.starts_with("cannot infer");
         if !(matches!(&first, Err(d) if infer(d)) || self.errors[before..].iter().any(infer)) {
             return first;
         }
@@ -2820,7 +2939,16 @@ impl<'a> Checker<'a> {
         }
         let exp = if hint.is_some() { hint.as_ref() } else { exp };
         cx.scopes.push(vec![]);
-        let tconds = self.conds(cx, conds)?;
+        let tconds = match self.conds(cx, conds) {
+            Ok(t) => t,
+            Err(d) if cx.recover => {
+                cx.scopes.pop();
+                let mut branches = vec![(conds_pats(conds), None, Branch::Block(then))];
+                branches.extend(els.map(|e| (vec![], None, Branch::Expr(e))));
+                return Ok(self.salvage(cx, d, branches, span));
+            }
+            Err(d) => return Err(d),
+        };
         let then_exp = if els.is_none() { Some(&Ty::Unit) } else { exp };
         let t = self.block(cx, then, then_exp);
         cx.scopes.pop();
@@ -2845,7 +2973,19 @@ impl<'a> Checker<'a> {
     }
 
     fn match_expr(&mut self, cx: &mut FnCx, scrut: &Expr, arms: &[Arm], exp: Option<&Ty>, span: Span) -> Res<TExpr> {
-        let s = self.expr(cx, scrut, None)?;
+        let s = match self.expr(cx, scrut, None) {
+            Ok(s) => s,
+            Err(d) if cx.recover => {
+                let branches = arms.iter().map(|a| (vec![&a.pat], a.guard.as_ref(), Branch::Expr(&a.body))).collect();
+                return Ok(self.salvage(cx, d, branches, span));
+            }
+            Err(d) => return Err(d),
+        };
+        if cx.recover && s.ty == Ty::Never && cx.tainted.get() {
+            // A poisoned scrutinee: no pattern fits `never`.
+            let branches = arms.iter().map(|a| (vec![&a.pat], a.guard.as_ref(), Branch::Expr(&a.body))).collect();
+            return Ok(self.salvage(cx, Diag::new(span, ""), branches, span));
+        }
         // An arm `P1 | P2 => body` whose alternatives bind names is one
         // arm per alternative, with the same guard and body (the body is
         // compiled once per alternative).
@@ -5272,4 +5412,16 @@ fn pat_names(p: &Pat, out: &mut Vec<String>) {
         }
         _ => {}
     }
+}
+
+/// A branch of an `if`, `while` or `match` (`Checker::salvage`).
+#[derive(Clone, Copy)]
+enum Branch<'e> {
+    Block(&'e Block),
+    Expr(&'e Expr),
+}
+
+/// The patterns of `if let`/`while let` conditions.
+fn conds_pats(conds: &[Cond]) -> Vec<&Pat> {
+    conds.iter().filter_map(|c| if let Cond::Let(p, _) = c { Some(p) } else { None }).collect()
 }
