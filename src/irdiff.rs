@@ -68,14 +68,28 @@ struct Input {
     llvm_args: Vec<&'static str>,
 }
 
+/// The first line of `loimi build --emit-llvm` output, when the build
+/// passes LLVM options: `; loimi-llvm-args: -opt=..`.
+pub const LLVM_ARGS_TAG: &str = "loimi-llvm-args:";
+
 fn load_input(opts: &mut Opts, path: &Path) -> Result<Input, String> {
     let label = path.display().to_string();
     if path.extension().is_some_and(|e| e == "ll") {
         let ir = std::fs::read_to_string(path).map_err(|e| format!("error: cannot read {}: {}", label, e))?;
-        // The vm options `compile` would pass, as far as the IR shows
-        // them (goto dispatch). Give `.lm` inputs for exact `--asm`.
+        // The vm options `compile` would pass: the ones the file names
+        // (`LLVM_ARGS_TAG`), else as far as the IR shows them (goto
+        // dispatch; a `.ll` from an older compiler). Give `.lm` inputs,
+        // or a `.ll` with the tag, for exact `--asm`.
         let mut llvm_args: Vec<&'static str> = Vec::new();
-        if ir.contains("indirectbr ") {
+        let known = || crate::GOTO_LLVM_ARGS.iter().chain(crate::SWITCH_LLVM_ARGS).chain(crate::BRANCH_ALIGN_LLVM_ARGS);
+        if let Some(tagged) = ir.lines().next().and_then(|l| l.strip_prefix("; ")).and_then(|l| l.strip_prefix(LLVM_ARGS_TAG)) {
+            for a in tagged.split_whitespace() {
+                match known().find(|k| **k == a) {
+                    Some(k) => llvm_args.push(k),
+                    None => return Err(format!("error: {}: unknown LLVM option `{}` in its `{}` line", label, a, LLVM_ARGS_TAG)),
+                }
+            }
+        } else if ir.contains("indirectbr ") {
             llvm_args.extend(crate::GOTO_LLVM_ARGS);
         }
         return Ok(Input { label, ir, llvm_args });

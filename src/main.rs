@@ -954,6 +954,11 @@ fn compiler_main() -> ExitCode {
         }
     }
     if opts.emit_llvm {
+        // The LLVM options the build would pass, for `loimi ir-diff` of
+        // `.ll` files (a comment, which clang ignores).
+        if !llvm_args.is_empty() {
+            ir = format!("; {} {}\n{}", irdiff::LLVM_ARGS_TAG, llvm_args.join(" "), ir);
+        }
         let out = opts.output.clone().unwrap_or_else(|| PathBuf::from(format!("{}.ll", stem)));
         if out.as_os_str() == "-" {
             print!("{}", ir);
