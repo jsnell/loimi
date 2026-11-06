@@ -1,0 +1,7 @@
+// `#[scan_raw_words]` needs every word below 2^48 to read as a float,
+// which `int_high` does not give: there the low 16 bits pick the variant.
+// error: `#[scan_raw_words]`: `V` does not read every word below 2^48 as a variant without references
+object O { x: i64 }
+#[scan_raw_words]
+value V repr nanbox(int_high) { Num(f64) unboxed, Int(i48), Obj(Gc<O>) }
+fn main() { let v = V.Int(1); }

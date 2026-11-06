@@ -968,8 +968,26 @@ pub fn explain(c: &Checker) -> String {
             }
             _ => "a tag word and a payload word",
         };
-        let _ = writeln!(s, "value {} repr {}: {} layout, {} tagged variant{}", d.name, repr, d.layout, ntag, if ntag == 1 { "" } else { "s" });
+        let opts = if d.int_high.is_some() { "(int_high)" } else { "" };
+        let _ = writeln!(s, "value {} repr {}{}: {} layout, {} tagged variant{}", d.name, repr, opts, d.layout, ntag, if ntag == 1 { "" } else { "s" });
         let _ = writeln!(s, "  {}", why);
+        if let Some(k) = d.int_high {
+            let iv = d.variants.iter().find(|v| !v.unboxed && mask_tag(d, v).1 == 0).map_or("", |v| v.name.as_str());
+            let _ = writeln!(
+                s,
+                "  int_high: each word is that layout's word rotated left by 16 bits and xored with {:#06X}: `{}` is its payload << 16 (low 16 bits zero; checked + - * are `add; jo` on the words), every other variant has nonzero low 16 bits, a pointer payload is `word >> 16`",
+                k, iv
+            );
+            if let Some(u) = d.variants.iter().find(|v| v.unboxed) {
+                let _ = writeln!(
+                    s,
+                    "  int_high costs: `{}` is decoded with `xor; ror` and encoded with `rol; xor`, and its test decodes before the compare; `{}.{}.limit` does not exist",
+                    u.name,
+                    crate::check::short_name(&d.name),
+                    u.name
+                );
+            }
+        }
         let decl = |v: &ValueVariantDef| match &v.payload {
             Some(t) => format!("{}({})", v.name, c.ty_name(t)),
             None => v.name.clone(),
@@ -982,14 +1000,25 @@ pub fn explain(c: &Checker) -> String {
                 continue;
             }
             if v.unboxed {
-                let _ = writeln!(s, "  {}  unboxed: the words below {} (`limit`)", name, hex(d.num_limit));
+                match d.int_high {
+                    Some(k) => {
+                        let _ = writeln!(s, "  {}  unboxed: the words w with rotr(w ^ {:#06X}, 16) below {} (the f64's bits)", name, k, hex(d.num_limit));
+                    }
+                    None => {
+                        let _ = writeln!(s, "  {}  unboxed: the words below {} (`limit`)", name, hex(d.num_limit));
+                    }
+                }
                 continue;
             }
             let (mask, tag) = mask_tag(d, v);
             let words = if mask == u64::MAX {
                 format!("the word {}", hex(tag))
+            } else if let (Some(l), Some(_)) = (v.sub, d.int_high) {
+                format!("words {} | ptr << 16, ptr's low 3 bits {}", hex(tag & !(low_mask(NAN_SUB_BITS) << 16)), l)
             } else if let Some(l) = v.sub {
                 format!("words {} | ptr, low 3 bits {}", hex(tag & !low_mask(NAN_SUB_BITS)), l)
+            } else if d.int_high.is_some() {
+                format!("words {} | payload << 16", hex(tag))
             } else if d.repr == ValueRepr::NanBox {
                 format!("words {} ..= {}", hex(tag), hex(tag | !mask))
             } else {
@@ -1025,7 +1054,11 @@ pub fn explain(c: &Checker) -> String {
             let _ = writeln!(s, "    block {:2}: {}", b, names.join(", "));
         }
         if let Some(u) = d.variants.iter().find(|v| v.unboxed) {
-            let _ = writeln!(s, "    unboxed:  {}  (umax(a, b, ..) < limit)", u.name);
+            if d.int_high.is_some() {
+                let _ = writeln!(s, "    unboxed:  {}  (umax(decoded a, b, ..) < {})", u.name, hex(d.num_limit));
+            } else {
+                let _ = writeln!(s, "    unboxed:  {}  (umax(a, b, ..) < limit)", u.name);
+            }
         }
         if d.variants.iter().any(|v| v.sub.is_some()) {
             let _ = writeln!(s, "    (with a block-{} variant, the 48-bit blocks of `Gc` variants merge into its test: their pointers' low 3 bits are 0)", NAN_SHARED_BITS);

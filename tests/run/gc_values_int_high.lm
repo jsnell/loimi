@@ -1,0 +1,155 @@
+// matrix: check-roots
+// `nanbox(int_high)` in the shared layout: each word is the shared
+// layout's word rotated left by 16 bits (and xored with the Int block's
+// tag), so a pointer sits above the 16-bit low tag, with a shared
+// variant's 3-bit tag in its alignment bits. The collector marks the
+// untagged pointers (so `--gc-check-roots` accepts them); generational
+// mode with stress and verify checks the barriers on value stores. Same
+// output as gc_values_shared.lm.
+import std.io;
+import std.gc;
+
+object A { x: i64, next: V }
+object B { x: i64, next: V }
+object C { x: i64, next: V }
+object D { x: i64, next: V }
+object E { x: i64, next: V }
+object F { x: i64, next: V }
+object G { x: i64, next: V }
+object H { x: i64, next: V }
+object I { x: i64, next: V }
+object J { x: i64, next: V }
+object K { x: i64, next: V }
+object Arr { items: [V] }
+
+#[allow(value_layout)]
+value V repr nanbox(int_high) {
+    Num(f64) unboxed,
+    Int(i48),
+    Nil,
+    Bool(bool),
+    Ga(Gc<A>), Gb(Gc<B>), Gc_(Gc<C>), Gd(Gc<D>), Ge(Gc<E>),
+    Gf(Gc<F>), Gg(Gc<G>), Gh(Gc<H>), Gi(Gc<I>), Gj(Gc<J>), Gk(Gc<K>),
+    Arr(Gc<Arr>),
+}
+
+fn mk(h: *gc.Heap, k: i64, x: i64, next: V) -> V {
+    match k % 11 {
+        0 => V.Ga(new(h, A { x: x, next: next })),
+        1 => V.Gb(new(h, B { x: x, next: next })),
+        2 => V.Gc_(new(h, C { x: x, next: next })),
+        3 => V.Gd(new(h, D { x: x, next: next })),
+        4 => V.Ge(new(h, E { x: x, next: next })),
+        5 => V.Gf(new(h, F { x: x, next: next })),
+        6 => V.Gg(new(h, G { x: x, next: next })),
+        7 => V.Gh(new(h, H { x: x, next: next })),
+        8 => V.Gi(new(h, I { x: x, next: next })),
+        9 => V.Gj(new(h, J { x: x, next: next })),
+        _ => V.Gk(new(h, K { x: x, next: next })),
+    }
+}
+
+/// (kind, x, next) of a node.
+fn parts(v: V) -> (i64, i64, V) {
+    match v {
+        Ga(o) => (0, o.x, o.next),
+        Gb(o) => (1, o.x, o.next),
+        Gc_(o) => (2, o.x, o.next),
+        Gd(o) => (3, o.x, o.next),
+        Ge(o) => (4, o.x, o.next),
+        Gf(o) => (5, o.x, o.next),
+        Gg(o) => (6, o.x, o.next),
+        Gh(o) => (7, o.x, o.next),
+        Gi(o) => (8, o.x, o.next),
+        Gj(o) => (9, o.x, o.next),
+        Gk(o) => (10, o.x, o.next),
+        _ => (-1, 0, V.Nil),
+    }
+}
+
+/// Sum of x * (kind + 1) along a chain, checking each node's kind.
+fn walk(v: V) -> i64 {
+    var t: i64 = 0;
+    var c = v;
+    var i: i64 = 0;
+    while true {
+        let (k, x, n) = parts(c);
+        if k < 0 { break; }
+        if k != x % 11 { io.println("wrong kind"); }
+        t = t + x * (k + 1);
+        c = n;
+        i += 1;
+    }
+    t
+}
+
+fn chain(h: *gc.Heap, n: i64) -> V uses gc {
+    var l = V.Nil;
+    for i in 0..n {
+        l = mk(h, i, i, l);
+        if i % 7 == 0 { gc.maybe_collect(h); }
+    }
+    l
+}
+
+/// Tuple patterns: two shared variants merge into one test, and a
+/// whole-block `Gc` variant merges with them.
+fn pair(a: V, b: V) -> i64 {
+    match (a, b) {
+        (Gk(x), Gk(y)) => 1000 + x.x + y.x,
+        (Gj(x), Gk(y)) => 2000 + x.x + y.x,
+        (Ga(x), Gk(y)) => 3000 + x.x + y.x,
+        (Int(x), Int(y)) => 4000 + (x as i64) + (y as i64),
+        (Arr(x), Gj(y)) => 5000 + (x.items.len as i64) + y.x,
+        _ => 0,
+    }
+}
+
+fn main() uses gc {
+    var heap = gc.Heap.new();
+    let h = &heap;
+    h.set_generational(true);
+    h.set_stress(true);
+    h.set_verify(true);
+    let arr: Gc<Arr> = new(h, Arr {}, 4);
+    for i in 0..4 { arr.items[i] = V.Nil; }
+    arr.items[0] = chain(h, 60);
+    let want = walk(arr.items[0]);
+    for i in 0..10 { chain(h, 30); }
+    gc.collect(h);
+    // Young values stored into the old array.
+    arr.items[1] = chain(h, 25);
+    arr.items[2] = V.Int(-140737488355328);
+    arr.items[3] = V.Arr(arr);
+    for i in 0..10 { chain(h, 30); }
+    gc.collect(h);
+    io.print_bool(walk(arr.items[0]) == want); io.println("");
+    io.print_int(walk(arr.items[1])); io.println("");
+    match arr.items[2] { Int(x) => io.print_int(x as i64), _ => io.print("?") }
+    io.println("");
+    if let Arr(a) = arr.items[3] { io.print_int(a.items.len as i64); io.println(""); }
+    let k1 = mk(h, 10, 21, V.Nil);
+    let k2 = mk(h, 21, 32, V.Nil);
+    let j = mk(h, 9, 9, V.Nil);
+    let a = mk(h, 0, 11, V.Nil);
+    io.print_int(pair(k1, k2)); io.println("");
+    io.print_int(pair(j, k2)); io.println("");
+    io.print_int(pair(a, k2)); io.println("");
+    io.print_int(pair(V.Int(5), V.Int(-7))); io.println("");
+    io.print_int(pair(V.Arr(arr), j)); io.println("");
+    io.print_int(pair(k1, j)); io.println("");
+    io.print_int(pair(V.Num(1.5), k1)); io.println("");
+    io.print_bool(k1 == k1 and k1 != k2); io.println("");
+}
+// expect: true
+// expect: 1746
+// expect: -140737488355328
+// expect: 4
+// expect: 1053
+// expect: 2041
+// expect: 3043
+// expect: 3998
+// expect: 5013
+// expect: 0
+// expect: 0
+// expect: true

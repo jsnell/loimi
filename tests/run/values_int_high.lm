@@ -1,0 +1,119 @@
+// `repr nanbox(int_high)`: `Int(i48)` is its payload << 16 (zero low
+// tag), so checked + - * are plain word arithmetic with an overflow flag
+// at exactly 48 bits; every other variant keeps nonzero low 16 bits; the
+// unboxed f64 is decoded with `xor; ror`. Boundaries of i48, compares,
+// floats (NaNs canonicalized, -0.0, infinities), pointers, bools, tuple
+// patterns, the encoding constants and the all-zero word (`Int(0)`).
+import std.io;
+struct Obj { id: i64 }
+
+value V repr nanbox(int_high) {
+    Num(f64) unboxed,
+    Int(i48),
+    Nil,
+    Bool(bool),
+    A(*Obj),
+    B(*Obj),
+}
+
+const MAX: i48 = 140737488355327;
+const MIN: i48 = -140737488355328;
+
+fn show(v: V) {
+    match v {
+        Num(x) => { io.print("num "); io.print_f64(x); }
+        Int(x) => { io.print("int "); io.print_int(x as i64); }
+        Nil => io.print("nil"),
+        Bool(b) => { io.print("bool "); io.print_bool(b); }
+        A(p) => { io.print("a "); io.print_int(p.id); }
+        B(p) => { io.print("b "); io.print_int(p.id); }
+    }
+    io.println("");
+}
+
+fn add(a: V, b: V) -> V {
+    match (a, b) {
+        (Int(x), Int(y)) => if let Some(r) = x.add_checked(y) { V.Int(r) } else { V.Nil },
+        (Num(x), Num(y)) => V.Num(x + y),
+        _ => V.Nil,
+    }
+}
+
+fn sub(a: V, b: V) -> V {
+    if let (Int(x), Int(y)) = (a, b) and let Some(r) = x.sub_checked(y) { return V.Int(r); }
+    V.Nil
+}
+
+fn mul(a: V, b: V) -> V {
+    if let (Int(x), Int(y)) = (a, b) and let Some(r) = x.mul_checked(y) { return V.Int(r); }
+    V.Nil
+}
+
+fn lt(a: V, b: V) -> bool {
+    match (a, b) {
+        (Int(x), Int(y)) => x < y,
+        (Num(x), Num(y)) => x < y,
+        _ => false,
+    }
+}
+
+/// Two Ints, from the raw words and the encoding constants.
+fn both_ints(a: V, b: V) -> bool {
+    ((a as u64 | b as u64) & V.Int.mask) == V.Int.tag
+}
+
+fn main() {
+    show(add(V.Int(2), V.Int(-5)));
+    show(add(V.Int(MAX - 1), V.Int(1)));
+    show(add(V.Int(MAX), V.Int(1)));
+    show(add(V.Int(MIN), V.Int(-1)));
+    show(sub(V.Int(MIN + 1), V.Int(1)));
+    show(sub(V.Int(MIN), V.Int(1)));
+    show(sub(V.Int(0), V.Int(MIN)));
+    show(mul(V.Int(-8388608), V.Int(16777216)));
+    show(mul(V.Int(8388608), V.Int(16777216)));
+    show(mul(V.Int(-3), V.Int(-7)));
+    io.print_bool(lt(V.Int(-1), V.Int(1)) and lt(V.Int(MIN), V.Int(MAX)) and !lt(V.Int(3), V.Int(-3))); io.println("");
+    show(add(V.Num(1.5), V.Num(2.25)));
+    show(add(V.Num(-0.0), V.Num(-0.0)));
+    let inf = 1.0 / 0.0;
+    let nan = add(V.Num(inf), V.Num(-inf));
+    match nan { Num(x) => { io.print("nan is num "); io.print_bool(x != x); io.println(""); } _ => io.println("nan not num") }
+    io.print_bool(lt(V.Num(-inf), V.Num(inf)) and lt(V.Num(0.5), V.Num(1.0))); io.println("");
+    var o1 = Obj { id: 41 };
+    var o2 = Obj { id: 42 };
+    show(V.A(&o1));
+    show(V.B(&o2));
+    show(V.Bool(true));
+    show(V.Bool(false));
+    show(V.Nil);
+    io.print_bool(both_ints(V.Int(3), V.Int(-4)) and !both_ints(V.Int(3), V.Nil) and !both_ints(V.Num(1.0), V.Int(1))); io.println("");
+    io.print_bool(V.Int(5) as u64 == 5 << 16 and V.Int.mask == 0xFFFF and V.Int.tag == 0); io.println("");
+    let z: u64 = 0;
+    show(z as V);
+    io.print_bool(V.A(&o1) != V.B(&o1) and V.Int(0) != V.Num(0.0)); io.println("");
+}
+// expect: int -3
+// expect: int 140737488355327
+// expect: nil
+// expect: nil
+// expect: int -140737488355328
+// expect: nil
+// expect: nil
+// expect: int -140737488355328
+// expect: nil
+// expect: int 21
+// expect: true
+// expect: num 3.75
+// expect: num -0
+// expect: nan is num true
+// expect: true
+// expect: a 41
+// expect: b 42
+// expect: bool true
+// expect: bool false
+// expect: nil
+// expect: true
+// expect: true
+// expect: int 0
+// expect: true
