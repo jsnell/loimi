@@ -23,22 +23,14 @@ implementation; `git log` has the details.
   supers first, so it can run again from a handler (`refuse`).
   `--vm-stats` points out supers over variants and the supers the
   variants split. Mini (mandelbrot 0.90, suite 0.994) and MiniJS (nbody
-  0.92-0.93, suite 0.997) use it. Scheme (mbrot 0.86-0.89) does not:
-  its integer ADD/SUB/MUL pay a `movq` to the accumulator, and its suite
-  came out 0.5% slower at one alignment (`docs/results.md`, 2026-11-06)
+  0.93-0.97, suite 0.990-0.997) use it. Scheme (mbrot 0.89-0.97) does
+  not: its integer ADD/SUB/MUL pay a `movq` to the accumulator, and its
+  suite averaged 0.3% slower. The seventh handler argument stops LLVM
+  folding the dispatch load into the `jmp` (`X86tcret_6regs`); folding
+  it back in the assembly measured no gain, and the 4% an earlier
+  control build blamed on it was noise (`docs/results.md`, 2026-11-06)
   ([language.md §7.4](docs/language.md#74-accumulators);
   [design/speed-audit.md](docs/design/speed-audit.md), item 1).
-- **The dispatch fold with more than six handler arguments**: LLVM's
-  x86 isel folds a tail call's table load into the `jmp` only when the
-  call passes at most six values in registers (`X86tcret_6regs`), so a
-  vm with an accumulator, or the wasm interpreter, got
-  `mov T(,%rax,8),%rax; jmp *%rax` in every handler. The build now
-  compiles such executables through assembly and folds those back
-  (`src/asmfold.rs`): Mini 1043 of 1051 dispatches, wasm all but 18.
-  Other programs build to the same executable as before. The time is
-  within noise: the 4% that an earlier control build blamed on the fold
-  does not reproduce ([lowering.md §3](docs/lowering.md#3-handlers-in-tailcall-mode);
-  `bench/mini/RESULTS.md`, item 44).
 - **Relations and data on ops**: `rel kform(I32_ADD) = I32_ADDK;` and
   `data cost(MUL) = 3;` (with `data cost: u32 = 1;`) generate host
   lookups by opcode, `W.kform(op) -> ?W` and `W.cost(op) -> u32`, and

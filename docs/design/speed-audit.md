@@ -494,9 +494,9 @@ tests, `--jit-stencils` and TSan all pass on Mini. Two claims were wrong:
   the `u64` class). A control build of Mini with the accumulator
   declared and nothing selected measured fib 1.038, queens 1.022 and
   1.006 over eight benchmarks. That cost is what decided the ports.
-  (Not so: the build now folds it back, and remeasured, neither the
-  fold nor the control build's loss shows; "The fold, recovered",
-  below.)
+  (Not so: remeasured, the control build's loss does not show, and
+  folding the load back gains nothing; "The fold, recovered and not
+  kept", below.)
 
 **Ports.** User+sys CPU, median of 9 paired interleaved rounds
 (min-of-runs moved ±10% between identical binaries: load 4 to 6 from
@@ -521,55 +521,56 @@ of 5:
   `first_temp`; mbrot's loop from 13 dispatches to 7. Integer ADD/SUB
   also pay a `movq`. Reverted.
 
-**The fold, recovered (2026-11-06, later).** The cause is LLVM's x86
-isel pattern for a tail call through memory, `X86tcret_6regs`
-(`X86InstrCompiler.td`): it counts the `X86ISD::TC_RETURN` node's
-register operands and refuses to fold past six, whatever their class
-or order, and whichever registers are free. `-print-after=finalize-isel`
-on a six-`ptr` handler gives `TCRETURNmi64` (folded); with a seventh
-`double`, `i64`, `float`, or even a `poison` one, `TCRETURNri64` after
-a separate load. A `<2 x i64>` counts once. No LLVM option changes
-the count, and in the IR the only way under it is dropping or packing
-state: dropping the instruction word (the callee reloads it from
-`pc`; tried on Mini, all dispatches fold) moves the extra µop instead
-of saving it, and packing the accumulator into a vector with another
-state value costs a shuffle at every use of the other lane. So the
-build folds in the assembly (`src/asmfold.rs`, `lowering.md` §3):
-x86-64 executables whose IR has a `preserve_none` function with more
-than six parameters are compiled to `.s`, and
-`movq T(,%rI,8),%rD; ...; jmpq *%rD` becomes `jmpq *T(,%rI,8)` when only
-plain instructions that leave `%rD` alone and do not write `%rI` come
-between. Mini folds 1043 of its 1051 indirect jumps, MiniJS's port
-868 of 877, the wasm interpreter all but 18 of 1217 (a side effect:
-it passes nine). Programs with six or fewer build as before, to the
-same executable.
+**The fold, recovered and not kept (2026-11-06, later).** The cause is
+LLVM's x86 isel pattern for a tail call through memory,
+`X86tcret_6regs` (`X86InstrCompiler.td`): it counts the
+`X86ISD::TC_RETURN` node's register operands and refuses to fold past
+six, whatever their class or order, and whichever registers are free.
+`-print-after=finalize-isel` on a six-`ptr` handler gives
+`TCRETURNmi64` (folded); with a seventh `double`, `i64`, `float`, or
+even a `poison` one, `TCRETURNri64` after a separate load. A
+`<2 x i64>` counts once. No LLVM option changes the count, and in the
+IR the only way under it is dropping or packing state: dropping the
+instruction word (the callee reloads it from `pc`; tried on Mini, all
+dispatches fold) moves the extra µop instead of saving it, and packing
+the accumulator into a vector with another state value costs a
+shuffle at every use of the other lane. Folding in the assembly works:
+a pass (commit 0c3bb46) compiled x86-64 executables whose IR has a
+`preserve_none` function with more than six parameters to `.s` and
+rewrote `movq T(,%rI,8),%rD; ...; jmpq *%rD` to `jmpq *T(,%rI,8)` when
+only plain instructions that leave `%rD` alone and do not write `%rI`
+came between: Mini folded 1043 of its 1051 indirect jumps, MiniJS's
+port 868 of 877, the wasm interpreter all but 18 of 1217, and every
+test passed.
 
-**The fold was not the cost, though.** The 2026-11-06 control build's
-fib 1.038 and queens 1.022 do not come back: with 11 paired rounds at
-64 and 9 at 128, the control build (accumulator declared, nothing
-selected) is within the A/A spread folded or not (`bench/mini/RESULTS.md`,
-item 44), and a dispatch microbenchmark (10^9 dispatches through four
-small handlers) times 6 arguments, 7, and 7 folded within 2.5% of each
-other, the 7-unfolded one fastest: the dispatch's critical path is the
-two dependent loads, not the extra µop. What an unselected accumulator
+**It was not the cost, and the pass is reverted.** Folded over
+unfolded, in paired rounds at align 64 and 128: Mini 0.996 and 1.001,
+the control build (accumulator declared, nothing selected) 1.000 and
+0.999, MiniJS's port 0.996 and 0.995, Scheme's 0.996 and 1.005, the
+wasm interpreter 1.022 at 64 (spectralnorm 1.08 at both). The
+2026-11-06 control result (fib 1.038, queens 1.022) does not come back
+either: with 11 rounds at 64 and 9 at 128 the control is within the
+A/A spread of no accumulator (`bench/mini/RESULTS.md`, item 44). A
+dispatch microbenchmark (10^9 dispatches through four small handlers)
+times 6 arguments, 7, and 7 folded within 2.5% of each other, 7
+unfolded the fastest: the dispatch's critical path is the two
+dependent loads, not the extra µop. What an unselected accumulator
 does cost is `xmm0` being live across a hot path's C calls (GETGLOBAL
-saves and restores it around `value.table_find`) and, in Scheme,
-the `movq` on ADD/SUB/MUL's integer paths. Re-measured:
+saves and restores it around `value.table_find`) and, in Scheme, the
+`movq` on ADD/SUB/MUL's integer paths. The ports, re-measured as built
+(unfolded), against master, A/A in brackets:
 
 | port | float benchmark, align 64 | align 128 | suite, align 64 | suite, align 128 | kept |
 |---|---:|---:|---:|---:|---|
-| Mini (14) | mandelbrot 0.924, nbody 0.974 | mandelbrot 0.901, nbody 1.010 | 0.994 (0.998) | 0.996 (1.002) | yes (unchanged) |
-| MiniJS (14) | nbody 0.932 | nbody 0.921 | 0.997 (0.996) | 0.997 (1.003) | **yes** |
-| Scheme (43) | mbrot 0.857 | mbrot 0.876, 0.889 | 0.998 (1.006) | 1.005 (0.992), 1.007 (0.999) | no |
+| Mini (14) | mandelbrot 0.906, nbody 1.027 | mandelbrot 0.907, nbody 0.986 | 0.999 (0.998) | 0.993 (1.002) | yes (unchanged) |
+| MiniJS (14) | nbody 0.974 | nbody 0.931 | 0.990 (0.996) | 0.997 (1.003) | **yes** |
+| Scheme (43) | mbrot 0.965 | mbrot 0.887 | 1.007 (1.006) | 0.999 (0.992) | no |
 
-User+sys CPU, median of 9 (Mini 11 at 64) paired interleaved rounds
-against master without the port, A/A in brackets, the ports with the
-fold. MiniJS is kept. Scheme stays out: at 128 it is 0.5-0.7% slower in
-two runs whose A/A was 0.992 and 0.999, with its integer benchmarks
-(tak, fib, cpstak) 1-2% slower from the `movq`; mbrot's 11-14% does
-not outweigh 42 benchmarks of that. Folded or not made no difference
-to either port's suite (MiniJS 0.996 and 0.995 for folded over
-unfolded; Scheme 0.996 and 1.005).
+User+sys CPU, median of 9 (Mini 11 at 64) paired interleaved rounds.
+MiniJS is kept (6d40423 again). Scheme stays out: over five suite runs,
+folded or not, it averages 0.3% slower where the A/A runs average 0.1%
+faster, with tak and fib slower in every run (the `movq`); mbrot's
+gain does not outweigh 42 benchmarks of mostly integer code.
 
 **Python** is not ported. Its arithmetic ops pass `dst.raw` to `call2`
 (a dunder method's frame, whose return writes the slot), so they read

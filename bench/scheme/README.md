@@ -612,15 +612,15 @@ heaps (nboyer, sboyer, mperm: marking is 8-15%), products in std.bigint
 (base-case code generation), and glibc's heap growth and trimming for
 large strings (`brk` is 5% of string).
 
-## A value accumulator, with the dispatch fold back: still not kept (2026-11-06)
+## A value accumulator, measured again: still not kept (2026-11-06)
 
-The port below (commit 161bfef) again, now that the build folds the
-dispatch load into the `jmp` in the assembly (`src/asmfold.rs`,
-`docs/lowering.md` §3): 467 of the port's 473 indirect jumps are
-`jmp *T(,%rax,8)` again (422 were `mov; jmp *%rax`). User+sys CPU,
-median of 9 paired interleaved rounds per benchmark (`compare.py`'s
-programs and inputs, one run of each binary in turn),
-against base (master), A/A in brackets:
+The port below (commit 161bfef) again, with the dispatch load folded
+back into the `jmp` in the assembly (a pass that was tried and not
+kept, `docs/lowering.md` §3: 467 of the port's 473 indirect jumps
+folded, against 51) and without. User+sys CPU, median of 9 paired
+interleaved rounds per benchmark (`compare.py`'s programs and inputs,
+one run of each binary in turn), against base (master), A/A in
+brackets; the rows above the last are the folded build:
 
 | | align 64 | align 128 | align 128, again |
 |---|---:|---:|---:|
@@ -630,11 +630,12 @@ against base (master), A/A in brackets:
 | suite (43) | 0.998 (1.006) | 1.005 (0.992) | 1.007 (0.999) |
 | suite, port without the fold | 1.007 | 0.999 | |
 
-Still not kept: slightly slower at 128 in both runs, and the fold is
-not what decides it (folded over unfolded, 0.996 at 64 and 1.005 at
-128). The integer paths of ADD/SUB/MUL pay a `movq` to the
-accumulator, and `xmm0` stays live across their calls, where the
-benchmarks are mostly integer code.
+Still not kept: across the five suite numbers (folded or not) the port
+averages about 0.3% slower than base where the A/A runs average 0.1%
+faster, tak and fib are slower in every run (1.002 to 1.096), and the fold is not what decides it (folded over unfolded,
+0.996 at 64 and 1.005 at 128). The integer paths of ADD/SUB/MUL pay a
+`movq` to the accumulator, and `xmm0` stays live across their calls;
+mbrot's 11-14% does not outweigh 42 benchmarks of mostly integer code.
 
 ## A value accumulator: measured, not kept (2026-11-06)
 

@@ -442,27 +442,26 @@ Interpreters without a value accumulator compile to the same code
 wasm differs only in `W.accumulate`, which now resets earlier variants
 first, and the host-side `W.disasm_op`).
 
-**Later the same day: the fold back, MiniJS ported.** The build now
-folds the table load into the `jmp` in the assembly of executables
-whose handlers pass more than six register arguments (`src/asmfold.rs`;
-the cause is LLVM's `X86tcret_6regs`, which counts register operands).
-Remeasured with more rounds (Mini 11 at align 64), the fold makes no
-difference that shows, and neither did it cost the "4% on fib" above:
-a control build with the accumulator declared and unselected is within
-the A/A spread of no accumulator, folded or not
-(`bench/mini/RESULTS.md`, item 44). The ports, folded, against master:
+**Later the same day: MiniJS ported after all; the fold was not the
+cost.** The fold is lost to LLVM's `X86tcret_6regs`, which counts the
+tail call's register operands. A pass that folded the load back in the
+assembly (commit 0c3bb46, reverted) measured no gain on Mini, MiniJS or
+Scheme and lost 2% on the wasm interpreter, which it also folded
+([lowering.md §3](lowering.md#3-handlers-in-tailcall-mode)). Remeasured
+with more rounds (Mini 11 at align 64), a control build with the
+accumulator declared and unselected is within the A/A spread of none
+(`bench/mini/RESULTS.md`, item 44), so the "4% on fib" above was noise.
+The ports against master, as built (unfolded):
 
 | suite | align 64 | align 128 | float benchmark |
 |---|---:|---:|---|
-| mini (14), unchanged | 0.994 (0.998) | 0.996 (1.002) | mandelbrot 0.924 / 0.901 |
-| minijs (14), **kept** | 0.997 (0.996) | 0.997 (1.003) | nbody 0.932 / 0.921 |
-| scheme (43), not kept | 0.998 (1.006) | 1.005 (0.992), 1.007 (0.999) | mbrot 0.857 / 0.876 |
+| mini (14), unchanged | 0.999 (0.998) | 0.993 (1.002) | mandelbrot 0.906 / 0.907 |
+| minijs (14), **kept** | 0.990 (0.996) | 0.997 (1.003) | nbody 0.974 / 0.931 |
+| scheme (43), not kept | 1.007 (1.006) | 0.999 (0.992) | mbrot 0.965 / 0.887 |
 
-Scheme stays out for its integer paths (a `movq` to the accumulator in
-ADD/SUB/MUL: tak, fib, cpstak 1-2% slower). The wasm interpreter, which
-passes nine arguments, now gets the folded dispatch too (1217 register
-jumps to 18); IR and executables of Lox, Stak, Python and Prolog are
-unchanged.
+Scheme stays out: over five runs, folded or not, it averages 0.3%
+slower, with tak and fib slower in every run (a `movq` to the
+accumulator on ADD/SUB/MUL's integer paths).
 
 ## Per suite
 

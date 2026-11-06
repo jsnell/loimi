@@ -557,14 +557,15 @@ Next candidates:
     benchmarks 1.006). Mini's suite still comes out ahead or even, so the
     port stays; MiniJS's did not (`bench/minijs/RESULTS.md`).
 
-44. **The dispatch fold, recovered; and it was not the cost.** The build
-    now folds the table load into the `jmp` in the assembly when the
-    handlers pass more than six register arguments (`src/asmfold.rs`,
-    `lowering.md` §3): Mini's handlers have 1043 `jmp *T(,%rax,8)` and
-    8 `jmp *%reg` (CALL supers whose index register is reassigned
-    before the jump), against 44 and 1007 before; MOVE is
-    `movzbl %sil,%eax; jmp *T(,%rax,8)` again, as without the
-    accumulator. Remeasured with base = item 43's base (no accumulator),
+44. **The dispatch fold: recovered, measured, not kept; it was not the
+    cost.** The cause of the lost fold is LLVM's x86 isel pattern
+    `X86tcret_6regs`, which counts the tail call's register operands
+    (`lowering.md` §3). A pass that folded the table load back into the
+    `jmp` in the assembly (commit 0c3bb46, reverted) gave Mini's
+    handlers 1043 `jmp *T(,%rax,8)` and 8 `jmp *%reg` (CALL supers whose
+    index register is reassigned before the jump), against 44 and 1007;
+    MOVE was `movzbl %sil,%eax; jmp *T(,%rax,8)` again, as without the
+    accumulator. Measured with base = item 43's base (no accumulator),
     the control build (`accumulate DIVK;`, nothing selected) and the
     current Mini, each unfolded and folded; user+sys CPU, median of
     paired interleaved rounds (11 at align 64, 9 at 128), against base:
@@ -583,14 +584,16 @@ Next candidates:
     Folded over unfolded: 0.996 and 1.001 (Mini), 1.000 and 0.999
     (control). Item 43's control result (fib 1.038, queens 1.022) does
     not come back, folded or not: the control is within half a percent
-    of base, about the A/A spread. A microbenchmark agrees (four small
-    handlers, 10^9 dispatches: 6, 7 and 7-folded arguments within 2.5%
-    of each other): the dispatch waits on its two dependent loads, and
-    the extra `mov` is a µop the front end has room for. The fold is
-    kept (an instruction fewer per dispatch, no cost); the control's
-    remaining code difference is `xmm0` saved around the C calls of
-    hot handlers (GETGLOBAL, NEWTABLE, CONCAT, POW) and a `xorps` on
-    computed jumps.
+    of base, about the A/A spread, so that result was noise. A
+    microbenchmark agrees (four small handlers, 10^9 dispatches: 6, 7
+    and 7-folded arguments within 2.5% of each other, 7 unfolded the
+    fastest): the dispatch waits on its two dependent loads, and the
+    extra `mov` is a µop the front end has room for. The pass was not
+    kept: no gain here, and on the wasm interpreter (nine arguments,
+    which it folded too) 1.022 at align 64, spectralnorm 1.08 at both
+    alignments. What the unselected accumulator does change is `xmm0`
+    saved around the C calls of a few hot handlers (GETGLOBAL,
+    NEWTABLE, CONCAT, POW) and a `xorps` on computed jumps.
 
 ## Int(i48): measured, not adopted
 
