@@ -2766,7 +2766,6 @@ fn Gen.finish(g: *Gen, fs: *FS) -> Gc<Proto> {
             fail(0, b.as_str())
         }
     };
-    Scheme.accumulate(proto.code.words(), 0);
     Scheme.optimize(proto.code);
     fs.code.free();
     fs.consts.free();
