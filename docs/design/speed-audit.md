@@ -211,6 +211,232 @@ stores in the variants) and the selector. Risks:
 
 **General:** five interpreters, numeric code first.
 
+#### Prototype results (2026-11-06)
+
+**Verdict: go.** Mandelbrot measured 0.85 with an untraced accumulator
+and 0.91 with a GC-safe one (write-through), against a 0.95 threshold.
+Both results held at both function alignments. nbody and spectral_norm
+did not gain. The suite geomean moved less than 1%. Build the
+write-through version first, with the accumulator held in an f64
+register. Details follow.
+
+**What was built.** The prototype is a patch, not committed:
+`proto-value-acc.patch` in the session scratch directory
+(`proto-acc-x7m3/`). It is about 140 lines, gated by
+`LOIMI_PROTO_VALUE_ACC` and `LOIMI_PROTO_ACC_WT` at build time and by
+`--cfg proto_acc*`. It changes the following.
+- **`vmacc.rs`.**
+  - A `value` kind may go to a `u64` accumulator, which holds the
+    word's bits, or to an `f64` accumulator, which holds them as
+    `f64.from_bits`.
+  - `accumulate` may name family members. Their variants stay members of
+    the family, so `become` still works.
+  - With `_WT`, a variant that writes the accumulator also stores the
+    slot.
+- **`vmexpand.rs`.** `Vm.acc_base(op)` is new. `Vm.accumulate` first
+  resets every variant to its base op and splits supers. This makes it
+  idempotent, so it can run again after quickening.
+- **Mini.**
+  - `accumulator vacc: u64|f64 for reg;`.
+  - The `accumulate` list: `ADD_F`, `SUB_F`, `MUL_F`, `ADDK_F`,
+    `SUBK_F`, `MULK_F`, `DIV`, `DIVK`, and `JLT`, `JLTK`, `JGTK` with
+    their `N` forms. That is 76 variants.
+  - `refuse` calls `Mini.accumulate(code, proto.first_temp)` before
+    `optimize`. `first_temp` is the most locals ever active at once,
+    tracked in `add_local`.
+  - Ten `#[forward]` supers over the variants. They mirror the existing
+    pairs, so mandelbrot's loop keeps its six dispatches.
+  - `MINI_PROTO_NOGC=1` sets the heap threshold to 2^62.
+- **Allocation without GC.** mandelbrot, nbody and spectral_norm
+  allocate nothing in their loops (8 MB RSS either way). The worst
+  benchmark was binary_trees at 1.55 GB, within the 2.5 GB limit, so no
+  input was shrunk. Every build matched all 14 `.expected` outputs.
+
+**Quickening complicates selection.** The `_F` members exist only
+after a site's first run (`become` in the generic member), so selection
+has to run again inside the handler that quickens. Two hazards follow,
+and any design must handle them:
+1. **The next op may have just become a reader.** After `refuse`, the
+   instruction after the quickening op may be a variant that reads the
+   accumulator, but the quickening op wrote only its slot. The prototype
+   also writes `vacc` in the generic member's `become` paths.
+2. **`redo` may re-run a reader.** The `_IF`/`_FI` members `redo`
+   after `become`, and the word they re-run may now be a variant that
+   reads an accumulator that was never written. The prototype finishes
+   the op in place instead. That also keeps `_IF`/`_FI` out of the
+   list: a variant cannot `become` a member whose operand kinds differ.
+
+**Timings.** Times are user+sys CPU, the minimum of 5 interleaved runs,
+with `MINI_PROTO_NOGC=1` for every build including base, so collection
+never runs. Load average was 2.7–4.1 on 8 cores, from two other agents.
+Ratios are against base built from the same tree:
+
+| build | mandelbrot | nbody | spectral_norm | suite geomean (14) | worst non-float |
+|---|---:|---:|---:|---:|---|
+| A/A (base vs base copy) | 1.000 | 0.998 | 0.999 | 1.001 | ±0.8% |
+| u64 acc, no supers on variants | 0.983 | 0.982 | 1.017 | 0.999 | sort 1.045, queens 1.030 |
+| u64 acc + supers | 0.921 | 0.978 | 1.005 | 0.993 | sort 1.046, queens 1.031 |
+| **f64 acc + supers** (raw bound) | **0.855** | 0.972 | 1.017 | 0.991 | oo_methods 1.028 |
+| u64 write-through + supers | 0.956 | 0.983 | 1.010 | 0.998 | queens 1.036 |
+| **f64 write-through + supers** (GC-safe) | **0.914** | 0.966 | 1.027 | 0.994 | fannkuch 1.033 |
+| f64 write-through, every slot (`first_temp` 0) | 0.904 | 0.976 | 1.028 | 0.996 | fannkuch 1.013 |
+
+`--align-functions=128` rerun of the same configurations:
+- f64 acc + supers: mandelbrot 0.852, nbody 1.004, spectral_norm 1.009.
+- f64 write-through + supers: mandelbrot 0.910, nbody 0.996,
+  spectral_norm 1.012.
+- u64 acc + supers: mandelbrot 0.922, queens 1.037, sort 1.015.
+- Every other benchmark stayed within ±1%, except binary_trees with
+  write-through (1.025).
+
+So:
+- **mandelbrot gains for real.**
+- **nbody's 2–3% is placement:** it is 1.00 at 128.
+- **spectral_norm is 1–3% slower** in every build.
+- **interp's 0.96–0.98 at 64 is placement too:** it is 0.996 at 128.
+
+**`--vm-stats` hit rates** (share of dispatches that are a variant or a
+super containing one, in the first_temp builds):
+- **mandelbrot: 73.5%.** Five dispatches of the six-dispatch inner loop
+  carry a variant: `MULK_F__AR_MUL_F__AAR`, `ADD_F__RAR_SUB_F__ARR`,
+  `ADD_F__RAR_MUL_F`, `MUL_F_ADD_F__ARR` and `JGTKN__A`, at 14.7% each.
+  Without supers on variants, the variants break up the existing
+  `#[forward]` supers. Dispatches then rise from 6 to 9 per iteration,
+  which is why "no supers" gains only 1.7%.
+- **nbody: 25%.** `GETFIELD_MUL_F__ARR`, `MUL_F__ARR_SUB_F__RRA` and
+  `ADD_F__RRA_SETFIELD` at 8.3% each. Most of its chains already ran
+  inside `#[forward]` supers (`MUL_F_ADD_F__f2`, `GETFIELD_SUB_F__f2`).
+- **spectral_norm: 8.3%.** `MUL_F__ARR_ADD_F__RRA` replaces
+  `MUL_F_ADD_F__f2`, which already forwarded. Its hot ops are integer
+  `ADD`/`MUL` and the `_IF`/`_FI` members, which are not in the list.
+- **The other 11 benchmarks: 0%.** Their changes come from the extra
+  state register alone.
+- **Chaining locals too** (write-through makes this correct, `first_temp`
+  0): mandelbrot's `zi*zi` feeds `zrq + ziq`
+  (`MUL_F__ARR_ADD_F__ARA`). That is a further 1%.
+
+**Assembly** (hot path, dispatch included):
+- **`MUL_F`, slot form:** 18 instructions: decode 7, `mulsd`, NaN test
+  2, store, dispatch 4.
+- **`MUL_F__AAR`, u64 accumulator:** 14. It includes a `movq` from
+  `%rsi` to `%xmm0` and a `movq` back, so a GPR accumulator costs two
+  cross-domain moves of 1–3 cycles each on the critical path.
+- **`MUL_F__AAR`, f64 accumulator:** 13, with the accumulator in
+  `%xmm0` and no `movq`.
+- **`MUL_F__AAR`, f64 write-through:** 15. It adds back one decode and
+  the store, both off the critical path.
+- **Supers:** `ADD_F__RAR_SUB_F__ARR` is 30 instructions against 33 for
+  `ADD_F_SUB_F`.
+
+**Every plain handler changed.** The tail-call build's jump through
+the table was `jmp *T(,%rax,8)`. With the u64 accumulator it becomes
+`mov T(,%rax,8),%rax; jmp *%rax`. One more argument register stops LLVM
+from folding the load into the `jmp`, and the instruction word moves
+from `%esi` to `%edx`. That is the likely cause of queens +3–4% and
+sort +1–5% in the u64 builds, which run no variant at all. An f64
+accumulator takes no GPR. Its builds keep queens and sort at 1.00, and
+their plain-handler costs are within ±1% at 128. So the register class
+matters as much as the variants.
+
+**Design for the real feature** (traced, safe):
+- **Register class.** `accumulator vacc: V for reg;` where `V` is a
+  `value` type, held in an f64 register for nanbox values. Floats are
+  already the raw word there, and the integer paths pay a `movq` only
+  in variants. Low-tagged VMs, or a declared class (`.. in u64`), use a
+  GPR. Measure that before choosing it, because of the dispatch fold
+  above.
+- **GC safety: write-through.** The collector is non-moving (sticky
+  mark bits, `roadmap.md` Q2), so a slot written through roots the
+  object, and the accumulator copy stays valid without tracing. Nothing
+  in the GC, `raise`, the debugger, `Vm.deopt` or the JIT needs to know.
+  It cost 6 points of mandelbrot (0.855 to 0.914) and stays under 0.95.
+  - **Spill-at-sync** gets the rest. A reader variant stores the
+    accumulator to its slot (the `__acc` field still names it) before
+    any `poll`, `uses gc` call, `raise`, `cold` block, `become` or
+    `redo`. A writer writes the accumulator only at `next`, and nothing
+    syncs after that. It is safe on a non-moving heap because the value
+    is only ever live between two adjacent ops. Keep it as a later
+    option (`#[accumulate(spill)]`).
+- **Write-through makes selection unconditional.** With the slot always
+  current, a reader is correct whenever it follows its writer and is not
+  a jump target. The "read once" promise and `first_temp` are no longer
+  needed, and locals chain too (`first_temp` 0 was correct on all 14
+  benchmarks and slightly faster). This matters for Scheme, whose
+  compiler cannot give a `first_temp`: let-bound values share registers
+  with temporaries.
+- **Polls, `redo`, raises, the debugger.**
+  - Polls and raises: with write-through, the register file is always
+    truthful at op boundaries.
+  - `redo`: the accumulator holds the reader's source while nothing
+    overwrote it, so `redo` stays correct. One case needs handling:
+    `redo` after `become` re-runs a different word. The generator
+    should make `become` write the op's result (or the source it is
+    about to re-read) to the accumulator. Simpler: re-selection inside
+    a handler (`refuse`) leaves the current op and the next op
+    unchanged until the next entry.
+  - The debugger: `set_break` and `step` act on base ops. Breaking at a
+    reader is fine with write-through, since the reader re-reads the
+    accumulator, which still holds the value.
+- **Idempotent selection.** Keep the prototype's `Vm.acc_base`, and the
+  reset at the start of `Vm.accumulate`, so `refuse` can call it. Mini
+  needs this because its float members appear only after quickening.
+- **f32.** Wasm needs a second float accumulator (`sacc: f32 for rs`).
+  An f64 one would convert at both ends (FRICTION 722). It is a small
+  extension of `prim`'s class check, untested here.
+- **Selection past ops that do not touch the slot.** wasm3's
+  `PreserveRegisterIfOccupied` keeps the value across such ops. In
+  Mini's loops the hot pairs were all adjacent: mandelbrot's chains
+  are, and nbody's breaks are `GETFIELD` loads that need their own slot.
+  So the prototype gives no evidence for it. Defer it.
+- **Opcode budget.** Mini's 8-bit opcode field held 76 variants and 10
+  supers. The first try, with 134 variants (all `_IF`/`_FI` members,
+  every compare form), did not fit, and `Resume.placeholder` vanishes
+  when every opcode is taken. Real lists must stay selective, or Mini
+  must widen its opcode field.
+- **Supers over variants are required.** Without them the variants
+  break up the existing `#[forward]` supers and give back most of the
+  gain: 0.983 against 0.921, u64. `--vm-stats` already suggests supers
+  over variants. The default `#[profile]` flow should regenerate them.
+
+**Which other interpreters gain.** These estimates come from `--vm-stats`
+dispatch profiles. The stats and binaries are in
+`proto-acc-x7m3/profiles/` in the scratch directory. "Share" is the
+fraction of dispatches that would be a variant, counting both ends of a
+single-use chain pair:
+
+| VM | benchmark | share | notes |
+|---|---|---:|---|
+| MiniJS | nbody | ~35% (~47% with SETPROP readers) | `MUL_F_MUL_F__f1`→`SUB_F`/`ADD_F`, and `ADD_F`/`SUB_F`→`SETPROP_IN` (6% each). No `#[forward]` super covers these yet. Likely the best case after mandelbrot |
+| MiniJS | raytrace, richards, fannkuch | 0–5% | chains broken by `GETPROP` |
+| MiniJS | spectral_norm | ~0% (`_F` only) | the hot ops are generic integer `ADD`/`MUL`/`DIV` |
+| Python | nbody | ~31% (~42% with SETINDEX) | `MUL`→`SUB`/`IADD`→`SETINDEX` temp chains. Python's arithmetic is generic (no `_F` members) and may allocate (Long), so it needs the traced, write-through form. `first_temp` is exact: locals are activated once at entry |
+| Python | chaos, float, raytrace | 6–18% | |
+| Scheme | mbrot | ~50% | 7 of 13 loop dispatches. Needs write-through selection, since there is no `first_temp` |
+| Scheme | nucleic, fft | 12–24% | |
+| Scheme | fibfp, sumfp, fib, tak | 0% | fibfp/sumfp want a float-constant `SUBK`/`LTK` instead: `LOADK` is 33% |
+| Lox | whole suite | ≤5% | no float kernels; the results feed calls, returns and globals |
+
+Mini's mandelbrot (73% share) gained 9–15%, and nbody (25% share, mostly
+already forwarded) gained nothing. So expect gains only where the
+chains are not already inside `#[forward]` supers:
+- MiniJS nbody and Python nbody: about 3–6%.
+- Scheme mbrot: 5–10%.
+- Scheme nucleic and fft, and Python chaos: 1–3%.
+- Lox: nothing.
+
+These are estimates; the suite-wide effect stays below 1% per VM.
+
+**Recommendation.** Build it: f64-class value accumulators,
+write-through, with `Vm.accumulate` idempotent and run from `refuse`.
+Two things come with it:
+- `become` must leave the accumulator holding its result.
+- `--vm-stats` must suggest supers over the variants.
+
+Try MiniJS nbody first, then Python nbody, and Scheme mbrot with
+unconditional selection. Spill-at-sync, selection past non-interfering
+ops and GPR accumulators come later, each only if a measurement asks
+for it.
+
 ### 2. Cheaper operand decoding and dispatch
 
 **Evidence.**
