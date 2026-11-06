@@ -1,9 +1,10 @@
 # Design note: a speed audit (features for faster interpreters)
 
 Status: **proposal.** Written 2026-11-06 against master at 0813bc1.
-Items 1, 3 and 8 are built (their "As built" notes); items 2 and 4
-were prototyped and dropped (their "Prototype results"); item 14 has an
-experiment and a staged plan (`trace-tier.md`).
+Items 1, 3, 6 and 8 are built (their "As built" notes); items 2 and 4
+were prototyped and dropped (their "Prototype results"); item 5's upper
+bound was measured and it is not worth building for speed; item 14 has
+an experiment and a staged plan (`trace-tier.md`).
 
 > Have we exhausted the possibilities for language improvements that
 > can be used to write faster interpreters or runtimes?
