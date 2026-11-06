@@ -21,8 +21,27 @@ const ESTACK_WORDS: u64 = 8 * 1024 * 1024;    // 64 MiB
 const CSTACK_WORDS: u64 = 4 * 1024 * 1024;    // 32 MiB
 
 /// An environment (the WAM's): the caller's environment, the continuation,
-/// and `n` permanent variables after it.
-pub struct Frame { ce: *Frame, cp: *u32, n: u64 }
+/// and `n` permanent variables after it. The three header words are `Int`
+/// terms' words (`x << 16` under `nanbox(int_high)`, `hword`), so that
+/// every word of the environment stack is a term, which the root scanner
+/// relies on (a raw pointer's low 16 bits could read as any tag).
+pub struct Frame { ce_w: u64, cp_w: u64, n_w: u64 }
+
+/// A pointer or count below 2^47 as the word of `Term.Int` of it.
+#[inline(always)]
+pub fn hword(x: u64) -> u64 { x << 16 }
+#[inline(always)]
+pub fn Frame.ce(f: *Frame) -> *Frame { (f.ce_w >> 16) as *Frame }
+#[inline(always)]
+pub fn Frame.cp(f: *Frame) -> *u32 { (f.cp_w >> 16) as *u32 }
+#[inline(always)]
+pub fn Frame.n(f: *Frame) -> u64 { f.n_w >> 16 }
+#[inline(always)]
+pub fn Frame.set(f: *Frame, ce: *Frame, cp: *u32, n: u64) {
+    f.ce_w = hword(ce as u64);
+    f.cp_w = hword(cp as u64);
+    f.n_w = hword(n);
+}
 
 /// A choicepoint, followed by its `n` saved argument registers.
 pub struct Choice {
@@ -98,7 +117,7 @@ pub fn Frame.ys(f: *Frame) -> *Term { (f + 1) as *Term }
 pub fn Machine.xregs(m: *Machine) -> *Term { &m.x[0] }
 /// `pend` as a raw pointer (no bounds checks).
 pub fn Machine.pendp(m: *Machine) -> **Term { &m.pend[0] }
-pub fn Frame.end(f: *Frame) -> *Term { ((f + 1) as *Term) + f.n }
+pub fn Frame.end(f: *Frame) -> *Term { ((f + 1) as *Term) + f.n() }
 pub fn Choice.args(c: *Choice) -> *Term { (c + 1) as *Term }
 pub fn Choice.end(c: *Choice) -> *Choice { ((((c + 1) as *Term) + c.n) as *Choice) }
 
@@ -106,7 +125,7 @@ pub fn Machine.init(m: *Machine) {
     m.ebase = mem.alloc<Term>(ESTACK_WORDS);
     m.eend = m.ebase + (ESTACK_WORDS - 64);
     let base = m.ebase as *Frame;
-    base.n = 0;
+    base.set(base, 0 as *u32, 0);
     m.e = base;
     m.ehw = base.end();
     let cb = mem.alloc<u64>(CSTACK_WORDS);
@@ -402,9 +421,8 @@ pub fn Machine.flush(m: *Machine) {
 pub fn scan_roots(h: *gc.Heap, m: *Machine) {
     m.trace(h);
     for i in 0..m.tr { gc_mark(h, m.trail[i]); }
-    // Environments: everything below the live top is scanned. Frames hold
-    // raw pointers next to terms, which read as floats: `Term` is
-    // `#[scan_raw_words]`, which the compiler checks (term.lm). Above the
+    // Environments: everything below the live top is scanned, word by
+    // word: frame headers are `Int` words (`Frame`), the rest terms. Above the
     // live top, words written since the last collection are zeroed so that
     // the next frames there never expose a stale reference.
     var top = m.e.end();

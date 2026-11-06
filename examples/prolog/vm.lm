@@ -466,15 +466,13 @@ pub vm Wam {
         if end >= ctx.eend { raise builtins.resource_error(ctx, "stack") }
         if end > ctx.ehw { ctx.ehw = end; }
         let ne = top as *Frame;
-        ne.ce = e;
-        ne.cp = ctx.cp;
-        ne.n = n;
+        ne.set(e, ctx.cp, n);
         e = ne;
         next
     }
     op DEALLOCATE() : A {
-        ctx.cp = e.cp;
-        e = e.ce;
+        ctx.cp = e.cp();
+        e = e.ce();
         next
     }
     /// Enter predicate `pr`: through its first-argument index (the INDEX

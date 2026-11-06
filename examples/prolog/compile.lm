@@ -86,13 +86,20 @@ pub struct Pred {
 
 /// Key of a first argument: its bits for an atomic term, a tagged functor
 /// id for a compound. 0 marks a variable (no key); `KEY_LIST` a list cell.
+/// An Int's word has zero low 16 bits (`nanbox(int_high)`), and is 0 for
+/// 0, so its key sets bit 15, which no other atomic term's word has there
+/// (the other tags are small, and a float word's low 16 bits are its top
+/// 16 xor Int's block tag: 0x8000 there would be the NaN 0x7FF9.., which
+/// canonicalization never stores).
 const KEY_LIST: u64 = 1;
 const KEY_EMPTY: u64 = 2;
+const KEY_INT: u64 = 0x8000;
 
 pub fn key_of(t: Term) -> u64 {
     match t {
         Ref(_) => 0,
         Lst(_) => KEY_LIST,
+        Int(_) => (t as u64) | KEY_INT,
         Str(s) => (Term.Atom(s.f) as u64) | (1 << 40),
         Big(_) => 0,      // equal values are different objects: not indexed
         _ => t as u64,
