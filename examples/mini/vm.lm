@@ -203,7 +203,7 @@ fn arith_slow(c: *Ctx, op: i64, a: V, b: V) -> Result<V, V> {
         let (i, j) = (i as i64, j as i64);
         var r = i % j;
         if r != 0 and (r ^ j) < 0 { r += j; }
-        return Ok(V.Int(r as i48));
+        return Ok(V.Int(r as i32));
     }
     let r = match op {
         0 => x + y,
@@ -267,8 +267,8 @@ fn concat(c: *Ctx, vals: *V, n: u64) -> Result<V, V> {
 
 fn length(c: *Ctx, v: V) -> Result<V, V> {
     match v {
-        S(s) => Ok(V.Int(s.data.len as i48)),
-        T(t) => Ok(V.Int(value.table_len(t) as i48)),
+        S(s) => Ok(V.Int(s.data.len as i32)),
+        T(t) => Ok(V.Int(value.table_len(t) as i32)),
         _ => Err(error(c, "attempt to get length of a ", v)),
     }
 }
@@ -561,7 +561,7 @@ pub vm Mini {
     }
 
     op LOADK(dst: reg, c: kst) : ABx { dst = c; next }
-    op LOADI(dst: reg, v: imm) : AsBx { dst = Int(v as i48); next }
+    op LOADI(dst: reg, v: imm) : AsBx { dst = Int(v as i32); next }
     op LOADNIL(dst: reg) : ABC { dst = Nil; next }
     op LOADBOOL(dst: reg, b: imm) : ABC { dst = Bool(b != 0); next }
     op MOVE(dst: reg, src: reg) : ABC { dst = src; next }
@@ -737,7 +737,7 @@ pub vm Mini {
         if let T(tab) = t {
             let u = (i as u64) - 1;
             if u < tab.asize { dst = tab.aptr[u]; next }
-            cold { dst = value.table_get(tab, Int(i as i48)); next }
+            cold { dst = value.table_get(tab, Int(i as i32)); next }
         }
         raise error(ctx, "attempt to index a ", t)
     }
@@ -789,8 +789,8 @@ pub vm Mini {
             #fname {
                 // Two floats: a tagged word is a NaN as a double, so a
                 // non-NaN result means both operands were numbers.
-                let r = value.fbits(a) sym value.fbits(b);
-                if likely(r == r) { dst = value.fword(r); next }
+                let r = f64.from_bits(a as u64) sym f64.from_bits(b as u64);
+                if likely(r == r) { dst = r.to_bits() as V; next }
                 match (a, b) {
                     (Num(x), Num(y)) => { dst = Num(x sym y); next }
                     (Int(x), Int(y)) => if let Some(r) = x.#checked(y) { dst = Int(r); next },
@@ -804,15 +804,15 @@ pub vm Mini {
             // anything else makes the site float-first.
             #ifname {
                 if let Int(x) = a {
-                    let r = x as f64 sym value.fbits(b);
-                    if likely(r == r) { dst = value.fword(r); next }
+                    let r = x as f64 sym f64.from_bits(b as u64);
+                    if likely(r == r) { dst = r.to_bits() as V; next }
                 }
                 become #fname; redo
             }
             #finame {
                 if let Int(y) = b {
-                    let r = value.fbits(a) sym y as f64;
-                    if likely(r == r) { dst = value.fword(r); next }
+                    let r = f64.from_bits(a as u64) sym y as f64;
+                    if likely(r == r) { dst = r.to_bits() as V; next }
                 }
                 become #fname; redo
             }
@@ -820,8 +820,8 @@ pub vm Mini {
     }
     /// R[dst] = R[a] + sc (a small signed constant).
     op ADDI(dst: reg, a: reg, sc: simm) : ABsC {
-        if let Int(x) = a and let Some(r) = x.add_checked(sc as i48) { dst = Int(r); next }
-        cold { dst = arith_slow(ctx, 0, a, Int(sc as i48))?; next }
+        if let Int(x) = a and let Some(r) = x.add_checked(sc as i32) { dst = Int(r); next }
+        cold { dst = arith_slow(ctx, 0, a, Int(sc as i32))?; next }
     }
     // `x % k` for a constant k divides by multiplying: the site caches
     // k as a std.math.Divisor (`urem31`: floor(x / k) = (x * m) >> s for
@@ -831,8 +831,8 @@ pub vm Mini {
     cache ModIC = math.Divisor;
 
     op MODK(dst: reg, a: reg, b: kst) : ABC + ModIC {
-        if let (Int(x), Int(_)) = (a, b) and x >= 0 and x < 0x80000000 and cache.d != 0 {
-            dst = Int((&cache).urem31(x as u64) as i48);
+        if let (Int(x), Int(_)) = (a, b) and x >= 0 and cache.d != 0 {
+            dst = Int((&cache).urem31(x as u64) as i32);
             next
         }
         if let (Int(x), Int(y)) = (a, b) and y > 0 {
@@ -846,8 +846,8 @@ pub vm Mini {
     }
     inline for (dname, bkind) in [("DIV", reg), ("DIVK", kst)] {
         op #dname(dst: reg, a: reg, b: bkind) : ABC {
-            let r = value.fbits(a) / value.fbits(b);
-            if likely(r == r) { dst = value.fword(r); next }
+            let r = f64.from_bits(a as u64) / f64.from_bits(b as u64);
+            if likely(r == r) { dst = r.to_bits() as V; next }
             match (a, b) {
                 (Num(x), Num(y)) => { dst = Num(x / y); next }
                 (Int(x), Int(y)) => { dst = Num(x as f64 / y as f64); next }
@@ -864,14 +864,14 @@ pub vm Mini {
     cache ModRIC = math.Divisor;
 
     op MOD(dst: reg, a: reg, b: reg) : ABC + ModRIC {
-        if let (Int(x), Int(y)) = (a, b) and x >= 0 and x < 0x80000000 and y > 0 and (y as u64) == (cache.d as u64) {
-            dst = Int((&cache).urem31(x as u64) as i48);
+        if let (Int(x), Int(y)) = (a, b) and x >= 0 and y > 0 and (y as u32) == cache.d {
+            dst = Int((&cache).urem31(x as u64) as i32);
             next
         }
         if let (Int(x), Int(y)) = (a, b) and y > 0 {
             if cache.d == 0 {
                 cold { (&cache).set(y as i64); let r = x % y; dst = Int(if r < 0 { r + y } else { r }); next }
-            } else if (cache.d as u64) != (y as u64) {
+            } else if cache.d != y as u32 {
                 cache.d = MOD_MANY;
             }
             let r = x % y;
@@ -883,13 +883,13 @@ pub vm Mini {
     /// R[dst] = k[b] - R[a] and k[b] / R[a] (a constant left operand).
     op RSUBK(dst: reg, a: reg, b: kst) : ABC {
         if let (Int(x), Int(y)) = (b, a) and let Some(r) = x.sub_checked(y) { dst = Int(r); next }
-        let r = value.fbits(b) - value.fbits(a);
-        if likely(r == r) { dst = value.fword(r); next }
+        let r = f64.from_bits(b as u64) - f64.from_bits(a as u64);
+        if likely(r == r) { dst = r.to_bits() as V; next }
         cold { dst = arith_mixed(ctx, 1, b, a)?; next }
     }
     op RDIVK(dst: reg, a: reg, b: kst) : ABC {
-        let r = value.fbits(b) / value.fbits(a);
-        if likely(r == r) { dst = value.fword(r); next }
+        let r = f64.from_bits(b as u64) / f64.from_bits(a as u64);
+        if likely(r == r) { dst = r.to_bits() as V; next }
         cold { dst = arith_slow(ctx, 3, b, a)?; next }
     }
     op POW(dst: reg, a: reg, b: reg) : ABC {
@@ -898,7 +898,7 @@ pub vm Mini {
     }
     op NEG(dst: reg, a: reg) : ABC {
         match a {
-            Int(x) => if x != -140737488355328 { dst = Int(0 - x); next },
+            Int(x) => if x != -2147483648 { dst = Int(0 - x); next },
             Num(x) => { dst = Num(-x); next }
             _ => {}
         }
@@ -908,7 +908,7 @@ pub vm Mini {
     op LEN(dst: reg, a: reg) : ABC {
         if let T(t) = a {
             let n = t.asize;
-            if n > 0 and t.aptr[n - 1] != V.Nil { dst = Int(n as i48); next }
+            if n > 0 and t.aptr[n - 1] != V.Nil { dst = Int(n as i32); next }
         }
         dst = length(ctx, a)?;
         next
@@ -995,7 +995,8 @@ pub vm Mini {
         rel negate(#("J" ++ cmp ++ "N")) = #("J" ++ cmp);
         inline for (opname, want) in [(#("J" ++ cmp), true), (#("J" ++ cmp ++ "N"), false)] {
             op #opname(unused: imm, a: reg, b: bkind) : ABC then JMP {
-                if let (Int(x), Int(y)) = (a, b) { branch((isub) == want, then.target) }
+                let (x, y) = ((a as u64) ^ value.int_bias(), (b as u64) ^ value.int_bias());
+                if ((x | y) & V.Int.mask) == 0 { branch((isub) == want, then.target) }
                 if let (Num(x), Num(y)) = (a, b) { branch((fsub) == want, then.target) }
                 cold { branch(slow? == want, then.target) }
             }
@@ -1063,7 +1064,7 @@ pub vm Mini {
         let n = if s == 1 { (l - i) as u64 }
             else if s > 0 { ((l - i) as u64) / (s as u64) }
             else { ((i - l) as u64) / ((0 - s) as u64) };
-        V.Int(n as i48)
+        V.Int(n as i32)
     }
 
     /// Numeric for: R[a] index, R[a+1] limit, R[a+2] step, R[a+3] the
@@ -1090,7 +1091,7 @@ pub vm Mini {
                 if si == 0 { raise error_msg(ctx, "'for' step is zero") }
                 let lf = if si > 0 { l.floor() } else { -((-l).floor()) };
                 if l != l or (si > 0 and lf < ii as f64) or (si < 0 and lf > ii as f64) { jump target }
-                let li: i48 = if lf > 140737488355327.0 { 140737488355327 } else if lf < -140737488355328.0 { -140737488355328 } else { lf as i48 };
+                let li: i32 = if lf > 2147483647.0 { 2147483647 } else if lf < -2147483648.0 { -2147483647 - 1 } else { lf as i32 };
                 regs[a + 1] = for_count(ii as i64, li as i64, si as i64);
                 regs[a + 3] = Int(ii);
                 next
@@ -1109,7 +1110,9 @@ pub vm Mini {
     op FORLOOP(a: forbase, target: label) : AsBx {
         if let Int(c) = regs[a + 1] {
             if c != 0 {
-                regs[a + 1] = V.Int(c - 1);
+                // The payload is not zero, so decrementing the word
+                // decrements it.
+                regs[a + 1] = ((regs[a + 1] as u64) - 1) as V;
                 let Int(i) = regs[a] else { unreachable };
                 let Int(s) = regs[a + 2] else { unreachable };
                 let n = V.Int(i +% s);
@@ -1139,7 +1142,7 @@ pub vm Mini {
         if let (T(t), Int(i)) = (regs[a], regs[a + 1]) {
             let n = value.table_iter(t, i as u64, regs + a + 2);
             if n != 0 {
-                regs[a + 1] = Int(n as i48);
+                regs[a + 1] = Int(n as i32);
                 poll gil; poll pause; jump target
             }
             next
@@ -1219,7 +1222,7 @@ pub vm Mini {
                             if let Int(_) = x { regs[base] = x; next }
                             // Truncate and adjust (libm's floor is a call).
                             if let Num(d) = x and d >= -2147483648.0 and d < 2147483648.0 {
-                                let t = d as i48;
+                                let t = d as i32;
                                 regs[base] = Int(if (t as f64) > d { t - 1 } else { t });
                                 next
                             }

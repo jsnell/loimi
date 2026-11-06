@@ -661,6 +661,41 @@ Compares and array indexing cost nothing extra once done on words
 (item 24). Because the remaining costs are per arithmetic instruction,
 and two benchmarks stay above 4%, the switch was not made.
 
+## Int(i48) on `nanbox(int_high)`: measured, not kept (2026-11-06)
+
+The layout that was to remove the i48 costs above (speed audit item 7):
+`value V repr nanbox(int_high)` with `Int(i48)`, commit 799eecc,
+reverted by the next. Checked `+ -` on two Ints become `add; jo` on
+the words, compares word compares, pointer payloads `shr $16`. The
+float-first members (ADD_F and the like, DIV) read a register as
+`rotr(w ^ V.Num.xor, 16)` and write `rotl(r, 16) ^ V.Num.xor`;
+`int_index`, the integer compare-and-branch, FORLOOP and the intern
+table's slot words were rewritten for the rotated words, and four test
+lines that overflowed i32 into floats print integers (as Lua 5.4).
+User+sys CPU, minimum of 9 interleaved runs per benchmark, against base
+(master), A/A (a copy of base) in brackets:
+
+| | align 64 | align 128 |
+|---|---:|---:|
+| fannkuch | 0.886 (0.998) | 0.843 (1.016) |
+| queens | 0.883 (1.000) | 0.920 (1.001) |
+| hash_strings | 0.922 (1.022) | 0.904 (0.966) |
+| sort | 0.932 (0.982) | 0.926 (1.001) |
+| sieve | 0.949 (0.999) | 0.938 (1.010) |
+| closures | 0.959 (1.082) | 0.973 (1.016) |
+| spectral_norm | 1.183 (0.968) | 1.196 (0.998) |
+| nbody | 1.329 (1.012) | 1.315 (0.999) |
+| mandelbrot | 1.799 (0.977) | 1.801 (1.000) |
+| suite (14) | 1.034 (1.003) | 1.030 (1.001) |
+
+Not kept. The integer benchmarks gain 3-16%, so i48 no longer costs
+them anything (against the 4-9% above), but the float kernels lose
+more: mandelbrot's float supers (`MULK_F; MUL_F__RAR`, `ADD_F__RAR;
+SUB_F` and the others, `--vm-prof`: 0.69 s to 1.12 s) each read two or
+three registers, and a register operand that was one `mulsd` from
+memory is now a load, `xor`, `rol` and `movq`, with two more
+instructions before each store.
+
 ## Remaining compiler and codegen issues
 
 - Supers of quickened members only form if something re-runs

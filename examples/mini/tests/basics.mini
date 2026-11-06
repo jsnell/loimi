@@ -23,7 +23,7 @@ end
 print(i)
 if n == 1 then print("one") elseif n == 5 then print("five") else print("other") end
 -- expect: 3	-3	42	3.5	1	2
--- expect: 2147483648	3.0	0.3
+-- expect: 2147483648.0	3.0	0.3
 -- expect: true	true	false	false	true	false	true
 -- expect: nil	x	2	false	true	false
 -- expect: hello, world	n=42	f=1.5

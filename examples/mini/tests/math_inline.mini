@@ -9,7 +9,7 @@ local a, b = floor(7.5), sqrt(4.0)
 print(a, b, (floor(-3.25)))
 -- expect: -1	0	0	3	-7	2
 -- expect: 2147483647	-2147483648	-2147483648
--- expect: -2147483649	2147483648	1e+300
+-- expect: -2147483649.0	2147483648.0	1e+300
 -- expect: inf	-inf	true
 -- expect: 4.0	1.5	true	inf
 -- expect: 7	2.0	-4

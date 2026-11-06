@@ -70,9 +70,9 @@ pub object Closure { proto: Gc<Proto>, upvals: [Gc<UpVal>] }
 /// (`loimi build --explain-values`). The pins keep it so: `Int` shares its
 /// block width with the pointers, so tuple tests such as `(T(t), Int(_))`
 /// merge into one test, and a ninth variant would leave it alone.
-pub value V repr nanbox(int_high) {
+pub value V repr nanbox {
     Num(f64) unboxed,
-    Int(i48),
+    Int(i32) block 48,
     Nil block 0,
     Bool(bool),
     S(Gc<Str>),
@@ -104,11 +104,10 @@ const PF: u64 = 16;
 const ADDR: u64 = 0xFFFFFFFFFFFF;
 const HTAG: u64 = 0xFFFF000000000000;
 
-/// The Str in slot word `w`: its address as a `V.S` word (above the
-/// low tag, `nanbox(int_high)`), with the tag bits of a `V.S` (a Gc
-/// pointer can only be made from an integer through a value).
+/// The Str in slot word `w`: its address with the tag bits of a `V.S`
+/// (a Gc pointer can only be made from an integer through a value).
 fn str_at(w: u64) -> Gc<Str> {
-    let S(o) = (((w & ADDR) << 16) | V.S.tag) as V else { unreachable };
+    let S(o) = ((w & ADDR) | V.S.tag) as V else { unreachable };
     o
 }
 
@@ -343,12 +342,12 @@ pub fn raw_equal(a: V, b: V) -> bool {
 
 /// A float with an integral value in the Int range.
 fn int_float(x: f64) -> bool {
-    x == x.floor() and x >= -140737488355328.0 and x <= 140737488355327.0
+    x == x.floor() and x >= -2147483648.0 and x <= 2147483647.0
 }
 
 /// The canonical form of a table key: integral floats become Int.
 fn norm_key(k: V) -> V {
-    if let Num(x) = k and int_float(x) { return V.Int(x as i48); }
+    if let Num(x) = k and int_float(x) { return V.Int(x as i32); }
     k
 }
 
@@ -423,28 +422,21 @@ pub fn hash_set_existing_nobar(t: Gc<Table>, k: V, hv: u64, v: V) -> bool {
     }
 }
 
-/// The array index of an Int key `k`: i - 1, as an unsigned number (for
-/// i <= 0 beyond any array part). An Int's word is i << 16
-/// (`nanbox(int_high)`), so this is its word minus Int(1)'s, shifted.
+/// The array index of an Int key `k`: its word minus the word of
+/// Int(1). Payloads are stored zero-extended below the tag, so this is
+/// i - 1 for i >= 1, and for i <= 0 it is beyond any array part (at
+/// least 2^31 - 1). Saves sign-extending the payload.
 pub fn int_index(k: V) -> u64 {
-    ((k as u64) -% (V.Int(1) as u64)) >> 16
+    (k as u64) -% (V.Int(1) as u64)
 }
 
-/// A word read as a double, for the float-first fast paths (ADD_F and
-/// the like add two registers before testing them): `nanbox(int_high)`
-/// stores an f64 with bits `b` as `rotl(b, 16) ^ V.Num.xor`, and every
-/// other variant's word reads as a NaN.
-#[inline(always)]
-pub fn fbits(v: V) -> f64 {
-    let x = (v as u64) ^ V.Num.xor;
-    f64.from_bits((x >> 16) | (x << 48))
-}
-
-/// The word of a double that is not a NaN (`fbits` inverted).
-#[inline(always)]
-pub fn fword(r: f64) -> V {
-    let b = r.to_bits();
-    (((b << 16) | (b >> 48)) ^ V.Num.xor) as V
+/// Int words xor this have no bits under `V.Int.mask` exactly for Ints
+/// (the tag cancels out), and as unsigned numbers they are ordered like
+/// the integers (the payload's sign bit is flipped). So two Ints are
+/// tested and compared without extracting their payloads, whatever the
+/// layout gives `Int` (`V.Int.mask` is the layout's).
+pub fn int_bias() -> u64 {
+    V.Int(-2147483648) as u64
 }
 
 pub fn table_get(t: Gc<Table>, k: V) -> V {
@@ -456,7 +448,7 @@ pub fn table_get(t: Gc<Table>, k: V) -> V {
         }
         Num(x) => {
             if int_float(x) {
-                k = V.Int(x as i48);
+                k = V.Int(x as i32);
                 let u = ((x as i64) - 1) as u64;
                 if u < t.asize { return t.aptr[u]; }
             }
@@ -561,7 +553,7 @@ fn array_append(h: *gc.Heap, t: Gc<Table>, v: V) {
         tbar(t);
         t.asize += 1;
         if t.hused == 0 { return; }
-        let next = V.Int((t.asize + 1) as i48);
+        let next = V.Int((t.asize + 1) as i32);
         let Some(i) = hash_find(t, next) else { return; };
         v = t.hptr[2 * i + 1];
         if v == V.Nil { return; }
@@ -583,7 +575,7 @@ pub fn table_set(h: *gc.Heap, t: Gc<Table>, k: V, v: V) {
 /// Store `n` positional constructor items `vals[0..n]` at keys start+1...
 pub fn table_setlist(h: *gc.Heap, t: Gc<Table>, vals: *V, n: u64, start: u64) {
     if t.hcap > 0 or t.asize < start {
-        for i in 0..n { table_set(h, t, V.Int((start + i + 1) as i48), vals[i]); }
+        for i in 0..n { table_set(h, t, V.Int((start + i + 1) as i32), vals[i]); }
         return;
     }
     let end = start + n;
@@ -633,7 +625,7 @@ pub fn table_iter(t: Gc<Table>, i: u64, out: *V) -> u64 {
         let v = a[i];
         i += 1;
         if v != V.Nil {
-            out[0] = V.Int(i as i48);
+            out[0] = V.Int(i as i32);
             out[1] = v;
             return i;
         }
