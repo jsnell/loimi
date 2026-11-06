@@ -505,6 +505,24 @@ slower with the port: re-fusing after property quickening forms
 `GETMETHOD_P_CALL` and two `GETPROP_IN` supers, with 10% fewer
 dispatches. The load facts change no hot handler of Mini or MiniJS.
 
+## Shifted-int nanbox (2026-11-06)
+
+Not a run of the suites: speed-audit item 7
+([design/speed-audit.md](design/speed-audit.md)), Python's `Value` on
+`repr nanbox(int_high)` against master's plain nanbox, tail-call
+builds, user+sys CPU, 11 interleaved runs, an A/A copy of the baseline
+in the same interleave (geometric means, min / median of the runs).
+
+| Change | Suite | 64 | A/A | 128 | A/A |
+|---|---|---:|---:|---:|---:|
+| `nanbox(int_high)` | Python (11) | 0.934 / 0.939 | 0.997 / 0.998 | 0.951 / 0.957 | 0.999 / 1.012 |
+
+Integer benchmarks 0.87–0.97 (fannkuch 0.87, hexiom and nqueens 0.91–0.92);
+chaos and raytrace 0.91 (pointer payloads are a shift, with no 48-bit
+mask constant); float 1.00; nbody 1.01 at 64 and 1.05 at 128;
+spectral_norm 0.91 at 64 and 1.07 at 128 (its int ops got cheaper and
+its float accumulation dearer).
+
 ## Per suite
 
 ### mini
