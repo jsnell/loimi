@@ -124,6 +124,11 @@ fn big_vect(h: *gc.Heap, rtd: V, src: *V, n: u64) -> Gc<Vect> {
 pub vm Scheme {
     context ctx: *Ctx;
     state { pc: *u32, regs: *V, k: *V, fp: *Frame }
+    // A value accumulator (language.md §7.4): an arithmetic result passes
+    // to the next op in xmm0, written through to its register too.
+    // Selection needs no first_temp, so let-bound values chain too.
+    accumulator vacc: f64 for reg;
+    accumulate ADD, SUB, MUL, DIV;
 
     // The generated verifier checks these against the prototype that
     // holds the code: Scheme.build_verified (compile.lm, `finish`)
@@ -935,6 +940,13 @@ pub vm Scheme {
     // All `#[forward]`: where a part reads the register the previous part
     // wrote, `optimize` picks a variant that keeps the value in a machine
     // register (no run-time test; it costs opcodes and code size).
+    // Over accumulator variants (mbrot's `(+ (* zr zr) (* zi zi))` and
+    // `(+ (- zr2 zi2) cr)`): a variant breaks up the supers over its op.
+    #[forward] supers {
+        LOADK, MUL, MUL__RRA, ADD__RAR;
+        MUL, MUL, ADD__RRA;
+        SUB, ADD__RAR;
+    }
     // Compare-and-branch pairs produced by every `if`:
     #[forward] supers {
         LTI, TEST;
