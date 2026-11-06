@@ -499,7 +499,7 @@ fn array_index_of(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
     let v = arg(args, n, 0);
     var i = rel_index(int_arg(args, n, 1, 0.0), a.len);
     while i < a.len {
-        if value.strict_eq(a.ptr[i], v) { return Ok(V.Int(i as i32)); }
+        if value.strict_eq(a.ptr[i], v) { return Ok(V.Int(i as i48)); }
         i += 1;
     }
     Ok(V.Int(-1))
@@ -511,7 +511,7 @@ fn array_last_index_of(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
     var i = a.len;
     while i > 0 {
         i -= 1;
-        if value.strict_eq(a.ptr[i], v) { return Ok(V.Int(i as i32)); }
+        if value.strict_eq(a.ptr[i], v) { return Ok(V.Int(i as i48)); }
     }
     Ok(V.Int(-1))
 }
@@ -595,7 +595,7 @@ fn str_char_code_at(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
     let s = this_str(c, this);
     let i = int_arg(args, n, 0, 0.0);
     if i < 0.0 or i >= s.data.len as f64 { return Ok(V.Num(0.0 / 0.0)); }
-    Ok(V.Int(s.data[i as u64] as i32))
+    Ok(V.Int(s.data[i as u64] as i48))
 }
 
 fn str_char_at(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
@@ -627,7 +627,7 @@ fn str_index_of(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
     let s = this_str(c, this);
     let sub = c.to_str(arg(args, n, 0));
     let from = rel_index_pos(int_arg(args, n, 1, 0.0), s.data.len);
-    Ok(V.Int(find_from(s.data, sub.data, from) as i32))
+    Ok(V.Int(find_from(s.data, sub.data, from) as i48))
 }
 
 /// A position clamped to 0..len (no counting from the end).
@@ -646,7 +646,7 @@ fn str_last_index_of(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
     var i = h.len - nd.len + 1;
     while i > 0 {
         i -= 1;
-        if h[i..i + nd.len].eq(nd) { return Ok(V.Int(i as i32)); }
+        if h[i..i + nd.len].eq(nd) { return Ok(V.Int(i as i48)); }
     }
     Ok(V.Int(-1))
 }

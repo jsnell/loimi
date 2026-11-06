@@ -1790,8 +1790,8 @@ fn Gen.switch_stmt(g: *Gen, n: *Node) {
     var labels: mem.Vec<bc.Label> = mem.Vec.new();
     var default_label: ?bc.Label = None;
     // Integer cases in a small range: a jump table.
-    var lo: i32 = 0x7FFFFFFF;
-    var hi: i32 = -0x7FFFFFFF;
+    var lo: i48 = 0x7FFFFFFFFFFF;
+    var hi: i48 = -0x7FFFFFFFFFFF;
     var ncase: u64 = 0;
     var dense = true;
     for i in 0..n.list.len {
