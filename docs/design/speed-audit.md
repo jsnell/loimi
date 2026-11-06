@@ -81,7 +81,7 @@ one, else an estimate.
 | 4 | **Load facts**: `dereferenceable`/`nonnull`/invariant loads on pointers and `const` operand kinds | Listed in Mini's "remaining compiler issues" (`RESULTS.md:579`). Dependent-load chains: Python GETATTR 14–26%, MiniJS GETPROP_IN. GETINDEX_GETINDEX (20% of interp) keeps a frame. **Prototyped 2026-11-06: no handler of Mini or MiniJS changes; no gain** (item 4, "Prototype results") | measured: 1.00 | S |
 | 5 | **Smaller objects**: typed small-object chunks with no per-object header (BiBoP), or an 8-byte header for fixed-size types | Every object has a 16-byte header. A Scheme pair is 32 bytes against Guile's 16, and CAR alone is 12–15% of nboyer. Size sensitivity, measured: +8 bytes per object cost MiniJS binary_trees 6% and Python float 6% | est. 3–10%; **upper bound measured 2026-11-06: 1–3%** on nboyer, sboyer, mperm, earley (16-byte pairs, no collection, faults excluded), 24-byte pairs and Prolog ≈0; RSS halved. No-go (item 5) | L |
 | 6 | **A sampling profiler in std** (`std.prof`), mapped to handlers, cold blocks and guest pcs | Every tuning round wrote its own LD_PRELOAD SIGPROF sampler (wasm FRICTION 366, Python FRICTION 618, Mini RESULTS:9). The 64 KiB verifier memset (Prolog sieve 0.54) was found only by sampling | indirect; it finds the next items. **Built 2026-11-06** (`--vm-prof`, item 6): top entries match the hand sampler within 1 point; costs 3% (tail-call) at 1000 Hz | S–M |
-| 7 | **Shifted-int nanbox option** (Int payload in the high bits, so `add; jo` checks overflow) | Python's i48 overflow check is `shl; shl; add; jo; shr`, costing spectral_norm 5–8%. Mini measured i48 at +4–9% and kept i32 (`RESULTS.md:527`). **Built 2026-11-06** as `repr nanbox(int_high)` (item 7, "As built"); Python uses it. Mini not tried (its float-first paths read raw words) | measured: Python suite 0.934 (align 64), 0.951 (128); integer benchmarks 0.87–0.97, nbody 1.01–1.05 | M |
+| 7 | **Shifted-int nanbox option** (Int payload in the high bits, so `add; jo` checks overflow) | Python's i48 overflow check is `shl; shl; add; jo; shr`, costing spectral_norm 5–8%. Mini measured i48 at +4–9% and kept i32 (`RESULTS.md:527`). **Built 2026-11-06** as `repr nanbox(int_high)` (item 7, "As built"); Python uses it. Mini not tried (its float-first paths read raw words) | measured: Python suite 0.932 (align 64), 0.942 (128); integer benchmarks 0.87–0.97 (spectral_norm 1.00 at 128), nbody 0.99–1.01 | M |
 | 8 | **Re-fusion on `become`**, and supers from a profile file | Mini and MiniJS call `refuse` (a whole-function `optimize`) by hand after quickening; doing so gave mandelbrot −6% and nbody −5%. Lox, Python and Scheme don't do it. **Built 2026-11-06** as `refuse CODE;` (item 8, "As built"): Lox zoo 0.88, suite 0.973; Python and Scheme no gain | measured: Lox 0.97; others 1.00 | S |
 | 9 | **A value-stack and frame runtime** (`std.rt.ValueStack`): high-water-mark clearing across coroutines, nested runs and the debugger | Built by hand in MiniJS, Scheme and Python; for Scheme it gave fib 0.81 and tak 0.85. Mini's three attempts failed: the unsafe upper bound was fib 0.92, the safe attempt 0.995–1.003. Python's frames do 8 stores | 1–2% for Mini and Lox; mostly ergonomic for the rest | M |
 | 10 | **Adaptive quickening**: warmup and backoff counters on families (CPython's PEP 659) | No interpreter counts; all specialize on first execution. There is no measured flip-flop yet, so measure first | 0–2% (est.) | S |
@@ -1462,36 +1462,38 @@ That made Python's `ADD` int path `or %si, %bx; je; add; jo; store`,
 18 instructions with operand decoding and dispatch against 28.
 
 Its bound on Python, user+sys CPU, minimum / median of 11 interleaved
-runs, against master's build, A/A in the same interleave:
+runs, against master's build, with an A/A copy of that build in the
+same interleave (the quieter of two rounds; the other gave suite 0.934
+and 0.951):
 
 | | align 64 | A/A | align 128 | A/A |
 |---|---:|---:|---:|---:|
-| fannkuch | 0.869 / 0.843 | 0.998 / 1.000 | 0.884 / 0.872 | 1.003 / 0.960 |
-| go | 0.923 / 1.062 | 1.001 / 0.988 | 0.916 / 0.890 | 0.988 / 0.990 |
-| hexiom | 0.913 / 0.900 | 1.004 / 1.017 | 0.903 / 0.933 | 1.000 / 0.988 |
-| nqueens | 0.925 / 0.933 | 0.995 / 1.024 | 0.920 / 0.870 | 1.007 / 1.003 |
-| spectral_norm | 0.911 / 0.855 | 0.991 / 0.958 | 1.071 / 1.101 | 0.996 / 0.997 |
-| deltablue | 0.950 / 0.931 | 0.996 / 0.997 | 0.955 / 0.933 | 0.994 / 0.997 |
-| richards | 0.966 / 0.971 | 0.991 / 1.041 | 0.959 / 1.023 | 1.009 / 1.095 |
-| chaos | 0.905 / 0.892 | 0.979 / 0.993 | 0.914 / 0.896 | 0.991 / 0.991 |
-| raytrace | 0.916 / 1.042 | 1.002 / 1.033 | 0.910 / 0.855 | 1.007 / 1.004 |
-| float | 0.995 / 0.937 | 1.008 / 0.992 | 1.000 / 1.010 | 1.000 / 0.998 |
-| nbody | 1.007 / 0.983 | 1.003 / 0.940 | 1.049 / 1.200 | 0.997 / 1.114 |
-| **suite (11)** | **0.934 / 0.939** | 0.997 / 0.998 | **0.951 / 0.957** | 0.999 / 1.012 |
+| fannkuch | 0.865 / 0.870 | 0.999 / 1.003 | 0.869 / 0.872 | 0.999 / 0.998 |
+| go | 0.920 / 0.918 | 1.001 / 1.000 | 0.934 / 0.934 | 0.999 / 1.001 |
+| hexiom | 0.916 / 0.913 | 1.001 / 1.011 | 0.907 / 0.907 | 1.001 / 0.994 |
+| nqueens | 0.914 / 0.920 | 1.000 / 0.992 | 0.923 / 0.917 | 1.007 / 0.999 |
+| spectral_norm | 0.920 / 0.913 | 1.004 / 1.006 | 1.001 / 1.072 | 0.994 / 1.001 |
+| deltablue | 0.958 / 0.953 | 1.001 / 1.003 | 0.958 / 0.951 | 1.002 / 1.002 |
+| richards | 0.967 / 0.940 | 0.999 / 0.976 | 0.958 / 0.957 | 0.993 / 1.007 |
+| chaos | 0.906 / 0.895 | 0.997 / 0.992 | 0.909 / 0.907 | 0.996 / 1.002 |
+| raytrace | 0.911 / 0.921 | 1.001 / 1.006 | 0.911 / 0.914 | 1.001 / 1.014 |
+| float | 0.995 / 0.996 | 0.999 / 1.001 | 0.996 / 1.000 | 1.001 / 1.002 |
+| nbody | 0.990 / 0.980 | 0.999 / 0.975 | 1.012 / 1.058 | 0.997 / 1.002 |
+| **suite (11)** | **0.932 / 0.928** | 1.000 / 0.997 | **0.942 / 0.952** | 0.999 / 1.002 |
 
 Far above the 3% bar, so it was built. Two things were not expected.
 The gain is not only in integer arithmetic: chaos and raytrace, float
-benchmarks, gained 9%, because every pointer payload became `shr $16`
-in place of an `and` with a 48-bit mask that needs a `movabs` and a
+benchmarks, gained 9%, most likely because every pointer payload
+became `shr $16` in place of an `and` with a 48-bit mask that needs a `movabs` and a
 register (Python's handlers have 5% fewer instructions in all: GETATTR
 64 → 56, CALLEX 1091 → 1025, BUILDCLASS 520 → 469). And the float paths
 cost less than feared: `ADD`'s float path went from 31 instructions to
 32, because the int test in front of it got shorter; only TRUEDIV (43 →
 50) and the float half of mixed operations grew. nbody, where nearly
-every value is a float, is the one benchmark that is slower (1.01 /
-1.05). spectral_norm moves with alignment (0.91 at 64, 1.07 at 128):
-`--vm-prof` shows the int ops cheaper (ADD 279 → 189 samples, FORITER2
-302 → 201) and the float ones dearer (TRUEDIV 288 → 345, IADD 127 →
+every value is a float, is the one benchmark that is slower, at 128
+only (1.01 / 1.06). spectral_norm moves with alignment (0.92 at 64,
+1.00 / 1.07 at 128): `--vm-prof` (8 times the loops) shows the int
+ops cheaper (ADD 279 → 189 samples, FORITER2 302 → 201) and the float ones dearer (TRUEDIV 288 → 345, IADD 127 →
 194, the accumulation `partial_sum += ..`).
 
 #### As built (2026-11-06)

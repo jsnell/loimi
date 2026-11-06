@@ -253,8 +253,8 @@ implementation; `git log` has the details.
   compares are word compares, pointer payloads are `w >> 16`; floats
   pay `xor; ror` to decode and `rol; xor` to encode. Opt-in; refused
   with `#[scan_raw_words]`; `V.Num.limit` does not exist under it.
-  Python uses it: suite 0.934 (align 64) and 0.951 (128) of the plain
-  nanbox's time, integer benchmarks 0.87–0.97, nbody 1.01–1.05
+  Python uses it: suite 0.932 (align 64) and 0.942 (128) of the plain
+  nanbox's time, integer benchmarks 0.87–0.97, nbody 0.99–1.01
   ([language.md §2](docs/language.md#2-value-types-declared-representations),
   [lowering.md §2](docs/lowering.md#2-values-nanbox-lowtag-boxed);
   [design/speed-audit.md](docs/design/speed-audit.md), item 7).

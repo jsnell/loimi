@@ -1629,8 +1629,8 @@ fn main() {
 ```
 
 Python uses it (`examples/python/value.lm`): its 11 benchmarks ran
-0.93–0.95 of the plain nanbox's time, the integer ones 0.87–0.97 and the
-float ones 0.91–1.05 (`design/speed-audit.md`, item 7). It is opt-in
+0.93–0.94 of the plain nanbox's time, the integer ones 0.87–0.97 and the
+float ones 0.91–1.01 (`design/speed-audit.md`, item 7). It is opt-in
 because it is an exchange: code whose values are mostly floats pays
 four instructions per float operation and gains little. Two things do
 not carry over from the plain nanbox: `V.Num.limit` does not exist (the
