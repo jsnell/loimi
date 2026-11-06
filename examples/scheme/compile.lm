@@ -627,13 +627,13 @@ fn Comp.record_defs(c: *Comp, x: V) -> V {
         if let P(q) = p.car {
             var r = q.cdr;
             if let P(acc) = r {
-                let fq = c.list([quote, value.cons(c.heap, rtd, V.Int(i))][0..2]);
+                let fq = c.list([quote, value.cons(c.heap, rtd, V.Int(i as i48))][0..2]);
                 let body = c.list([c.sym("%record-ref"), fq, xs][0..3]);
                 defs.push(c.list([define, c.list([acc.car, xs][0..2]), body][0..3]));
                 r = acc.cdr;
             }
             if let P(md) = r {
-                let fq = c.list([quote, value.cons(c.heap, rtd, V.Int(i))][0..2]);
+                let fq = c.list([quote, value.cons(c.heap, rtd, V.Int(i as i48))][0..2]);
                 let body = c.list([c.sym("%record-set!"), fq, xs, vs][0..4]);
                 defs.push(c.list([define, c.list([md.car, xs, vs][0..3]), body][0..3]));
             }
@@ -2442,7 +2442,7 @@ fn mentions(n: *Node, v: *Var) -> bool {
 }
 
 fn small_const(n: *Node) -> ?i32 {
-    if n.kind == K.Const and let Int(i) = n.v and i >= -128 and i <= 127 { return Some(i); }
+    if n.kind == K.Const and let Int(i) = n.v and i >= -128 and i <= 127 { return Some(i as i32); }
     None
 }
 

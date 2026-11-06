@@ -67,9 +67,9 @@ pub object Proto {
 /// A flat closure: the values of its free variables (boxes for assigned ones).
 pub object Closure { proto: Gc<Proto>, free: [V] }
 
-pub value V repr nanbox {
+pub value V repr nanbox(int_high) {
     Num(f64) unboxed,
-    Int(i32) block 48,
+    Int(i48),
     Imm(i32) block 48,
     P(Gc<Pair>),
     Sym(Gc<Sym>) block 45,

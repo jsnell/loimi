@@ -283,8 +283,10 @@ pub fn arith(c: *Ctx, op: i32, a: V, b: V) -> Result<V, V> {
                 return Ok(V.Num((i as f64) / (j as f64)));
             }
         }
+        // i48 sums fit an i64; products need not.
+        if op == 2 { return Ok(bignum.mul(&c.heap, a, b)); }
         let (i, j) = (x as i64, y as i64);
-        return Ok(bignum.of_i64(&c.heap, match op { 0 => i + j, 1 => i - j, _ => i * j }));
+        return Ok(bignum.of_i64(&c.heap, if op == 0 { i + j } else { i - j }));
     }
     let name = match op { 0 => "+", 1 => "-", 2 => "*", _ => "/" };
     if bignum.is_exact(a) and bignum.is_exact(b) {
@@ -427,14 +429,14 @@ fn expt(c: *Ctx, a: V, b: V) -> Result<V, V> {
         }
         if a == V.Int(-1) { return Ok(if bignum.is_odd(b) { a } else { V.Int(1) }); }
         if let (Int(x), Int(y)) = (a, b) {
-            // |x| >= 2: a fixnum result takes at most 31 steps.
+            // |x| >= 2: a fixnum result takes at most 47 steps.
             var r: i64 = 1;
             var ok = true;
             for _ in 0..y as u64 {
                 r = r * x as i64;
-                if r > 2147483647 or r < -2147483648 { ok = false; break; }
+                if r > 140737488355327 or r < -140737488355328 { ok = false; break; }
             }
-            if ok { return Ok(V.Int(r as i32)); }
+            if ok { return Ok(V.Int(r as i48)); }
         }
         if let Int(e) = b and let Some(r) = bignum.pow(&c.heap, a, e as u64) { return Ok(r); }
         return Err(rt.err(c, "expt: result too large, exponent", b));
@@ -448,7 +450,7 @@ fn expt(c: *Ctx, a: V, b: V) -> Result<V, V> {
 fn sqrt(c: *Ctx, a: V) -> Result<V, V> {
     if let Int(x) = a and x >= 0 {
         let r = (x as f64).sqrt() as i64;
-        if r * r == x as i64 { return Ok(V.Int(r as i32)); }
+        if r * r == x as i64 { return Ok(V.Int(r as i48)); }
     }
     if let Big(_) = a and bignum.sign(a) > 0 {
         let s = bignum.isqrt(&c.heap, a).unwrap();
@@ -469,7 +471,7 @@ fn isqrt(c: *Ctx, a: V) -> Result<V, V> {
             var r = (x as f64).sqrt() as i64;
             while r * r > x as i64 { r -= 1; }
             while (r + 1) * (r + 1) <= x as i64 { r += 1; }
-            return Ok(V.Int(r as i32));
+            return Ok(V.Int(r as i48));
         }
         return Ok(bignum.isqrt(&c.heap, a).unwrap());
     }
@@ -750,7 +752,7 @@ pub fn call_native(c: *Ctx, p: Prim, args: *V, n: u64) -> Result<V, V> {
         }
         Prim.Length => {
             match list_len(a) {
-                Some(k) => Ok(V.Int(k as i32)),
+                Some(k) => Ok(V.Int(k as i48)),
                 None => Err(rt.type_err(c, name, "list", a)),
             }
         }
@@ -838,7 +840,7 @@ pub fn call_native(c: *Ctx, p: Prim, args: *V, n: u64) -> Result<V, V> {
             v.data.ptr[i] = args[2];
             Ok(value.unspec())
         }
-        Prim.VectorLength => Ok(V.Int(vec_arg(c, name, a)?.data.len as i32)),
+        Prim.VectorLength => Ok(V.Int(vec_arg(c, name, a)?.data.len as i48)),
         Prim.VectorToList => {
             let v = vec_arg(c, name, a)?;
             var l = value.nil();
@@ -855,7 +857,7 @@ pub fn call_native(c: *Ctx, p: Prim, args: *V, n: u64) -> Result<V, V> {
             for i in 0..v.data.len { v.data.ptr[i] = b; }
             Ok(value.unspec())
         }
-        Prim.StringLength => Ok(V.Int(str_arg(c, name, a)?.data.len as i32)),
+        Prim.StringLength => Ok(V.Int(str_arg(c, name, a)?.data.len as i48)),
         Prim.StringRef => {
             let s = str_arg(c, name, a)?;
             let i = index_arg(c, name, b, s.data.len)?;
@@ -918,11 +920,11 @@ pub fn call_native(c: *Ctx, p: Prim, args: *V, n: u64) -> Result<V, V> {
             let s = str_arg(c, name, a)?;
             Ok(V.Sym(c.syms.intern(h, s.data)))
         }
-        Prim.CharToInteger => Ok(V.Int(char_arg(c, name, a)?)),
+        Prim.CharToInteger => Ok(V.Int(char_arg(c, name, a)? as i48)),
         Prim.IntegerToChar => {
             let Int(k) = a else { return Err(rt.type_err(c, name, "integer", a)); };
             if k < 0 or k > 0x10FFFF { return Err(rt.err(c, "integer->char: out of range", a)); }
-            Ok(value.chr(k))
+            Ok(value.chr(k as i32))
         }
         Prim.CharEqP | Prim.CharLtP | Prim.CharGtP | Prim.CharLeP | Prim.CharGeP => {
             let x = char_arg(c, name, a)?;
@@ -967,7 +969,7 @@ pub fn call_native(c: *Ctx, p: Prim, args: *V, n: u64) -> Result<V, V> {
         Prim.Exit => {
             c.flush();
             var code: i32 = 0;
-            if let Int(k) = a { code = k; }
+            if let Int(k) = a { code = k as i32; }
             if a == value.f() { code = 1; }
             os.quit(code)
         }

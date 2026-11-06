@@ -158,7 +158,7 @@ pub vm Scheme {
     poll gc_fall { if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } } }
 
     op LOADK(dst: reg, c: kst) : ABx { dst = c; next }
-    op LOADI(dst: reg, v: simm) : AsBx { dst = Int(v as i32); next }
+    op LOADI(dst: reg, v: simm) : AsBx { dst = Int(v as i48); next }
     op MOVE(dst: reg, src: reg) : ABC { dst = src; next }
 
     // Globals live in a slot vector indexed by the symbol's slot number,
@@ -278,8 +278,8 @@ pub vm Scheme {
     }
     /// R[dst] = R[a] + sc (a small signed constant).
     op ADDI(dst: reg, a: reg, sc: simm) : ABsC {
-        if let Int(x) = a and let Some(r) = x.add_checked(sc as i32) { dst = Int(r); next }
-        cold { dst = builtins.arith_gc(ctx, 0, a, Int(sc as i32))?; next }
+        if let Int(x) = a and let Some(r) = x.add_checked(sc as i48) { dst = Int(r); next }
+        cold { dst = builtins.arith_gc(ctx, 0, a, Int(sc as i48))?; next }
     }
     /// quotient, remainder, modulo: fixnums with a positive divisor inline.
     op QUO(dst: reg, a: reg, b: reg) : ABC {
@@ -327,8 +327,8 @@ pub vm Scheme {
         ("GEI", >=, 4),
     ] {
         op #name(dst: reg, a: reg, sc: simm) : ABsC {
-            if let Int(x) = a { dst = value.boolean(x sym (sc as i32)); next }
-            cold { dst = value.boolean(builtins.compare(ctx, code, a, Int(sc as i32))?); next }
+            if let Int(x) = a { dst = value.boolean(x sym (sc as i48)); next }
+            cold { dst = value.boolean(builtins.compare(ctx, code, a, Int(sc as i48))?); next }
         }
     }
     op ZEROP(dst: reg, a: reg) : ABC {
@@ -475,8 +475,8 @@ pub vm Scheme {
         raise rt.type_err(ctx, "set-cdr!", "pair", a)
     }
     op VREF(dst: reg, v: reg, i: reg) : ABC {
-        if let (Vec(x), Int(j)) = (v, i) and (j as u32 as u64) < x.data.len {
-            dst = x.data.ptr[j as u32 as u64];
+        if let (Vec(x), Int(j)) = (v, i) and (j as u64) < x.data.len {
+            dst = x.data.ptr[j as u64];
             next
         }
         raise index_err(ctx, "vector-ref", v, i)
@@ -487,18 +487,18 @@ pub vm Scheme {
             dst = x.data.ptr[i as u64];
             next
         }
-        raise index_err(ctx, "vector-ref", v, Int(i as i32))
+        raise index_err(ctx, "vector-ref", v, Int(i as i48))
     }
     op VSETI(v: reg, i: imm, src: reg) : ABC {
         if let Vec(x) = v and (i as u64) < x.data.len {
             x.data.ptr[i as u64] = src;
             next
         }
-        raise index_err(ctx, "vector-set!", v, Int(i as i32))
+        raise index_err(ctx, "vector-set!", v, Int(i as i48))
     }
     op VSET(v: reg, i: reg, src: reg) : ABC {
-        if let (Vec(x), Int(j)) = (v, i) and (j as u32 as u64) < x.data.len {
-            x.data.ptr[j as u32 as u64] = src;
+        if let (Vec(x), Int(j)) = (v, i) and (j as u64) < x.data.len {
+            x.data.ptr[j as u64] = src;
             next
         }
         raise index_err(ctx, "vector-set!", v, i)
@@ -507,7 +507,7 @@ pub vm Scheme {
     // Builtins of one argument with an inline fast path; the rest (other
     // types, errors) is the native's, on the argument's register.
     op LENGTH(dst: reg, a: callbase) : ABC {
-        var n: i32 = 0;
+        var n: i48 = 0;
         var cur = regs[a as u64];
         while let P(p) = cur {
             n += 1;
@@ -549,7 +549,7 @@ pub vm Scheme {
     }
     op VLEN(dst: reg, a: callbase) : ABC {
         if let Vec(v) = regs[a as u64] {
-            dst = Int(v.data.len as i32);
+            dst = Int(v.data.len as i48);
             next
         }
         cold { dst = builtins.call_native(ctx, Prim.VectorLength, regs + a as u64, 1)?; next }
@@ -645,7 +645,7 @@ pub vm Scheme {
         if tail { dst = regs; }
         if dst + 3 >= ctx.hwm and !rt.grow(ctx, dst + 3) { raise rt.err_msg(ctx, "stack overflow") }
         let kc = new(&ctx.heap, Closure { proto: cp }, 1);
-        kc.free.ptr[0] = Int((((nf as u64) - (ctx.frames as u64)) / size_of<Frame>()) as i32);
+        kc.free.ptr[0] = Int((((nf as u64) - (ctx.frames as u64)) / size_of<Frame>()) as i48);
         dst[0] = regs[base + 1];
         dst[1] = Clo(kc);
         if !tail {
@@ -702,7 +702,7 @@ pub vm Scheme {
             if tail { dst = regs; }
             if dst + 3 >= ctx.hwm and !rt.grow(ctx, dst + 3) { raise rt.err_msg(ctx, "stack overflow") }
             let kc = new(&ctx.heap, Closure { proto: cp }, 1);
-            kc.free.ptr[0] = Int((((nf as u64) - (ctx.frames as u64)) / size_of<Frame>()) as i32);
+            kc.free.ptr[0] = Int((((nf as u64) - (ctx.frames as u64)) / size_of<Frame>()) as i48);
             dst[0] = regs[base + 1];
             dst[1] = Clo(kc);
             if !tail {
