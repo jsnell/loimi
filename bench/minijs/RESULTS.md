@@ -286,3 +286,28 @@ Where the time goes now: strings spends 13% in `Ctx.key` (interning
 CALL/RET and the property loads elsewhere (`GETPROP_IN` is a dependent
 load of the shape id; the Obj.sid experiment above did not pay);
 `MODK` by non-power-of-two constants is an `idiv` (closures 8%).
+
+## A value accumulator: measured, not kept (2026-11-06)
+
+Speed audit item 1 (`language.md` §7.4, "Value accumulators"):
+`accumulator vacc: f64 for reg;` over ADD_F, SUB_F, MUL_F, DIV_F, the
+register and constant compare-and-branch forms and SETPROP_IN (18
+reader variants), with four `#[forward]` supers over the variants
+(`MUL_F; MUL_F__RAR; SUB_F__RRA; SETPROP_IN__RA` and its ADD_F twin,
+which take nbody's `b.vx -= dx * b2.mass * mag` to one dispatch),
+selected in `refuse` and in `finish`, and `minijs.vmprofile`
+regenerated. nbody's dispatches fell from 235M to 157M. User+sys CPU,
+median of 9 paired interleaved rounds against base (A/A in brackets):
+
+| | align 64 | align 128 |
+|---|---:|---:|
+| nbody | 0.944 (0.998) | 0.942 (0.994) |
+| spectral_norm | 0.989 (0.998) | 1.050 (0.994) |
+| fannkuch | 1.017 (0.992) | 1.065 (0.950) |
+| bitops | 1.013 (0.995) | 1.059 (1.011) |
+| suite (14) | 1.004 (0.998) | 1.007 (0.982) |
+
+Dropped: the `f64` argument is a seventh register argument, which stops
+LLVM folding the dispatch table's load into the `jmp` in every handler
+(`lowering.md` §3), and MiniJS has one float kernel among 14
+benchmarks. The port is commit 6d40423, reverted.

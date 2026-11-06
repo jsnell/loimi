@@ -1,0 +1,22 @@
+// error: `ADD` writes accumulator `vacc`: it cannot leave through vm function `slow`
+// A writer that leaves through a vm function (here `slow`, which jumps
+// through `go`) would reach the next word without leaving its result in
+// the accumulator.
+value V repr nanbox { Num(f64) unboxed, Int(i32), Nil }
+vm M {
+    state { pc: *u32, regs: *V }
+    operand reg = regs[it];
+    accumulator vacc: f64 for reg;
+    encoding fixed(u32) { format ABC { op: 8, a: 8, b: 8, c: 8 } }
+    fn go(t: *u32) -> never { jump t }
+    fn slow() -> never { go(pc + 1) }
+    #[accumulate] op ADD(d: reg, a: reg, b: reg) : ABC {
+        if let (Num(x), Num(y)) = (a, b) { d = Num(x + y); next }
+        d = Nil;
+        slow()
+    }
+    op HALT() : ABC { exit 0 }
+    entry run(code: *u32, r: *V) -> i64 { regs = r; jump code }
+}
+
+fn main() {}

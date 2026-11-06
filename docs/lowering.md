@@ -413,6 +413,21 @@ Notes:
   load or store of `acc` (checked with LLVM 19 on x86-64). That is
   wasm3's `fp0`. An `accumulator` declaration (language.md §7.4) adds
   such a state variable and derives the ops that read and write it.
+- **A value accumulator is an `f64` too.** `accumulator vacc: f64 for
+  reg;` over a nanbox `V` holds the word as `f64.from_bits(w as u64)`,
+  and a reader takes `vacc.to_bits() as V`: bitcasts, so a float chain
+  (`MUL_F` then `ADD_F__RAR`) keeps the product in `xmm0` with no move.
+  A writer's slot store stays (write-through); its accumulator write
+  sits before each `next` as `vacc = f64.from_bits(dst as u64)`, and
+  LLVM forwards the value just stored to `dst`, so it costs no load,
+  only, on an integer path, a `movq` to `xmm0`. A `jump` to a computed
+  target zeroes the accumulator (`xorps`, a zero idiom). The register
+  is still an argument of every tail call: in a vm that passes six
+  (Mini, MiniJS, Scheme) it is the seventh, and every handler's dispatch
+  loses the fold of the table load into the `jmp` (the next item), an
+  `f64` as much as a `u64`. On Mini that cost fib 3.8% and queens 2.2%
+  with nothing selected (`bench/mini/RESULTS.md`, item 43); it is what
+  made the MiniJS and Scheme ports a net loss.
 - **The dispatch table's address.** On x86-64 an executable (`-fno-pic`)
   indexes the table as an absolute address. Whether the load folds into
   the jump depends only on how many values the tail call passes in
@@ -442,7 +457,12 @@ Notes:
   gave a geometric mean of 1.007 of the original's time (per benchmark
   0.96 to 1.03, within run-to-run noise). With nothing to win, the
   compiler neither warns about the count nor reorders or packs state to
-  get under it.
+  get under it. (Mini disagrees, 2026-11-06: a value accumulator, as its
+  seventh argument, cost fib 3.8% and queens 2.2% with no variant ever
+  selected, in paired medians at load 4. So the fold matters on
+  dispatch-bound integer code, and a fix, such as folding in the
+  assembly or keeping state under seven registers, would make value
+  accumulators pay in MiniJS and Scheme: see the speed audit, item 1.)
   A table address passed as an argument does not fold on x86-64 at any
   count (`mov (%r14,%rax,8),%rax; jmp *%rax`), which is one reason the
   table stays a global there.

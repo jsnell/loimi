@@ -1,0 +1,18 @@
+// error: accumulator `vacc` holds operand kind `reg` as its word: `V` must be a `value` type of one word (nanbox or lowtag) whose word 0 holds no reference
+// A boxed value is two words: an accumulator cannot hold it.
+value V repr boxed { Num(f64), Int(i64), Nil }
+vm M {
+    state { pc: *u32, regs: *V }
+    operand reg = regs[it];
+    accumulator vacc: f64 for reg;
+    encoding fixed(u32) { format ABC { op: 8, a: 8, b: 8, c: 8 } }
+    #[accumulate] op ADD(d: reg, a: reg, b: reg) : ABC {
+        if let (Num(x), Num(y)) = (a, b) { d = Num(x + y); next }
+        d = Nil;
+        next
+    }
+    op HALT() : ABC { exit 0 }
+    entry run(code: *u32, r: *V) -> i64 { regs = r; jump code }
+}
+
+fn main() {}

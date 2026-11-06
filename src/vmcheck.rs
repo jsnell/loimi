@@ -533,6 +533,30 @@ pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
     for p in &d.state {
         add_state(c, p, &mut state)?;
     }
+    // A value accumulator holds a kind's word in a number register, and is
+    // zeroed where a reader cannot be (`vmacc::write_through`): the kind
+    // must hold a one-word value whose word 0 holds no reference.
+    for a in d.accs.iter().filter(|a| a.wt) {
+        for k in &a.kinds {
+            let Some(t) = d.operands.iter().find(|o| o.name.name == k.name).and_then(|o| crate::vmacc::kind_type(&d, o)) else { continue };
+            let ty = c.resolve_type(m, &t)?;
+            let ok = match &ty {
+                Ty::Value(vi) => c.prog.values[*vi as usize].repr != crate::tir::ValueRepr::Boxed && c.zero_invalid(&ty, true, 0).is_none(),
+                _ => false,
+            };
+            if !ok {
+                return Err(Diag::new(
+                    k.span,
+                    format!(
+                        "accumulator `{}` holds operand kind `{}` as its word: `{}` must be a `value` type of one word (nanbox or lowtag) whose word 0 holds no reference",
+                        a.name.name,
+                        k.name,
+                        c.ty_name(&ty)
+                    ),
+                ));
+            }
+        }
+    }
     let dispatch = match c.dispatch_override {
         Some(x) => x,
         None => match d.attrs.get("dispatch").and_then(|a| a.first()).map(|s| s.as_str()) {
@@ -1687,7 +1711,13 @@ pub fn check_vm_expr(c: &mut Checker, cx: &mut FnCx, v: &VmExpr, exp: Option<&Ty
                 return Err(Diag::new(name.span, format!("unknown op `{}`", name.name)));
             };
             let (a, b) = (&info.ops[op], &info.ops[t]);
-            if a.format != b.format || a.cache != b.cache || a.kinds != b.kinds {
+            // A value accumulator's reader may become an op without its
+            // variant: the field it reads from the accumulator names a
+            // slot of the kind, which is current (`vmacc::rename_becomes`).
+            let wt_kinds: Vec<&str> = c.vm_decls[vmi].1.accs.iter().filter(|x| x.wt).flat_map(|x| x.kinds.iter().map(|k| k.name.as_str())).collect();
+            let same_kinds = a.kinds.len() == b.kinds.len()
+                && a.kinds.iter().zip(&b.kinds).all(|(&x, &y)| x == y || (info.kinds[x].name == crate::vmacc::ACC_KIND && wt_kinds.contains(&info.kinds[y].name.as_str())));
+            if a.format != b.format || a.cache != b.cache || !same_kinds {
                 return Err(Diag::new(
                     name.span,
                     format!("`become {}`: `{}` and `{}` must have the same format, cache and operand kinds", b.name, a.name, b.name),

@@ -790,6 +790,12 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool) -> Res
         if is_break_op(o) {
             arms.push(fail("__i", "BadOpcode", &op_at("__i")));
         }
+        // A value accumulator's reader (or a super with one) is chosen by
+        // `Vm.accumulate` on verified code, after its writer: in code to
+        // verify, it would read whatever the accumulator holds.
+        if o.parts.iter().chain(std::iter::once(&k)).any(|&p| value_reader(v, &l.ops[p].name)) {
+            arms.push(fail("__i", "BadOpcode", &op_at("__i")));
+        }
         if !arms.is_empty() {
             let _ = writeln!(s, "      {} => {{ {} }}", o.opcode, arms.join(" "));
         }
@@ -1694,6 +1700,11 @@ fn is_label_kind(v: &VmDecl, kind: &str) -> bool {
 ///
 /// `set_label` and `label` have the shapes `std.bc` takes as its patch
 /// and jump-threading functions.
+/// Whether `name` is a variant that reads a value accumulator.
+fn value_reader(v: &VmDecl, name: &str) -> bool {
+    v.acc_ops.iter().any(|a| a.variants.iter().any(|(_, s, n)| n == name && *s > 0 && v.accs[a.srcs[*s - 1].1].wt))
+}
+
 /// `Vm.accumulate(code, first_temp)` (vms with an `accumulator`): where an
 /// op writes a slot at or above `first_temp` that the next op (not a jump
 /// target) reads as a source of the same accumulator, and names in no
@@ -1719,11 +1730,24 @@ fn generate_accumulate(v: &VmDecl, l: &VmLayout) -> String {
         let _ = writeln!(s, "    {} => match __k {{ {}, _ => op }},", opc(&a.op), arms.join(", "));
     }
     let _ = writeln!(s, "    _ => op\n  }}\n}}");
+    // The op a variant was derived from: `accumulate` first turns every
+    // word back into it (and splits supers, whose parts' words keep their
+    // own ops), so that it can run again on code it already ran on, as
+    // after quickening.
+    let _ = writeln!(s, "{vis}fn {n}__acc_base(op: {w}) -> {w} {{\n  match op {{");
+    for a in &v.acc_ops {
+        for (_, _, name) in &a.variants {
+            let _ = writeln!(s, "    {} => {},", opc(name), opc(&a.op));
+        }
+    }
+    let _ = writeln!(s, "    _ => op\n  }}\n}}");
     let _ = writeln!(
         s,
         "{vis}fn {n}__accumulate(code: []{w}, first_temp: u64) {{\n\
          \x20 let __n = code.len;\n\
          \x20 if __n < 2 {{ return; }}\n\
+         \x20 var __r: u64 = 0;\n\
+         \x20 while __r < __n {{ code[__r] = {n}__with_opcode(code[__r], {n}__acc_base({n}__base_op(code[__r]))); __r += {n}__base_size(code[__r]); }}\n\
          \x20 let __tg = __extern_calloc(__n + 1, 1);\n\
          \x20 let __d = __extern_calloc(__n + 1, 1);\n\
          \x20 let __s = __extern_calloc(__n + 1, 1);\n\
@@ -1738,19 +1762,29 @@ fn generate_accumulate(v: &VmDecl, l: &VmLayout) -> String {
          \x20   if __j < __n and __tg[__j] == 0 {{\n\
          \x20     var __slot: u64 = 0;\n\
          \x20     var __acc: u64 = 0;\n\
+         \x20     var __wt: u64 = 0;\n\
          \x20     match {n}__opcode(code[i]) {{"
     );
     for a in &v.acc_ops {
         if let Some((di, ai)) = a.dst {
             let o = opc(&a.op);
-            let _ = writeln!(s, "      {o} => {{ __slot = {}; __acc = {}; }},", field(o, di, "code[i]"), ai + 1);
+            // A value accumulator is written through: any slot may chain
+            // (`first_temp` 0), and the writer needs no variant.
+            let wt = v.accs[ai].wt;
+            let _ = writeln!(
+                s,
+                "      {o} => {{ __slot = {}; __acc = {}; {}}},",
+                field(o, di, "code[i]"),
+                ai + 1,
+                if wt { "__wt = 1; " } else { "" }
+            );
         }
     }
     let _ = writeln!(
         s,
         "      _ => {{}}\n\
          \x20     }}\n\
-         \x20     if __acc != 0 and __slot >= first_temp {{\n\
+         \x20     if __acc != 0 and (__slot >= first_temp or __wt != 0) {{\n\
          \x20       var __sel: u64 = 0;\n\
          \x20       var __c: u64 = 0;\n\
          \x20       match {n}__opcode(code[__j]) {{"
@@ -1774,7 +1808,7 @@ fn generate_accumulate(v: &VmDecl, l: &VmLayout) -> String {
         s,
         "        _ => {{}}\n\
          \x20       }}\n\
-         \x20       if __sel != 0 and __c == 1 {{ __d[i] = 1; __s[__j] = __sel as u8; }}\n\
+         \x20       if __sel != 0 and (__c == 1 or __wt != 0) {{ __d[i] = (1 - __wt) as u8; __s[__j] = __sel as u8; }}\n\
          \x20     }}\n\
          \x20   }}\n\
          \x20   i = __j;\n\
@@ -1917,7 +1951,7 @@ fn mark_lazy(v: &VmDecl, items: &mut [Item]) {
                     v.formats.iter().any(|f| f.fields.iter().any(|x| x.name.name != "op" && r == format!("{}_{}", f.name.name, x.name.name)))
                 });
                 let encoder = short.strip_prefix("encode_").is_some_and(|r| v.formats.iter().any(|f| r == f.name.name));
-                if setter || encoder || short == "accumulate" || short == "acc_variant" {
+                if setter || encoder || short == "accumulate" || short == "acc_variant" || short == "acc_base" {
                     f.attrs.list.push((LAZY_ATTR.to_string(), vec![], f.name.span));
                 }
             }

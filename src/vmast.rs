@@ -91,6 +91,9 @@ pub struct AccDecl {
     pub name: Ident,
     pub ty: TypeExpr,
     pub kinds: Vec<Ident>,
+    /// A value accumulator (its kinds hold a `value` type, not numbers):
+    /// written through, so the slot stays current (set by `vmacc`).
+    pub wt: bool,
 }
 
 /// What `Vm.accumulate` needs to know of an `#[accumulate]` op: the

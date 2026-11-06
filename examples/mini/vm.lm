@@ -306,7 +306,12 @@ fn arith_mixed(c: *Ctx, op: i64, a: V, b: V) -> Result<V, V> {
 /// Fuse superinstructions in a function again after one of its sites
 /// was quickened: fusion compares words by the op they stand for, so
 /// specialized members (MUL_F; ADD_F) fuse too.
+/// Selects accumulator variants first (`vacc`): the float members exist
+/// only once a site has run, and selection splits supers, so it runs
+/// before fusion. It may run in the handler of the op that quickened:
+/// that op leaves its result in `vacc` (language.md §7.4).
 fn refuse(cl: Gc<Closure>) {
+    Mini.accumulate(cl.proto.code.words(), 0);
     Mini.optimize(cl.proto.code);
 }
 
@@ -484,6 +489,13 @@ pub vm Mini {
     // switches to the stepping variant when the debugger asks for a pause
     // (`--cfg debug`). Without the cfg, `poll gil;` and `poll pause;` are
     // nothing.
+    // A value accumulator (language.md §7.4): a float result passes to the
+    // next op in xmm0, and is written through to its register too. The
+    // float members appear by quickening (`refuse` selects again).
+    accumulator vacc: f64 for reg;
+    accumulate ADD_F, SUB_F, MUL_F, ADDK_F, SUBK_F, MULK_F, DIV, DIVK,
+        JLT, JLTN, JLE, JLEN, JLTK, JLTKN, JLEK, JLEKN, JGTK, JGTKN, JGEK, JGEKN;
+
     poll gc { if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } } }
     #[cfg(gil)] poll gil { if unlikely(ctx.gil.waiting()) { cold { ctx.gil.yield_now(); } } }
     #[cfg(debug)] poll pause { if unlikely((&ctx.pause).atomic_load_relaxed() != 0) { use_variant step; } }
@@ -1408,6 +1420,19 @@ pub vm Mini {
     // All `#[forward]`: where a part reads the register the previous part
     // wrote, `optimize` picks a variant that keeps the value in a machine
     // register (no run-time test; it costs opcodes and code size).
+    // Over accumulator variants (mandelbrot, nbody): a variant breaks up
+    // the supers over its op, so the hot pairs are declared again.
+    #[forward] #[allow(super_overlap)] supers {
+        MULK_F, MUL_F__RAR;
+        ADD_F__RAR, SUB_F;
+        ADD_F__RAR, MUL_F;
+        ADD_F__RAR, MUL_F__RRA;
+        MUL_F, ADD_F__RRA;
+        ADD_F, JGTKN__A;
+        MUL_F, SUB_F__RRA;
+        ADD_F__RRA, SETFIELD;
+        SUB_F__RRA, SETFIELD;
+    }
     #[forward] #[allow(super_overlap)] supers {
         LOADI, SUB;
         ADD, RET1;

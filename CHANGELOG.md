@@ -8,6 +8,26 @@ implementation; `git log` has the details.
 
 ### `vm` declarations and dispatch
 
+- **Value accumulators**: `accumulator vacc: f64 for reg;` where `reg`
+  holds a nanbox (or low-tag) `value`. The accumulator holds the
+  value's word in an SSE register and is written through: every form
+  of an op with a result of that kind stores the slot and leaves the
+  word in `vacc`, so there are only reader variants, selection needs no
+  `first_temp` (locals chain too), and the collector, `raise`, the
+  debugger and the JIT need no change. The compiler makes quickening
+  safe: an op that `become`s a writer leaves its result in the
+  accumulator, a writer may only become a writer, variants become the
+  same variant, computed jumps zero the accumulator, `verify` rejects
+  readers and `deopt` turns them back into their ops. `accumulate` may
+  name family members, and `Vm.accumulate` resets variants and splits
+  supers first, so it can run again from a handler (`refuse`).
+  `--vm-stats` points out supers over variants and the supers the
+  variants split. Mini uses it (mandelbrot 0.90, suite 0.994). MiniJS
+  (nbody 0.94) and Scheme (mbrot 0.89) do not: there the `f64` argument
+  costs every handler the dispatch fold, and the suites came out 0.2 to
+  0.6% slower (`docs/results.md`, 2026-11-06)
+  ([language.md §7.4](docs/language.md#74-accumulators);
+  [design/speed-audit.md](docs/design/speed-audit.md), item 1).
 - **Relations and data on ops**: `rel kform(I32_ADD) = I32_ADDK;` and
   `data cost(MUL) = 3;` (with `data cost: u32 = 1;`) generate host
   lookups by opcode, `W.kform(op) -> ?W` and `W.cost(op) -> u32`, and
