@@ -1,0 +1,92 @@
+// matrix: dispatch
+// matrix: jit
+// `refuse CODE;`: after a `become`, supers are fused again over the code
+// the instruction is in, so a super of two quickened members forms
+// (MUL_F; ADD_F: neither `become` alone could form it), a `redo` after
+// the `become` runs the super the word now heads, and a deopt splits it.
+import std.io;
+import std.gc;
+
+object Proto { code: verified [u32] by V }
+
+#[require_verified]
+#[allow(super_overlap)]
+vm V {
+    context heap: *gc.Heap;
+    state { pc: *u32, regs: *f64, p: Gc<Proto> }
+    verify_context owner proto: Gc<Proto>;
+
+    operand reg = regs[it] verify it < 8;
+    encoding fixed(u32) { format ABC { op: 8, a: 8, b: 8, c: 8 } }
+
+    family MUL(dst: reg, a: reg, b: reg) : ABC {
+        generic { dst = a * b; become MUL_F; next }
+        MUL_F {
+            if a < 0.0 { become MUL; redo }
+            dst = a * b;
+            next
+        }
+    }
+    family ADD(dst: reg, a: reg, b: reg) : ABC {
+        generic { dst = a + b; become ADD_F; next }
+        ADD_F { dst = a + b; next }
+    }
+    // Quickens with `redo`: the word it rewrites heads NEG_F_RET then.
+    family NEG(dst: reg, a: reg) : ABC {
+        generic { become NEG_F; redo }
+        NEG_F { dst = 0.0 - a; next }
+    }
+    op RET(src: reg) : ABC { exit src }
+
+    // Supers of quickened members only: `optimize` on fresh code fuses
+    // nothing; `refuse` fuses them once both sites have quickened.
+    super MUL_F_ADD_F = MUL_F; ADD_F;
+    super NEG_F_RET = NEG_F; RET;
+
+    refuse p.code;
+
+    entry run(h: *gc.Heap, q: Gc<Proto>, r: *f64) -> f64 {
+        heap = h;
+        p = q;
+        regs = r;
+        jump q.code
+    }
+}
+
+fn names(p: Gc<Proto>) {
+    let w = p.code.words();
+    for i in 0..w.len {
+        if i > 0 { io.print(" "); }
+        io.print(V.op_name(w[i]));
+    }
+    io.println("");
+}
+
+fn main() uses gc {
+    var heap = gc.Heap.new();
+    let h = &heap;
+    var regs: [f64; 8] = [0.0; 8];
+    regs[0] = 3.0;
+    regs[1] = 4.0;
+    var code: [u32; 5] = [V.MUL(2, 0, 1), V.ADD(3, 2, 1), V.NEG(4, 3), V.RET(4), V.RET(3)];
+    let Ok(p) = V.build_verified(h, Proto {}, code[..]) else { return; };
+    V.optimize(p.code);
+    names(p);
+    io.print_int(V.run(h, p, &regs[0]) as i64); io.println("");
+    names(p);
+    io.print_int(V.run(h, p, &regs[0]) as i64); io.println("");
+    // MUL_F deoptimizes inside the super: the head splits, and MUL
+    // quickens again on the `redo`, which fuses the pair again.
+    regs[0] = -3.0;
+    io.print_int(V.run(h, p, &regs[0]) as i64); io.println("");
+    names(p);
+    regs[0] = 3.0;
+    io.print_int(V.run(h, p, &regs[0]) as i64); io.println("");
+}
+// expect: MUL ADD NEG RET RET
+// expect: -16
+// expect: MUL_F_ADD_F ADD_F NEG_F_RET RET RET
+// expect: -16
+// expect: 8
+// expect: MUL_F_ADD_F ADD_F NEG_F_RET RET RET
+// expect: -16

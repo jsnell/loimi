@@ -1227,6 +1227,14 @@ fn generate_verifier_types(sm: &SourceMap, v: &VmDecl, l: &VmLayout) -> String {
          {vis}fn {n}__optimize(v: {n}__Verified) -> {n}__Verified {{ {n}__optimize_words(v.__code); v }}\n\
          {vis}fn {n}__deopt(v: {n}__Verified) -> {n}__Verified {{ {n}__deopt_words(v.__code); v }}"
     );
+    if v.refuse.is_some() {
+        // `refuse CODE;`: what a `become` calls (`vmparse::desugar_refuse`).
+        // Value accumulators' variants are selected first, as they exist
+        // only for quickened members and selection splits supers; other
+        // accumulators are selected before verification only.
+        let acc = if !v.accs.is_empty() && v.accs.iter().all(|a| a.wt) { format!("{n}__accumulate(v.__code, 0); ") } else { String::new() };
+        let _ = writeln!(s, "{vis}fn {n}__refuse(v: {n}__Verified) {{ {acc}{n}__optimize_words(v.__code); }}");
+    }
     // A placeholder proof, for a field that must hold a Verified before
     // the real code is verified (a prototype built before the program it
     // belongs to is complete): one word with an opcode no op has, which
@@ -2556,6 +2564,78 @@ fn cache_struct_fields(modules: &[Module], mi: usize, t: &TypeExpr) -> Res<Vec<(
 }
 
 /// Expand every vm in every module: append generated items.
+/// `supers from "file";`: add the supers that a `--vm-stats` report in
+/// `file` (relative to the file declaring the vm, or to the file it links
+/// to) suggests for this vm: the first list of each `== vm stats: NAME ==`
+/// section, the one that can be added whole (the commented-out
+/// alternatives are not taken). A file with no such section is a list of
+/// `super` lines. A suggestion is skipped, with a warning, if a part is
+/// not an op of the vm or is itself a super (a stale report); and
+/// silently if a super with the same parts or name is declared already
+/// (the suggestions of several runs, or one also declared by hand).
+fn supers_from(sm: &SourceMap, v: &mut VmDecl) -> Res<()> {
+    for (p, sp, fwd) in std::mem::take(&mut v.supers_from) {
+        let file = std::path::Path::new(&sm.files[sp.file as usize].path);
+        let near = |f: &std::path::Path| f.parent().map(|d| d.join(&p)).unwrap_or_else(|| std::path::PathBuf::from(&p));
+        let path = match near(file) {
+            q if q.exists() => q,
+            q => std::fs::canonicalize(file).map(|f| near(&f)).ok().filter(|r| r.exists()).unwrap_or(q),
+        };
+        let text = std::fs::read_to_string(&path).map_err(|e| Diag::new(sp, format!("cannot read the profile {}: {}", path.display(), e)))?;
+        let head = format!("== vm stats: {} ==", v.name.name);
+        let sections = text.lines().any(|l| l.trim_start().starts_with("== vm stats: "));
+        let mut mine = !sections;
+        let mut stale: Vec<String> = Vec::new();
+        let mut found = 0;
+        for l in text.lines() {
+            let t = l.trim();
+            if t.starts_with("== vm stats: ") {
+                mine = t == head;
+                continue;
+            }
+            // `super NAME = A; B;    // count, share, saving`
+            let Some(rest) = t.strip_prefix("super ") else { continue };
+            if !mine {
+                continue;
+            }
+            let rest = rest.split("//").next().unwrap_or("");
+            let Some((name, parts)) = rest.split_once('=') else { continue };
+            let name = name.trim();
+            let parts: Vec<&str> = parts.split(';').map(str::trim).filter(|s| !s.is_empty()).collect();
+            if name.is_empty() || parts.len() < 2 {
+                continue;
+            }
+            found += 1;
+            let is_op = |n: &str| v.ops.iter().any(|o| o.name.name == n);
+            let is_super = |n: &str| v.supers.iter().any(|s| s.name.name == n);
+            if let Some(bad) = parts.iter().find(|q| !is_op(q) || is_super(q)) {
+                stale.push(format!("{} ({})", name, bad));
+                continue;
+            }
+            if v.supers.iter().any(|s| s.name.name == name || s.parts.iter().map(|x| x.name.as_str()).eq(parts.iter().copied())) || is_op(name) {
+                continue;
+            }
+            let id = |n: &str| Ident { name: n.to_string(), span: sp };
+            v.supers.push(SuperDecl { name: id(name), parts: parts.iter().map(|q| id(q)).collect(), forward: fwd });
+        }
+        if found == 0 {
+            eprintln!("warning: the profile {} suggests no supers for vm `{}`", path.display(), v.name.name);
+        }
+        if !stale.is_empty() {
+            let n = stale.len();
+            eprintln!(
+                "warning: the profile {} suggests {} super{} over ops vm `{}` does not have, or over supers ({}); regenerate it with --vm-stats",
+                path.display(),
+                n,
+                if n == 1 { "" } else { "s" },
+                v.name.name,
+                stale.iter().take(5).cloned().collect::<Vec<_>>().join(", ")
+            );
+        }
+    }
+    Ok(())
+}
+
 pub fn expand(sm: &mut SourceMap, modules: &mut [Module], jit: bool) -> Res<()> {
     cache_structs(modules)?;
     let resume = uses_resume(sm);
@@ -2565,6 +2645,11 @@ pub fn expand(sm: &mut SourceMap, modules: &mut [Module], jit: bool) -> Res<()> 
         // Each C function is declared once per module.
         let (mut externs, mut jit_externs, mut word_extern) = (false, false, false);
         check_reserved_names(&m.items)?;
+        for it in m.items.iter_mut() {
+            if let Item::Vm(v) = it {
+                supers_from(sm, v)?;
+            }
+        }
         for it in &m.items {
             if let Item::Vm(v) = it {
                 if std::env::var_os("LOIMI_COLD_AUDIT").is_some() {

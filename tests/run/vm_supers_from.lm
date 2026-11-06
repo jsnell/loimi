@@ -1,0 +1,37 @@
+// `supers from "file";`: the supers a `--vm-stats` report suggests for
+// this vm (its first list; a suggestion over an op the vm does not have
+// is skipped with a warning; one also declared by hand is not added
+// twice).
+// expect-stderr: suggests 1 super over ops vm `W` does not have
+import std.io;
+
+vm W {
+    state { pc: *u32, regs: *i64 }
+    operand reg = regs[it];
+    encoding fixed(u32) { format ABC { op: 8, a: 8, b: 8, c: 8 } }
+
+    op ADD(dst: reg, a: reg, b: reg) : ABC { dst = a + b; next }
+    op MUL(dst: reg, a: reg, b: reg) : ABC { dst = a * b; next }
+    op NEG(dst: reg, a: reg) : ABC { dst = 0 - a; next }
+    op RET(src: reg) : ABC { exit src }
+
+    supers from "vm_supers_from.vmprofile";
+    super NEG_RET = NEG; RET;
+
+    entry run(code: *u32, r: *i64) -> i64 { regs = r; jump code }
+}
+
+fn main() {
+    var code: [u32; 4] = [W.ADD(2, 0, 1), W.MUL(3, 2, 2), W.NEG(3, 3), W.RET(3)];
+    W.optimize_words(code[..]);
+    for i in 0..4 {
+        if i > 0 { io.print(" "); }
+        io.print(W.op_name(code[i]));
+    }
+    io.println("");
+    var regs: [i64; 4] = [1, 2, 0, 0];
+    io.print_int(W.run(&code[0], &regs[0]));
+    io.println("");
+}
+// expect: ADD_MUL MUL NEG_RET RET
+// expect: -9

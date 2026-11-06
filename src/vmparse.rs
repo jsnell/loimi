@@ -1,7 +1,7 @@
 //! Parsing of `vm` and `value` declarations.
 
 use crate::ast::*;
-use crate::diag::{Diag, Res};
+use crate::diag::{Diag, Res, Span};
 use crate::lexer::Tok;
 use crate::parser::Parser;
 use crate::vmast::*;
@@ -48,6 +48,96 @@ fn desugar_break(vm: &mut VmDecl) -> Res<()> {
     Ok(())
 }
 
+/// `refuse CODE;`: after every `become X` of a family that some super
+/// names (as a part, or a member of a part's family), call
+/// `Vm.refuse(CODE)`, which selects value accumulator variants again and
+/// fuses supers again over the whole code, as `Vm.optimize` does on
+/// quickened code. A `become` of a family that no super names and that
+/// has no accumulator variants to select cannot change what fuses, so it
+/// stays a single store.
+fn desugar_refuse(vm: &mut VmDecl) {
+    let Some(code) = vm.refuse.clone() else { return };
+    let fams: Vec<(String, String)> = vm.ops.iter().map(|o| (o.name.name.clone(), o.family.clone().unwrap_or_else(|| o.name.name.clone()))).collect();
+    let fam = |n: &str| fams.iter().find(|(o, _)| o == n).map(|(_, f)| f.clone());
+    let mut fused: Vec<String> = vm.supers.iter().flat_map(|s| s.parts.iter()).filter_map(|p| fam(&p.name)).collect();
+    // `Vm.refuse` selects value accumulator variants too (`vmexpand`).
+    if !vm.accs.is_empty() && vm.accs.iter().all(|a| a.wt) {
+        fused.extend(vm.ops.iter().filter(|o| o.accumulate).filter_map(|o| fam(&o.name.name)));
+    }
+    // With `supers from`, the supers are known only at expansion: every
+    // `become` re-fuses.
+    let all = !vm.supers_from.is_empty();
+    let wants = |n: &str| all || fam(n).is_some_and(|f| fused.contains(&f));
+    let vname = vm.name.name.clone();
+    let call = |sp: Span| Expr {
+        kind: ExprKind::Call(
+            Box::new(Expr {
+                kind: ExprKind::Field(Box::new(Expr { kind: ExprKind::Ident(vname.clone()), span: sp }), Ident { name: "refuse".into(), span: sp }),
+                span: sp,
+            }),
+            vec![code.clone()],
+        ),
+        span: sp,
+    };
+    fn is_call(s: &Stmt) -> bool {
+        matches!(s, Stmt::Expr { expr: Expr { kind: ExprKind::Call(c, _), .. }, .. }
+            if matches!(&c.kind, ExprKind::Field(_, f) if f.name == "refuse"))
+    }
+    // A call after each `become` statement of the block (and of its
+    // `let .. else` blocks).
+    fn ins(b: &mut Block, wants: &dyn Fn(&str) -> bool, call: &dyn Fn(Span) -> Expr) {
+        let mut i = 0;
+        while i < b.stmts.len() {
+            if let Stmt::Let { els: Some(e), .. } = &mut b.stmts[i] {
+                ins(e, wants, call);
+            }
+            let sp = match &b.stmts[i] {
+                Stmt::Expr { expr: Expr { kind: ExprKind::Vm(VmExpr::Become(n)), span }, .. } if wants(&n.name) => Some(*span),
+                _ => None,
+            };
+            if let Some(sp) = sp {
+                if !b.stmts.get(i + 1).is_some_and(is_call) {
+                    // The `become` may be the block's value (no `;`).
+                    if let Stmt::Expr { semi, .. } = &mut b.stmts[i] {
+                        *semi = true;
+                    }
+                    b.stmts.insert(i + 1, Stmt::Expr { expr: call(sp), semi: true });
+                }
+                i += 1;
+            }
+            i += 1;
+        }
+    }
+    for o in &mut vm.ops {
+        ins(&mut o.body, &wants, &call);
+        crate::vmacc::walk_block_pub(&mut o.body, &mut |x: &mut Expr| {
+            match &mut x.kind {
+                ExprKind::Block(b)
+                | ExprKind::Unsafe(b)
+                | ExprKind::Loop(b)
+                | ExprKind::While(_, b)
+                | ExprKind::For(_, _, _, _, b)
+                | ExprKind::If(_, b, _)
+                | ExprKind::Vm(VmExpr::Cold(b)) => ins(b, &wants, &call),
+                ExprKind::Match(_, arms) => {
+                    for a in arms {
+                        if matches!(&a.body.kind, ExprKind::Vm(VmExpr::Become(n)) if wants(&n.name)) {
+                            let sp = a.body.span;
+                            let b = a.body.clone();
+                            a.body = Expr {
+                                kind: ExprKind::Block(Block { stmts: vec![Stmt::Expr { expr: b, semi: true }, Stmt::Expr { expr: call(sp), semi: true }], span: sp }),
+                                span: sp,
+                            };
+                        }
+                    }
+                }
+                _ => {}
+            }
+            true
+        });
+    }
+}
+
 impl Parser {
     pub fn parse_vm(&mut self, attrs: Attrs, is_pub: bool) -> Res<VmDecl> {
         self.expect_kw("vm")?;
@@ -75,6 +165,8 @@ impl Parser {
             verify_owner: None,
             checks: vec![],
             stack_entry: None,
+            refuse: None,
+            supers_from: vec![],
             accs: vec![],
             acc_list: vec![],
             acc_sel: vec![],
@@ -287,6 +379,27 @@ impl Parser {
                         self.expect(";")?;
                     }
                     vm.supers.push(SuperDecl { name: n, parts, forward: item_attrs.has("forward") });
+                }
+                "supers" if matches!(self.peek_at(1), Tok::Ident(s) if s == "from") => {
+                    // `supers from "file";`: the first list of supers a
+                    // `--vm-stats` report suggests (`vmexpand::supers_from`;
+                    // the path is relative to this file).
+                    self.bump();
+                    self.bump();
+                    let sp = self.span();
+                    let path = self.string_lit()?;
+                    self.expect(";")?;
+                    vm.supers_from.push((path, sp, item_attrs.has("forward")));
+                }
+                "refuse" => {
+                    // `refuse fp.cl.proto.code;`: `become` fuses supers
+                    // again in the code it rewrites (`desugar_refuse`).
+                    self.bump();
+                    if vm.refuse.is_some() {
+                        return self.err("a vm has at most one `refuse`");
+                    }
+                    vm.refuse = Some(self.parse_expr()?);
+                    self.expect(";")?;
                 }
                 "supers" => {
                     // `supers { A, B; NAME = C, D, E; }`: one super per
@@ -546,6 +659,7 @@ impl Parser {
         vm.auto_cold = crate::autocold::run(&mut vm, &self.vm_hot)?;
         desugar_break(&mut vm)?;
         crate::vmacc::desugar(&mut vm)?;
+        desugar_refuse(&mut vm);
         for v in &loop_vars {
             if vm.state.iter().chain(vm.context.iter()).any(|p| p.name.name == v.name) {
                 return Err(crate::diag::Diag::new(

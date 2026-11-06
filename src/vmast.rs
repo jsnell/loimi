@@ -220,6 +220,13 @@ pub struct VmDecl {
     /// `stack_entry EXPR;`: the operand stack depth code starts with (an
     /// expression of the verify context; 0 if absent).
     pub stack_entry: Option<Expr>,
+    /// `refuse CODE;`: after every `become` of a family that is part of a
+    /// super, fuse supers again in CODE, the `Verified` code the current
+    /// instruction is in (`vmparse::desugar_refuse`, `Vm.refuse`).
+    pub refuse: Option<Expr>,
+    /// `supers from "file";`: supers suggested by a `--vm-stats` report
+    /// (`vmexpand::supers_from`), with the item's attributes.
+    pub supers_from: Vec<(String, crate::diag::Span, bool)>,
     /// `accumulator` declarations, and the `#[accumulate]` ops' variants.
     pub accs: Vec<AccDecl>,
     /// `accumulate OP, OP;`: more ops to derive variants of (selectors,
