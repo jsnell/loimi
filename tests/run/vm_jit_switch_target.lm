@@ -1,0 +1,104 @@
+// matrix: jit
+// A computed jump to a guest pc that is not one of the op's labels: SW
+// reads the JMP it picks (another instruction's word) and jumps straight
+// to that JMP's target. Under the JIT (`--jit-stencils`, compiled at the
+// first backward jump) the JMPs are enter words: the field getter maps
+// them back through `V.real_word` (the runtime's table, inline), and the
+// stencil's jump enters the target's compiled code, or the interpreter
+// at that pc. Host code reading the words afterwards sees real words.
+import std.io;
+import std.gc;
+import std.mem;
+
+object Proto { code: verified [u32] by V }
+
+#[require_verified]
+vm V {
+    context heap: *gc.Heap;
+    state { pc: *u32, regs: *i64 }
+    verify_context owner proto: Gc<Proto>;
+
+    operand reg = regs[it] verify it < 8;
+    operand imm = it;
+    operand label = pc + it verify is_insn_boundary(pc + it);
+    /// SW's case count n: the n + 1 words after it are JMPs.
+    operand ncases = it verify {
+        var ok = true;
+        var j: u64 = 0;
+        while ok and j <= it {
+            ok = is_insn_boundary(pc + 1 + j) and V.opcode(*(pc + 1 + j)) == V.OP_JMP;
+            j += 1;
+        }
+        ok
+    };
+    encoding fixed(u32) {
+        format ABC { op: 8, a: 8, b: 8, c: 8 }
+        format AsBx { op: 8, a: 8, sbx: s16 }
+        format sJ { op: 8, sj: s24 }
+    }
+
+    op LOADI(dst: reg, v: imm) : ABC { dst = v as i64; next }
+    op ADDI(dst: reg, v: imm) : ABC { dst = dst + (v as i64); next }
+    /// To JMP min(R[a], n)'s target, decoded from that JMP's word.
+    op SW(a: reg, n: ncases) : ABC {
+        var i = n as u64;
+        if a >= 0 and (a as u64) < (n as u64) { i = a as u64; }
+        let j = pc + 1 + i;
+        jump j + V.sJ_sj(*j)
+    }
+    op JMP(target: label) : sJ { jump target }
+    /// R[a] -= 1; back to target while it is positive.
+    op LOOP(a: reg, target: label) : AsBx {
+        a = a - 1;
+        if a > 0 { jump target }
+        next
+    }
+    op RET(src: reg) : ABC { exit src }
+
+    entry run(h: *gc.Heap, p: Gc<Proto>, r: *i64) -> i64 {
+        heap = h;
+        regs = r;
+        jump p.code
+    }
+}
+
+fn main() uses gc {
+    var heap = gc.Heap.new();
+    let h = &heap;
+    // r3 picks the arm (0, 1, 2 add 1, 10, 100 to r2; the default 200),
+    // and goes up by one per iteration of the loop that r1 counts.
+    //  0: LOADI r3, 0
+    //  1: SW r3, 3
+    //  2: JMP -> 6   3: JMP -> 8   4: JMP -> 10   5: JMP -> 12 (default)
+    //  6: ADDI r2, 1      7: JMP -> 13
+    //  8: ADDI r2, 10     9: JMP -> 13
+    // 10: ADDI r2, 100   11: JMP -> 13
+    // 12: ADDI r2, 200
+    // 13: ADDI r3, 1
+    // 14: LOOP r1, -> 1
+    // 15: RET r2
+    var code: [u32; 16] = [
+        V.LOADI(3, 0), V.SW(3, 3),
+        V.JMP(4), V.JMP(5), V.JMP(6), V.JMP(7),
+        V.ADDI(2, 1), V.JMP(6),
+        V.ADDI(2, 10), V.JMP(4),
+        V.ADDI(2, 100), V.JMP(2),
+        V.ADDI(2, 200),
+        V.ADDI(3, 1),
+        V.LOOP(1, -13),
+        V.RET(2),
+    ];
+    let Ok(p) = V.build_verified(h, Proto {}, code[..]) else { io.println("not verified"); return; };
+    let regs: *i64 = mem.alloc(8);
+    for i in 0..8 { regs[i] = 0; }
+    regs[1] = 6;
+    // r3 runs 0..5: arms 0, 1, 2, then the default three times.
+    io.print_int(V.run(h, p, regs));
+    io.println("");
+    io.println(V.op_name(p.code.words()[2]));
+    io.print_int(V.sJ_sj(p.code.words()[3]));
+    io.println("");
+}
+// expect: 711
+// expect: JMP
+// expect: 5

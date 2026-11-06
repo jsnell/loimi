@@ -310,11 +310,19 @@ did not pay, section 10).
   (`Vm.disasm`, `op_name`, `op_size`, `label`, `set_label`, the field
   getters, operand metadata, `Vm.verify`) first map a word through
   `Vm.real_word`, which compares the opcode with `ENTER` and, for an
-  enter word, asks the runtime (`loimi_jit_word`: the entry index
-  records the code word it was made for) for the real word.
+  enter word, loads the real word from the runtime's table
+  (`loimi_jit_words`, by entry index, kept by the runtime wherever it
+  writes or restores an enter word). The load is inline, not a call, so
+  handlers may read other instructions' words too: an op that decodes
+  the word at a computed pc (a jump table's JMP) gets the real word in
+  the interpreter and in its stencil (2026-11-06; it was a C call
+  before, and a hand-written decode of an enter word jumped to garbage).
 - **Exits.** Compiled code leaves through the dispatch table: dynamic
   jumps, cold paths, and instructions without a stencil (their slot holds
-  the exit stencil, `musttail tbl[opcode(*pc)]`). A continuation that
+  the exit stencil, `musttail tbl[opcode(*pc)]`). A `jump` to a computed
+  guest pc that is none of the op's labels (Mini's SWITCH, MiniJS's
+  SWITCHI) tests the target word first: an enter word goes straight to
+  its compiled code, anything else to the interpreter at that pc. A continuation that
   is not an instruction goes to the shared exit copy. It is never taken:
   for example, MiniJS's `SWITCHI` jumps to `pc + 1 + i`, which the
   stencil compares with `pc + field` for each signed field, and a field

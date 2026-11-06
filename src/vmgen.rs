@@ -943,6 +943,10 @@ fn jit_dispatch(g: &mut FnGen, target: &str, kind: crate::jitgen::JumpKind) {
                 cont(g, format!("__jit.j.{}.{}.{}", word_off + off, shift, bits));
                 g.label(&no);
             }
+            // Not a label: a computed guest pc (Mini's SWITCH, decoded
+            // from the JMP it picks). Its compiled code if it has an
+            // enter word, else the interpreter at that pc.
+            crate::jitgen::enter_if_compiled(g, vd, target);
             dispatch(g, target);
         }
         JumpKind::Entry | JumpKind::Resume => {

@@ -72,6 +72,11 @@ extern const int32_t loimi_jit_nvariants;
 
 #define HOT_SLOTS 4096
 void **loimi_jit_entries;
+/* Per entry index: the real word of the instruction while its word is
+ * that enter word, else the enter word itself. Read inline by
+ * `Vm.real_word` (`codegen`: `loimi_jit_real_word`), so that handlers
+ * can read other instructions' words (Mini's SWITCH reads its JMPs). */
+uint32_t *loimi_jit_words;
 uint16_t loimi_jit_hotcount[HOT_SLOTS];
 
 enum { K_SYM, K_WORD, K_FIELD, K_NEXT, K_JUMP, K_TLS, K_RODATA, K_HELPER, K_SELF, K_CONST };
@@ -131,9 +136,7 @@ static uint16_t threshold = 50;
 static struct rec *recs;
 static size_t nrecs;
 static size_t nentries, capentries;
-/* Per entry index: the code word it was made for (see loimi_jit_word).
- * Entry indices are never reused. */
-static uint32_t **entry_at;
+/* Entry indices are never reused. */
 static ptrdiff_t wdelta;
 #define WR(p) ((p) + wdelta)
 static uint8_t *region, *region_end, *bump, *rodata, *helpers, *exit_code;
@@ -583,14 +586,23 @@ static void map_line(uint8_t *a, uint32_t len, uint32_t s, const uint32_t *pc) {
     if (loimi_prof_jit) loimi_prof_jit(a, a + len, nm, v, pc);
 }
 
-static uint32_t new_entry(void *native, uint32_t *at) {
+static uint32_t enter_word(uint32_t e) { return loimi_jit_enter_op | e << loimi_jit_op_bits; }
+
+/* Instruction i's word goes back from its enter word to its real word. */
+static void unenter(struct rec *r, uint64_t i) {
+    r->code[i] = r->w[i];
+    r->fl[i] &= ~F_ENTRY;
+    loimi_jit_words[r->ent[i]] = enter_word((uint32_t)r->ent[i]);
+}
+
+static uint32_t new_entry(void *native) {
     if (nentries == capentries) {
         capentries = capentries ? capentries * 2 : 4096;
         loimi_jit_entries = realloc(loimi_jit_entries, capentries * sizeof(void *));
-        entry_at = realloc(entry_at, capentries * sizeof *entry_at);
+        loimi_jit_words = realloc(loimi_jit_words, capentries * sizeof *loimi_jit_words);
     }
     loimi_jit_entries[nentries] = native;
-    entry_at[nentries] = at;
+    loimi_jit_words[nentries] = enter_word((uint32_t)nentries);
     return (uint32_t)nentries++;
 }
 
@@ -620,18 +632,18 @@ static void sync_entries(struct rec *r) {
         int want = !(r->fl[pc] & (F_NOPATCH | F_INTERP)) && stencil_for(w) != loimi_jit_nops;
         if (want && r->ent[pc] < 0) {
             if (nentries >= (1ull << (32 - loimi_jit_op_bits))) want = 0;
-            else r->ent[pc] = (int32_t)new_entry(r->body[pc], r->code + pc);
+            else r->ent[pc] = (int32_t)new_entry(r->body[pc]);
         }
         if (want) {
             loimi_jit_entries[r->ent[pc]] = r->body[pc];
             if (!(r->fl[pc] & F_ENTRY)) {
                 r->w[pc] = w;
-                r->code[pc] = loimi_jit_enter_op | (uint32_t)r->ent[pc] << loimi_jit_op_bits;
+                loimi_jit_words[r->ent[pc]] = w;
+                r->code[pc] = enter_word((uint32_t)r->ent[pc]);
                 r->fl[pc] |= F_ENTRY;
             }
         } else if (r->fl[pc] & F_ENTRY) {
-            r->code[pc] = r->w[pc];
-            r->fl[pc] &= ~F_ENTRY;
+            unenter(r, pc);
         }
     }
 }
@@ -642,7 +654,7 @@ static void sync_entries(struct rec *r) {
 static void drop(struct rec *r) {
     if (debug) fprintf(stderr, "jit: invalidated %p\n", (void *)r->code);
     for (uint64_t i = 0; i < r->n; i++)
-        if (r->fl[i] & F_ENTRY) r->code[i] = r->w[i];
+        if (r->fl[i] & F_ENTRY) unenter(r, i);
     free_compiled(r);
     r->rewriting = 0;
     r->state = r->compiles >= MAX_COMPILES ? S_FAILED : S_NONE;
@@ -732,7 +744,7 @@ static int recompile(struct rec *r) {
     int32_t *oent = r->ent;
     trace_forget(r);
     for (uint64_t i = 0; i < n; i++)
-        if (ofl[i] & F_ENTRY) r->code[i] = r->w[i];
+        if (ofl[i] & F_ENTRY) unenter(r, i);
     r->home = NULL;
     r->fl = NULL;
     r->ent = NULL;
@@ -806,6 +818,7 @@ void loimi_jit_become(uint32_t *p, uint32_t opc) {
     trace_touch(r, i);
     r->w[i] = nw;
     if (!(r->fl[i] & F_ENTRY)) *p = nw;
+    else loimi_jit_words[r->ent[i]] = nw;
     int k = r->home[i] ? rewrite(r, i, 1) : 0;
     if (k == 2) {
         recompile(r);
@@ -829,24 +842,6 @@ void loimi_jit_become(uint32_t *p, uint32_t opc) {
     trace_install(r);
 }
 
-/* `Vm.real_word` (and so the generated host readers of code words:
- * disasm, op_name, label, verify, ...): the real word of enter word w,
- * from where its entry was made, if that word is still an enter word of
- * that entry (a copy of a code object's words maps too, while the
- * original is compiled); otherwise w. The record is looked up again
- * rather than kept, as records go when their code is freed. */
-uint32_t loimi_jit_word(uint32_t w) {
-    if ((w & OPMASK) != loimi_jit_enter_op) return w;
-    uint64_t e = w >> loimi_jit_op_bits;
-    if (e >= nentries) return w;
-    uint32_t *p = entry_at[e];
-    struct rec *r = nrecs ? lookup(p) : NULL;
-    if (!r || r->state != S_COMPILED || !r->ent) return w;
-    uint64_t i = (uint64_t)(p - r->code);
-    if (r->ent[i] != (int32_t)e || !(r->fl[i] & F_ENTRY)) return w;
-    return r->w[i];
-}
-
 /* `Vm.optimize` and `Vm.deopt` rewrite words of a code object between
  * these two calls: the enter words go back first, and afterwards the
  * instructions whose words changed are updated. */
@@ -855,10 +850,7 @@ void loimi_jit_invalidate(uint32_t *code) {
     if (!r || r->state != S_COMPILED) return;
     trace_forget(r);
     for (uint64_t i = 0; i < r->n; i++)
-        if (r->fl[i] & F_ENTRY) {
-            r->code[i] = r->w[i];
-            r->fl[i] &= ~F_ENTRY;
-        }
+        if (r->fl[i] & F_ENTRY) unenter(r, i);
     r->rewriting = 1;
 }
 

@@ -1035,9 +1035,14 @@ pub vm Mini {
             let t = f as i64;
             if (t as f64) == f { i = (t - (lo as i64)) as u64; }
         }
-        // To the JMP, not its target: the JIT (`--jit-stencils`) supports
-        // jumps to a computed instruction, not into its operands.
-        jump pc + 1 + i
+        // Straight to JMP i's target (one dispatch less). With the JIT
+        // (`--jit-stencils`) a compiled JMP's word is an enter word: then
+        // to the JMP, whose code jumps on directly (decoding the word
+        // through `Mini.real_word` would add a dependent load).
+        let j = pc + 1 + i;
+        let w = *j;
+        if Mini.opcode(w) == Mini.OP_JMP { jump j + Mini.sJ_sj(w) }
+        jump j
     }
 
     #[poll(gil, pause)] op JMP(target: label) : sJ { jump target }

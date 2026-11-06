@@ -1429,7 +1429,10 @@ pub fn generate(v: &VmDecl, l: &VmLayout, jit: bool, cached: bool) -> String {
     // compiled instruction's word is an enter word; see maps_words).
     let enter = if jw { enter_opcode(l.op_bits, l.ops.iter().map(|o| o.opcode)) } else { None };
     if let Some(e) = enter {
-        let _ = writeln!(s, "{vis}fn {n}__real_word(w: {w}) -> {w} {{ if (w & {mask}) == {e} {{ __extern_loimi_jit_word(w) }} else {{ w }} }}");
+        // The runtime's table of real words, by entry index: an inline
+        // load (codegen defines `loimi_jit_real_word`), so that handlers
+        // may read other instructions' words (Mini's SWITCH reads JMPs).
+        let _ = writeln!(s, "{vis}fn {n}__real_word(w: {w}) -> {w} {{ if (w & {mask}) == {e} {{ __extern_loimi_jit_real_word((w >> {b}) as u64) }} else {{ w }} }}", b = l.op_bits);
     } else {
         let _ = writeln!(s, "{vis}fn {n}__real_word(w: {w}) -> {w} {{ w }}");
     }
@@ -2668,7 +2671,7 @@ pub fn expand(sm: &mut SourceMap, modules: &mut [Module], jit: bool) -> Res<()> 
                     jit_externs = true;
                 }
                 if maps_words(&l, jit) && !word_extern {
-                    src.push_str("extern \"C\" fn __extern_loimi_jit_word(w: u32) -> u32;\n");
+                    src.push_str("extern \"C\" fn __extern_loimi_jit_real_word(e: u64) -> u32;\n");
                     word_extern = true;
                 }
                 src.push_str(&generate_verifier(sm, v, &l, jit)?);

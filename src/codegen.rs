@@ -411,6 +411,16 @@ impl<'p> Codegen<'p> {
                 continue;
             }
             if f.body.is_none() {
+                if f.linkage == Linkage::Extern && f.symbol == "loimi_jit_real_word" {
+                    // `Vm.real_word` in a `--jit-stencils` build: the real
+                    // word of entry e from the runtime's table (jit_rt.c,
+                    // `loimi_jit_words`), inline rather than a C call.
+                    self.decls.insert("@loimi_jit_words = external global ptr");
+                    self.decls.insert(
+                        "define internal i32 @loimi_jit_real_word(i64 %e) alwaysinline nounwind {\n  %b = load ptr, ptr @loimi_jit_words\n  %p = getelementptr inbounds i32, ptr %b, i64 %e\n  %w = load i32, ptr %p\n  ret i32 %w\n}",
+                    );
+                    continue;
+                }
                 if f.linkage == Linkage::Extern {
                     let mut ps: Vec<String> = f.param_tys.iter().map(|t| format!("{} {}", llty(p, t), c_abi_attr(t)).trim_end().to_string()).collect();
                     if f.variadic {
