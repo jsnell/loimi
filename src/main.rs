@@ -1128,6 +1128,12 @@ fn compiler_main() -> ExitCode {
     for a in &llvm_args {
         cmd.arg("-mllvm").arg(a);
     }
+    // A profiling build's regions are `optnone` functions with every
+    // step's locals: stack coloring is quadratic in them (minutes, and
+    // gigabytes, for a few hundred regions).
+    if !opts.trace_regions.is_empty() {
+        cmd.arg("-mllvm").arg("-no-stack-coloring");
+    }
     // Libraries carry the instrumentation only: the host links the ASan
     // or TSan runtime (docs/language.md §10.1).
     let san = if opts.sanitize_address {

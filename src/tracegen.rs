@@ -1341,6 +1341,10 @@ struct FnGen<'t, 'a> {
     debug: bool,
     /// The guards, for the report.
     guard_info: Vec<String>,
+    /// Window slots the steps access at constant offsets.
+    used: BTreeSet<usize>,
+    /// Some access to the register file has an unknown offset.
+    dynamic: bool,
 }
 
 impl<'t, 'a> FnGen<'t, 'a> {
@@ -1374,10 +1378,28 @@ impl<'t, 'a> FnGen<'t, 'a> {
     /// Copies the window between `from` and `to` (`%lregs`, `%snap`,
     /// `%tr.regs`).
     fn copy_window(&mut self, from: &str, to: &str) {
-        // one memcpy: SROA splits it into the promoted slots' loads and
-        // stores (and the IR stays small: regions have many exits)
         if self.nr > 0 {
-            self.e.line(format!("  call void @llvm.memcpy.p0.p0.i64(ptr align 8 {}, ptr align 8 {}, i64 {}, i1 false)", to, from, 8 * self.nr));
+            // expanded by `expand_copy` once the whole function is known
+            self.e.line(format!("@@COPY {} {}", from, to));
+        }
+    }
+
+    /// A window copy: one memcpy in regions (many exits) and where an
+    /// access with an unknown offset keeps the window in memory;
+    /// otherwise the slots steps name, one by one, which SROA promotes
+    /// each (a memcpy would leave the slots no step names as memory it
+    /// copies on every iteration).
+    fn expand_copy(&mut self, from: &str, to: &str, out: &mut Vec<String>) {
+        if self.kind == Kind::Region || self.dynamic {
+            out.push(format!("  call void @llvm.memcpy.p0.p0.i64(ptr align 8 {}, ptr align 8 {}, i64 {}, i1 false)", to, from, 8 * self.nr));
+            return;
+        }
+        for j in self.used.clone() {
+            let (a, v, b) = (self.e.fresh("wa"), self.e.fresh("wv"), self.e.fresh("wb"));
+            out.push(format!("  {} = getelementptr inbounds i64, ptr {}, i64 {}", a, from, j));
+            out.push(format!("  {} = load i64, ptr {}", v, a));
+            out.push(format!("  {} = getelementptr inbounds i64, ptr {}, i64 {}", b, to, j));
+            out.push(format!("  store i64 {}, ptr {}", v, b));
         }
     }
     fn writeback(&mut self) {
@@ -1525,11 +1547,13 @@ impl<'t, 'a> FnGen<'t, 'a> {
         if c.callee == "loimi_trace_check" {
             return CallK::Pure;
         }
-        if redo_exempt(c.callee) {
-            return CallK::Exempt;
-        }
+        // read-only first: a write barrier's test (`std.gc.needs_barrier`)
+        // only reads, and needs no writeback unless given the registers
         if self.t.m.readonly(c.callee) {
             return CallK::ReadOnly;
+        }
+        if redo_exempt(c.callee) {
+            return CallK::Exempt;
         }
         CallK::Unsafe
     }
@@ -1791,6 +1815,7 @@ impl<'t, 'a> FnGen<'t, 'a> {
                         }
                         Val::Regs(Some(_), false) => {}
                         Val::Regs(..) if window => {
+                            self.dynamic = true;
                             // unknown offset: the window if it is in it
                             let (x, y, dd, q, g, sel) = (self.e.fresh("ri"), self.e.fresh("rl"), self.e.fresh("rd"), self.e.fresh("rin"), self.e.fresh("rg"), self.e.fresh("rp"));
                             self.e.line(format!("  {} = ptrtoint ptr {} to i64", x, ptr));
@@ -1812,7 +1837,14 @@ impl<'t, 'a> FnGen<'t, 'a> {
                 }
                 if let Some(c) = parse_call(rhs) {
                     let k = self.classify_call(st, &c);
-                    let reaches = c.args.iter().any(|a| a.0.starts_with("ptr") && (st.statevars.contains(a.1) || matches!(val_of(&st.vals, a.1), Val::Regs(..) | Val::Frame | Val::Top | Val::Bot)));
+                    if self.debug {
+                        self.e.line(format!("  ; call {:?} window={} on={}", k, window, on[b]));
+                    }
+                    // a pointer into the register file, a state register
+                    // through which the frames are reached, or a local
+                    // holding one (heap objects do not reach the running
+                    // frame's registers: an assumption, section 11.3)
+                    let reaches = c.args.iter().any(|a| a.0.starts_with("ptr") && (st.statevars.contains(a.1) || matches!(val_of(&st.vals, a.1), Val::Regs(..) | Val::Frame)));
                     match k {
                         CallK::Pure => self.e.line(l.clone()),
                         CallK::ReadOnly | CallK::Exempt => {
@@ -1948,6 +1980,9 @@ pub struct Options {
     /// Loops whose region or trace would be larger (lines of IR) get
     /// none (LOIMI_TRACE_MAXLINES; LLVM's time and memory grow with it).
     pub max_lines: usize,
+    /// All regions or traces of a build together (LOIMI_TRACE_MAXTOTAL):
+    /// loops past it get none.
+    pub max_total: usize,
 }
 
 impl Options {
@@ -1963,6 +1998,7 @@ impl Options {
             only: var("LOIMI_TRACE_ONLY").map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect()).unwrap_or_default(),
             verbose: var("LOIMI_TRACE_REPORT").is_some_and(|v| v == "2"),
             max_lines: var("LOIMI_TRACE_MAXLINES").and_then(|v| v.parse().ok()).unwrap_or(150_000),
+            max_total: var("LOIMI_TRACE_MAXTOTAL").and_then(|v| v.parse().ok()).unwrap_or(3_000_000),
             skip: var("LOIMI_TRACE_SKIP").map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect()).unwrap_or_default(),
         }
     }
@@ -2031,12 +2067,16 @@ impl<'t, 'a> FnGen<'t, 'a> {
             flushed: false,
             debug: std::env::var_os("LOIMI_TRACE_DEBUG").is_some(),
             guard_info: Vec::new(),
+            used: BTreeSet::new(),
+            dynamic: false,
         }
     }
 
     /// The window: every register slot a step accesses at a constant
-    /// offset (as an 8-byte value), up to the largest.
-    fn window_size(&self) -> usize {
+    /// offset (as an 8-byte value), up to the largest; which slots those
+    /// are; and whether some access has an unknown offset (then the
+    /// window lives in memory, and copies of it are whole).
+    fn window_size(&mut self) -> usize {
         if self.t.regs_idx.is_none() {
             return 0;
         }
@@ -2048,10 +2088,14 @@ impl<'t, 'a> FnGen<'t, 'a> {
                     let (_, rhs) = def_of(l);
                     let a = parse_load(rhs).or_else(|| parse_store(rhs).map(|(t, _, p)| (t, p)));
                     if let Some((ty, p)) = a {
-                        if let Val::Regs(Some(o), false) = val_of(&st.vals, p) {
-                            if o >= 0 && o % 8 == 0 && ty_size(ty) == Some(8) && ((o / 8) as usize) < MAX_WINDOW {
-                                nr = nr.max(o as usize / 8 + 1);
+                        match val_of(&st.vals, p) {
+                            Val::Regs(Some(o), false) => {
+                                if o >= 0 && o % 8 == 0 && ty_size(ty) == Some(8) && ((o / 8) as usize) < MAX_WINDOW {
+                                    nr = nr.max(o as usize / 8 + 1);
+                                    self.used.insert(o as usize / 8);
+                                }
                             }
+                            _ => {}
                         }
                     }
                 }
@@ -2152,12 +2196,23 @@ impl<'t, 'a> FnGen<'t, 'a> {
         }
         let g = self.st_gep(ST_GEN);
         self.e.line(format!("  %tr.gen0 = load i64, ptr {}", g));
-        for l in std::mem::take(&mut self.e.out) {
-            f.push_str(&l);
-            f.push('\n');
+        let entry = std::mem::take(&mut self.e.out);
+        let side = std::mem::take(&mut self.side);
+        let mut all: Vec<String> = Vec::new();
+        for (i, part) in [entry, vec![format!("  br label %s{}.head", first)], res, side].into_iter().enumerate() {
+            let _ = i;
+            for l in part {
+                match l.strip_prefix("@@COPY ") {
+                    Some(r) => {
+                        let (a, b) = r.split_once(' ').unwrap();
+                        let (a, b) = (a.to_string(), b.to_string());
+                        self.expand_copy(&a, &b, &mut all);
+                    }
+                    None => all.push(l),
+                }
+            }
         }
-        let _ = writeln!(f, "  br label %s{}.head", first);
-        for l in res.iter().chain(self.side.iter()) {
+        for l in &all {
             f.push_str(l);
             f.push('\n');
         }
@@ -2178,6 +2233,7 @@ struct GenFn {
     nguards: usize,
     neffect: usize,
     guard_info: Vec<String>,
+    lines: usize,
 }
 
 /// The function `kind` for loop h of `code`, over `order`.
@@ -2195,7 +2251,7 @@ fn generate_fn(m: &Module, vm: &VmInfo, code: &Code, h: usize, order: &[usize], 
     if lines > opts.max_lines {
         return Err(format!("{} lines of IR (more than LOIMI_TRACE_MAXLINES={})", lines, opts.max_lines));
     }
-    let r = GenFn { ir, blockmap: std::mem::take(&mut g.blockmap), edges: std::mem::take(&mut g.edges), kchk: BTreeSet::new(), nr: g.nr, nguards: g.nguards, neffect: g.neffect, guard_info: std::mem::take(&mut g.guard_info) };
+    let r = GenFn { ir, blockmap: std::mem::take(&mut g.blockmap), edges: std::mem::take(&mut g.edges), kchk: BTreeSet::new(), nr: g.nr, nguards: g.nguards, neffect: g.neffect, guard_info: std::mem::take(&mut g.guard_info), lines };
     drop(g);
     Ok(GenFn { kchk: std::mem::take(&mut t.kchk), ..r })
 }
@@ -2210,6 +2266,7 @@ fn region_order(code: &Code, lp: &BTreeMap<usize, usize>, h: usize, skip: &[usiz
 
 /// The generated functions, their globals and table entries.
 struct Out {
+    lines: usize,
     defs: String,
     entries: Vec<String>,
     globals: Vec<String>,
@@ -2347,7 +2404,7 @@ pub fn regions(ir: &str, stencils: &str, vm: &VmInfo, codes: &[Code], opts: &Opt
     let m = Module::new(ir, stencils);
     check_sig(&m, vm)?;
     let sh = stencil_hash(stencils);
-    let mut out = Out { defs: String::new(), entries: Vec::new(), globals: Vec::new() };
+    let mut out = Out { lines: 0, defs: String::new(), entries: Vec::new(), globals: Vec::new() };
     let mut report = String::new();
     for code in codes {
         let lp = loops(&m, code);
@@ -2359,8 +2416,12 @@ pub fn regions(ir: &str, stencils: &str, vm: &VmInfo, codes: &[Code], opts: &Opt
             let name = format!("r{}", out.entries.len());
             let index = out.entries.len();
             match generate_fn(&m, vm, code, h, &order, Kind::Region, &name, index, HashMap::new(), None, opts) {
+                Ok(g) if out.lines + g.lines > opts.max_total => {
+                    let _ = writeln!(report, "no region for code {:016x} loop {}: the regions so far have {} lines of IR (LOIMI_TRACE_MAXTOTAL={})", code.hash, h, out.lines, opts.max_total);
+                }
                 Ok(g) => {
                     let fp = region_fingerprint(sh, code, h);
+                    out.lines += g.lines;
                     out.defs.push_str(&g.ir);
                     add_entry(&mut out, &m, code, h, &order, &name, g.blockmap.len(), &g.kchk, Some(&code.text), fp, opts.fail_limit);
                     let _ = writeln!(report, "region {}: code {:016x} ({} words), loop {}..{}, {} instructions, window {}", name, code.hash, code.n, h, lp[&h], order.len(), g.nr);
@@ -2380,7 +2441,7 @@ pub fn traces(ir: &str, stencils: &str, vm: &VmInfo, profs: &[ProfRegion], opts:
     let m = Module::new(ir, stencils);
     check_sig(&m, vm)?;
     let sh = stencil_hash(stencils);
-    let mut out = Out { defs: String::new(), entries: Vec::new(), globals: Vec::new() };
+    let mut out = Out { lines: 0, defs: String::new(), entries: Vec::new(), globals: Vec::new() };
     let mut report = String::new();
     for pr in profs {
         let code = &pr.code;
@@ -2457,7 +2518,11 @@ pub fn traces(ir: &str, stencils: &str, vm: &VmInfo, profs: &[ProfRegion], opts:
         let name = format!("t{}", out.entries.len());
         let index = out.entries.len();
         match generate_fn(&m, vm, code, h, &path, Kind::Trace, &name, index, succ, Some(prof), opts) {
+            Ok(g) if out.lines + g.lines > opts.max_total => {
+                let _ = writeln!(report, "no trace for code {:016x} loop {}: the traces so far have {} lines of IR (LOIMI_TRACE_MAXTOTAL={})", code.hash, h, out.lines, opts.max_total);
+            }
             Ok(g) => {
+                out.lines += g.lines;
                 out.defs.push_str(&g.ir);
                 add_entry(&mut out, &m, code, h, &path, &name, 0, &g.kchk, None, pr.fingerprint, opts.fail_limit);
                 let ops: Vec<String> = path.iter().map(|&pc| format!("{}:{}", pc, code.op[pc].as_deref().unwrap_or("?"))).collect();

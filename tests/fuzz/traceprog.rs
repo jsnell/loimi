@@ -35,6 +35,8 @@ struct Gen {
     out: String,
     depth: usize,
     nfun: usize,
+    /// In a function body: leaves are its parameters, not the locals.
+    in_fn: bool,
 }
 
 const VARS: [&str; 4] = ["a", "b", "c", "d"];
@@ -57,6 +59,7 @@ impl Gen {
                 1 => format!("{}", self.r.below(9) + 1),
                 2 => format!("{}.5", self.r.below(4)),
                 3 => self.r.pick(&["N", "M", "F"]).to_string(),
+                _ if self.in_fn => self.r.pick(&["x", "y"]).to_string(),
                 _ => self.r.pick(&VARS).to_string(),
             };
         }
@@ -74,7 +77,8 @@ impl Gen {
 
     /// Keeps a local small and finite.
     fn clamp(&mut self, v: &str) {
-        self.line(&format!("if {v} > 100000 or {v} < -100000 or {v} ~= {v} then {v} = {} end", self.r.below(7)));
+        let k = self.r.below(7);
+        self.line(&format!("if {v} > 100000 or {v} < -100000 or {v} ~= {v} then {v} = {} end", k));
     }
 
     fn stmt(&mut self, lv: &str, budget: &mut u32) {
@@ -121,14 +125,16 @@ impl Gen {
             }
             10 if self.nfun > 0 => {
                 let f = self.r.below(self.nfun as u64);
-                self.line(&format!("{} = {} + f{}({}, {})", v, v, f, lv, self.r.pick(&VARS)));
+                let w = self.r.pick(&VARS);
+                self.line(&format!("{} = {} + f{}({}, {})", v, v, f, lv, w));
                 self.clamp(v);
             }
             _ => {
                 // a closure over the loop variable, called at once
                 let e = self.expr("x", 2);
                 self.line(&format!("local g = function(x) return {} + {} end", e, lv));
-                self.line(&format!("{} = g({})", v, self.r.pick(&VARS)));
+                let w = self.r.pick(&VARS);
+                self.line(&format!("{} = g({})", v, w));
                 self.clamp(v);
             }
         }
@@ -137,8 +143,10 @@ impl Gen {
     fn func(&mut self, i: usize) {
         self.line(&format!("local function f{}(x, y)", i));
         self.depth += 1;
+        self.in_fn = true;
         let e = self.expr("x", 2);
-        self.line(&format!("local r = {}", e.replace('a', "y").replace('b', "y").replace('c', "x").replace('d', "x")));
+        self.in_fn = false;
+        self.line(&format!("local r = {}", e));
         self.line("if r ~= r or r > 100000 or r < -100000 then r = 1 end");
         self.line("return r");
         self.depth -= 1;
@@ -187,7 +195,7 @@ impl Gen {
 /// The program of `seed` with the inputs `(n, m, f)` (strings: an int,
 /// an int and a number).
 pub fn generate(seed: u64, input: (&str, &str, &str)) -> String {
-    let mut g = Gen { r: Rng::new(seed), out: String::new(), depth: 0, nfun: 0 };
+    let mut g = Gen { r: Rng::new(seed), out: String::new(), depth: 0, nfun: 0, in_fn: false };
     g.line(&format!("-- trace fuzz program, seed {}", seed));
     g.line(&format!("local N = tonumber(\"{}\")", input.0));
     g.line(&format!("local M = tonumber(\"{}\")", input.1));

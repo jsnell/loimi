@@ -363,7 +363,8 @@ fn mini_traces() {
         v.sort();
         inputs.extend(v);
     }
-    let bt = build_traces("mini", &root.join("examples/mini/main.lm"), &inputs, &[("LOIMI_JIT_HOT", "2")]);
+    // recorded and profiled at the default hot threshold: code that got hot
+    let bt = build_traces("mini", &root.join("examples/mini/main.lm"), &inputs, &[]);
     let env = [("LOIMI_JIT", "1"), ("LOIMI_JIT_HOT", "2")];
     let mut failures = Vec::new();
     // traces of every loop of the tests, and the benchmarks' outputs

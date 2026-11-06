@@ -1,5 +1,12 @@
 # Design note: a trace tier stitched from stencils (experiment, 2026-11-06)
 
+**Status: M1 built** (§11): `loimi build --jit-stencils
+--trace-regions=REC` and `--traces=PROF` make ahead-of-time traces from a
+profile, with the generator in the compiler (`src/tracegen.rs`). §1–§10
+describe the experiment as it was run; its hooks were replaced
+(`LOIMI_TRACE_DUMP` is `LOIMI_TRACE_RECORD`, `LOIMI_TRACE_IR` is
+`--traces`, `loimi_trace_blacklist` is `loimi_trace_failing`).
+
 **Question.** Is there a "moral equivalent of a tracing JIT" for
 Loimi's interpreters? That means compiling the common path through a
 hot loop as one unit, with automatic fallback to the interpreter when a
@@ -606,3 +613,174 @@ LOIMI_JIT=1 $S/mini-mandtr bench/mini/programs/mandelbrot.lua
 
 nbody: `--code 0 --header 23`; sieve: `--header 32` and `--header 23`,
 merged; fannkuch: `--header 40`.
+
+## 11. M1 as built: ahead-of-time traces from a profile
+
+M1 turned the experiment into a compiler mode. The generator is
+`src/tracegen.rs`, in Rust and in the compiler; the hooks in
+`src/jit_rt.c` became a supported runtime; `tools/trace-exp/` stays as
+the experiment's record.
+
+### 11.1 Workflow
+
+Any vm that builds with `--jit-stencils` (one tail-call vm, x86-64
+Linux) can use it. Three steps, each a plain build or run:
+
+```sh
+# 1. record: any JIT build, run on the workload
+loimi build vm.lm --release --jit-stencils -o vm-jit
+LOIMI_JIT=1 LOIMI_TRACE_RECORD=prog.rec ./vm-jit prog
+# 2. profile: every loop of the recording as a counted region
+loimi build vm.lm --release --jit-stencils --trace-regions=prog.rec -o vm-prof
+LOIMI_JIT=1 LOIMI_TRACE_PROFILE=prog.prof ./vm-prof prog
+# 3. traces of the loops that ran often enough
+loimi build vm.lm --release --jit-stencils --traces=prog.prof -o vm-fast
+LOIMI_JIT=1 ./vm-fast prog
+```
+
+- **The recording** (`LOIMI_TRACE_RECORD`) lists each compiled code
+  object: its real words, the op of each instruction, and the constants
+  its stencils patch in. It is written at each compile and again at
+  exit, so quickening that retargeted instead of recompiling is in it
+  (the last entry per code object wins).
+- **The profile** (`LOIMI_TRACE_PROFILE`) is self-contained: per region
+  that ran, its fingerprint, the code's recording and the block counts.
+  It names the build it came from (a hash of the stencils); a profile
+  of another build of the vm or compiler is an error.
+- Several recordings or profiles can be given (`--traces=a,b`), or
+  concatenated: a region profiled by several runs sums its counts.
+- Runtime switches: `LOIMI_TRACE=0` installs nothing (the A/B switch in
+  one binary); `LOIMI_TRACE_FAILS=n` sets how many guard failures pass
+  between blacklist checks; `LOIMI_JIT_STATS=1` adds a line per trace
+  (iterations, guard failures, invalidations).
+- Build-time knobs (environment): `LOIMI_TRACE_REPORT=1` lists the
+  regions and traces made and why loops got none (`=2` also lists the
+  guards); `LOIMI_TRACE_MIN=n` (default 1000) is the number of times the
+  hot path must have closed; `LOIMI_TRACE_MAXLINES=n` (default 150,000)
+  skips loops whose function would be larger; `LOIMI_TRACE_MINFRAC=x`
+  (default 0) takes blocks run in under that fraction of their
+  instruction's runs off the trace (testing: guards that fail);
+  `LOIMI_TRACE_CHECK=1` checks every access the generator could not
+  place (below); `LOIMI_TRACE_ONLY` / `LOIMI_TRACE_SKIP` restrict
+  regions to some loops or leave instructions out (bisection);
+  `LOIMI_TRACE_DEBUG=1` annotates accesses in the IR.
+
+**Why three steps.** Branch directions inside handlers are only known
+by running the handlers' blocks, and the stencils are machine code
+without counters. The middle build compiles each loop as a region whose
+every block counts, which is the experiment's method, made automatic.
+A one-build alternative (counters in the stencils, with a hole for a
+per-instruction counter base) would also need counters in the
+interpreter's outlined cold blocks, which the stencils call; it is left
+for M3, where a recording variant of the handlers replaces both.
+
+**Why Rust.** The generator works on the compiler's own unoptimized
+handler IR, which the compiler already has in memory (the program's IR
+and the stencils), in a format it controls. In the compiler it needs no
+files, no Python, and no `--keep-ll`; it knows the vm's state layout
+(which arguments are `pc`, the register file, the constant pool, the
+accumulators) and the encodings of immediate constants from the vm
+declaration instead of Mini's NaN-box ranges. It parses IR lines with a
+small hand-written parser (no regex crate), about 2,400 lines.
+
+### 11.2 Loop selection
+
+Loops are found in the code, not from the JIT's hot counter (which named
+the wrong loop for nbody, sieve and fannkuch in the experiment): every
+target of a backward continuation of a stencil (`next` or a label jump
+with `target <= pc`) is a header, its loop runs to its last back edge.
+A region is that range without the ranges of inner loops, whose headers
+are exits (they have regions of their own). The trace is the hottest
+path from the header by the region's edge counts; a loop gets a trace if
+that path closes at the header at least `LOIMI_TRACE_MIN` times. A path
+that leaves the loop first (an outer loop whose hot path goes into an
+inner one) gets none: linking to inner traces is M2.
+
+### 11.3 The register window
+
+The experiment replaced `regs` with a local array everywhere. That was
+wrong in ways its four loops did not show: a handler that compares
+`regs + a` with a pointer from memory (Mini's `CLOSE`) compared an
+address on the stack; after a native, `regs = fp.base` switched the
+code to memory with the window still dirty; dynamic offsets
+(`SETLIST`, call arguments) indexed past the array; and handlers pass
+the address of their `regs` variable to vm functions (`for_count`).
+M1 keeps `regs` the real register file and treats the window as a cache
+of `regs[0..NR)`:
+
+- A per-step analysis computes constants (fields, words, pool
+  constants) and register-file offsets over the handler's locals,
+  flow-sensitively (locals passed by reference to a call are reset by
+  it; a local that ever holds `regs` holds a register-file pointer
+  whatever is stored in it). A load or store at a constant offset in
+  the window uses the window slot; other constant offsets use memory;
+  unknown offsets choose at run time. `NR` is the largest constant slot
+  any step accesses, plus one.
+- Each block is in *window mode* (the window is the truth) or *real
+  mode*. A call that may write memory (not a pure intrinsic, a
+  read-only function, or one of the runtime's collector, lock or
+  `become`) is preceded by a writeback and starts real mode: memory is
+  the truth until the step's end, where the trace continues only if
+  `regs` is still its register file and then reloads the window. A
+  window-mode edge into a real-mode block writes back on the edge.
+  Read-only calls given a pointer that reaches the register file (one
+  into it, or to `ctx`, a frame, or a local holding one of those) are
+  preceded by a writeback. So the collector, natives and nested runs see
+  the interpreter's state, and a stack that moves during a call (Mini's
+  coroutine stacks grow) is never written back to.
+- Assumption: within a step, the stitched code reaches the window's
+  slots only through `regs`; other paths to the register file go through
+  calls. `LOIMI_TRACE_CHECK=1` checks every access through a pointer the
+  analysis cannot place (`loimi_trace_check` aborts if it is in the
+  window); the Mini suite passes with it (§11.6).
+- Writebacks and reloads are one `memcpy` each, which SROA splits into
+  the promoted slots' stores and loads (the regions' IR shrank fivefold).
+
+### 11.4 Guards, exits and invalidation
+
+- **Guards** follow the `redo_effect` rules (`lowering.md` §10,
+  `redocheck.rs`): a branch from an on-trace block to an off-trace one
+  is a guard if nothing on an on-trace path from the step's start has an
+  effect a re-execution would repeat: a store outside the step's locals,
+  the window and its own instruction (cache words, `become`), an atomic,
+  or a call that may store, with the collector, the lock and `become`
+  exempt as in `redocheck.rs` (allocation is a collector call). Window
+  stores are undone by the guard, which writes back the window as it
+  was at the step's start (a snapshot SROA keeps in registers). After an
+  effect, the untaken code stays and all its continuations exit with
+  the effect done.
+- A guard runs the instruction again in the interpreter through the
+  dispatch table at the **real word's** op, not the word in memory: at
+  the loop header that is the enter word, which leads back into the
+  trace (the first version looped there until the blacklist ended it).
+- **Blacklisting** is by rate: every `LOIMI_TRACE_FAILS` (1024) guard
+  failures the trace calls the runtime, which drops it for good if more
+  than one iteration in 8 failed (iterations are counted in a register
+  and added up at exits). Loop exits are not guards: blocks that ran in
+  the profile stay on the trace and leave by exits.
+- **Installation** needs the code's length, a hash of the instruction
+  words in the trace's range, and each baked-in pool constant to match
+  (pool constants that are heap pointers are loaded, not baked; a
+  constant is an immediate if its bits match an encoding of the
+  constant pool's value type with no pointer payload). A trace is
+  installed after each compile, after rewrites that kept the compiled
+  code (`become` by retargeting, `Vm.optimize`), and per code object, so
+  two code objects with the same words each get it.
+- **Uninstalling**: a word change in a trace's range (`become`,
+  `Vm.optimize`/`deopt` through `loimi_jit_invalidate`) uninstalls it
+  first, then the rewrite proceeds on the restored header; a recompile
+  or drop uninstalls it (the old code's header is restored too, for
+  copies still running). Each uninstall bumps the trace's `gen`; a trace
+  that made a call that may rewrite code checks `gen` before going on
+  to the next step and exits if it changed.
+- **Debugger and polls**: polls are in the handlers and come along
+  (`poll gc` collects with a writeback; `poll gil` hands over the lock
+  after one). `--cfg debug` builds cannot use `--jit-stencils` (`on
+  break` is not supported there), so traces are off under the debugger.
+- **Code not in the profile** (other programs, code loaded later, a
+  changed script) matches no trace and runs on the stencils.
+- **State**: the vm's handler arguments come from its declaration, so
+  the accumulator of `docs/language.md` §7.4 (`vacc`, Mini) is carried
+  through the trace in SSA like the context and frame registers, live
+  into every step and out at every exit; accumulator variants
+  (`ADD_F__RAR`, `JGTKN__A`) stitch like any op.
