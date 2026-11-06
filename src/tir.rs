@@ -553,6 +553,12 @@ pub struct ValueDef {
     /// nanbox: the lowest tagged encoding; words below it are the unboxed
     /// f64 variant.
     pub num_limit: u64,
+    /// `repr nanbox(int_high)`: the word is the other layouts' word `c`
+    /// rotated, `rotl(c, 16) ^ k`, where `k` is the 16-bit tag of the
+    /// integer variant's 48-bit block. That variant's words are then
+    /// `payload << 16` (zero low bits), every other variant's low 16 bits
+    /// are nonzero, and the unboxed f64 is decoded with `xor; ror`.
+    pub int_high: Option<u64>,
     /// The layout the compiler chose, for `--explain-values`: "classic",
     /// "eight" (nanbox: classic plus the 47-bit block), "packed",
     /// "shared" (nanbox: packed, with some `Gc` variants sharing blocks),

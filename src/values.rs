@@ -83,6 +83,18 @@ pub fn check_value_decl(c: &mut Checker, m: usize, v: &ValueDecl) -> Res<ValueDe
         "boxed" => ValueRepr::Boxed,
         r => return Err(Diag::new(v.repr.span, format!("unknown representation `{}` (nanbox, lowtag or boxed)", r))),
     };
+    let mut want_int_high = None;
+    for o in &v.repr_opts {
+        match o.name.as_str() {
+            "int_high" if repr == ValueRepr::NanBox => want_int_high = Some(o.span),
+            n => {
+                return Err(Diag::new(
+                    o.span,
+                    format!("unknown option `{}` for `repr {}` (`nanbox` takes `int_high`; `lowtag` and `boxed` take none)", n, v.repr.name),
+                ))
+            }
+        }
+    }
     let mut variants: Vec<ValueVariantDef> = Vec::new();
     let mut have_unboxed = false;
     // (variant index, payload bits) of the variants that need a tag.
@@ -349,23 +361,42 @@ pub fn check_value_decl(c: &mut Checker, m: usize, v: &ValueDecl) -> Res<ValueDe
             c.warnings.push(w);
         }
     }
+    // `nanbox(int_high)`: the first integer variant with a whole 48-bit
+    // block gets the zero low tag (`k` is its block's 16-bit tag).
+    let mut int_high = None;
+    if let Some(sp) = want_int_high {
+        let Some(iv) = variants.iter().find(|x| matches!(x.payload, Some(Ty::Int(_))) && x.sub.is_none() && x.shift == NAN_PTR_BITS) else {
+            return Err(Diag::new(
+                sp,
+                format!(
+                    "`int_high` puts an integer variant's payload in the high 48 bits, but `{}` has no integer variant with a 48-bit block (declare one such as `Int(i48)`, or pin `block 48`)",
+                    v.name.name
+                ),
+            ));
+        };
+        int_high = Some(iv.tag);
+    }
     // `#[scan_raw_words]`: a root scanner may read memory that mixes
     // values with raw pointers and small integers as values. Only a
     // nanbox whose unboxed (float) variant takes every word below 2^48
-    // guarantees that.
+    // guarantees that (not `int_high`: there the low 16 bits of a word
+    // pick the variant, so a raw pointer can read as a `Gc` one).
     if let Some(sp) = v.scan_raw {
-        let ok = repr == ValueRepr::NanBox && variants.iter().any(|x| x.unboxed && x.payload.as_ref().is_none_or(|t| !matches!(t, Ty::Gc(_)))) && num_limit >= 1u64 << 48;
+        let ok = repr == ValueRepr::NanBox
+            && int_high.is_none()
+            && variants.iter().any(|x| x.unboxed && x.payload.as_ref().is_none_or(|t| !matches!(t, Ty::Gc(_))))
+            && num_limit >= 1u64 << 48;
         if !ok {
             return Err(Diag::new(
                 sp,
                 format!(
-                    "`#[scan_raw_words]`: `{}` does not read every word below 2^48 as a variant without references (that needs `repr nanbox` with an unboxed float variant)",
+                    "`#[scan_raw_words]`: `{}` does not read every word below 2^48 as a variant without references (that needs `repr nanbox` with an unboxed float variant, and not `int_high`)",
                     v.name.name
                 ),
             ));
         }
     }
-    Ok(ValueDef { name: format!("{}.{}", c.module_prefix(m), v.name.name), repr, variants, num_limit, layout })
+    Ok(ValueDef { name: format!("{}.{}", c.module_prefix(m), v.name.name), repr, variants, num_limit, int_high, layout })
 }
 
 /// A tagged variant's block width in bits: nanbox, the payload bits below
@@ -389,6 +420,25 @@ pub fn low_mask(bits: u32) -> u64 {
 /// `x << s`, for s up to 64.
 fn shl(x: u64, s: u32) -> u64 {
     if s >= 64 { 0 } else { x << s }
+}
+
+/// `nanbox(int_high)`: the word of the layout's word `c` (`rotl(c, 16) ^ k`).
+pub fn int_high_word(k: u64, c: u64) -> u64 {
+    c.rotate_left(16) ^ k
+}
+
+/// `nanbox(int_high)`: IR for the layout's word of `w` (`rotr(w ^ k, 16)`).
+fn int_high_decode(g: &mut FnGen, k: u64, w: &str) -> String {
+    g.cg.decls.insert("declare i64 @llvm.fshl.i64(i64, i64, i64)");
+    let x = g.inst(format!("xor i64 {}, {}", w, k));
+    g.inst(format!("call i64 @llvm.fshl.i64(i64 {}, i64 {}, i64 48)", x, x))
+}
+
+/// `nanbox(int_high)`: IR for the word of the layout's word `c`.
+fn int_high_encode(g: &mut FnGen, k: u64, c: &str) -> String {
+    g.cg.decls.insert("declare i64 @llvm.fshl.i64(i64, i64, i64)");
+    let r = g.inst(format!("call i64 @llvm.fshl.i64(i64 {}, i64 {}, i64 16)", c, c));
+    g.inst(format!("xor i64 {}, {}", r, k))
 }
 
 fn def<'a>(g: &FnGen<'_, 'a>, t: &Ty) -> &'a ValueDef {
@@ -498,11 +548,32 @@ pub fn make(g: &mut FnGen, t: &Ty, idx: u32, args: &[TExpr], vals: &[String]) ->
         ValueRepr::NanBox => {
             if var.unboxed {
                 let bits = g.inst(format!("bitcast double {} to i64", vals[0]));
-                if nan_safe(g, &args[0]) {
-                    return bits;
-                }
-                let nan = g.inst(format!("fcmp uno double {}, {}", vals[0], vals[0]));
-                return g.inst(format!("select i1 {}, i64 {}, i64 {}", nan, CANONICAL_NAN as i64, bits));
+                let bits = if nan_safe(g, &args[0]) {
+                    bits
+                } else {
+                    let nan = g.inst(format!("fcmp uno double {}, {}", vals[0], vals[0]));
+                    g.inst(format!("select i1 {}, i64 {}, i64 {}", nan, CANONICAL_NAN as i64, bits))
+                };
+                return match d.int_high {
+                    Some(k) => int_high_encode(g, k, &bits),
+                    None => bits,
+                };
+            }
+            if let Some(k) = d.int_high {
+                // The payload sits at bit 16 (above the low tag); a
+                // pointer's bits above 48 shift out.
+                let tag = int_high_word(k, shl(var.tag, var.shift) | var.sub.unwrap_or(0));
+                return match &var.payload {
+                    None => (tag as i64).to_string(),
+                    Some(pt) => {
+                        let b = match pt {
+                            Ty::Int(it) if it.signed && it.bits < 64 => g.inst(format!("zext i{} {} to i64", it.bits, vals[0])),
+                            _ => payload_bits(g, pt, &vals[0]),
+                        };
+                        let s = g.inst(format!("shl i64 {}, 16", b));
+                        if tag == 0 { s } else { g.inst(format!("or i64 {}, {}", s, tag as i64)) }
+                    }
+                };
             }
             let tag = ((shl(var.tag, var.shift) | var.sub.unwrap_or(0)) as i64).to_string();
             match &var.payload {
@@ -552,6 +623,18 @@ pub fn make(g: &mut FnGen, t: &Ty, idx: u32, args: &[TExpr], vals: &[String]) ->
 /// i1: does `v` (loaded value) hold variant `idx`?
 pub fn is_variant(g: &mut FnGen, d: &ValueDef, idx: u32, v: &str) -> String {
     let var = &d.variants[idx as usize];
+    if let Some(k) = d.int_high {
+        if var.unboxed {
+            let c = int_high_decode(g, k, v);
+            return g.inst(format!("icmp ult i64 {}, {}", c, d.num_limit as i64));
+        }
+        let (mask, tag) = mask_tag(d, var);
+        if mask == u64::MAX {
+            return g.inst(format!("icmp eq i64 {}, {}", v, tag as i64));
+        }
+        let m = g.inst(format!("and i64 {}, {}", v, mask as i64));
+        return g.inst(format!("icmp eq i64 {}, {}", m, tag as i64));
+    }
     match d.repr {
         ValueRepr::NanBox if var.unboxed => g.inst(format!("icmp ult i64 {}, {}", v, d.num_limit as i64)),
         ValueRepr::NanBox if var.sub.is_some() => {
@@ -581,6 +664,32 @@ pub fn payload(g: &mut FnGen, d: &ValueDef, idx: u32, v: &str) -> String {
     let var = &d.variants[idx as usize];
     let pt = var.payload.as_ref().unwrap();
     let raw = match d.repr {
+        ValueRepr::NanBox if d.int_high.is_some() => {
+            let k = d.int_high.unwrap();
+            if var.unboxed {
+                let c = int_high_decode(g, k, v);
+                return g.inst(format!("bitcast i64 {} to double", c));
+            }
+            // The payload is the bits above the low 16. For the integer
+            // variant with the zero low tag the shift is `exact`, so LLVM
+            // folds it into a later `<< 16` (checked arithmetic, re-tagging):
+            // `Int(x + y)` is `add; jo` on the words.
+            let zero_tag = mask_tag(d, var).1 == 0;
+            let signed = matches!(pt, Ty::Int(it) if it.signed);
+            let s = if zero_tag && signed {
+                g.inst(format!("ashr exact i64 {}, 16", v))
+            } else {
+                g.inst(format!("lshr {}i64 {}, 16", if zero_tag { "exact " } else { "" }, v))
+            };
+            if let Ty::Ptr(_) | Ty::Gc(_) = pt {
+                let p = g.inst(format!("inttoptr i64 {} to ptr", s));
+                return match var.sub {
+                    Some(l) if l != 0 => g.inst(format!("getelementptr i8, ptr {}, i64 {}", p, -(l as i64))),
+                    _ => p,
+                };
+            }
+            s
+        }
         ValueRepr::NanBox => {
             if var.unboxed {
                 return g.inst(format!("bitcast i64 {} to double", v));
@@ -685,7 +794,13 @@ pub fn try_merged_tuple(g: &mut FnGen, pats: &[TPat], tuple_ty: &Ty, ptr: &str, 
     for (d, idx, _, v) in &loaded {
         let var = &d.variants[*idx as usize];
         match d.repr {
-            ValueRepr::NanBox if var.unboxed => unboxed.push(v.clone()),
+            ValueRepr::NanBox if var.unboxed => match d.int_high {
+                Some(k) => {
+                    let c = int_high_decode(g, k, v);
+                    unboxed.push(c)
+                }
+                None => unboxed.push(v.clone()),
+            },
             ValueRepr::NanBox | ValueRepr::LowTag => {
                 let (mut m, tagbits) = mask_tag(d, var);
                 if let Some(sm) = shared_mask {
@@ -754,6 +869,10 @@ pub fn variant_const(d: &ValueDef, idx: u32, name: &str) -> Result<(i128, bool),
     }
     if var.unboxed {
         return match name {
+            "limit" if d.int_high.is_some() => Err(format!(
+                "`{}` is `nanbox(int_high)`: its unboxed variant `{}` is not the words below a limit (its words are those that no tagged variant's `mask` and `tag` match)",
+                short, var.name
+            )),
             "limit" => Ok((d.num_limit as i128, true)),
             _ => Err(format!(
                 "no constant `{}` for the unboxed variant `{}.{}`: it has `limit` (its words are those below it)",
@@ -776,6 +895,10 @@ pub fn zero_variant(d: &ValueDef) -> Option<usize> {
     if d.repr == ValueRepr::Boxed {
         return d.variants.iter().position(|v| v.tag == 0);
     }
+    if d.int_high.is_some() {
+        // The all-zero word is the integer 0.
+        return d.variants.iter().position(|v| !v.unboxed && mask_tag(d, v).1 == 0);
+    }
     if d.repr == ValueRepr::NanBox && d.variants.iter().any(|v| v.unboxed) {
         // Words below `num_limit` are the unboxed f64: 0 is 0.0.
         return d.variants.iter().position(|v| v.unboxed);
@@ -794,12 +917,19 @@ pub fn zero_variant(d: &ValueDef) -> Option<usize> {
 
 /// A tagged variant's (mask, tag): a word `w` holds it iff `w & mask == tag`.
 fn mask_tag(d: &ValueDef, v: &ValueVariantDef) -> (u64, u64) {
-    if let Some(l) = v.sub {
-        return (!low_mask(v.shift) | low_mask(NAN_SUB_BITS), shl(v.tag, v.shift) | l);
-    }
-    match d.repr {
-        ValueRepr::NanBox => (!low_mask(v.shift), shl(v.tag, v.shift)),
-        _ => (low_mask(v.shift), v.tag),
+    let (m, t) = if let Some(l) = v.sub {
+        (!low_mask(v.shift) | low_mask(NAN_SUB_BITS), shl(v.tag, v.shift) | l)
+    } else {
+        match d.repr {
+            ValueRepr::NanBox => (!low_mask(v.shift), shl(v.tag, v.shift)),
+            _ => (low_mask(v.shift), v.tag),
+        }
+    };
+    // int_high: the mask always covers the high 16 bits of the layout's
+    // word, which become the low 16, so `^ k` stays inside it.
+    match d.int_high {
+        Some(k) => (m.rotate_left(16), int_high_word(k, t)),
+        None => (m, t),
     }
 }
 
