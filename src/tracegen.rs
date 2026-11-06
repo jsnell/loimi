@@ -500,6 +500,7 @@ struct Module<'a> {
     ro: RefCell<HashMap<String, bool>>,
     /// The handlers' state register types (from a stencil's signature).
     sig: Vec<String>,
+    ret: String,
 }
 
 impl<'a> Module<'a> {
@@ -512,6 +513,7 @@ impl<'a> Module<'a> {
             types: HashSet::new(),
             ro: RefCell::new(HashMap::new()),
             sig: Vec::new(),
+            ret: "void".into(),
         };
         for (text, program) in [(ir, true), (stencils, false)] {
             let mut cur: Option<(&str, Vec<&str>)> = None;
@@ -528,6 +530,9 @@ impl<'a> Module<'a> {
                 if line.starts_with("define ") {
                     if let Some(n) = first_global(line) {
                         if !program && m.sig.is_empty() && n.starts_with("__jit.op.") {
+                            if let Some(r) = line.strip_prefix("define preserve_nonecc ").and_then(|r| r.split(" @").next()) {
+                                m.ret = r.to_string();
+                            }
                             if let (Some(a), Some(b)) = (line.find('('), line.find(')')) {
                                 m.sig = split_top(&line[a + 1..b], b',').iter().filter(|x| !x.ends_with("%insn")).map(|x| x[..x.len() - last_tok(x).len()].trim().to_string()).collect();
                             }
@@ -708,6 +713,8 @@ struct Trace<'a> {
     /// The handlers' state registers (the context, the state, the
     /// accumulators): their types, and which are pc and the register file.
     sig: Vec<String>,
+    /// The handlers' return type (`void`, or a vm's result).
+    ret: String,
     pc_idx: usize,
     regs_idx: Option<usize>,
     const_idx: Option<usize>,
@@ -795,6 +802,7 @@ impl<'a> Trace<'a> {
             at: BTreeMap::new(),
             kchk: BTreeSet::new(),
             sig: m.sig.clone(),
+            ret: m.ret.clone(),
             pc_idx: vm.pc_idx,
             regs_idx: vm.regs_idx,
             const_idx: vm.const_idx,
@@ -818,7 +826,7 @@ impl<'a> Trace<'a> {
         for &l in body {
             if skip_ret {
                 skip_ret = false;
-                if l.trim() == "ret void" {
+                if l.trim().starts_with("ret ") {
                     continue;
                 }
             }
@@ -911,7 +919,7 @@ impl<'a> Trace<'a> {
                     let tok = part.trim_end_matches(',').split([',', ' ']).next().unwrap_or("");
                     ss.push(*index.get(tok).ok_or_else(|| format!("{}: branch to unknown block {} in {}", name, tok, lab))?);
                 }
-            } else if !(t == "ret void" || t == "unreachable") {
+            } else if !(t.starts_with("ret ") || t == "unreachable") {
                 return Err(format!("{}: block {} ends in `{}`", name, lab, t));
             }
             succs.push(ss);
@@ -1366,12 +1374,10 @@ impl<'t, 'a> FnGen<'t, 'a> {
     /// Copies the window between `from` and `to` (`%lregs`, `%snap`,
     /// `%tr.regs`).
     fn copy_window(&mut self, from: &str, to: &str) {
-        for j in 0..self.nr {
-            let (a, v, b) = (self.e.fresh("wa"), self.e.fresh("wv"), self.e.fresh("wb"));
-            self.e.line(format!("  {} = getelementptr inbounds i64, ptr {}, i64 {}", a, from, j));
-            self.e.line(format!("  {} = load i64, ptr {}", v, a));
-            self.e.line(format!("  {} = getelementptr inbounds i64, ptr {}, i64 {}", b, to, j));
-            self.e.line(format!("  store i64 {}, ptr {}", v, b));
+        // one memcpy: SROA splits it into the promoted slots' loads and
+        // stores (and the IR stays small: regions have many exits)
+        if self.nr > 0 {
+            self.e.line(format!("  call void @llvm.memcpy.p0.p0.i64(ptr align 8 {}, ptr align 8 {}, i64 {}, i1 false)", to, from, 8 * self.nr));
         }
     }
     fn writeback(&mut self) {
@@ -1404,8 +1410,14 @@ impl<'t, 'a> FnGen<'t, 'a> {
         let n = self.t.sig.len();
         let mut a: Vec<String> = (0..n).map(|i| format!("{} {}", self.t.sig[i], args[i])).collect();
         a.push(format!("i32 {}", args[n]));
-        self.e.line(format!("  musttail call preserve_nonecc void {}({})", callee, a.join(", ")));
-        self.e.line("  ret void".into());
+        if self.t.ret == "void" {
+            self.e.line(format!("  musttail call preserve_nonecc void {}({})", callee, a.join(", ")));
+            self.e.line("  ret void".into());
+        } else {
+            let r = self.e.fresh("ret");
+            self.e.line(format!("  {} = musttail call preserve_nonecc {} {}({})", r, self.t.ret, callee, a.join(", ")));
+            self.e.line(format!("  ret {} {}", self.t.ret, r));
+        }
     }
 
     /// Dispatches through the table at the pc of `state`.
@@ -1684,7 +1696,7 @@ impl<'t, 'a> FnGen<'t, 'a> {
             for l in ls {
                 if skip_ret {
                     skip_ret = false;
-                    if l.trim() == "ret void" {
+                    if l.trim().starts_with("ret ") {
                         continue;
                     }
                 }
@@ -1933,6 +1945,9 @@ pub struct Options {
     pub skip: Vec<usize>,
     /// LOIMI_TRACE_REPORT=2: the report lists every guard.
     pub verbose: bool,
+    /// Loops whose region or trace would be larger (lines of IR) get
+    /// none (LOIMI_TRACE_MAXLINES; LLVM's time and memory grow with it).
+    pub max_lines: usize,
 }
 
 impl Options {
@@ -1947,6 +1962,7 @@ impl Options {
             fail_limit: 1024,
             only: var("LOIMI_TRACE_ONLY").map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect()).unwrap_or_default(),
             verbose: var("LOIMI_TRACE_REPORT").is_some_and(|v| v == "2"),
+            max_lines: var("LOIMI_TRACE_MAXLINES").and_then(|v| v.parse().ok()).unwrap_or(150_000),
             skip: var("LOIMI_TRACE_SKIP").map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect()).unwrap_or_default(),
         }
     }
@@ -2116,7 +2132,8 @@ impl<'t, 'a> FnGen<'t, 'a> {
         let ps: Vec<String> = (0..self.t.sig.len()).map(|i| format!("{} {}", self.t.sig[i], self.param(i))).collect();
         let _ = writeln!(
             f,
-            "define internal preserve_nonecc void @\"loimi.trace.{}\"({}, i32 %tr.insn) nounwind{} \"no-builtin-memset\" \"no-builtin-memcpy\" \"no-builtin-memmove\" {{",
+            "define internal preserve_nonecc {} @\"loimi.trace.{}\"({}, i32 %tr.insn) nounwind{} \"no-builtin-memset\" \"no-builtin-memcpy\" \"no-builtin-memmove\" {{",
+            self.t.ret,
             self.name,
             ps.join(", "),
             if self.kind == Kind::Region { " noinline optnone" } else { "" }
@@ -2174,6 +2191,10 @@ fn generate_fn(m: &Module, vm: &VmInfo, code: &Code, h: usize, order: &[usize], 
     }
     let mut g = FnGen::new(&mut t, kind, name.to_string(), index, order.to_vec(), succ, prof, opts.check);
     let ir = g.emit()?;
+    let lines = ir.bytes().filter(|&b| b == b'\n').count();
+    if lines > opts.max_lines {
+        return Err(format!("{} lines of IR (more than LOIMI_TRACE_MAXLINES={})", lines, opts.max_lines));
+    }
     let r = GenFn { ir, blockmap: std::mem::take(&mut g.blockmap), edges: std::mem::take(&mut g.edges), kchk: BTreeSet::new(), nr: g.nr, nguards: g.nguards, neffect: g.neffect, guard_info: std::mem::take(&mut g.guard_info) };
     drop(g);
     Ok(GenFn { kchk: std::mem::take(&mut t.kchk), ..r })
@@ -2269,7 +2290,9 @@ fn declarations(m: &Module, text: &str) -> Result<Vec<String>, String> {
         if m.program_syms.contains(n) || n.starts_with("loimi.trace.") || n == "loimi_traces" || n == "loimi_ntraces" || n == "loimi_trace_build" {
             continue;
         }
-        if n == "loimi_trace_failing" {
+        if n == "llvm.memcpy.p0.p0.i64" {
+            out.push("declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)".to_string());
+        } else if n == "loimi_trace_failing" {
             out.push("declare void @loimi_trace_failing(i64)".to_string());
         } else if n == "loimi_trace_check" {
             out.push("declare void @loimi_trace_check(ptr, ptr, i64)".to_string());

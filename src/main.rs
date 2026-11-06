@@ -202,6 +202,8 @@ const USAGE: &str = "\
 usage: loimi build <file.lm> [-o out] [--release | -O] [--emit-llvm] [--dispatch=tailcall|goto|switch] [--vm-stats] [--align-functions=N] [--no-branch-align]
                   [--sanitize=address|thread] [-W error | -Werror | --deny-warnings] [-W hot_gc] [-W handler_frame]
                   [--lib | --shared] [--header out.h [--header-prefix p]] [--tls=initial-exec|local-dynamic|global-dynamic] [--jit-stencils]
+                  [--trace-regions=REC,..]   (with --jit-stencils: a profiling build, every loop of LOIMI_TRACE_RECORD recordings counted)
+                  [--traces=PROF,..]   (with --jit-stencils: ahead-of-time traces of the hot loops of LOIMI_TRACE_PROFILE profiles; docs/design/trace-tier.md)
                   [--max-errors N]   (print at most N errors, default 20; 0: all)
                   [--cfg NAME]   (keep code marked #[cfg(NAME)], drop #[cfg(not(NAME))]; docs/language.md section 1.4)
                   [--gc-check-roots]   (the collector validates every reference it marks; docs/lowering.md section 9)
@@ -714,7 +716,13 @@ fn add_traces(ir: &mut String, jit: &JitParts, opts: &Opts) -> Result<(), String
     if !report.lines().any(|l| l.starts_with(what)) {
         eprintln!("warning: no {}s: the {} has no loop that qualifies (LOIMI_TRACE_REPORT=1 says why)", what, if what == "region" { "recording" } else { "profile" });
     }
-    ir.push_str(&text);
+    // `--sanitize=address`: the program's functions were marked before
+    // (`sanitize`); traces are instrumented too (stencils are not).
+    if opts.sanitize_address {
+        ir.push_str(&text.replace("i32 %tr.insn) nounwind", "i32 %tr.insn) nounwind sanitize_address"));
+    } else {
+        ir.push_str(&text);
+    }
     Ok(())
 }
 
@@ -950,17 +958,14 @@ fn parse_args() -> Result<Opts, String> {
     if let Some(name) = cpu_name.filter(|n| !n.is_empty()) {
         o.cpu = Some(resolve_cpu(&name, o.target.as_ref())?);
     }
-    if o.jit && (o.kind != OutKind::Exe || o.sanitize_address || o.sanitize_thread || o.dispatch.is_some_and(|d| d != tir::Dispatch::TailCall)) {
-        return Err("--jit-stencils builds executables with tail-call dispatch, without sanitizers".into());
+    if o.jit && (o.kind != OutKind::Exe || o.sanitize_thread || o.dispatch.is_some_and(|d| d != tir::Dispatch::TailCall)) {
+        return Err("--jit-stencils builds executables with tail-call dispatch, without ThreadSanitizer".into());
     }
     if (!o.trace_regions.is_empty() || !o.traces.is_empty()) && !o.jit {
         return Err("--trace-regions and --traces need --jit-stencils (traces are entered by the JIT)".into());
     }
     if !o.trace_regions.is_empty() && !o.traces.is_empty() {
         return Err("--trace-regions (a profiling build) and --traces (a trace build) are separate builds".into());
-    }
-    if o.jit && o.gc_check_roots {
-        return Err("--gc-check-roots cannot be combined with --jit-stencils".into());
     }
     if o.jit && !(cfg!(target_arch = "x86_64") && cfg!(target_os = "linux")) {
         return Err("--jit-stencils supports x86-64 Linux only".into());

@@ -338,6 +338,207 @@ fn mini_jit_stencils() {
     mini_conformance_with(&["--jit-stencils"], &env, |_| true);
 }
 
+/// Ahead-of-time traces (`--trace-regions`, `--traces`, src/tracegen.rs,
+/// docs/design/trace-tier.md): Mini's scripts, conformance tests and
+/// benchmarks are recorded with a JIT build, profiled with a region
+/// build, and run with traces of every loop that closed (`build_traces`)
+/// in every GC mode; then again with traces whose guards fail often
+/// (blocks run in under half of their instruction's runs are off the
+/// trace), with blacklisting at the default rate and at every failure.
+/// Programs whose code was not profiled run without traces.
+#[test]
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn mini_traces() {
+    if cross() {
+        return;
+    }
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut inputs: Vec<PathBuf> = Vec::new();
+    for (dir, ext) in [("examples/mini/tests", "mini"), ("examples/mini/tests/conformance", "lua"), ("bench/mini/programs", "lua")] {
+        let mut v: Vec<PathBuf> = std::fs::read_dir(root.join(dir))
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == ext))
+            .collect();
+        v.sort();
+        inputs.extend(v);
+    }
+    let bt = build_traces("mini", &root.join("examples/mini/main.lm"), &inputs, &[("LOIMI_JIT_HOT", "2")]);
+    let env = [("LOIMI_JIT", "1"), ("LOIMI_JIT_HOT", "2")];
+    let mut failures = Vec::new();
+    // traces of every loop of the tests, and the benchmarks' outputs
+    let n = bt.ntraces(&bt.normal);
+    assert!(n >= 20, "only {} traces from the Mini tests and benchmarks", n);
+    failures.extend(mini_scripts_on(&bt.normal, "traces", &env, &|_| true));
+    failures.extend(mini_conformance_on(&bt.normal, &env, &|_| true));
+    failures.extend(bt.check_benchmarks(&bt.normal, &root.join("bench/mini/programs"), &env));
+    // guards that fail
+    failures.extend(mini_scripts_on(&bt.forced, "traces, guards failing", &env, &|_| true));
+    failures.extend(mini_conformance_on(&bt.forced, &env, &|_| true));
+    let env1 = [("LOIMI_JIT", "1"), ("LOIMI_JIT_HOT", "2"), ("LOIMI_TRACE_FAILS", "1")];
+    failures.extend(mini_scripts_on(&bt.forced, "traces, guards failing, blacklisting at once", &env1, &|_| true));
+    failures.extend(mini_conformance_on(&bt.forced, &env1, &|_| true));
+    failures.extend(bt.check_benchmarks(&bt.forced, &root.join("bench/mini/programs"), &env1));
+    bt.cleanup();
+    if !failures.is_empty() {
+        panic!("{} failure(s):\n\n{}", failures.len(), failures.join("\n\n"));
+    }
+}
+
+#[path = "fuzz/traceprog.rs"]
+mod traceprog;
+
+/// Differential test of traces on random Mini programs
+/// (tests/fuzz/traceprog.rs): each is profiled with one input and run
+/// with another (and the first), with traces and with guards forced to
+/// fail; the output must be the interpreter's (the same binary, JIT off).
+/// TRACEFUZZ_SEEDS=n sets the number of programs (default 16).
+#[test]
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn mini_traces_fuzz() {
+    if cross() {
+        return;
+    }
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let n: u64 = std::env::var("TRACEFUZZ_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(16);
+    let first: u64 = std::env::var("TRACEFUZZ_FIRST").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!("loimi-tracefuzz-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let inputs = [("40", "5", "1.5"), ("57", "3", "2"), ("9", "8", "0.25")];
+    let mut progs: Vec<Vec<PathBuf>> = Vec::new();
+    for seed in first..first + n {
+        let v: Vec<PathBuf> = inputs
+            .iter()
+            .enumerate()
+            .map(|(i, inp)| {
+                let p = dir.join(format!("p{}-{}.lua", seed, i));
+                std::fs::write(&p, traceprog::generate(seed, *inp)).unwrap();
+                p
+            })
+            .collect();
+        progs.push(v);
+    }
+    // profiled with the first input only
+    let profiled: Vec<PathBuf> = progs.iter().map(|v| v[0].clone()).collect();
+    let bt = build_traces("fuzz", &root.join("examples/mini/main.lm"), &profiled, &[("LOIMI_JIT_HOT", "2")]);
+    let mut failures = Vec::new();
+    let mut ran = 0;
+    let mut ok = 0;
+    for v in &progs {
+        for p in v {
+            let want = program(&bt.normal).arg(p).output().unwrap();
+            ok += want.status.success() as usize;
+            for (exe, extra) in [(&bt.normal, None), (&bt.forced, None), (&bt.forced, Some(("LOIMI_TRACE_FAILS", "1")))] {
+                let mut cmd = program(exe);
+                cmd.arg(p).env("LOIMI_JIT", "1").env("LOIMI_JIT_HOT", "2");
+                if let Some((k, v)) = extra {
+                    cmd.env(k, v);
+                }
+                let got = cmd.output().unwrap();
+                ran += 1;
+                if got.stdout != want.stdout || got.status.code() != want.status.code() {
+                    failures.push(format!(
+                        "{} ({}{}): differs from the interpreter\n--- interpreter ({:?})\n{}--- traces ({:?})\n{}{}",
+                        p.display(),
+                        exe.display(),
+                        extra.map(|e| format!(", {}={}", e.0, e.1)).unwrap_or_default(),
+                        want.status.code(),
+                        String::from_utf8_lossy(&want.stdout),
+                        got.status.code(),
+                        String::from_utf8_lossy(&got.stdout),
+                        String::from_utf8_lossy(&got.stderr)
+                    ));
+                }
+            }
+        }
+    }
+    let nt = bt.ntraces(&bt.normal);
+    if failures.is_empty() {
+        let _ = std::fs::remove_dir_all(&dir);
+        bt.cleanup();
+    }
+    assert!(failures.is_empty(), "{} of {} runs failed (programs kept in {}):\n\n{}", failures.len(), ran, dir.display(), failures.join("\n\n"));
+    assert!(nt >= n as usize / 2, "only {} traces from {} programs", nt, n);
+    // (programs that fail in the interpreter test less)
+    assert!(ok * 4 >= progs.len() * inputs.len() * 3, "only {} of {} programs ran without error", ok, progs.len() * inputs.len());
+}
+
+/// A vm built three ways for traces: `normal` (traces of every loop that
+/// closed once in the profile) and `forced` (`LOIMI_TRACE_MINFRAC=0.5`,
+/// with `LOIMI_TRACE_CHECK=1` checking the accesses the generator cannot place:
+/// blocks run in under half of their instruction's runs become guards).
+struct TraceBuilds {
+    dir: PathBuf,
+    normal: PathBuf,
+    forced: PathBuf,
+}
+
+impl TraceBuilds {
+    /// How many traces a build linked (`LOIMI_JIT_STATS`).
+    fn ntraces(&self, exe: &Path) -> usize {
+        let out = program(exe).arg("/dev/null").env("LOIMI_JIT", "1").env("LOIMI_JIT_STATS", "1").output().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        err.lines().find_map(|l| l.strip_prefix("jit: traces: ").and_then(|r| r.split(' ').next()).and_then(|n| n.parse().ok())).unwrap_or(0)
+    }
+
+    /// Each NAME.lua in `dir` must print NAME.expected; returns failures.
+    fn check_benchmarks(&self, exe: &Path, dir: &Path, env: &[(&str, &str)]) -> Vec<String> {
+        let mut failures = Vec::new();
+        let mut progs: Vec<PathBuf> = std::fs::read_dir(dir).unwrap().filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.extension().is_some_and(|x| x == "lua")).collect();
+        progs.sort();
+        for p in progs {
+            let out = program(exe).arg(&p).envs(env.iter().copied()).env("LOIMI_JIT_STATS", "1").output().unwrap();
+            let want = std::fs::read_to_string(p.with_extension("expected")).unwrap();
+            if String::from_utf8_lossy(&out.stdout) != want || !out.status.success() {
+                failures.push(format!("{} with traces ({}): wrong output\n{}", p.display(), exe.display(), String::from_utf8_lossy(&out.stderr)));
+            }
+        }
+        failures
+    }
+
+    fn cleanup(&self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Records `inputs` with a `--jit-stencils` build of `src` (run with
+/// `env`), builds the profiling binary (`--trace-regions`), profiles the
+/// inputs, and builds the trace binaries (`TraceBuilds`).
+fn build_traces(tag: &str, src: &Path, inputs: &[PathBuf], env: &[(&str, &str)]) -> TraceBuilds {
+    let dir = std::env::temp_dir().join(format!("loimi-traces-{}-{}", tag, std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let build = |name: &str, flags: &[String], benv: &[(&str, &str)]| -> PathBuf {
+        let exe = dir.join(name);
+        let out = loimi().envs(benv.iter().copied()).arg("build").args(["-W", "error", "--release", "--jit-stencils"]).args(flags).arg(src).arg("-o").arg(&exe).output().unwrap();
+        assert!(out.status.success(), "building {} {} failed:\n{}", tag, name, String::from_utf8_lossy(&out.stderr));
+        exe
+    };
+    // one run per input, its output file named by `var`; the files joined
+    let run_all = |exe: &Path, var: &str, ext: &str| -> PathBuf {
+        let mut all = String::new();
+        for (i, f) in inputs.iter().enumerate() {
+            let file = dir.join(format!("{}.{}", i, ext));
+            let _ = program(exe).arg(f).env("LOIMI_JIT", "1").env(var, &file).envs(env.iter().copied()).output().unwrap();
+            all.push_str(&std::fs::read_to_string(&file).unwrap_or_default());
+            let _ = std::fs::remove_file(&file);
+        }
+        let p = dir.join(format!("all.{}", ext));
+        std::fs::write(&p, all).unwrap();
+        p
+    };
+    let jit = build("jit", &[], &[]);
+    let rec = run_all(&jit, "LOIMI_TRACE_RECORD", "rec");
+    let reg = build("regions", &[format!("--trace-regions={}", rec.display())], &[]);
+    let prof = run_all(&reg, "LOIMI_TRACE_PROFILE", "prof");
+    let tflag = [format!("--traces={}", prof.display())];
+    let normal = build("traces", &tflag, &[("LOIMI_TRACE_MIN", "1")]);
+    let forced = build("traces-forced", &tflag, &[("LOIMI_TRACE_MIN", "1"), ("LOIMI_TRACE_MINFRAC", "0.5"), ("LOIMI_TRACE_CHECK", "1")]);
+    for p in [&jit, &reg] {
+        let _ = std::fs::remove_file(p);
+    }
+    TraceBuilds { dir, normal, forced }
+}
+
 /// The Mini debugger (`--cfg debug`, examples/mini/debugger.lm): each
 /// examples/mini/tests/debug/NAME.mini run as `mini --debug NAME.mini`
 /// with NAME.cmds on stdin must print the transcript NAME.out, in every
@@ -483,6 +684,17 @@ fn mini_scripts_with(flags: &[&str], env: &[(&str, &str)], select: impl Fn(&str)
     let exe = std::env::temp_dir().join(format!("loimi-mini-{}{}{}", std::process::id(), flags.join("").replace(['-', '='], ""), target_tag(env)));
     let out = loimi().envs(env.iter().copied()).arg("build").args(["-W", "error"]).args(flags).arg(root.join("examples/mini/main.lm")).arg("-o").arg(&exe).output().unwrap();
     assert!(out.status.success(), "building mini {:?} failed:\n{}", flags, String::from_utf8_lossy(&out.stderr));
+    let failures = mini_scripts_on(&exe, &flags.join(" "), env, &select);
+    let _ = std::fs::remove_file(&exe);
+    if !failures.is_empty() {
+        panic!("{} failure(s):\n\n{}", failures.len(), failures.join("\n\n"));
+    }
+}
+
+/// The Mini scripts that `select` picks, run by the Mini `exe` (named
+/// `what` in failures) in `env` in every GC mode: the failures.
+fn mini_scripts_on(exe: &Path, what: &str, env: &[(&str, &str)], select: &dyn Fn(&str) -> bool) -> Vec<String> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut failures = Vec::new();
     let mut scripts: Vec<PathBuf> = std::fs::read_dir(root.join("examples/mini/tests"))
         .unwrap()
@@ -512,7 +724,7 @@ fn mini_scripts_with(flags: &[&str], env: &[(&str, &str)], select: impl Fn(&str)
             let out = cmd.output().unwrap();
             let stdout = String::from_utf8_lossy(&out.stdout);
             let stderr = String::from_utf8_lossy(&out.stderr);
-            let name = format!("{}{} {}", f.file_name().unwrap().to_string_lossy(), gc_mode_name(mode), flags.join(" "));
+            let name = format!("{}{} {}", f.file_name().unwrap().to_string_lossy(), gc_mode_name(mode), what);
             let got: Vec<&str> = stdout.lines().collect();
             if got != expect.iter().map(|s| s.as_str()).collect::<Vec<_>>() {
                 failures.push(format!("{}: stdout mismatch\n--- expected\n{}\n--- got\n{}\n--- stderr\n{}", name, expect.join("\n"), stdout, stderr));
@@ -528,10 +740,7 @@ fn mini_scripts_with(flags: &[&str], env: &[(&str, &str)], select: impl Fn(&str)
             }
         }
     }
-    let _ = std::fs::remove_file(&exe);
-    if !failures.is_empty() {
-        panic!("{} failure(s):\n\n{}", failures.len(), failures.join("\n\n"));
-    }
+    failures
 }
 
 /// The clean-room conformance tests (examples/mini/tests/conformance):
@@ -550,6 +759,17 @@ fn mini_conformance_with(flags: &[&str], env: &[(&str, &str)], select: impl Fn(&
     let exe = std::env::temp_dir().join(format!("loimi-mini-conf-{}{}", std::process::id(), flags.join("").replace(['-', '='], "")));
     let out = loimi().arg("build").args(["-W", "error"]).args(flags).arg(root.join("examples/mini/main.lm")).arg("-o").arg(&exe).output().unwrap();
     assert!(out.status.success(), "building mini failed:\n{}", String::from_utf8_lossy(&out.stderr));
+    let failures = mini_conformance_on(&exe, env, &select);
+    let _ = std::fs::remove_file(&exe);
+    if !failures.is_empty() {
+        panic!("{} failure(s):\n\n{}", failures.len(), failures.join("\n\n"));
+    }
+}
+
+/// The conformance scripts `select` picks, run by the Mini `exe` in
+/// `env` in every GC mode: the failures.
+fn mini_conformance_on(exe: &Path, env: &[(&str, &str)], select: &dyn Fn(&str) -> bool) -> Vec<String> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let dir = root.join("examples/mini/tests/conformance");
     let mut scripts: Vec<PathBuf> = std::fs::read_dir(&dir)
         .unwrap()
@@ -584,11 +804,8 @@ fn mini_conformance_with(flags: &[&str], env: &[(&str, &str)], select: impl Fn(&
             }
         }
     }
-    let _ = std::fs::remove_file(&exe);
     assert!(ran > 0);
-    if !failures.is_empty() {
-        panic!("{} failure(s):\n\n{}", failures.len(), failures.join("\n\n"));
-    }
+    failures
 }
 
 /// The Scheme interpreter (examples/scheme): run every program in
