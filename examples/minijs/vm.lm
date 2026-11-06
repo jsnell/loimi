@@ -59,7 +59,12 @@ fn arith_cold(c: *Ctx, op: i64, a: V, b: V) -> Result<V, V> {
 /// Fuse superinstructions in a function again after one of its sites was
 /// quickened (fusion compares words by the op they stand for, so supers
 /// of specialized members form too).
+/// Accumulator variants are selected first (`vacc`): the float members
+/// exist only once a site has run, and selection splits supers. It may
+/// run in the handler of the op that quickened, which leaves its result
+/// in `vacc` (language.md §7.4).
 fn refuse(cl: Gc<Fn>) {
+    JS.accumulate(cl.proto.code.words(), 0);
     JS.optimize(cl.proto.code);
 }
 
@@ -376,6 +381,10 @@ fn find_handler(p: Gc<Proto>, at: *u32) -> ?(u64, u64) {
 pub vm JS {
     context ctx: *Ctx;
     state { pc: *u32, regs: *V, k: *V, fp: *Frame }
+    // A value accumulator (language.md §7.4): a float result passes to the
+    // next op in xmm0, written through to its register too.
+    accumulator vacc: f64 for reg;
+    accumulate ADD_F, SUB_F, MUL_F, DIV_F, JLT, JLE, JLTK, JLEK, JGTK, JGEK, SETPROP_IN;
 
     // The generated verifier checks these against the prototype that
     // holds the code: JS.build_verified (compile.lm, `finish`) creates
@@ -655,10 +664,10 @@ pub vm JS {
     // monomorphic member that keeps missing becomes _POLY (up to eight
     // own-slot entries), and a Poly entry that keeps filling up makes the
     // site _MEGA (the slow path, without refilling).
-    family SETPROP(obj: reg, key: kst, val: reg) : ABC + PropIC {
+    family SETPROP(tgt: reg, key: kst, val: reg) : ABC + PropIC {
         generic {
             if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
-            let st = write_miss(ctx, obj, key, val, &cache, obj.IcState.Generic)?;
+            let st = write_miss(ctx, tgt, key, val, &cache, obj.IcState.Generic)?;
             if st == obj.IcState.OwnIn { become SETPROP_IN; }
             if st == obj.IcState.OwnOut { become SETPROP_OUT; }
             if st == obj.IcState.Add { become SETPROP_ADD; }
@@ -666,13 +675,13 @@ pub vm JS {
             next
         }
         SETPROP_IN {
-            if let O(o) = obj and o.shape.id == cache.sid {
+            if let O(o) = tgt and o.shape.id == cache.sid {
                 o.inline.ptr[cache.slot] = val;
                 next
             }
             cold {
                 if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
-                let st = write_miss(ctx, obj, key, val, &cache, obj.IcState.OwnIn)?;
+                let st = write_miss(ctx, tgt, key, val, &cache, obj.IcState.OwnIn)?;
                 if st == obj.IcState.OwnOut { become SETPROP_OUT; }
                 if st == obj.IcState.Add { become SETPROP_ADD; }
                 if st == obj.IcState.Poly { become SETPROP_POLY; }
@@ -681,14 +690,14 @@ pub vm JS {
             }
         }
         SETPROP_OUT {
-            if let O(o) = obj and o.shape.id == cache.sid {
+            if let O(o) = tgt and o.shape.id == cache.sid {
                 let Some(s) = o.overflow else { unreachable };
                 s.data.ptr[cache.slot & !obj.OUT] = val;
                 next
             }
             cold {
                 if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
-                let st = write_miss(ctx, obj, key, val, &cache, obj.IcState.OwnOut)?;
+                let st = write_miss(ctx, tgt, key, val, &cache, obj.IcState.OwnOut)?;
                 if st == obj.IcState.OwnIn { become SETPROP_IN; }
                 if st == obj.IcState.Add { become SETPROP_ADD; }
                 if st == obj.IcState.Poly { become SETPROP_POLY; }
@@ -697,77 +706,77 @@ pub vm JS {
             }
         }
         // A cached add: the shape check proves the object is not a
-        // prototype (std.obj gives those other shapes).
+        // prototype (std.tgt gives those other shapes).
         SETPROP_ADD {
-            if let O(o) = obj and o.shape.id == cache.sid {
+            if let O(o) = tgt and o.shape.id == cache.sid {
                 ctx.m.add_hit(o, cache.ent, cache.slot, val);
                 next
             }
             become SETPROP; redo
         }
         SETPROP_POLY {
-            if let O(o) = obj and ctx.m.poly_set(o, cache.ent, val) { next }
+            if let O(o) = tgt and ctx.m.poly_set(o, cache.ent, val) { next }
             cold {
                 if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
-                let st = write_miss(ctx, obj, key, val, &cache, obj.IcState.Poly)?;
+                let st = write_miss(ctx, tgt, key, val, &cache, obj.IcState.Poly)?;
                 if st == obj.IcState.Mega { become SETPROP_MEGA; }
                 next
             }
         }
         SETPROP_MEGA {
-            if let (O(o), S(ks)) = (obj, key) and ctx.m.mega_set(o, ks.key as u64, val) { next }
+            if let (O(o), S(ks)) = (tgt, key) and ctx.m.mega_set(o, ks.key as u64, val) { next }
             cold {
                 if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
-                write_miss(ctx, obj, key, val, &cache, obj.IcState.Mega)?;
+                write_miss(ctx, tgt, key, val, &cache, obj.IcState.Mega)?;
                 next
             }
         }
     }
 
-    op GETINDEX(dst: reg, obj: reg, key: reg) : ABC {
-        if let (A(a), Int(i)) = (obj, key) and (i as u32 as u64) < a.len {
+    op GETINDEX(dst: reg, tgt: reg, key: reg) : ABC {
+        if let (A(a), Int(i)) = (tgt, key) and (i as u32 as u64) < a.len {
             dst = a.ptr[i as u32 as u64];
             next
         }
-        if let (S(s), Int(i)) = (obj, key) and (i as u32 as u64) < s.data.len {
+        if let (S(s), Int(i)) = (tgt, key) and (i as u32 as u64) < s.data.len {
             // One-character strings of ASCII bytes are made at startup.
             if let Some(c) = ctx.ascii_str(s.data.ptr[i as u32 as u64]) { dst = S(c); next }
         }
         cold {
-            if let R(r) = obj { obj = S(value.flatten(r)); redo }
-            dst = ctx.get_index(obj, key)?;
+            if let R(r) = tgt { tgt = S(value.flatten(r)); redo }
+            dst = ctx.get_index(tgt, key)?;
             next
         }
     }
-    op SETINDEX(obj: reg, key: reg, val: reg) : ABC {
-        if let (A(a), Int(i)) = (obj, key) and (i as u32 as u64) < a.len {
+    op SETINDEX(tgt: reg, key: reg, val: reg) : ABC {
+        if let (A(a), Int(i)) = (tgt, key) and (i as u32 as u64) < a.len {
             a.ptr[i as u32 as u64] = val;
             value.abar(a);
             next
         }
         cold {
             if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
-            ctx.set_index(obj, key, val)?;
+            ctx.set_index(tgt, key, val)?;
             next
         }
     }
-    op GETLEN(dst: reg, obj: reg) : ABC {
-        if let A(a) = obj { dst = Int(a.len as i32); next }
-        if let S(s) = obj { dst = Int(s.data.len as i32); next }
-        if let R(r) = obj { dst = Int(r.len as i32); next }
-        cold { dst = ctx.get(obj, ctx.k_length)?; next }
+    op GETLEN(dst: reg, tgt: reg) : ABC {
+        if let A(a) = tgt { dst = Int(a.len as i32); next }
+        if let S(s) = tgt { dst = Int(s.data.len as i32); next }
+        if let R(r) = tgt { dst = Int(r.len as i32); next }
+        cold { dst = ctx.get(tgt, ctx.k_length)?; next }
     }
-    op DELPROP(dst: reg, obj: reg, key: reg) : ABC {
-        cold { dst = delete_prop(ctx, obj, key)?; next }
+    op DELPROP(dst: reg, tgt: reg, key: reg) : ABC {
+        cold { dst = delete_prop(ctx, tgt, key)?; next }
     }
-    op IN(dst: reg, key: reg, obj: reg) : ABC {
-        cold { dst = Bool(ctx.has(obj, ctx.key_of(key))?); next }
+    op IN(dst: reg, key: reg, tgt: reg) : ABC {
+        cold { dst = Bool(ctx.has(tgt, ctx.key_of(key))?); next }
     }
-    /// R[dst] = the keys `for (k in R[obj])` visits.
-    op KEYS(dst: reg, obj: reg) : ABC {
+    /// R[dst] = the keys `for (k in R[tgt])` visits.
+    op KEYS(dst: reg, tgt: reg) : ABC {
         cold {
             if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
-            dst = A(ctx.for_in_keys(obj));
+            dst = A(ctx.for_in_keys(tgt));
             next
         }
     }
@@ -1536,6 +1545,14 @@ pub vm JS {
         ADDI, JLTK;
         ADDI, JLEK;
         GETINDEX, TEST;
+    }
+    // Over accumulator variants (nbody's `b.vx -= dx * b2.mass * mag`): a
+    // variant breaks up the supers over its op (MUL_F; MUL_F).
+    #[forward] #[allow(super_overlap)] supers {
+        MUL_F, MUL_F__RAR, SUB_F__RRA, SETPROP_IN__RA;
+        MUL_F, MUL_F__RAR, ADD_F__RRA, SETPROP_IN__RA;
+        MUL_F, MUL_F__RAR;
+        ADD_F__RRA, SETPROP_IN__RA;
     }
 
     entry run(c: *Ctx, cl: Gc<Fn>) -> V uses gc {

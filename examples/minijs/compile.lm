@@ -1462,6 +1462,7 @@ fn Gen.finish(g: *Gen, fs: *FS) -> Gc<Proto> {
             fail(f.line, b.as_str())
         }
     };
+    JS.accumulate(proto.code.words(), 0);
     JS.optimize(proto.code);
     if getenv("MINIJS_DIS\0".ptr).is_some() {
         // Debugging aid: the function's code after peephole fusion.
