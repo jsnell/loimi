@@ -727,7 +727,21 @@ fn write_through(v: &mut VmDecl, plans: &[(usize, Option<(usize, usize)>, Vec<St
             w.push((n.clone(), di, ai));
         }
     }
-    let exits: Vec<String> = v.fns.iter().filter(|f| f.body.as_ref().is_some_and(has_exit)).map(|f| f.name.name.clone()).collect();
+    // The vm functions that may leave the op (`next`, `jump`), directly or
+    // through one they call.
+    let mut exits: Vec<String> = v.fns.iter().filter(|f| f.body.as_ref().is_some_and(has_exit)).map(|f| f.name.name.clone()).collect();
+    loop {
+        let more: Vec<String> = v
+            .fns
+            .iter()
+            .filter(|f| !exits.contains(&f.name.name) && f.body.as_ref().is_some_and(|b| called(b, &exits).is_some()))
+            .map(|f| f.name.name.clone())
+            .collect();
+        if more.is_empty() {
+            break;
+        }
+        exits.extend(more);
+    }
     let wts: Vec<usize> = (0..v.accs.len()).filter(|&i| v.accs[i].wt).collect();
     let accs = v.accs.clone();
     let zero = |sp: Span| wts.iter().map(|&i| zero_stmt(&accs[i], sp)).collect::<Vec<_>>();
