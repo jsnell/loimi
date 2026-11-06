@@ -17,6 +17,7 @@ says so. Some modules are design only; their sections say so at the top.
 | [`std.hash`, `std.map`](#stdhash-and-stdmap), [`std.dict`](#ordered-maps-maporderedmap-and-dictdict) | built (`HashMap`, insertion-ordered `OrderedMap`; `Dict`, the same in the GC heap; `KeyDict`, without stored hashes, for keys that cache theirs) | `std/hash.lm`, `std/map.lm`, `std/dict.lm` |
 | [`std.text`](#stdtext) | built (`StrBuf` with `{}` formatting, `Interner`, small helpers) | `std/text.lm` |
 | [`std.num`](#stdnum) | built | `std/num.lm` |
+| [`std.math`](stdlib/math.md) | built (`Divisor`: division by a prepared constant, as an inline cache) | `std/math.lm` |
 | [`std.bigint`](#stdbigint) | built (Karatsuba, Toom-3, divide-and-conquer division, square root and radix conversion; no FFT) | `std/bigint.lm` |
 | [`std.io`, `std.os`](#stdio-and-stdos) | built (minimal) | `std/io.lm`, `std/os.lm` |
 | [`std.lex`](#stdlex) | built (a cursor toolkit, no generator) | `std/lex.lm` |

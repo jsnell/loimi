@@ -3,6 +3,7 @@
 import std.gc;
 import std.text;
 import std.mem;
+import std.math;
 import value;
 import lib;
 import value.{V, Str, Arr, Table, Proto, Closure, UpVal};
@@ -285,19 +286,7 @@ fn field_set_slow(h: *gc.Heap, t: Gc<Table>, key: V, v: V, slot: *u32) {
     if let Some(i) = value.table_find(t, key) { *slot = i as u32; }
 }
 
-/// MODK's cache: m in the low 56 bits, s above, such that
-/// floor(x / d) = (x * m) >> s for every 0 <= x < 2^31 (d >= 1). With
-/// l = ceil(log2 d), s = 31 + l and m = ceil(2^s / d): m * d - 2^s < d <= 2^l,
-/// which is Granlund and Montgomery's condition (PLDI 1994, theorem 4.2)
-/// for 31-bit dividends; m <= 2^32, so x * m < 2^63 does not overflow.
-fn mod_magic(d: i32) -> u64 {
-    let dd = d as u64;
-    let l: u64 = if dd <= 1 { 0 } else { 64 - ((dd - 1).clz() as u64) };
-    let sh = 31 + l;
-    let m = (((1 as u64) << sh) + dd - 1) / dd;
-    m | (sh << 56)
-}
-pub const MAGIC_M: u64 = 0xFFFFFFFFFFFFFF;
+/// ModRIC.d of a MOD site that saw two divisors (never an Int > 0).
 pub const MOD_MANY: u32 = 0xFFFFFFFF;
 
 /// Arithmetic outside the (Int, Int) and (Num, Num) fast paths: mixed
@@ -830,22 +819,21 @@ pub vm Mini {
         if let Int(x) = a and let Some(r) = x.add_checked(sc as i32) { dst = Int(r); next }
         cold { dst = arith_slow(ctx, 0, a, Int(sc as i32))?; next }
     }
-    // `x % k` for a constant k divides by multiplying (Granlund and
-    // Montgomery): the site caches m and s (`mod_magic`) with
-    // floor(x / k) = (x * m) >> s for 0 <= x < 2^31. idiv takes about 26
-    // cycles, the multiply 3. Zero until the site first runs with an Int
-    // constant k > 0.
-    cache ModIC { magic: u64 }
+    // `x % k` for a constant k divides by multiplying: the site caches
+    // k as a std.math.Divisor (`urem31`: floor(x / k) = (x * m) >> s for
+    // 0 <= x < 2^31).
+    // idiv takes about 26 cycles, the multiply 3. Zero until the site
+    // first runs with an Int constant k > 0.
+    cache ModIC = math.Divisor;
 
     op MODK(dst: reg, a: reg, b: kst) : ABC + ModIC {
-        if let (Int(x), Int(y)) = (a, b) and x >= 0 and cache.magic != 0 {
-            let mg = cache.magic;
-            let q = ((x as u64) * (mg & MAGIC_M)) >> (mg >> 56);
-            dst = Int(((x as u64) - q * (y as u64)) as i32);
+        if let (Int(x), Int(_)) = (a, b) and x >= 0 and cache.d != 0 {
+            dst = Int((&cache).urem31(x as u64) as i32);
             next
         }
         if let (Int(x), Int(y)) = (a, b) and y > 0 {
-            if cache.magic == 0 { cache.magic = mod_magic(y); }
+            // The first run fills the cache (two divisions: off the hot path).
+            if cache.d == 0 { cold { (&cache).set(y as i64); let r = x % y; dst = Int(if r < 0 { r + y } else { r }); next } }
             let r = x % y;
             dst = Int(if r < 0 { r + y } else { r });
             next
@@ -867,21 +855,18 @@ pub vm Mini {
         }
     }
     // The same for a divisor in a register, keyed by the divisor seen
-    // first. A site that sees a second divisor gives up (d = MOD_MANY,
-    // never an Int > 0): recomputing m costs a 64-bit division.
-    cache ModRIC { d: u32, magic: u64 }
+    // first (its `d`). A site that sees a second divisor gives up (d =
+    // MOD_MANY): preparing a divisor costs a 128-bit division.
+    cache ModRIC = math.Divisor;
 
     op MOD(dst: reg, a: reg, b: reg) : ABC + ModRIC {
         if let (Int(x), Int(y)) = (a, b) and x >= 0 and y > 0 and (y as u32) == cache.d {
-            let mg = cache.magic;
-            let q = ((x as u64) * (mg & MAGIC_M)) >> (mg >> 56);
-            dst = Int(((x as u64) - q * (y as u64)) as i32);
+            dst = Int((&cache).urem31(x as u64) as i32);
             next
         }
         if let (Int(x), Int(y)) = (a, b) and y > 0 {
             if cache.d == 0 {
-                cache.d = y as u32;
-                cache.magic = mod_magic(y);
+                cold { (&cache).set(y as i64); let r = x % y; dst = Int(if r < 0 { r + y } else { r }); next }
             } else if cache.d != y as u32 {
                 cache.d = MOD_MANY;
             }

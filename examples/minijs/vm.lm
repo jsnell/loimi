@@ -10,6 +10,7 @@
 
 import std.gc;
 import std.mem;
+import std.math;
 import std.text;
 import std.obj;
 import value;
@@ -870,7 +871,31 @@ pub vm JS {
     }
     /// `%` with a positive Int divisor is exact in integers when the
     /// dividend is integral (an Int, or a Num below 2^53).
-    inline for (name, bkind) in [("MOD", reg), ("MODK", kst)] {
+    /// MODK's constant divisor is also a std.math.Divisor in its cache,
+    /// filled by the emitter (compile.lm): a multiply, not an `idiv`.
+    cache ModK = math.Divisor;
+    op MODK(dst: reg, a: reg, b: kst) : ABC + ModK {
+        if let Int(y) = b and y > 0 and (y as u32) == cache.d {
+            if let Int(x) = a and x >= 0 { dst = Int((&cache).urem(x as u64) as i32); next }
+            var xi: i64 = 0;
+            var ok = false;
+            if let Int(x) = a { xi = x as i64; ok = true; }
+            if let Num(x) = a and x >= -9007199254740992.0 and x <= 9007199254740992.0 {
+                xi = x as i64;
+                ok = xi as f64 == x;
+            }
+            if ok {
+                let r = (&cache).rem_trunc(xi);
+                if r != 0 or xi > 0 { dst = Int(r as i32); next }
+            }
+        }
+        cold {
+            if let (Num(x), Num(y)) = (a, b) { dst = Num(value.js_mod(x, y)); next }
+            dst = arith(ctx, 4, a, b)?;
+            next
+        }
+    }
+    inline for (name, bkind) in [("MOD", reg)] {
     op #name(dst: reg, a: reg, b: bkind) : ABC {
         if let Int(y) = b and y > 0 {
             if let Int(x) = a and x >= 0 { dst = Int(x % y); next }

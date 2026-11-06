@@ -439,6 +439,18 @@ implementation; `git log` has the details.
 
 ### Standard library
 
+- **`std.math.Divisor`**: division by a prepared constant (Granlund and
+  Montgomery, with a 64-bit magic). It has truncating and flooring
+  signed `div`/`rem`, unsigned and 31-bit forms, and four `u32` fields,
+  so `cache DivK = math.Divisor;` is an inline-cache layout and a
+  constant-divisor op is one line. Prolog's `//`, `mod`, `div` and
+  `rem` by a constant compile to `IDIVK`/`MODK`/`DIVK`/`REMK`: crypt
+  takes 0.855 of its time, and the suite 0.9935. MiniJS's `MODK` gets
+  closures 0.970. Mini's hand-written `mod_magic` is gone, with timing
+  unchanged (1.0002). Tested exhaustively for small divisors and
+  dividends, and on edge and random values up to 2^32 and 2^63
+  ([stdlib/math.md](docs/stdlib/math.md);
+  [design/speed-audit.md](docs/design/speed-audit.md), item 3).
 - `std.hash.bytes` hashes eight bytes per multiply (was byte-at-a-time
   FNV-1a), the length in the seed: Mini's string_build 0.92 of the time
   before (Mini interns every string it makes); MiniJS and Python within

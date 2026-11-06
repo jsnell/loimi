@@ -1,0 +1,127 @@
+// Integer arithmetic for interpreters: division by a constant.
+//
+// `Divisor` is a divisor d (1 <= d < 2^32) prepared once, so that each
+// division by it is a multiply and a shift instead of a 64-bit `idiv`
+// (40-90 cycles on Skylake against about 4). It is Granlund and
+// Montgomery's method (PLDI 1994), as libdivide does it, with a magic
+// number wide enough that one form covers every dividend magnitude
+// below 2^63: every i32 and i48 value, every i64 but i64.min.
+//
+// Its fields are four u32 words, so `cache DivK = math.Divisor;` is an
+// inline cache layout in a u32 (or wider) vm, and `&cache` is a
+// `*Divisor` (language.md §7.1). docs/stdlib/math.md has the details.
+
+/// A prepared positive divisor. Zeroed words (an unfilled cache) are not
+/// a divisor: `d` is 0 there, and the methods give 0 quotients.
+pub struct Divisor {
+    /// The magic number m = ceil(2^(63 + l) / d), low and high half.
+    m_lo: u32,
+    m_hi: u32,
+    /// The divisor.
+    d: u32,
+    /// l = ceil(log2 d): floor(n / d) = hi(2n * m) >> l.
+    l: u32,
+}
+
+/// Code words a `Divisor` takes as an inline cache in a u32 vm.
+pub const DIVISOR_WORDS: u64 = 4;
+
+/// The divisor `d`, or None unless 1 <= d < 2^32. The magic number costs
+/// two 64-bit divisions: prepare it once (when emitting the instruction),
+/// not per execution.
+pub fn Divisor.new(d: i64) -> ?Divisor {
+    if d < 1 or d > 4294967295 { return None; }
+    let dd = d as u64;
+    let l: u64 = if dd == 1 { 0 } else { 64 - ((dd - 1).clz() as u64) };
+    // m = floor((2^(63+l) - 1) / d) + 1, the 95-bit numerator as hi:lo
+    // (hi < d < 2^32), divided in two 64-bit steps of 32 bits each: two
+    // `div` instructions, no call of the runtime's 128-bit division (so a
+    // handler that fills a cache with `set` needs no stack frame).
+    let hi: u64 = if l == 0 { 0 } else { ((1 as u64) << (l - 1)) - 1 };
+    let lo: u64 = if l == 0 { ((1 as u64) << 63) - 1 } else { 0xFFFFFFFFFFFFFFFF };
+    let t1 = (hi << 32) | (lo >> 32);
+    let q1 = t1 / dd;
+    let t0 = ((t1 - q1 * dd) << 32) | (lo & 0xFFFFFFFF);
+    let m = ((q1 << 32) | (t0 / dd)) + 1;
+    Some(Divisor { m_lo: m as u32, m_hi: (m >> 32) as u32, d: dd as u32, l: l as u32 })
+}
+
+/// Prepare `d` in place (a cache filled when its op first runs); false,
+/// and `*dv` unchanged, unless 1 <= d < 2^32.
+pub fn Divisor.set(dv: *Divisor, d: i64) -> bool {
+    let Some(v) = Divisor.new(d) else { return false; };
+    *dv = v;
+    true
+}
+
+/// The divisor itself.
+#[inline(always)]
+pub fn Divisor.divisor(dv: *Divisor) -> i64 { dv.d as i64 }
+
+/// Write the divisor's words to `w[0..4]` (a cache an emitter fills).
+pub fn Divisor.store(dv: *Divisor, w: []u32) {
+    w[0] = dv.m_lo; w[1] = dv.m_hi; w[2] = dv.d; w[3] = dv.l;
+}
+
+/// floor(n / d) for 0 <= n < 2^63.
+#[inline(always)]
+pub fn Divisor.udiv(dv: *Divisor, n: u64) -> u64 {
+    let m = ((dv.m_hi as u64) << 32) | (dv.m_lo as u64);
+    let (_, hi) = (n << 1).mul_wide(m);
+    hi >> (dv.l as u64)
+}
+
+/// n mod d for 0 <= n < 2^63.
+#[inline(always)]
+pub fn Divisor.urem(dv: *Divisor, n: u64) -> u64 { n - dv.udiv(n) * (dv.d as u64) }
+
+/// floor(n / d) for 0 <= n < 2^31 (i32 dividends that are not
+/// negative), with one 64-bit `imul` instead of the 128-bit product:
+/// m' = floor(m / 2^32) + 1 <= 2^32 has m' * d - 2^(31+l) <= d, which is
+/// exact for 31-bit dividends, and n * m' < 2^63.
+#[inline(always)]
+pub fn Divisor.udiv31(dv: *Divisor, n: u64) -> u64 {
+    (n * ((dv.m_hi as u64) + 1)) >> ((dv.l as u64) + 31)
+}
+
+/// n mod d for 0 <= n < 2^31.
+#[inline(always)]
+pub fn Divisor.urem31(dv: *Divisor, n: u64) -> u64 { n - dv.udiv31(n) * (dv.d as u64) }
+
+/// |x| as a u64 (x > i64.min).
+#[inline(always)]
+fn magnitude(x: i64) -> u64 { if x < 0 { (0 -% x) as u64 } else { x as u64 } }
+
+/// x / d rounded toward zero (C, JS, Prolog `//`), for |x| < 2^63.
+#[inline(always)]
+pub fn Divisor.div_trunc(dv: *Divisor, x: i64) -> i64 {
+    let q = dv.udiv(magnitude(x)) as i64;
+    if x < 0 { 0 -% q } else { q }
+}
+
+/// The remainder of `div_trunc`, with the sign of x (C `%`, JS `%`,
+/// Prolog `rem`), for |x| < 2^63.
+#[inline(always)]
+pub fn Divisor.rem_trunc(dv: *Divisor, x: i64) -> i64 {
+    let r = dv.urem(magnitude(x)) as i64;
+    if x < 0 { 0 -% r } else { r }
+}
+
+/// floor(x / d) (Lua and Python `//`, Prolog `div`), for |x| < 2^63.
+#[inline(always)]
+pub fn Divisor.div_floor(dv: *Divisor, x: i64) -> i64 {
+    let n = magnitude(x);
+    let q = dv.udiv(n);
+    if x >= 0 { return q as i64; }
+    // -ceil(n / d)
+    let r = n - q * (dv.d as u64);
+    0 -% ((q + (if r != 0 { 1 } else { 0 })) as i64)
+}
+
+/// The remainder of `div_floor`, in 0..d (Lua and Python `%`, Prolog
+/// `mod`), for |x| < 2^63.
+#[inline(always)]
+pub fn Divisor.rem_floor(dv: *Divisor, x: i64) -> i64 {
+    let r = dv.urem(magnitude(x));
+    (if x < 0 and r != 0 { (dv.d as u64) - r } else { r }) as i64
+}
