@@ -1,5 +1,4 @@
 mod ast;
-mod asmfold;
 mod autocold;
 mod traits;
 mod check;
@@ -1094,17 +1093,7 @@ fn compiler_main() -> ExitCode {
     if san.is_some() && (san_lib.is_some() || opts.kind != OutKind::Exe) {
         cmd.arg("-fno-sanitize-link-runtime");
     }
-    // An x86-64 executable whose handlers pass more than six register
-    // arguments: from assembly, with the dispatch loads folded (asmfold.rs).
-    let folded = if opts.kind == OutKind::Exe && arch == codegen::Arch::X86_64 && asmfold::wanted(&ir) {
-        asmfold::assemble(&clang, &cmd, &ll)
-    } else {
-        None
-    };
-    match &folded {
-        Some(s) => cmd.arg("-x").arg("assembler").arg(s),
-        None => cmd.arg("-x").arg("ir").arg(&ll),
-    };
+    cmd.arg("-x").arg("ir").arg(&ll);
     // C runtime sources. A static library compiles each to its own
     // object (`-c` takes one input per `-o`), all archived together.
     let mut extra_objs = Vec::new();

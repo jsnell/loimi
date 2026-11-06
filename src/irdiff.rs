@@ -161,21 +161,15 @@ fn optimize(opts: &Opts, inputs: [&Input; 2], tmp: &Path, emit_ir: bool) -> Resu
         }
         c.arg("-x").arg("ir").arg(&src).arg("-o").arg(&out);
         let child = c.spawn().map_err(|e| format!("error: cannot run {}: {}", clang, e))?;
-        kids.push((child, out, *inp));
+        kids.push((child, out, &inp.label));
     }
-    let arch = opts.target.as_ref().map_or(codegen::Arch::host(), |t| t.arch);
     let mut res = Vec::new();
-    for (mut k, out, inp) in kids {
+    for (mut k, out, label) in kids {
         let ok = k.wait().is_ok_and(|s| s.success());
         if !ok {
-            return Err(format!("error: {} failed on the IR of {}", clang, inp.label));
+            return Err(format!("error: {} failed on the IR of {}", clang, label));
         }
-        let mut text = std::fs::read_to_string(&out).map_err(|e| format!("error: {}: {}", out.display(), e))?;
-        // The assembly `loimi build` would assemble (asmfold.rs).
-        if !emit_ir && opts.kind == OutKind::Exe && arch == codegen::Arch::X86_64 && crate::asmfold::wanted(&inp.ir) {
-            text = crate::asmfold::fold(&text, &crate::asmfold::is_table).0;
-        }
-        res.push(text);
+        res.push(std::fs::read_to_string(&out).map_err(|e| format!("error: {}: {}", out.display(), e))?);
     }
     let b = res.pop().unwrap();
     let a = res.pop().unwrap();
