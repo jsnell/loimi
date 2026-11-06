@@ -482,6 +482,29 @@ inlining monomorphic calls took spectral_norm from 1.00 to 0.64. No
 program is slower than the JIT; binary_trees, fib, `interp`,
 string_build, closures and oo_methods are at 0.99–1.01.
 
+## Re-fusion on `become`; load facts (2026-11-06)
+
+Not a run of the suites: speed-audit items 8 and 4
+([design/speed-audit.md](design/speed-audit.md)), tail-call builds,
+user+sys CPU, interleaved runs, an A/A copy of the baseline in the
+same interleave (geometric means, min / median of the runs).
+
+| Change | Suite | 64 | A/A | 128 | A/A |
+|---|---|---:|---:|---:|---:|
+| `refuse fp.cl.proto.code;` + six supers of quickened members | Lox (9) | 0.973 / 0.986 | 1.013 / 0.997 | 0.985 / 0.984 | 1.002 / 1.005 |
+| `refuse` in place of the hand-written one | Mini (14) | 0.999 / 0.995 | 0.997 / 0.994 | 1.002 / 1.002 | 1.000 / 1.001 |
+| same, reverted (64: the first cut, which also re-fused after misses) | MiniJS (14) | 1.010 / 1.013 | 1.004 / 1.004 | 1.003 / 1.005 | 0.997 / 1.001 |
+| hand `refuse` + supers of quickened members, reverted | Python (11) | 0.998 / 0.994 | 1.007 / 0.990 | | |
+| same, reverted | Scheme (11) | 0.999 / 1.002 | 0.997 / 1.005 | | |
+| `Gc` facts + `!invariant.load` (prototype, not built) | Python deltablue, go, richards | 1.007 / 0.993 | 1.003 / 0.994 | | |
+| same | MiniJS properties, deltablue, richards, raytrace | 1.003 / 0.999 | 0.999 / 0.997 | | |
+| same | Mini interp | 1.007 / 1.002 | 1.005 / 0.997 | | |
+
+Lox's zoo is 0.88 at both alignments. MiniJS's deltablue is 1.06
+slower with the port: re-fusing after property quickening forms
+`GETMETHOD_P_CALL` and two `GETPROP_IN` supers, with 10% fewer
+dispatches. The load facts change no hot handler of Mini or MiniJS.
+
 ## Per suite
 
 ### mini
