@@ -1,0 +1,26 @@
+// --vm-stats output for tests/run/vm_supers_from.lm (abridged by hand):
+// the first list of suggestions is taken, the commented-out one is not,
+// and another vm's section is ignored.
+== vm stats: W ==
+         count       %  op
+       1000000   40.0%  ADD
+       1000000   40.0%  MUL
+        500000   20.0%  NEG
+
+suggested superinstructions (each at least 1% of executed ops; none overlaps another or an
+existing super, so they can all be added together):
+    super ADD_MUL = ADD; MUL;    // 1000000, 40.0%, saves 1000000 dispatches
+    super NEG_RET = NEG; RET;    // 500000, 20.0%, saves 500000 dispatches
+    super OLD_NEG = OLD; NEG;    // 10, 1.0%, saves 10 dispatches
+
+also frequent, but each overlaps one of the above or an existing super (an alternative to
+it, not an addition):
+//  super MUL_NEG = MUL; NEG;    // 500000, 20.0%, saves 500000 dispatches; overlaps ADD_MUL
+
+== vm stats: Other ==
+         count       %  op
+            10  100.0%  NEG
+
+suggested superinstructions (each at least 1% of executed ops; none overlaps another or an
+existing super, so they can all be added together):
+    super NEG_NEG = NEG; NEG;    // 10, 100.0%, saves 10 dispatches

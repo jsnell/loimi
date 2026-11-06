@@ -71,6 +71,11 @@ struct Use {
     read: bool,
 }
 
+/// `walk_block`, for other desugarings (`vmparse::desugar_refuse`).
+pub fn walk_block_pub(b: &mut Block, f: &mut dyn FnMut(&mut Expr) -> bool) {
+    walk_block(b, f)
+}
+
 fn walk_block(b: &mut Block, f: &mut dyn FnMut(&mut Expr) -> bool) {
     for s in &mut b.stmts {
         match s {

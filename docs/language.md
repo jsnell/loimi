@@ -3385,6 +3385,83 @@ quickening, declare both: the pair with the generic member, which
 `optimize` forms, and the pair with the quickened member, which the
 `become` turns it into.
 
+**Fusing again after `become`: `refuse`.** A super of two quickened
+members (`MUL_F; ADD_F`, `GETGLOBAL_C; INVOKE_P`) cannot form either
+way: the first site quickens next to a generic op, and the second
+cannot see the word before it (with inline caches and words of
+different sizes, only a walk from the start of the code finds where
+the previous instruction starts). `refuse CODE;` in the vm names that
+code: an expression of the handler's state of type `Verified<Vm>`, the
+code the running instruction is in. After every `become X` where `X` is
+a part of some super, the handler then calls the generated
+`Vm.refuse(CODE)`, which runs `Vm.optimize` over the whole code again,
+so the words end up as `optimize` would make the quickened code, supers
+of quickened members included. A `become` of an op that no super names
+cannot form one, so it stays a single store: a miss member, a
+polymorphic one, a deopt to a generic member no super names.
+
+<!-- snippet: check
+object Proto { code: verified [u32] by V }
+#[require_verified]
+vm V {
+    state { pc: *u32, regs: *f64, p: Gc<Proto> }
+    verify_context owner proto: Gc<Proto>;
+    operand reg = regs[it] verify it < 8;
+    encoding fixed(u32) { format ABC { op: 8, a: 8, b: 8, c: 8 } }
+    family MUL(dst: reg, a: reg, b: reg) : ABC {
+        generic { dst = a * b; become MUL_F; next }
+        MUL_F { dst = a * b; next }
+    }
+    family ADD(dst: reg, a: reg, b: reg) : ABC {
+        generic { dst = a + b; become ADD_F; next }
+        ADD_F { dst = a + b; next }
+    }
+    op RET(a: reg) : ABC { exit a }
+{snippet}
+    entry run(q: Gc<Proto>, r: *f64) -> f64 { p = q; regs = r; jump q.code }
+}
+-->
+```loimi
+super MUL_F_ADD_F = MUL_F; ADD_F;   // forms once both sites have quickened
+refuse p.code;                      // the code a `become` rewrites
+```
+
+- **Accumulators.** In a vm whose accumulators are all value
+  accumulators (section 7.4), `Vm.refuse` runs `Vm.accumulate(code, 0)`
+  first, and a `become` of an op with accumulator variants calls it
+  too, so quickening selects variants as Mini's hand-written `refuse`
+  did.
+- **`redo`.** `become X; redo` runs the word as it is after the
+  re-fusion: the super `X` now heads, if one formed, else `X` alone.
+- **The JIT and traces.** `Vm.optimize` invalidates compiled code and
+  uninstalls traces over the words it rewrites, as when called by hand.
+- **Cost.** The pass is over the whole code, once per `become`. A
+  site that flips between two members that supers name repeats the
+  pass each time.
+
+Lox declares `refuse fp.cl.proto.code;` and `GETGLOBAL_C, INVOKE_P;`
+(zoo 0.89); Mini uses it in place of the `refuse` function it called by
+hand. MiniJS keeps its hand-written one (after arithmetic quickening
+only): re-fusing after its property quickening too formed supers that
+made deltablue slower (`design/speed-audit.md`, item 8).
+
+**Supers from a profile.** `supers from "file";` adds the supers that
+a `--vm-stats` report suggests for the vm: the first list of each
+`== vm stats: NAME ==` section of the file (path relative to the file
+declaring the vm), the list that can be added whole; the commented-out
+alternatives are not taken. A file with no such section is read as
+`super` lines. A suggestion is skipped with a warning when a part is not
+an op of the vm (a stale report), and without one when a super with the
+same parts or name is declared already, so reports of several runs can
+be concatenated and hand-declared supers kept beside them. With
+`#[forward]` on the item, the supers are `#[forward]`; with `#[allow(super_overlap)]`, overlaps among them and with the
+declared ones are not reported.
+
+<!-- snippet: skip names a profile file (tests/run/vm_supers_from.lm builds one) -->
+```loimi
+#[forward] supers from "vm.vmprofile";
+```
+
 **Forwarding.** A super's parts exchange values through the register
 file: `MUL; ADD` stores the product to `R[dst]` and loads `R[a]` back,
 and since both indices are operands, LLVM cannot tell that they are the

@@ -344,7 +344,7 @@ impl Parser {
             _ => self.err(format!("expected integer, found {}", self.describe())),
         }
     }
-    fn string_lit(&mut self) -> Res<String> {
+    pub fn string_lit(&mut self) -> Res<String> {
         match self.peek().clone() {
             Tok::Str(s) => {
                 self.bump();

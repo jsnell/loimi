@@ -303,18 +303,6 @@ fn arith_mixed(c: *Ctx, op: i64, a: V, b: V) -> Result<V, V> {
     arith_slow(c, op, a, b)
 }
 
-/// Fuse superinstructions in a function again after one of its sites
-/// was quickened: fusion compares words by the op they stand for, so
-/// specialized members (MUL_F; ADD_F) fuse too.
-/// Selects accumulator variants first (`vacc`): the float members exist
-/// only once a site has run, and selection splits supers, so it runs
-/// before fusion. It may run in the handler of the op that quickened:
-/// that op leaves its result in `vacc` (language.md §7.4).
-fn refuse(cl: Gc<Closure>) {
-    Mini.accumulate(cl.proto.code.words(), 0);
-    Mini.optimize(cl.proto.code);
-}
-
 /// The single dispatch point for natives. Most allocate but never
 /// collect; `table.sort` and host natives may call back into Mini.
 /// `from_vm`: called by a CALL instruction, so coroutine.yield may leave
@@ -493,6 +481,10 @@ pub vm Mini {
     // next op in xmm0, and is written through to its register too. The
     // float members appear by quickening (`refuse` selects again).
     accumulator vacc: f64 for reg;
+    // After a `become` (a site quickened), select accumulator variants
+    // and fuse supers again in the function: supers of specialized
+    // members (MUL_F; ADD_F) form only then (language.md §7.3).
+    refuse fp.cl.proto.code;
     accumulate ADD_F, SUB_F, MUL_F, ADDK_F, SUBK_F, MULK_F, DIV, DIVK,
         JLT, JLTN, JLE, JLEN, JLTK, JLTKN, JLEK, JLEKN, JGTK, JGTKN, JGEK, JGEKN;
 
@@ -781,13 +773,13 @@ pub vm Mini {
             generic {
                 match (a, b) {
                     (Int(x), Int(y)) => if let Some(r) = x.#checked(y) { dst = Int(r); next },
-                    (Num(x), Num(y)) => cold { dst = Num(x sym y); become #fname; refuse(fp.cl); next },
+                    (Num(x), Num(y)) => cold { dst = Num(x sym y); become #fname; next },
                     _ => {}
                 }
                 cold {
                     match (a, b) {
-                        (Int(x), Num(y)) => { dst = Num(x as f64 sym y); become #ifname; refuse(fp.cl); next }
-                        (Num(x), Int(y)) => { dst = Num(x sym y as f64); become #finame; refuse(fp.cl); next }
+                        (Int(x), Num(y)) => { dst = Num(x as f64 sym y); become #ifname; next }
+                        (Num(x), Int(y)) => { dst = Num(x sym y as f64); become #finame; next }
                         _ => {}
                     }
                     dst = arith_slow(ctx, code, a, b)?;
@@ -815,14 +807,14 @@ pub vm Mini {
                     let r = x as f64 sym f64.from_bits(b as u64);
                     if likely(r == r) { dst = r.to_bits() as V; next }
                 }
-                become #fname; refuse(fp.cl); redo
+                become #fname; redo
             }
             #finame {
                 if let Int(y) = b {
                     let r = f64.from_bits(a as u64) sym y as f64;
                     if likely(r == r) { dst = r.to_bits() as V; next }
                 }
-                become #fname; refuse(fp.cl); redo
+                become #fname; redo
             }
         }
     }

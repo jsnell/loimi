@@ -8,6 +8,30 @@ implementation; `git log` has the details.
 
 ### `vm` declarations and dispatch
 
+- **Re-fusion after `become`**: `refuse fp.cl.proto.code;` in a vm
+  names the code the running instruction is in; after every `become`
+  of an op that some super names, the handler calls the generated
+  `Vm.refuse(code)` (value accumulator selection, then `Vm.optimize`
+  over the code), so supers of two quickened members form, which no
+  single `become` could. `redo` runs the super the word heads after
+  the pass; the JIT and traces see the rewrite as for `optimize`.
+  Lox uses it with six supers of quickened members (`GETGLOBAL_C;
+  INVOKE_P`: zoo 0.88, suite 0.973); Mini uses it in place of its
+  hand-written `refuse` (the same code). MiniJS keeps its own, which
+  re-fuses after arithmetic quickening only: re-fusing after property
+  quickening too formed supers that made deltablue 1.06 slower. Python and
+  Scheme measured no gain from it and do not
+  ([language.md §7.3](docs/language.md#73-superinstructions);
+  [design/speed-audit.md](docs/design/speed-audit.md), item 8).
+- **Supers from a profile**: `supers from "vm.vmprofile";` adds the
+  supers a `--vm-stats` report suggests for the vm (the first list of
+  each of its sections), skipping stale ones with a warning
+  ([language.md §7.3](docs/language.md#73-superinstructions)).
+- **Load facts (item 4): measured, not built.** `dereferenceable` and
+  `nonnull` on `Gc` loads and match payloads, and `!invariant.load` on
+  shape and prototype fields, change no hot handler of Mini or MiniJS
+  and three of Python's (LOADMETHOD), within noise
+  ([design/speed-audit.md](docs/design/speed-audit.md), item 4).
 - **Value accumulators**: `accumulator vacc: f64 for reg;` where `reg`
   holds a nanbox (or low-tag) `value`. The accumulator holds the
   value's word in an SSE register and is written through: every form

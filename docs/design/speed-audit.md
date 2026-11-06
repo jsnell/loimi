@@ -1,8 +1,8 @@
 # Design note: a speed audit (features for faster interpreters)
 
 Status: **proposal.** Written 2026-11-06 against master at 0813bc1.
-Items 1 and 3 are built (their "As built" notes); item 2 was
-prototyped and dropped (its "Prototype results"); item 14 has an
+Items 1, 3 and 8 are built (their "As built" notes); items 2 and 4
+were prototyped and dropped (their "Prototype results"); item 14 has an
 experiment and a staged plan (`trace-tier.md`).
 
 > Have we exhausted the possibilities for language improvements that
@@ -77,11 +77,11 @@ one, else an estimate.
 | 1 | **Accumulators for `value` types** (GC-safe, write-through or spilled at sync points), f32 accumulators, selection past non-interfering ops | Only wasm can use accumulators; it got 0.91, and 0.79 with supers. The five nanbox VMs (Mini, MiniJS, Lox, Python, Scheme) cannot (`vmacc.rs:267`). The latency probe puts an 8% bound on one cached register (`copy-and-patch.md` §13). Store-to-load chains appear in mandelbrot, nbody and spectral_norm | 2–5% on numeric benchmarks in 5 VMs (est.) | M |
 | 2 | **Cheaper operand decoding and dispatch**: pre-scaled byte-offset fields, then offset-threaded dispatch (a handler offset in the word, no table load) | `F64_MUL` is 14 instructions: 6 decode, 3 work, 5 dispatch. wasm3's is 5 (`roadmap.md` Q11). Every interpreter pays this on every op. **Prototyped 2026-11-06: no gain on x86-64** (item 2, "Prototype results") | measured: 1.00 (step 1); 1.01, slower (step 2) | M, then L |
 | 3 | **Division by a verified constant**: `std.math.Divisor` (Granlund–Montgomery) and a verify-time hook that fills it | Prolog crypt: MOD/IDIV 27% of samples. MiniJS closures: MODK's `idiv` 8%. Mini built a magic-number IC by hand (`vm.lm:833`), and recomputing the magic on a miss cost 12%. Python slicing: `idiv` 14% (special-cased by hand) | 5–20% on 3–4 benchmarks; ~0.5% suite | S |
-| 4 | **Load facts**: `dereferenceable`/`nonnull`/invariant loads on pointers and `const` operand kinds | Listed in Mini's "remaining compiler issues" (`RESULTS.md:579`). Dependent-load chains: Python GETATTR 14–26%, MiniJS GETPROP_IN. GETINDEX_GETINDEX (20% of interp) keeps a frame | unknown; 0–3% (est.) | S |
+| 4 | **Load facts**: `dereferenceable`/`nonnull`/invariant loads on pointers and `const` operand kinds | Listed in Mini's "remaining compiler issues" (`RESULTS.md:579`). Dependent-load chains: Python GETATTR 14–26%, MiniJS GETPROP_IN. GETINDEX_GETINDEX (20% of interp) keeps a frame. **Prototyped 2026-11-06: no handler of Mini or MiniJS changes; no gain** (item 4, "Prototype results") | measured: 1.00 | S |
 | 5 | **Smaller objects**: typed small-object chunks with no per-object header (BiBoP), or an 8-byte header for fixed-size types | Every object has a 16-byte header. A Scheme pair is 32 bytes against Guile's 16, and CAR alone is 12–15% of nboyer. Size sensitivity, measured: +8 bytes per object cost MiniJS binary_trees 6% and Python float 6% | est. 3–10%; **upper bound measured 2026-11-06: 1–3%** on nboyer, sboyer, mperm, earley (16-byte pairs, no collection, faults excluded), 24-byte pairs and Prolog ≈0; RSS halved. No-go (item 5) | L |
 | 6 | **A sampling profiler in std** (`std.prof`), mapped to handlers, cold blocks and guest pcs | Every tuning round wrote its own LD_PRELOAD SIGPROF sampler (wasm FRICTION 366, Python FRICTION 618, Mini RESULTS:9). The 64 KiB verifier memset (Prolog sieve 0.54) was found only by sampling | indirect; it finds the next items. **Built 2026-11-06** (`--vm-prof`, item 6): top entries match the hand sampler within 1 point; costs 3% (tail-call) at 1000 Hz | S–M |
 | 7 | **Shifted-int nanbox option** (Int payload in the high bits, so `add; jo` checks overflow) | Python's i48 overflow check is `shl; shl; add; jo; shr`, costing spectral_norm 5–8%. Mini measured i48 at +4–9% and kept i32 (`RESULTS.md:527`) | 3–8% on integer-heavy code in Python, and i48 for Mini (est.) | M |
-| 8 | **Re-fusion on `become`**, and supers from a profile file | Mini and MiniJS call `refuse` (a whole-function `optimize`) by hand after quickening; doing so gave mandelbrot −6% and nbody −5%. Lox, Python and Scheme don't do it | 1–3% where quickening precedes fusion (est.) | S |
+| 8 | **Re-fusion on `become`**, and supers from a profile file | Mini and MiniJS call `refuse` (a whole-function `optimize`) by hand after quickening; doing so gave mandelbrot −6% and nbody −5%. Lox, Python and Scheme don't do it. **Built 2026-11-06** as `refuse CODE;` (item 8, "As built"): Lox zoo 0.88, suite 0.973; Python and Scheme no gain | measured: Lox 0.97; others 1.00 | S |
 | 9 | **A value-stack and frame runtime** (`std.rt.ValueStack`): high-water-mark clearing across coroutines, nested runs and the debugger | Built by hand in MiniJS, Scheme and Python; for Scheme it gave fib 0.81 and tak 0.85. Mini's three attempts failed: the unsafe upper bound was fib 0.92, the safe attempt 0.995–1.003. Python's frames do 8 stores | 1–2% for Mini and Lox; mostly ergonomic for the rest | M |
 | 10 | **Adaptive quickening**: warmup and backoff counters on families (CPython's PEP 659) | No interpreter counts; all specialize on first execution. There is no measured flip-flop yet, so measure first | 0–2% (est.) | S |
 | 11 | **Coroutine and generator switching** as a vm primitive (`suspend`, state snapshot and restore) | Mini's resume/yield cold blocks are 31% of chameneos, the one Mini benchmark slower than LuaJIT `-joff` (1.06). Python generators copy every register on YIELD and resume | 10–30% on coroutine benchmarks; niche | M |
@@ -1014,6 +1014,75 @@ benchmarks; Mini interp.
 **General:** every interpreter, but the size of the gain is unknown.
 That is why it ranks below items 1–3 despite its cost.
 
+#### Prototype results (2026-11-06): no gain, no-go
+
+**What was built.** Rather than editing the `.ll` by hand, a throwaway
+switch in codegen (`LOIMI_PROTO_FACTS`, not kept) put the facts where
+the compiler already knows the types, on every handler at once:
+- **`gc`.** Every load of a `Gc<T>` struct field got `!nonnull` and
+  `!dereferenceable(size_of T)`. Every `Gc` payload extracted after a
+  successful match (`values::payload`, nanbox) got
+  `llvm.assume(true) ["dereferenceable"(p, size_of T), "nonnull"(p)]`.
+  The pointer is the one the match produced, so a nil encoding never
+  gets the fact.
+- **`inv=S.f,..`.** Loads of the named fields got `!invariant.load`:
+  - Python: `Box.s`, `Box.kind`, `Inst.cls`, `Func.proto`,
+    `Func.globals`, `Proto.nregs`, `Proto.simple`;
+  - MiniJS: `Shape.id` (std.obj), `Fn.proto`, `Proto.nregs`, `fixed`,
+    `nparams`, `flags`, `nfree`;
+  - Mini: `Closure.proto`, `Proto.nregs`, `consts`, `nparams`,
+    `protos`, `nupvals`.
+
+The IR has them where intended. Python got 681 payload assumes, 251
+field loads with `nonnull`/`dereferenceable` and 582 invariant loads;
+MiniJS 399, 963 and 925; Mini 398, 321 and 677. MiniJS's GETPROP_IN,
+for one, is `assume(deref 32) %o` → `load ptr %o.shape, !nonnull,
+!dereferenceable 56` → `load i32 %shape.id, !invariant.load`.
+
+**The machine code barely changes.** Comparing the disassembly
+function by function (addresses and symbol names stripped):
+- **Mini.** 0 of 154 handlers differ. Only 14 cold blocks of the call
+  paths change, by 14–26 bytes.
+- **MiniJS.** 0 of 165 handlers differ. One cold block changes (KEYS,
+  −50 bytes).
+- **Python.** 3 of the 11 attribute, global and call handlers differ
+  (LOADMETHOD, LOADMETHOD_CALLMETHOD, CALLMETHODKW): a kind test folded
+  away and blocks reordered (−32 bytes in LOADMETHOD). GETATTR,
+  GETATTR_GETATTR, SETATTR and GETGLOBAL_C are identical.
+
+**Why nothing changes.** A tail-call handler is one straight-line path
+from the dispatch to the next dispatch:
+- **Nothing to speculate above.** The loads of the chain `o → o.shape
+  → shape.id` (or `o.keys → keys.s → keys.extra[i]`) depend on each
+  other's results. The first one depends on the tag test, through the
+  payload. `dereferenceable` lets LLVM hoist a load above a branch, but
+  there is no earlier point that already has the pointer.
+- **Nothing to reuse.** `!invariant.load` lets a load be reused across
+  stores and calls. A handler loads each field once, so there is
+  nothing to CSE; the next handler is another function.
+- **Register pressure stays.** Mini's GETINDEX_GETINDEX frame comes
+  from what is live across its two parts, not from reloads.
+
+**Timing**, as an upper bound (user+sys CPU; interleaved;
+`--align-functions=64`; A/A = a copy of the baseline in the same
+interleave; load average 4–5 from other agents):
+
+| Suite (benchmarks, runs) | `gc` | `gc` + `inv` | A/A |
+|---|---:|---:|---:|
+| Python: deltablue, go, richards (11) | 1.004 / 0.998 | 1.007 / 0.993 | 1.003 / 0.994 |
+| MiniJS: properties, deltablue, richards, raytrace (7) | — | 1.003 / 0.999 | 0.999 / 0.997 |
+| Mini: interp (9) | — | 1.007 / 1.002 | 1.005 / 0.997 |
+
+(min / median, geometric means of the ratio to the baseline.) Every
+column is inside the A/A range.
+
+**Decision: not built.** `const` fields and pointer facts on `Gc`
+would be sound (the prototype put them only after a match) and cheap,
+but they buy nothing on these interpreters' handlers. They would matter
+for code with loops over objects or calls between reuses: library code
+in `std`, a trace, or an optimizing tier (item 14). That is where to
+look again, not at the handlers.
+
 ### 5. Smaller objects: headerless typed chunks
 
 **Evidence.**
@@ -1428,6 +1497,138 @@ Python's arithmetic families, then time them. An hour each.
 
 **General:** five interpreters with families. The speed is in the
 three that do not re-fuse today; (b) is ergonomic.
+
+#### Prototype results (2026-11-06)
+
+**The premise was wrong.** Lox, Python and Scheme have no arithmetic
+families: their ADD and MUL test the types every time and never
+`become` anything. What they quicken is globals, properties and calls
+(Lox: GETGLOBAL, SETGLOBAL, GETPROP, SETPROP, INVOKE; Python: GETGLOBAL,
+CALL; Scheme: GETGLOBAL, CHKGLOBAL). On their numeric benchmarks
+(`--vm-stats`) quickened ops are 0% of dispatches (Python nbody,
+fannkuch; Scheme fib, fibfp, sumfp, mbrot, ack, tak), so re-fusion has
+nothing to act on there.
+
+**Where it could act.** A `refuse` call adds nothing unless some super
+names quickened members. The existing rules already cover a pair with
+one quickened member: declare the generic pair and the quickened one,
+and the `become` in the part re-targets the head. What only re-fusion
+forms is a pair of two quickened members, since the second site to
+quicken cannot see the word before it. From `--vm-stats` of every
+benchmark of the three suites, the hot pairs of that kind are:
+
+| Suite | Pair | Share of dispatches |
+|---|---|---|
+| Lox | `GETGLOBAL_C; INVOKE_P` | invocation, properties 31%; zoo 21% |
+| Lox | `GETPROP_IN; INVOKE_POLY`, `GETPROP_POLY; JNEQK` | trees 15% |
+| Lox | `SETGLOBAL_C; GETGLOBAL_C`, `SETPROP_ADD; SETPROP_ADD` | method_call 7%; binary_trees 5% |
+| Python | `GETGLOBAL_C; GETATTR`, `GETATTR; GETGLOBAL_C` | deltablue 6–7%, go 3% |
+| Scheme | `CHKGLOBAL_B; GETGLOBAL_B`, `GETGLOBAL_B; GETGLOBAL_B` | conform 8%, triangl 10% |
+| Scheme | `GETGLOBAL_B; VREF`, `GETGLOBAL_B; PRIMCALL` | puzzle 14%, string 12% |
+
+**What was measured.** Mini's pattern (`become X; refuse(cl); ..`,
+`refuse` = `Vm.optimize` over the function) after every `become` in the
+three suites, plus those pairs as supers: six in Lox, five in Python
+(with the single-quickened pairs above), five in Scheme. Same machine
+and method as item 2: user+sys CPU, interleaved runs, `--align-functions=64`,
+an A/A copy of the baseline in the same interleave. The load average
+was 4–5 on 8 cores, from two other agents' builds and benchmarks, so
+the A/A column moved up to ±8% on single short benchmarks (medians);
+the minimums are steadier.
+
+| Suite (benchmarks, runs) | refuse + supers, min / median | A/A, min / median |
+|---|---:|---:|
+| Lox (9, 7) | 0.981 / 0.976 | 0.995 / 0.997 |
+| Lox (9, 11), second run | 0.978 / 0.977 | 1.013 / 0.997 |
+| Python (11, 7) | 0.998 / 0.994 | 1.007 / 0.990 |
+| Scheme (11 of them, 7) | 0.999 / 1.002 | 0.997 / 1.005 |
+
+- **Lox pays**, all of it on the benchmarks above: zoo **0.883–0.886**
+  in both runs (min and median), invocation 0.94–0.97, instantiation
+  0.94–0.99, properties 0.94–0.99; fib, equality and binary_trees
+  stay within the A/A range.
+- **Python and Scheme do not.** deltablue 0.97 (min) / 1.00 (median);
+  conform 0.93 / 0.94 against an A/A of 0.99 / 0.94; puzzle, triangl,
+  string within noise. These were reverted.
+
+**Decision:** build (a) for Lox; keep Python and Scheme as they are.
+
+#### As built (2026-11-06)
+
+**(a) `refuse CODE;`** (`language.md` §7.3, "Fusing again after
+`become`"). A vm item naming the code the running instruction is in,
+an expression of the handler's state of type `Verified<Vm>`:
+`refuse fp.cl.proto.code;`. After every `become X` where `X` is a part
+of some super (or has value accumulator variants), the handler calls
+the generated `Vm.refuse(CODE)`:
+`Vm.accumulate(code, 0)` first when every accumulator is a value
+accumulator (so Mini's and MiniJS's variant selection comes along), then
+`Vm.optimize_words`. Any other `become` stays one store: an op no super
+names cannot form one, and a super it was a later part of keeps
+running.
+
+- **Why not local.** The proposal asked for a local rewrite of the
+  word and its neighbours. Forward is easy: the next instruction is at
+  `pc + size(X)`. Backward is not: with inline caches and ops of several
+  sizes, the word before `pc` may be a cache word or an operand word,
+  and rewriting it as an opcode would corrupt the cache. Only a walk
+  from the start of the code finds the previous instruction, and once
+  the code is walked, running `optimize`'s pass over it costs about
+  the same and gives exactly `optimize`'s result (the same rules, by
+  construction). The pairs that matter (two quickened members) are
+  formed by the *second* `become`, which is the backward case.
+- **`redo`.** `become X; redo` dispatches the word as it is after the
+  pass: the super `X` heads if one formed (`tests/run/vm_refuse.lm`,
+  `NEG_F_RET`), else `X` alone. A `become` inside a super first
+  re-targets or splits the head as before; the pass then sees the
+  result.
+- **JIT and traces.** `optimize_words` already calls
+  `loimi_jit_invalidate`/`loimi_jit_rewritten`, which uninstall traces
+  and re-patch the stencils; the test runs under the JIT matrix.
+- **Cost.** One pass over the function per `become` (three `calloc`s
+  and a DP over its words). Mini's hand `refuse` paid the same.
+
+**Ports** (same method; base is master, with Mini's and MiniJS's hand
+`refuse`):
+
+| Suite | Change | min / median | A/A min / median |
+|---|---|---:|---:|
+| Lox (9, 11) | `refuse fp.cl.proto.code;`, six supers of quickened members | 0.973 / 0.986 | 1.013 / 0.997 |
+| Lox, `--align-functions=128` (9, 9) | same | 0.985 / 0.984 | 1.002 / 1.005 |
+| Mini (14, 9) | the hand `refuse` (5 calls) replaced by the item | 0.999 / 0.995 | 0.997 / 0.994 |
+| Mini, 128 (14, 5) | same | 1.002 / 1.002 | 1.000 / 1.001 |
+| MiniJS (14, 9), first cut | the hand `refuse` (6 calls) replaced; every `become` of a family in a super re-fused | 1.010 / 1.013 | 1.004 / 1.004 |
+| MiniJS (6 object benchmarks, 9) | only `become`s of ops a super names re-fuse | 1.001 / 1.008 | 1.001 / 0.996 |
+| MiniJS, 128 (14, 7) | same | 1.003 / 1.005 | 0.997 / 1.001 |
+
+- **Lox** keeps it: zoo 0.883 (0.878 at 128), invocation 0.91–0.98,
+  properties 0.98; trees moved 1.00 at 64 and 1.04 at 128.
+- **Mini** keeps it. The hot code is the same: Mini's families in
+  supers are the arithmetic ones that called `refuse` by hand.
+- **MiniJS does not; its port was reverted.** Re-fusing after property
+  quickening forms supers that its hand `refuse` (arithmetic only) never
+  formed in deltablue: `GETMETHOD_P_CALL`, `GETPROP_IN_GETMETHOD_P` and
+  `GETPROP_IN_GETPROP_IN`, 10% fewer dispatches (`--vm-stats`). Yet
+  deltablue is 1.006–1.06 slower (1.057 at 128), and richards 1.02–1.03
+  at 128. Those supers were picked when they formed only by accident
+  (in functions where an arithmetic site also quickened). They are a
+  candidate for re-measuring, not for this item.
+- **The first cut** re-fused after every `become` of a family that some
+  super named, misses and polymorphic members included. It was the
+  slower one (MiniJS 1.010, deltablue 1.05). Now only a `become` to an
+  op that a super names (or that has accumulator variants) calls
+  `Vm.refuse`.
+
+At 64 Lox gained zoo 0.883 and invocation 0.907 (min) / 0.962 (median).
+
+**(b) `supers from "file";`** reads the first list of supers that
+`--vm-stats` suggests in the `== vm stats: NAME ==` sections of the file
+(or plain `super` lines), skips stale ones (parts the vm does not have)
+with a warning and ones declared already silently, and accepts
+`#[forward]` and `#[allow(super_overlap)]` on the item. Cheap (60
+lines in `vmexpand.rs`), so built; no example uses it yet: the
+examples' supers are hand-picked from several reports and measured one
+by one.
 
 ### 9. A value-stack and frame runtime
 
