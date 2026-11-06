@@ -287,6 +287,31 @@ CALL/RET and the property loads elsewhere (`GETPROP_IN` is a dependent
 load of the shape id; the Obj.sid experiment above did not pay);
 `MODK` by non-power-of-two constants is an `idiv` (closures 8%).
 
+## A value accumulator, with the dispatch fold back: kept (2026-11-06)
+
+The port below (commit 6d40423) again, now that the build folds the
+dispatch load into the `jmp` in the assembly when handlers pass more
+than six register arguments (`src/asmfold.rs`, `docs/lowering.md` §3):
+868 of the port's 877 indirect jumps are `jmp *T(,%rax,8)` again (833
+were `mov; jmp *%rax`). User+sys CPU, median of 9 paired interleaved
+rounds against base (master without the port), A/A in brackets; the
+port without the fold measured in the same rounds:
+
+| | align 64 | align 128 |
+|---|---:|---:|
+| nbody | 0.932 (1.008) | 0.921 (1.002) |
+| spectral_norm | 1.002 (1.003) | 1.004 (1.000) |
+| fannkuch | 1.023 (1.004) | 1.008 (0.997) |
+| bitops | 0.997 (0.986) | 0.988 (0.998) |
+| suite (14) | 0.997 (0.996) | 0.997 (1.003) |
+| suite, port without the fold | 0.990 | 0.997 |
+
+Kept: neutral on the suite at both alignments, nbody 7-8% faster. The
+fold itself makes no difference that these rounds can see (the port
+with and without it: 0.996 and 0.995 across the suite), and the port's
+earlier 1.004 and 1.007 below were within the A/A spread (0.982 at
+128) of the same protocol; the decision then was the noise's.
+
 ## A value accumulator: measured, not kept (2026-11-06)
 
 Speed audit item 1 (`language.md` §7.4, "Value accumulators"):

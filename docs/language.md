@@ -3616,11 +3616,14 @@ error). Measured on Mini (`bench/mini/RESULTS.md`, item 43):
 mandelbrot 0.90, with supers over the variants; a variant breaks up the
 supers over its op, so those matter: `--vm-stats` suggests supers over
 variants, and names the super they split. The cost is the register
-itself: it is an argument of every handler's tail call, and a seventh
-register argument stops LLVM folding the dispatch load into the `jmp`
-(`lowering.md` §3). That cost Mini's fib 4% with nothing selected, and
-made the same port a net loss in MiniJS and Scheme, which have fewer
-float kernels.
+itself: it is an argument of every handler's tail call (a seventh one
+stops LLVM folding the dispatch load into the `jmp`, which the build
+then folds in the assembly, `lowering.md` §3), it is saved around the
+C calls of handlers that make them, and an integer writer moves its
+result into it. With nothing selected Mini measures within noise of no
+accumulator. MiniJS uses one too (nbody 0.92, suite 0.997); in Scheme,
+whose benchmarks are mostly integer code, the port was 0.5% slower and
+is not kept.
 
 **Op selectors.** The ops of an `accumulate` list, and of a variant's
 `wraps [..]` (section 9), are given by selectors, each naming one or

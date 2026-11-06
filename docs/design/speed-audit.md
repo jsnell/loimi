@@ -494,6 +494,9 @@ tests, `--jit-stencils` and TSan all pass on Mini. Two claims were wrong:
   the `u64` class). A control build of Mini with the accumulator
   declared and nothing selected measured fib 1.038, queens 1.022 and
   1.006 over eight benchmarks. That cost is what decided the ports.
+  (Not so: the build now folds it back, and remeasured, neither the
+  fold nor the control build's loss shows; "The fold, recovered",
+  below.)
 
 **Ports.** User+sys CPU, median of 9 paired interleaved rounds
 (min-of-runs moved ±10% between identical binaries: load 4 to 6 from
@@ -518,11 +521,55 @@ of 5:
   `first_temp`; mbrot's loop from 13 dispatches to 7. Integer ADD/SUB
   also pay a `movq`. Reverted.
 
-**Next:** recover the fold, and the MiniJS and Scheme ports are worth
-measuring again. Options: fold in the assembly (`jmp *T(,%rax,8)` is
-valid while `%rax` is not an argument, which under `preserve_none` it
-is only for the twelfth general one), or keep a vm with an accumulator under seven register
-arguments.
+**The fold, recovered (2026-11-06, later).** The cause is LLVM's x86
+isel pattern for a tail call through memory, `X86tcret_6regs`
+(`X86InstrCompiler.td`): it counts the `X86ISD::TC_RETURN` node's
+register operands and refuses to fold past six, whatever their class
+or order, and whichever registers are free. `-print-after=finalize-isel`
+on a six-`ptr` handler gives `TCRETURNmi64` (folded); with a seventh
+`double`, `i64`, `float`, or even a `poison` one, `TCRETURNri64` after
+a separate load. A `<2 x i64>` counts once. No LLVM option changes
+the count, and in the IR the only way under it is dropping or packing
+state: dropping the instruction word (the callee reloads it from
+`pc`; tried on Mini, all dispatches fold) moves the extra µop instead
+of saving it, and packing the accumulator into a vector with another
+state value costs a shuffle at every use of the other lane. So the
+build folds in the assembly (`src/asmfold.rs`, `lowering.md` §3):
+x86-64 executables whose IR has a `preserve_none` function with more
+than six parameters are compiled to `.s`, and
+`movq T(,%rI,8),%rD; ...; jmpq *%rD` becomes `jmpq *T(,%rI,8)` when only
+plain instructions that leave `%rD` alone and do not write `%rI` come
+between. Mini folds 1043 of its 1051 indirect jumps, MiniJS's port
+868 of 877, the wasm interpreter all but 18 of 1217 (a side effect:
+it passes nine). Programs with six or fewer build as before, to the
+same executable.
+
+**The fold was not the cost, though.** The 2026-11-06 control build's
+fib 1.038 and queens 1.022 do not come back: with 11 paired rounds at
+64 and 9 at 128, the control build (accumulator declared, nothing
+selected) is within the A/A spread folded or not (`bench/mini/RESULTS.md`,
+item 44), and a dispatch microbenchmark (10^9 dispatches through four
+small handlers) times 6 arguments, 7, and 7 folded within 2.5% of each
+other, the 7-unfolded one fastest: the dispatch's critical path is the
+two dependent loads, not the extra µop. What an unselected accumulator
+does cost is `xmm0` being live across a hot path's C calls (GETGLOBAL
+saves and restores it around `value.table_find`) and, in Scheme,
+the `movq` on ADD/SUB/MUL's integer paths. Re-measured:
+
+| port | float benchmark, align 64 | align 128 | suite, align 64 | suite, align 128 | kept |
+|---|---:|---:|---:|---:|---|
+| Mini (14) | mandelbrot 0.924, nbody 0.974 | mandelbrot 0.901, nbody 1.010 | 0.994 (0.998) | 0.996 (1.002) | yes (unchanged) |
+| MiniJS (14) | nbody 0.932 | nbody 0.921 | 0.997 (0.996) | 0.997 (1.003) | **yes** |
+| Scheme (43) | mbrot 0.857 | mbrot 0.876, 0.889 | 0.998 (1.006) | 1.005 (0.992), 1.007 (0.999) | no |
+
+User+sys CPU, median of 9 (Mini 11 at 64) paired interleaved rounds
+against master without the port, A/A in brackets, the ports with the
+fold. MiniJS is kept. Scheme stays out: at 128 it is 0.5-0.7% slower in
+two runs whose A/A was 0.992 and 0.999, with its integer benchmarks
+(tak, fib, cpstak) 1-2% slower from the `movq`; mbrot's 11-14% does
+not outweigh 42 benchmarks of that. Folded or not made no difference
+to either port's suite (MiniJS 0.996 and 0.995 for folded over
+unfolded; Scheme 0.996 and 1.005).
 
 **Python** is not ported. Its arithmetic ops pass `dst.raw` to `call2`
 (a dunder method's frame, whose return writes the slot), so they read

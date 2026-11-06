@@ -557,6 +557,41 @@ Next candidates:
     benchmarks 1.006). Mini's suite still comes out ahead or even, so the
     port stays; MiniJS's did not (`bench/minijs/RESULTS.md`).
 
+44. **The dispatch fold, recovered; and it was not the cost.** The build
+    now folds the table load into the `jmp` in the assembly when the
+    handlers pass more than six register arguments (`src/asmfold.rs`,
+    `lowering.md` §3): Mini's handlers have 1043 `jmp *T(,%rax,8)` and
+    8 `jmp *%reg` (CALL supers whose index register is reassigned
+    before the jump), against 44 and 1007 before; MOVE is
+    `movzbl %sil,%eax; jmp *T(,%rax,8)` again, as without the
+    accumulator. Remeasured with base = item 43's base (no accumulator),
+    the control build (`accumulate DIVK;`, nothing selected) and the
+    current Mini, each unfolded and folded; user+sys CPU, median of
+    paired interleaved rounds (11 at align 64, 9 at 128), against base:
+
+    | | A/A | Mini | Mini folded | control | control folded |
+    |---|---:|---:|---:|---:|---:|
+    | fib, 64 | 0.998 | 1.002 | 1.000 | 1.004 | 0.998 |
+    | queens, 64 | 0.978 | 1.027 | 0.998 | 1.002 | 1.027 |
+    | mandelbrot, 64 | 0.981 | 0.906 | 0.924 | 0.987 | 0.990 |
+    | suite (14), 64 | 0.998 | 0.999 | 0.994 | 1.005 | 1.005 |
+    | fib, 128 | 1.004 | 1.017 | 1.014 | 0.995 | 1.008 |
+    | queens, 128 | 0.996 | 0.989 | 1.001 | 1.001 | 1.006 |
+    | mandelbrot, 128 | 1.001 | 0.907 | 0.901 | 0.989 | 1.003 |
+    | suite (14), 128 | 1.002 | 0.993 | 0.996 | 1.003 | 1.005 |
+
+    Folded over unfolded: 0.996 and 1.001 (Mini), 1.000 and 0.999
+    (control). Item 43's control result (fib 1.038, queens 1.022) does
+    not come back, folded or not: the control is within half a percent
+    of base, about the A/A spread. A microbenchmark agrees (four small
+    handlers, 10^9 dispatches: 6, 7 and 7-folded arguments within 2.5%
+    of each other): the dispatch waits on its two dependent loads, and
+    the extra `mov` is a µop the front end has room for. The fold is
+    kept (an instruction fewer per dispatch, no cost); the control's
+    remaining code difference is `xmm0` saved around the C calls of
+    hot handlers (GETGLOBAL, NEWTABLE, CONCAT, POW) and a `xorps` on
+    computed jumps.
+
 ## Int(i48): measured, not adopted
 
 Mini keeps 32-bit integers (SPEC §2.1). Switching the payload to `i48`

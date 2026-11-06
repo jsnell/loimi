@@ -423,11 +423,13 @@ Notes:
   only, on an integer path, a `movq` to `xmm0`. A `jump` to a computed
   target zeroes the accumulator (`xorps`, a zero idiom). The register
   is still an argument of every tail call: in a vm that passes six
-  (Mini, MiniJS, Scheme) it is the seventh, and every handler's dispatch
-  loses the fold of the table load into the `jmp` (the next item), an
-  `f64` as much as a `u64`. On Mini that cost fib 3.8% and queens 2.2%
-  with nothing selected (`bench/mini/RESULTS.md`, item 43); it is what
-  made the MiniJS and Scheme ports a net loss.
+  (Mini, MiniJS) it is the seventh, which LLVM will not fold
+  into the dispatch `jmp` (the next item), an `f64` as much as a `u64`;
+  the build folds it back in the assembly. What remains is the
+  register's liveness: `xmm0` is not preserved by C calls, so a handler
+  that calls out on its hot path (Mini's GETGLOBAL calls
+  `value.table_find`) saves and restores it around the call, and its
+  frame grows by 16 bytes.
 - **The dispatch table's address.** On x86-64 an executable (`-fno-pic`)
   indexes the table as an absolute address. Whether the load folds into
   the jump depends only on how many values the tail call passes in
@@ -455,14 +457,43 @@ Notes:
   `jmp *table(,%rax,8)` in its assembly and timing both builds
   (`bench/wasm/bench.py`, best of 3 interleaved, `-align-all-functions=6`)
   gave a geometric mean of 1.007 of the original's time (per benchmark
-  0.96 to 1.03, within run-to-run noise). With nothing to win, the
-  compiler neither warns about the count nor reorders or packs state to
-  get under it. (Mini disagrees, 2026-11-06: a value accumulator, as its
-  seventh argument, cost fib 3.8% and queens 2.2% with no variant ever
-  selected, in paired medians at load 4. So the fold matters on
-  dispatch-bound integer code, and a fix, such as folding in the
-  assembly or keeping state under seven registers, would make value
-  accumulators pay in MiniJS and Scheme: see the speed audit, item 1.)
+  0.96 to 1.03, within run-to-run noise).
+
+  **The build folds it in the assembly** (`src/asmfold.rs`, since
+  2026-11-06). Nothing in the IR gets the fold back with seven values:
+  an `undef` or `poison` argument still takes a register operand, a
+  `<2 x i64>` counts once but costs a shuffle at every use of the lane,
+  and dropping the instruction word (the callee reloads it from `pc`)
+  trades the `mov` for a load, the same count. So an x86-64 executable
+  whose IR has a `preserve_none` function of more than six parameters
+  is compiled to assembly with the build's flags, and each
+  `movq T(,%rI,8), %rD` followed in its block by `jmpq *%rD # TAILCALL`
+  becomes `jmpq *T(,%rI,8)`, when `T` is a dispatch table (a constant,
+  so the load may move down) and the instructions between are plain
+  ones (moves, `lea`, ALU, `pop`, SSE moves) that do not mention `%rD`
+  and do not write `%rI`. Other programs build from the IR as before,
+  to the same executable (Lox, Python, Prolog; Stak, whose tables are a
+  register, folds nothing and is unchanged too). Mini with its
+  accumulator folds 1043 of 1051 dispatches (`mov T(,%rax,8),%rax;
+  jmp *%rax` becomes `jmp *T(,%rax,8)` in MOVE, the variants and the
+  rest); the 8 left are CALL supers where the index register is
+  reassigned in between. In the wasm interpreter 1217 register jumps
+  become 18.
+  `loimi ir-diff` applies the same rewrite to the assembly it compares.
+
+  The rewrite is for the instruction count: the time it saves is below
+  what this machine can measure. A dispatch microbenchmark (four
+  handlers that add to a register and dispatch the next of 4096 words,
+  10^9 dispatches, i7-6700) ran 1.405 s with six arguments, 1.371 s
+  with seven and 1.399 s with seven folded when the opcodes repeat (the
+  branch predicted), and 7.6 to 8.3 s for all three when they are
+  random: the dispatch's critical path is the load of the word and then
+  of the target, which folding does not shorten, and the extra `mov` is
+  one more fused µop where the front end has room. Mini's fib and
+  queens, the benchmarks the 2026-11-06 control build blamed on the
+  fold (3.8% and 2.2%), measure within their A/A spread with the
+  accumulator declared and unselected, folded or not (`bench/mini/RESULTS.md`,
+  item 44).
   A table address passed as an argument does not fold on x86-64 at any
   count (`mov (%r14,%rax,8),%rax; jmp *%rax`), which is one reason the
   table stays a global there.

@@ -436,12 +436,33 @@ the previous build (A/A in brackets; load 4 to 6 from other agents):
 
 The accumulator is a seventh register argument of every handler's tail
 call in these three, which stops LLVM folding the dispatch table's load
-into the `jmp` ([lowering.md §3](lowering.md#3-handlers-in-tailcall-mode)):
-about 1% across integer code, 4% on Mini's fib. Interpreters without
-a value accumulator compile to the same code (`loimi ir-diff`, all three
-dispatch modes: Lox, Stak, Python, Prolog; wasm differs only in
-`W.accumulate`, which now resets earlier variants first, and the
-host-side `W.disasm_op`).
+into the `jmp` ([lowering.md §3](lowering.md#3-handlers-in-tailcall-mode)).
+Interpreters without a value accumulator compile to the same code
+(`loimi ir-diff`, all three dispatch modes: Lox, Stak, Python, Prolog;
+wasm differs only in `W.accumulate`, which now resets earlier variants
+first, and the host-side `W.disasm_op`).
+
+**Later the same day: the fold back, MiniJS ported.** The build now
+folds the table load into the `jmp` in the assembly of executables
+whose handlers pass more than six register arguments (`src/asmfold.rs`;
+the cause is LLVM's `X86tcret_6regs`, which counts register operands).
+Remeasured with more rounds (Mini 11 at align 64), the fold makes no
+difference that shows, and neither did it cost the "4% on fib" above:
+a control build with the accumulator declared and unselected is within
+the A/A spread of no accumulator, folded or not
+(`bench/mini/RESULTS.md`, item 44). The ports, folded, against master:
+
+| suite | align 64 | align 128 | float benchmark |
+|---|---:|---:|---|
+| mini (14), unchanged | 0.994 (0.998) | 0.996 (1.002) | mandelbrot 0.924 / 0.901 |
+| minijs (14), **kept** | 0.997 (0.996) | 0.997 (1.003) | nbody 0.932 / 0.921 |
+| scheme (43), not kept | 0.998 (1.006) | 1.005 (0.992), 1.007 (0.999) | mbrot 0.857 / 0.876 |
+
+Scheme stays out for its integer paths (a `movq` to the accumulator in
+ADD/SUB/MUL: tak, fib, cpstak 1-2% slower). The wasm interpreter, which
+passes nine arguments, now gets the folded dispatch too (1217 register
+jumps to 18); IR and executables of Lox, Stak, Python and Prolog are
+unchanged.
 
 ## Per suite
 
