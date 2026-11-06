@@ -1,5 +1,5 @@
 // Exact integers beyond the fixnums, on std.bigint's GC layer. An exact
-// integer is a fixnum (`Int`, i48) when it fits one and a `Big` (limbs
+// integer is a fixnum (`Int`, i32) when it fits one and a `Big` (limbs
 // and a sign in the GC heap) otherwise: every result is normalized, so
 // the fixnum fast paths never see a small `Big`, and `eqv?` on fixnums
 // stays a word compare. These functions allocate but never collect (the
@@ -34,15 +34,15 @@ fn view(v: V, buf: *u64) -> Num { arg(v).num(buf) }
 
 /// A std.bigint result as a value: a fixnum if it fits.
 pub fn norm(l: Gc<Big>) -> V {
-    if let Some(x) = bigint.to_i64(l.num()) and x >= -140737488355328 and x <= 140737488355327 {
-        return V.Int(x as i48);
+    if let Some(x) = bigint.to_i64(l.num()) and x >= -2147483648 and x <= 2147483647 {
+        return V.Int(x as i32);
     }
     V.Big(l)
 }
 
 /// An i64 as an exact integer.
 pub fn of_i64(h: *gc.Heap, x: i64) -> V {
-    if x >= -140737488355328 and x <= 140737488355327 { return V.Int(x as i48); }
+    if x >= -2147483648 and x <= 2147483647 { return V.Int(x as i32); }
     V.Big(bigint.gc_of_i64(h, x))
 }
 
@@ -107,7 +107,7 @@ pub fn to_f64(v: V) -> f64 {
 
 /// The exact integer equal to an integral flonum (None for inf and nan).
 pub fn of_f64(h: *gc.Heap, f: f64) -> ?V {
-    if f >= -140737488355328.0 and f <= 140737488355327.0 { return Some(V.Int(f as i48)); }
+    if f >= -2147483648.0 and f <= 2147483647.0 { return Some(V.Int(f as i32)); }
     let Some(l) = bigint.gc_from_f64(h, f) else { return None; };
     Some(norm(l))
 }

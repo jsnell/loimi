@@ -1,4 +1,4 @@
-; Exact integers beyond the fixnums (48-bit; the 32-bit edges too): promotion on overflow,
+; Exact integers beyond the 32-bit fixnums: promotion on overflow,
 ; demotion of results that fit, mixed exact/inexact comparisons, radix
 ; input and output. Expected output: Guile 3.0.11's, which Gauche 0.9.15
 ; matches except that it writes two of the flonums as 1.099511627776e12
@@ -23,14 +23,6 @@
 ; expect: #t #t #t
 (show (eq? (+ (- -2147483648 1) 1) -2147483648) (exact-integer? (- big 1)) (exact-integer? big))
 ; expect: #t #t #t
-; The 48-bit fixnum edges: + and - promote, * of two fixnums whose i64
-; product overflows, and expt.
-(show (+ 140737488355327 1) (- -140737488355328 1) (* 140737488355327 140737488355327))
-; expect: 140737488355328 -140737488355329 19807040628565802923409276929
-(show (add 140737488355327 1) (* -1 -140737488355328) (expt 2 47) (expt -2 47) (expt 3 30))
-; expect: 140737488355328 140737488355328 140737488355328 -140737488355328 205891132094649
-(show (eq? (- (+ 140737488355327 1) 1) 140737488355327) (eq? (* 4294967296 4) 17179869184))
-; expect: #t #t
 (show (let loop ((i 0) (x 2147483600)) (if (= i 200) x (loop (+ i 1) (if (< i 100) (+ x 1) (- x 1))))))
 ; expect: 2147483600
 
