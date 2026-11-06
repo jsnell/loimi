@@ -70,6 +70,26 @@ fn fnv_str(mut h: u64, s: &str) -> u64 {
 /// The largest window (register slots cached in SSA values).
 const MAX_WINDOW: usize = 256;
 
+/// A set of window slots.
+#[derive(Clone, Copy, Default, PartialEq, Debug)]
+struct Bits([u64; MAX_WINDOW / 64]);
+
+impl Bits {
+    fn set(&mut self, j: usize) {
+        self.0[j / 64] |= 1 << (j % 64);
+    }
+    fn or(&self, o: &Bits) -> Bits {
+        let mut r = *self;
+        for (a, b) in r.0.iter_mut().zip(&o.0) {
+            *a |= b;
+        }
+        r
+    }
+    fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..MAX_WINDOW).filter(|&j| self.0[j / 64] >> (j % 64) & 1 == 1)
+    }
+}
+
 // ---------------------------------------------------------------- recordings
 
 /// A compiled code object as recorded (`LOIMI_TRACE_RECORD`).
@@ -1345,6 +1365,11 @@ struct FnGen<'t, 'a> {
     used: BTreeSet<usize>,
     /// Some access to the register file has an unknown offset.
     dynamic: bool,
+    /// Per step (by prefix): the window slots it may store to (its
+    /// snapshot: what a guard restores).
+    snapsets: HashMap<String, BTreeSet<usize>>,
+    /// The window slots the step being emitted stores to.
+    cur_stores: BTreeSet<usize>,
 }
 
 impl<'t, 'a> FnGen<'t, 'a> {
@@ -1384,23 +1409,130 @@ impl<'t, 'a> FnGen<'t, 'a> {
         }
     }
 
-    /// A window copy: one memcpy in regions (many exits) and where an
-    /// access with an unknown offset keeps the window in memory;
-    /// otherwise the slots steps name, one by one, which SROA promotes
-    /// each (a memcpy would leave the slots no step names as memory it
-    /// copies on every iteration).
-    fn expand_copy(&mut self, from: &str, to: &str, out: &mut Vec<String>) {
-        if self.kind == Kind::Region || self.dynamic {
-            out.push(format!("  call void @llvm.memcpy.p0.p0.i64(ptr align 8 {}, ptr align 8 {}, i64 {}, i1 false)", to, from, 8 * self.nr));
-            return;
-        }
-        for j in self.used.clone() {
+    /// A copy of window slots `slots` (`(slot, from)`) to `to`.
+    fn copy_slots(&mut self, slots: &[(usize, &str)], to: &str, out: &mut Vec<String>) {
+        for &(j, from) in slots {
             let (a, v, b) = (self.e.fresh("wa"), self.e.fresh("wv"), self.e.fresh("wb"));
             out.push(format!("  {} = getelementptr inbounds i64, ptr {}, i64 {}", a, from, j));
             out.push(format!("  {} = load i64, ptr {}", v, a));
             out.push(format!("  {} = getelementptr inbounds i64, ptr {}, i64 {}", b, to, j));
             out.push(format!("  store i64 {}, ptr {}", v, b));
         }
+    }
+
+    /// Expands the window copies (`@@COPY from to`, `@@SNAP`, `@@GUARD`)
+    /// once the whole function is known.
+    ///
+    /// Regions (many exits) and functions with an access at an unknown
+    /// offset (the window is memory there anyway) copy the whole window
+    /// with one memcpy. Otherwise copies name slots one by one, which
+    /// SROA promotes each (a memcpy would leave the slots no step names
+    /// as memory it copies on every iteration), and only the slots that
+    /// need it: a flow analysis over the function's blocks finds the
+    /// slots that may differ from memory (*dirty*: stored to, `@@DIRTY`,
+    /// since the last writeback or reload); a writeback copies those; a
+    /// step's snapshot (`@@SNAP`) copies the slots the step stores to; a
+    /// guard (`@@GUARD`) restores the slots dirty at its step's start
+    /// and those the step stores to, as they were at its start.
+    fn expand_markers(&mut self, raw: Vec<String>) -> Vec<String> {
+        let full = self.kind == Kind::Region || self.dynamic;
+        let memcpy = |from: &str, to: &str, nr: usize| format!("  call void @llvm.memcpy.p0.p0.i64(ptr align 8 {}, ptr align 8 {}, i64 {}, i1 false)", to, from, 8 * nr);
+        // blocks: (label, first line, end)
+        let mut blocks: Vec<(String, usize, usize)> = vec![("entry".into(), 0, raw.len())];
+        for (i, l) in raw.iter().enumerate() {
+            if let Some(lab) = label_of(l) {
+                blocks.last_mut().unwrap().2 = i;
+                blocks.push((lab.trim_matches('"').to_string(), i + 1, raw.len()));
+            }
+        }
+        let index: HashMap<&str, usize> = blocks.iter().enumerate().map(|(i, b)| (b.0.as_str(), i)).collect();
+        let nb = blocks.len();
+        let mut succs: Vec<Vec<usize>> = vec![Vec::new(); nb];
+        for (b, &(_, lo, hi)) in blocks.iter().enumerate() {
+            let Some(t) = raw[lo..hi].iter().rev().find(|l| !l.starts_with("@@")) else { continue };
+            for part in t.split("label %").skip(1) {
+                if let Some((nm, _, _)) = name_at(part, 0) {
+                    if let Some(&s) = index.get(nm) {
+                        succs[b].push(s);
+                    }
+                }
+            }
+        }
+        // the flow: dirty slots at each block's start
+        let mut din: Vec<Option<Bits>> = vec![None; nb];
+        if !full {
+            din[0] = Some(Bits::default());
+            let mut work: Vec<usize> = vec![0];
+            while let Some(b) = work.pop() {
+                let mut d = din[b].unwrap();
+                for l in &raw[blocks[b].1..blocks[b].2] {
+                    if let Some(j) = l.strip_prefix("@@DIRTY ") {
+                        d.set(j.parse().unwrap());
+                    } else if l.starts_with("@@COPY ") && (l.ends_with(" %tr.regs") || l.ends_with(" %lregs")) {
+                        // a writeback or a reload: the window is memory
+                        d = Bits::default();
+                    }
+                }
+                for &s in &succs[b] {
+                    let n = match din[s] {
+                        None => d,
+                        Some(o) => o.or(&d),
+                    };
+                    if din[s] != Some(n) {
+                        din[s] = Some(n);
+                        work.push(s);
+                    }
+                }
+            }
+        }
+        let head_dirty: HashMap<String, Bits> = blocks.iter().zip(&din).filter_map(|(b, d)| b.0.strip_suffix("head").map(|p| (p.to_string(), d.unwrap_or_default()))).collect();
+        let used: Vec<usize> = self.used.iter().copied().collect();
+        let mut out = Vec::with_capacity(raw.len() + 1024);
+        for (b, &(_, lo, hi)) in blocks.iter().enumerate() {
+            if lo > 0 {
+                out.push(raw[lo - 1].clone());
+            }
+            let mut d = din[b].unwrap_or_default();
+            for l in &raw[lo..hi] {
+                if let Some(j) = l.strip_prefix("@@DIRTY ") {
+                    d.set(j.parse().unwrap());
+                } else if let Some(r) = l.strip_prefix("@@COPY ") {
+                    let (from, to) = r.split_once(' ').unwrap();
+                    if full {
+                        out.push(memcpy(from, to, self.nr));
+                    } else if to == "%tr.regs" {
+                        let s: Vec<(usize, &str)> = d.iter().map(|j| (j, from)).collect();
+                        self.copy_slots(&s, to, &mut out);
+                    } else {
+                        let s: Vec<(usize, &str)> = used.iter().map(|&j| (j, from)).collect();
+                        self.copy_slots(&s, to, &mut out);
+                    }
+                    if to == "%tr.regs" || to == "%lregs" {
+                        d = Bits::default();
+                    }
+                } else if let Some(p) = l.strip_prefix("@@SNAP ") {
+                    if full {
+                        out.push(memcpy("%lregs", "%snap", self.nr));
+                    } else {
+                        let s: Vec<(usize, &str)> = self.snapsets.get(p).into_iter().flatten().map(|&j| (j, "%lregs")).collect();
+                        self.copy_slots(&s, "%snap", &mut out);
+                    }
+                } else if let Some(p) = l.strip_prefix("@@GUARD ") {
+                    if full {
+                        out.push(memcpy("%snap", "%tr.regs", self.nr));
+                    } else {
+                        let ss = self.snapsets.get(p).cloned().unwrap_or_default();
+                        let mut all = head_dirty.get(p).copied().unwrap_or_default();
+                        ss.iter().for_each(|&j| all.set(j));
+                        let s: Vec<(usize, &str)> = all.iter().map(|j| (j, if ss.contains(&j) { "%snap" } else { "%lregs" })).collect();
+                        self.copy_slots(&s, "%tr.regs", &mut out);
+                    }
+                } else {
+                    out.push(l.clone());
+                }
+            }
+        }
+        out
     }
     fn writeback(&mut self) {
         self.copy_window("%lregs", "%tr.regs");
@@ -1693,9 +1825,11 @@ impl<'t, 'a> FnGen<'t, 'a> {
         self.e.label(&format!("{}head", p));
         self.e.line(format!("@@PHIS {}", pc));
         self.e.line(format!("  %{}pc = getelementptr inbounds i32, ptr %tr.pc, i64 {}", p, pc as i64 - self.t.h as i64));
-        if snap {
-            self.copy_window("%lregs", "%snap");
+        if snap && self.nr > 0 {
+            // the slots this step stores to (known once it is emitted)
+            self.e.line(format!("@@SNAP {}", p));
         }
+        self.cur_stores.clear();
         self.e.line(format!("  br label %{}{}", p, st.blocks[0].0));
         let mut table_geps: HashSet<String> = HashSet::new();
         let mut table_fns: HashSet<String> = HashSet::new();
@@ -1802,15 +1936,21 @@ impl<'t, 'a> FnGen<'t, 'a> {
                 }
                 // memory accesses through register-file pointers
                 let access = parse_load(rhs).map(|(ty, p)| (ty, p, false)).or_else(|| parse_store(rhs).map(|(ty, _, p)| (ty, p, true)));
-                if let Some((ty, ptr, _)) = access {
+                if let Some((ty, ptr, is_store)) = access {
                     let v = val_of(&st.vals, ptr);
                     if self.debug {
                         self.e.line(format!("  ; {:?} window={}", v, window));
                     }
                     match v {
                         Val::Regs(Some(o), false) if window && self.in_window(o, ty) => {
-                            let s = self.window_slot((o / 8) as usize);
+                            let j = (o / 8) as usize;
+                            let s = self.window_slot(j);
                             self.e.line(replace_ptr(l, ptr, &s));
+                            if is_store {
+                                // the slot now differs from memory
+                                self.e.line(format!("@@DIRTY {}", j));
+                                self.cur_stores.insert(j);
+                            }
                             continue;
                         }
                         Val::Regs(Some(_), false) => {}
@@ -1913,6 +2053,7 @@ impl<'t, 'a> FnGen<'t, 'a> {
                 self.e.line(l.clone());
             }
         }
+        self.snapsets.insert(p, std::mem::take(&mut self.cur_stores));
         Ok(())
     }
 
@@ -1966,6 +2107,10 @@ pub struct Options {
     pub check: bool,
     /// A loop gets a trace if its path closed this many times.
     pub min_iters: u64,
+    /// ... and this many times per entry, on average (a trace's entry
+    /// and exits cost a load and a store per register it caches, which
+    /// short runs do not repay).
+    pub min_run: f64,
     /// A block is on the trace if it ran at least this fraction of its
     /// step's runs (and at least once).
     pub min_frac: f64,
@@ -1993,6 +2138,7 @@ impl Options {
         Options {
             check: var("LOIMI_TRACE_CHECK").is_some_and(|v| v != "0"),
             min_iters: var("LOIMI_TRACE_MIN").and_then(|v| v.parse().ok()).unwrap_or(1000),
+            min_run: var("LOIMI_TRACE_MINRUN").and_then(|v| v.parse().ok()).unwrap_or(0.0),
             min_frac: var("LOIMI_TRACE_MINFRAC").and_then(|v| v.parse().ok()).unwrap_or(0.0),
             fail_limit: 1024,
             only: var("LOIMI_TRACE_ONLY").map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect()).unwrap_or_default(),
@@ -2069,6 +2215,8 @@ impl<'t, 'a> FnGen<'t, 'a> {
             guard_info: Vec::new(),
             used: BTreeSet::new(),
             dynamic: false,
+            snapsets: HashMap::new(),
+            cur_stores: BTreeSet::new(),
         }
     }
 
@@ -2132,8 +2280,11 @@ impl<'t, 'a> FnGen<'t, 'a> {
             self.e.line(format!("  call void @loimi_trace_failing(i64 {})", self.index));
             self.e.line(format!("  br label %{}", lc));
             self.e.label(&lc);
-            self.copy_window("%snap", "%tr.regs");
             let p = format!("s{}.", pc);
+            if self.nr > 0 {
+                // the slots dirty at the step's start, as they were then
+                self.e.line(format!("@@GUARD {}", p));
+            }
             self.flushed = true;
             let state: Vec<String> = (0..self.t.sig.len()).map(|i| state_name(&p, i, self.t.pc_idx, self.t.regs_idx)).collect();
             let word = self.t.code.w[*pc];
@@ -2201,20 +2352,8 @@ impl<'t, 'a> FnGen<'t, 'a> {
         self.e.line(format!("  %tr.gen0 = load i64, ptr {}", g));
         let entry = std::mem::take(&mut self.e.out);
         let side = std::mem::take(&mut self.side);
-        let mut all: Vec<String> = Vec::new();
-        for (i, part) in [entry, vec![format!("  br label %s{}.head", first)], res, side].into_iter().enumerate() {
-            let _ = i;
-            for l in part {
-                match l.strip_prefix("@@COPY ") {
-                    Some(r) => {
-                        let (a, b) = r.split_once(' ').unwrap();
-                        let (a, b) = (a.to_string(), b.to_string());
-                        self.expand_copy(&a, &b, &mut all);
-                    }
-                    None => all.push(l),
-                }
-            }
-        }
+        let raw: Vec<String> = [entry, vec![format!("  br label %s{}.head", first)], res, side].into_iter().flatten().collect();
+        let all = self.expand_markers(raw);
         for l in &all {
             f.push_str(l);
             f.push('\n');
@@ -2498,6 +2637,14 @@ pub fn traces(ir: &str, stencils: &str, vm: &VmInfo, profs: &[ProfRegion], opts:
         if why.is_none() && back < opts.min_iters {
             why = Some(format!("{} iterations (fewer than {})", back, opts.min_iters));
         }
+        // entries: the header's runs that did not come around the loop
+        let hruns = bm.iter().position(|(pc, _)| *pc == h).map(|i| pr.counts[i]).unwrap_or(0);
+        let around: u64 = edges.iter().filter(|e| e.2 == h).map(|e| pr.counts[e.1]).sum();
+        let entries = hruns.saturating_sub(around).max(1);
+        let per_entry = back as f64 / entries as f64;
+        if why.is_none() && per_entry < opts.min_run {
+            why = Some(format!("{:.1} iterations per entry (fewer than LOIMI_TRACE_MINRUN={})", per_entry, opts.min_run));
+        }
         if let Some(w) = why {
             let _ = writeln!(report, "no trace for code {:016x} loop {}: {}", code.hash, h, w);
             continue;
@@ -2531,12 +2678,13 @@ pub fn traces(ir: &str, stencils: &str, vm: &VmInfo, profs: &[ProfRegion], opts:
                 let ops: Vec<String> = path.iter().map(|&pc| format!("{}:{}", pc, code.op[pc].as_deref().unwrap_or("?"))).collect();
                 let _ = writeln!(
                     report,
-                    "trace {}: code {:016x} ({} words), loop {}, {} iterations, window {}, {} guards, {} steps with effects: {}",
+                    "trace {}: code {:016x} ({} words), loop {}, {} iterations ({:.1} per entry), window {}, {} guards, {} steps with effects: {}",
                     name,
                     code.hash,
                     code.n,
                     h,
                     back,
+                    per_entry,
                     g.nr,
                     g.nguards,
                     g.neffect,
