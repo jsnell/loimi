@@ -84,7 +84,14 @@ impl Gen {
     fn stmt(&mut self, lv: &str, budget: &mut u32) {
         *budget = budget.saturating_sub(1);
         let v = self.r.pick(&VARS);
-        match self.r.below(12) {
+        // calls and closures end traces (calls are exits): rarer than the rest
+        let c = match self.r.below(20) {
+            10..=17 => 0,
+            18 => 10,
+            19 => 11,
+            k => k,
+        };
+        match c {
             0..=3 => {
                 let e = self.expr(lv, 3);
                 self.line(&format!("{} = {}", v, e));

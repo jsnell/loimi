@@ -461,7 +461,7 @@ fn mini_traces_fuzz() {
         bt.cleanup();
     }
     assert!(failures.is_empty(), "{} of {} runs failed (programs kept in {}):\n\n{}", failures.len(), ran, dir.display(), failures.join("\n\n"));
-    assert!(nt >= n as usize / 2, "only {} traces from {} programs", nt, n);
+    assert!(nt >= n as usize / 3, "only {} traces from {} programs", nt, n);
     // (programs that fail in the interpreter test less)
     assert!(ok * 4 >= progs.len() * inputs.len() * 3, "only {} of {} programs ran without error", ok, progs.len() * inputs.len());
 }

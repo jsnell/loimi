@@ -876,8 +876,14 @@ programs, and loses on one:
   (benchmark profiles; trace functions instrumented, stencils not) ran
   mandelbrot, nbody, sieve, fannkuch, sort, queens and hash_strings with
   their traces, correct and without reports, and the scripts without
-  reports. `--gc-check-roots` builds with `--jit-stencils` now; see
-  §11.7 for what ran.
+  reports. Neither combination was rejected for a reason the code or
+  history gives, so both are allowed now; ASan is not in `cargo test`
+  (the ASan trace build takes 10 minutes on this machine).
+- `--gc-check-roots` with `--jit-stencils`: Mini's scripts in every GC
+  mode with the JIT at threshold 1 print what the same binary's
+  interpreter prints (159 runs, stderr included). Traces were not run in
+  this mode (its stencils differ, so it needs its own recording and
+  profile).
 - During the work the tests caught: dispatching a header guard's
   re-execution through the enter word (an endless re-entry), heap
   constants named by Mini's state order (`%k`), branches with `!prof`
