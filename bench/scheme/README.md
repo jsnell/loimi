@@ -612,6 +612,23 @@ heaps (nboyer, sboyer, mperm: marking is 8-15%), products in std.bigint
 (base-case code generation), and glibc's heap growth and trimming for
 large strings (`brk` is 5% of string).
 
+## A value accumulator: measured, not kept (2026-11-06)
+
+Speed audit item 1 (`docs/language.md` §7.4, "Value accumulators"):
+`accumulator vacc: f64 for reg;` over ADD, SUB, MUL and DIV (eight
+reader variants), selected at the end of `finish` with no `first_temp`
+(let-bound values chain too), and three `#[forward]` supers over the
+variants (`LOADK; MUL; MUL__RRA; ADD__RAR`, `MUL; MUL; ADD__RRA`,
+`SUB; ADD__RAR`), which take mbrot's inner loop from 13 dispatches to 7.
+User+sys CPU (`compare.py --cpu --exe`), against base, A/A in brackets:
+mbrot 0.885 at `--align-functions=64` (n=5) and 0.87 at 128; nqueens
+1.07 at 64 but 1.015 at 128 (n=11, placement); suite geomean (43) 1.003
+(0.998) at 64 and 1.002 (0.996) at 128. Not kept: the `f64` argument
+is a seventh register argument, so every handler's dispatch loses the
+fold of the table load into the `jmp` (`docs/lowering.md` §3), and
+ADD/SUB/MUL's integer paths pay a `movq` to the accumulator. The port is
+commit 161bfef, reverted.
+
 ## Bignums (2026-11-03)
 
 Exact bignums (`examples/scheme/bignum.lm`, on `std.bigint`) made pi

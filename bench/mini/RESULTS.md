@@ -524,6 +524,39 @@ Next candidates:
 - Coroutine resume/yield cold blocks (31% of chameneos), the intern
   table's probe miss (string_build), LEN and CONCAT frames: as before.
 
+## Value accumulators (2026-11-06)
+
+43. **A value accumulator** (speed audit item 1, `language.md` §7.4):
+    `accumulator vacc: f64 for reg;` over the float members, DIV/DIVK
+    and the register and constant compare-and-branch forms (20 ops, 28
+    reader variants), with ten `#[forward]` supers over the variants,
+    selected again in `refuse` and at the end of `finish`
+    (`first_temp` 0). 233 of 256 opcodes. `mini.vmprofile` regenerated.
+    User+sys CPU, median of 9 paired interleaved rounds (load 4-6 from
+    other agents; min-of-runs varied ±10% between identical binaries),
+    against base (A/A in brackets):
+
+    | | align 64 | align 128 |
+    |---|---:|---:|
+    | mandelbrot | 0.912 (1.012) | 0.902 (0.996) |
+    | nbody | 0.950 (1.022) | 0.973 (0.977) |
+    | queens | 1.033 (0.994) | 0.987 (1.000) |
+    | sort | 1.025 (0.988) | 1.012 (0.994) |
+    | sieve | 1.015 (0.992) | 1.043 (1.003) |
+    | fib | 1.004 (1.013) | 1.043 (0.983) |
+    | spectral_norm | 1.027 (1.004) | 0.986 (0.997) |
+    | suite (14) | 0.994 (1.000) | 0.996 (0.996) |
+
+    mandelbrot's loop is six dispatches, five of them variants or supers
+    of them. The cost elsewhere is the dispatch: a seventh register
+    argument (the `f64`, `xmm0`) stops LLVM folding the table load into
+    the `jmp` (`lowering.md` §3), one more instruction in every
+    handler. A control build with the accumulator declared but nothing
+    selected (`accumulate DIVK;`, no `Mini.accumulate`) measured fib
+    1.038, queens 1.022, sort 1.007, sieve 1.007 (geomean of eight
+    benchmarks 1.006). Mini's suite still comes out ahead or even, so the
+    port stays; MiniJS's did not (`bench/minijs/RESULTS.md`).
+
 ## Int(i48): measured, not adopted
 
 Mini keeps 32-bit integers (SPEC §2.1). Switching the payload to `i48`

@@ -418,6 +418,31 @@ not placement: unaligned (`--no-branch-align`) builds give MiniJS
 switch/tail-call 1.198 against 1.215 aligned, Python goto/tail-call
 1.091 against 1.104.
 
+## Value accumulators (2026-11-06)
+
+A dated A/B after this run, not reflected in the tables below
+([language.md §7.4](language.md#74-accumulators), "Value accumulators";
+[design/speed-audit.md](design/speed-audit.md), item 1, "As built").
+Mini keeps a nanbox value's word in an `f64` accumulator between its
+float ops, compare-and-branch forms and DIV, with supers over the
+variants. User+sys CPU, median of 9 paired interleaved rounds against
+the previous build (A/A in brackets; load 4 to 6 from other agents):
+
+| suite | align 64 | align 128 | float benchmark |
+|---|---:|---:|---|
+| mini (14) | 0.994 (1.000) | 0.996 (0.996) | mandelbrot 0.912 / 0.902 |
+| minijs (14), not kept | 1.004 (0.998) | 1.007 (0.982) | nbody 0.944 / 0.942 |
+| scheme (43), not kept | 1.003 (0.998) | 1.002 (0.996) | mbrot 0.885 / 0.87 |
+
+The accumulator is a seventh register argument of every handler's tail
+call in these three, which stops LLVM folding the dispatch table's load
+into the `jmp` ([lowering.md §3](lowering.md#3-handlers-in-tailcall-mode)):
+about 1% across integer code, 4% on Mini's fib. Interpreters without
+a value accumulator compile to the same code (`loimi ir-diff`, all three
+dispatch modes: Lox, Stak, Python, Prolog; wasm differs only in
+`W.accumulate`, which now resets earlier variants first, and the
+host-side `W.disasm_op`).
+
 ## Per suite
 
 ### mini

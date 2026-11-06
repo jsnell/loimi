@@ -1,7 +1,7 @@
 # Design note: a speed audit (features for faster interpreters)
 
-Status: **proposal; nothing in it is built.** Written 2026-11-06 against
-master at 0813bc1.
+Status: **proposal.** Written 2026-11-06 against master at 0813bc1.
+Item 1 is built (its "As built" note).
 
 > Have we exhausted the possibilities for language improvements that
 > can be used to write faster interpreters or runtimes?
@@ -435,6 +435,97 @@ Try MiniJS nbody first, then Python nbody, and Scheme mbrot with
 unconditional selection. Spill-at-sync, selection past non-interfering
 ops and GPR accumulators come later, each only if a measurement asks
 for it.
+
+#### As built (2026-11-06)
+
+Built as recommended, with one change of design: **there are no writer
+variants.** With write-through, a variant that writes the accumulator
+also stores the slot, so it is the op itself plus one register write.
+So every form of a *writer* (an op whose result is of a value
+accumulator's kind) leaves the word in the accumulator before each
+`next`, and only readers are variants. LLVM forwards the value just
+stored, so that write is a register move, and none at all for a float
+result. Mini's list is 20 ops and gives 28 variants (the prototype had
+76 from 14 ops), so the compare-and-branch forms fit: 233 of 256
+opcodes with the supers. `language.md` §7.4 has the syntax:
+`accumulator vacc: f64 for reg;` over a nanbox `V`, and
+`accumulate ADD_F, .., JGEKN;` naming family members.
+
+**The hazards, by construction:**
+1. *The next op may have just become a reader.* In an op that is not a
+   writer, every `next` that may follow (in source order) a `become` of
+   a writer stores the accumulator from the result slot (`vmacc.rs`,
+   `after_become_block`). Mini's generic `ADD` keeps its integer path
+   unchanged; only its quickening path pays a load.
+2. *`redo` after `become`.* Nothing is needed beyond the first rule:
+   the reader's writer ran just before and left the accumulator
+   current, and `redo_effect` already forbids a store to a state
+   register before a `redo`.
+3. *`become` must not undo selection.* A writer may only `become` a
+   writer of the same accumulator (an error otherwise). A variant's
+   `become X` is to `X`'s variant with the same letters, or, for a
+   value reader, to `X` itself (the slot it reads is current; `vmcheck`
+   accepts the `__acc` field for that).
+4. *Control that arrives other than from the op before.* Readers are
+   never jump targets, entries zero the accumulator, and every `jump` to
+   a computed target (not a label operand, `then.x` or `pc`) zeroes it:
+   a return address or exception handler cannot read a stale reference,
+   only the word 0, which `vmcheck` requires to hold none. A writer may
+   not leave through a vm function that has `next` or `jump`, directly
+   or through another (an error).
+5. *Code from outside.* `Vm.verify` rejects reader variants and supers
+   containing one (as an invalid opcode). Selection runs on verified
+   code, where it sees every label.
+
+**The claims, checked.** The collector, polls, `raise`, the debugger and
+the JIT needed no change: GC stress, verify mode, the debugger and DAP
+tests, `--jit-stencils` and TSan all pass on Mini. Two claims were wrong:
+- **`Vm.deopt` needed a change.** It maps each family member to its
+  generic op, and variants of plain ops (`DIV__RAR`) were in no family:
+  a deoptimized writer (`ADD_F` to `ADD`) would have left a reader after
+  it. A value reader is now a member of its op's family (of the op
+  itself, for a plain op), so `deopt` turns it back.
+- **The f64 accumulator does cost the dispatch fold.** Every tail-call
+  handler's dispatch went from `jmp *T(,%rax,8)` to
+  `mov T(,%rax,8),%rax; jmp *%rax`, as `lowering.md` §3 says for any
+  seventh register argument, `xmm` included (the prototype blamed only
+  the `u64` class). A control build of Mini with the accumulator
+  declared and nothing selected measured fib 1.038, queens 1.022 and
+  1.006 over eight benchmarks. That cost is what decided the ports.
+
+**Ports.** User+sys CPU, median of 9 paired interleaved rounds
+(min-of-runs moved ±10% between identical binaries: load 4 to 6 from
+other agents), A/A in brackets; Scheme with `compare.py --cpu`, minimum
+of 5:
+
+| port | float benchmark, align 64 | align 128 | suite, align 64 | suite, align 128 | kept |
+|---|---:|---:|---:|---:|---|
+| Mini (14) | mandelbrot 0.912 (1.012), nbody 0.950 | mandelbrot 0.902 (0.996), nbody 0.973 | 0.994 (1.000) | 0.996 (0.996) | yes |
+| MiniJS (14) | nbody 0.944 (0.998) | nbody 0.942 (0.994) | 1.004 (0.998) | 1.007 (0.982) | no |
+| Scheme (43) | mbrot 0.885 | mbrot 0.87 | 1.003 (0.998) | 1.002 (0.996) | no |
+
+- **Mini** (`bench/mini/RESULTS.md`, item 43): 20 ops, 28 variants,
+  ten supers over them; mandelbrot's loop is six dispatches. queens,
+  sort and spectral_norm were 1.025–1.033 at 64, 0.99–1.01 at 128;
+  fib and sieve 1.04 at 128.
+- **MiniJS** (`bench/minijs/RESULTS.md`): the float members, compare
+  forms and SETPROP_IN; four supers take nbody's
+  `b.vx -= dx * b2.mass * mag` to one dispatch (235M dispatches to
+  157M). One float kernel among 14 does not pay for the fold. Reverted.
+- **Scheme** (`bench/scheme/README.md`): ADD, SUB, MUL, DIV with no
+  `first_temp`; mbrot's loop from 13 dispatches to 7. Integer ADD/SUB
+  also pay a `movq`. Reverted.
+
+**Next:** recover the fold, and the MiniJS and Scheme ports are worth
+measuring again. Options: fold in the assembly (`jmp *T(,%rax,8)` is
+valid while `%rax` is not an argument, which under `preserve_none` it
+is only for the twelfth general one), or keep a vm with an accumulator under seven register
+arguments.
+
+**Python** is not ported. Its arithmetic ops pass `dst.raw` to `call2`
+(a dunder method's frame, whose return writes the slot), so they read
+their result operand and are not writers. A port would move the dunder
+call out of the op first.
 
 ### 2. Cheaper operand decoding and dispatch
 

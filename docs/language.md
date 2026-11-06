@@ -3612,10 +3612,15 @@ Quickening is what makes it subtle, and the compiler handles it:
 
 A writer cannot leave through a vm function with `next` or `jump`, such
 as a call of a guest method whose return lands on the next word (an
-error). Measured on Mini (`bench/mini/RESULTS.md`): mandelbrot 0.90,
-with supers over the variants. A variant breaks up the supers over its
-op, so those matter: `--vm-stats` suggests supers over variants, and
-names the super they split.
+error). Measured on Mini (`bench/mini/RESULTS.md`, item 43):
+mandelbrot 0.90, with supers over the variants; a variant breaks up the
+supers over its op, so those matter: `--vm-stats` suggests supers over
+variants, and names the super they split. The cost is the register
+itself: it is an argument of every handler's tail call, and a seventh
+register argument stops LLVM folding the dispatch load into the `jmp`
+(`lowering.md` §3). That cost Mini's fib 4% with nothing selected, and
+made the same port a net loss in MiniJS and Scheme, which have fewer
+float kernels.
 
 **Op selectors.** The ops of an `accumulate` list, and of a variant's
 `wraps [..]` (section 9), are given by selectors, each naming one or
