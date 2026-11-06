@@ -118,6 +118,10 @@ struct rec {
      * super that splits itself (`become` in a part, in the interpreter)
      * still decodes its later parts from their words after the split. */
     uint8_t *read;
+    /* words_hash(r, 0, n) while whash_ok (cleared when a word changes):
+     * what traces bind inlined callees by. */
+    uint64_t whash;
+    int whash_ok;
 };
 
 static int enabled, stats, debug, inited, max_recompile = MAX_COMPILES;
@@ -592,6 +596,7 @@ static uint32_t new_entry(void *native, uint32_t *at) {
  * every change of words. */
 static void sync_entries(struct rec *r) {
     uint64_t n = r->n;
+    r->whash_ok = 0;
     if (!r->read) r->read = calloc(n, 1);
     for (uint64_t pc = 0; pc < n; pc++) r->fl[pc] &= ~F_NOPATCH;
     for (uint64_t pc = 0; pc < n; pc++) {
@@ -911,6 +916,20 @@ struct loimi_trace {
     uint64_t nk;
     const char *rec; /* regions: the recording of the code, for profiles */
     uint64_t fingerprint;
+    /* Regions: per dynamic exit, where it went (loimi_trace_site). */
+    uint64_t *sites, nsites;
+    /* Traces: the code objects inlined at calls, and the address each
+     * was last bound to (loimi_trace_bind). */
+    const struct loimi_callee *callees;
+    uint64_t ncallees;
+    const uint32_t **slots;
+};
+/* A code object a trace inlines at a call: its words, their hash, the
+ * offset the call enters at, the pool constants baked in. */
+struct loimi_callee {
+    uint64_t n, hash, off;
+    const uint64_t *kchk;
+    uint64_t nk;
 };
 extern const struct loimi_trace loimi_traces[] __attribute__((weak));
 extern const int64_t loimi_ntraces __attribute__((weak));
@@ -921,7 +940,7 @@ static int trace_off, trace_inited;
 static uint64_t trace_fail_every = 1024;
 static uint8_t *trace_banned;
 static struct {
-    uint64_t installs, uninstalls, blacklisted;
+    uint64_t installs, uninstalls, blacklisted, binds;
 } tst;
 /* Installed traces: trace t at r's header, what its home held, and the
  * body it ran. */
@@ -933,6 +952,14 @@ struct inst {
 };
 static struct inst *insts;
 static size_t ninsts, capinsts;
+/* Bound callees: trace t's slot k holds an address in r's code. */
+struct binding {
+    int64_t t;
+    uint64_t k;
+    struct rec *r;
+};
+static struct binding *bindings;
+static size_t nbindings, capbindings;
 
 static int64_t ntraces(void) { return &loimi_ntraces ? loimi_ntraces : 0; }
 
@@ -953,20 +980,42 @@ static void uninstall(size_t i) {
     insts[i] = insts[--ninsts];
 }
 
+/* Unbind the callees bound in r's code: the slot is cleared (the next
+ * call binds again) and the trace's gen bumped (a running trace that
+ * made the call that changed r leaves at its next check). */
+static void unbind(struct rec *r) {
+    for (size_t i = 0; i < nbindings;) {
+        struct binding *b = &bindings[i];
+        if (b->r != r) {
+            i++;
+            continue;
+        }
+        const struct loimi_trace *tr = &loimi_traces[b->t];
+        tr->slots[b->k] = NULL;
+        tr->state[0]++;
+        bindings[i] = bindings[--nbindings];
+    }
+}
+
 /* r's compiled code goes (a recompile or a drop). */
 static void trace_forget(struct rec *r) {
+    r->whash_ok = 0;
     for (size_t i = 0; i < ninsts;)
         if (insts[i].r == r) uninstall(i);
         else i++;
+    unbind(r);
 }
 
-/* Word i of r changes: uninstall the traces whose range holds it. */
+/* Word i of r changes: uninstall the traces whose range holds it, and
+ * unbind the callees in r (their hash covers all of r's words). */
 static void trace_touch(struct rec *r, uint64_t i) {
+    r->whash_ok = 0;
     for (size_t j = 0; j < ninsts;) {
         const struct loimi_trace *tr = &loimi_traces[insts[j].t];
         if (insts[j].r == r && tr->lo <= i && i < tr->hi) uninstall(j);
         else j++;
     }
+    unbind(r);
 }
 
 /* FNV-1a of the instruction words in [lo, hi) (not cache words). */
@@ -997,6 +1046,72 @@ void loimi_trace_failing(int64_t t) {
         else i++;
 }
 
+/* The hash of all of r's words (cached). */
+static uint64_t code_hash(struct rec *r) {
+    if (!r->whash_ok) {
+        r->whash = words_hash(r, 0, r->n);
+        r->whash_ok = 1;
+    }
+    return r->whash;
+}
+
+/* A trace calls code at pc that is not the address its slot k holds:
+ * if pc is where the code object it inlined there is entered (the same
+ * length, words and baked-in pool constants), bind the slot to pc and
+ * return 1 (the trace goes on inline); else 0 (it leaves). */
+int loimi_trace_bind(int64_t t, int64_t k, const uint32_t *pc) {
+    const struct loimi_trace *tr = &loimi_traces[t];
+    const struct loimi_callee *c = &tr->callees[k];
+    struct rec *r = nrecs ? lookup(pc) : NULL;
+    if (!r || !r->home || r->rewriting || r->n != c->n || pc != r->code + c->off) return 0;
+    if (code_hash(r) != c->hash) return 0;
+    if (c->nk && !r->pool) return 0;
+    for (uint64_t j = 0; j < c->nk; j++)
+        if (r->pool[c->kchk[2 * j]] != c->kchk[2 * j + 1]) return 0;
+    if (tr->slots[k]) {
+        /* rebinding: forget the old binding */
+        for (size_t i = 0; i < nbindings; i++)
+            if (bindings[i].t == t && bindings[i].k == (uint64_t)k) {
+                bindings[i] = bindings[--nbindings];
+                break;
+            }
+    }
+    if (nbindings == capbindings) {
+        capbindings = capbindings ? 2 * capbindings : 16;
+        bindings = realloc(bindings, capbindings * sizeof *bindings);
+    }
+    bindings[nbindings++] = (struct binding){t, (uint64_t)k, r};
+    tr->slots[k] = pc;
+    tst.binds++;
+    return 1;
+}
+
+/* Regions (profiling builds): dynamic exit `site` of a region, whose
+ * counters start at s, went to pc. Per site: [0] runs, then 4 targets
+ * of (pc, runs, words, hash of the words, offset); the code object of
+ * pc must be compiled (its words' hash is what traces match). */
+void loimi_trace_site(uint64_t *s, int64_t site, const uint32_t *pc) {
+    uint64_t *e = s + 22 * site;
+    e[0]++;
+    for (int i = 0; i < 4; i++) {
+        uint64_t *x = e + 2 + 5 * i;
+        if (x[0] == (uint64_t)(uintptr_t)pc) {
+            x[1]++;
+            return;
+        }
+        if (!x[0]) {
+            struct rec *r = nrecs ? lookup(pc) : NULL;
+            if (!r || !r->home) return;
+            x[0] = (uint64_t)(uintptr_t)pc;
+            x[1] = 1;
+            x[2] = r->n;
+            x[3] = code_hash(r);
+            x[4] = (uint64_t)(pc - r->code);
+            return;
+        }
+    }
+}
+
 /* `LOIMI_TRACE_CHECK=1` builds: a trace accessed p, which the generator
  * could not place, with the window [regs, regs + n) cached. */
 void loimi_trace_check(const uint64_t *p, const uint64_t *regs, int64_t n) {
@@ -1021,14 +1136,33 @@ static void trace_profile(void) {
                 (unsigned long long)tr->ncounts);
         for (uint64_t i = 0; i < tr->ncounts; i++)
             if (tr->counts[i]) fprintf(f, "c %llu %llu\n", (unsigned long long)i, (unsigned long long)tr->counts[i]);
+        for (uint64_t i = 0; i < tr->nsites; i++) {
+            const uint64_t *e = tr->sites + 22 * i;
+            if (!e[0]) continue;
+            fprintf(f, "site %llu %llu\n", (unsigned long long)i, (unsigned long long)e[0]);
+            for (int j = 0; j < 4; j++) {
+                uint64_t *x = (uint64_t *)e + 2 + 5 * j;
+                /* the code as it is now (its last recording): rewrites
+                 * after the first visit changed its hash */
+                struct rec *r = x[0] && nrecs ? lookup((const uint32_t *)(uintptr_t)x[0]) : NULL;
+                if (r && r->home && !r->rewriting) {
+                    x[2] = r->n;
+                    x[3] = code_hash(r);
+                    x[4] = (uint64_t)((const uint32_t *)(uintptr_t)x[0] - r->code);
+                }
+                if (x[0])
+                    fprintf(f, "to %llu %016llx %llu %llu\n", (unsigned long long)x[2], (unsigned long long)x[3], (unsigned long long)x[4],
+                            (unsigned long long)x[1]);
+            }
+        }
         fprintf(f, "end\n");
     }
     fclose(f);
 }
 
 static void trace_report(void) {
-    fprintf(stderr, "jit: traces: %lld linked, %llu installs, %llu uninstalls, %llu blacklisted\n", (long long)ntraces(),
-            (unsigned long long)tst.installs, (unsigned long long)tst.uninstalls, (unsigned long long)tst.blacklisted);
+    fprintf(stderr, "jit: traces: %lld linked, %llu installs, %llu uninstalls, %llu blacklisted, %llu callees bound\n", (long long)ntraces(),
+            (unsigned long long)tst.installs, (unsigned long long)tst.uninstalls, (unsigned long long)tst.blacklisted, (unsigned long long)tst.binds);
     for (int64_t t = 0; t < ntraces(); t++) {
         const uint64_t *s = loimi_traces[t].state;
         if (s[0] || s[1] || s[2])

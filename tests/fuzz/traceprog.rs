@@ -1,7 +1,9 @@
 //! Random Mini programs for the trace tier's differential test
 //! (`mini_traces_fuzz` in golden.rs): loops of arithmetic that changes
 //! type with the input (ints, floats), table reads and writes, string
-//! building, closures over loop variables, calls, `break`s and nested
+//! building, closures over loop variables, calls (which traces inline:
+//! callees that branch, allocate and call each other, call sites whose
+//! callee changes now and then, recursion), `break`s and nested
 //! loops. The input is a string constant (`tonumber("..")`): constant
 //! strings are loaded from the constant pool, not baked into traces, so
 //! one program's code with two inputs is the same code object, and a
@@ -84,12 +86,13 @@ impl Gen {
     fn stmt(&mut self, lv: &str, budget: &mut u32) {
         *budget = budget.saturating_sub(1);
         let v = self.r.pick(&VARS);
-        // calls and closures end traces (calls are exits): rarer than the rest
-        let c = match self.r.below(20) {
-            10..=17 => 0,
-            18 => 10,
+        let c = match self.r.below(24) {
+            10..=15 => 0,
+            16..=18 => 10,
             19 => 11,
-            k => k,
+            20 => 12,
+            21 => 13,
+            k => k - 12,
         };
         match c {
             0..=3 => {
@@ -136,6 +139,23 @@ impl Gen {
                 self.line(&format!("{} = {} + f{}({}, {})", v, v, f, lv, w));
                 self.clamp(v);
             }
+            12 if self.nfun > 1 => {
+                // a call site whose callee is mostly one function: traces
+                // inline it, and its identity guard fails now and then
+                let (f, g) = (self.r.below(self.nfun as u64), self.r.below(self.nfun as u64));
+                let k = self.r.pick(&["17", "M + 3", "N % 9 + 5"]);
+                let w = self.r.pick(&VARS);
+                self.line(&format!("local h = f{}", f));
+                self.line(&format!("if {} % ({}) == 1 then h = f{} end", lv, k, g));
+                self.line(&format!("{} = {} + h({}, {})", v, v, lv, w));
+                self.clamp(v);
+            }
+            13 => {
+                // recursion: the recursive call leaves the trace
+                let w = self.r.pick(&VARS);
+                self.line(&format!("{} = {} + rec({} % 4, {})", v, v, lv, w));
+                self.clamp(v);
+            }
             _ => {
                 // a closure over the loop variable, called at once
                 let e = self.expr("x", 2);
@@ -152,8 +172,25 @@ impl Gen {
         self.depth += 1;
         self.in_fn = true;
         let e = self.expr("x", 2);
-        self.in_fn = false;
         self.line(&format!("local r = {}", e));
+        self.line("if r ~= r or r > 100000 or r < -100000 then r = 1 end");
+        if self.r.below(2) == 0 {
+            // a branch: rare or frequent, by the input
+            let k = self.r.pick(&["7", "2", "M + 1"]);
+            let e = self.expr("x", 1);
+            self.line(&format!("if math.floor(x) % ({}) == 0 then r = r + {} else r = r - 1 end", k, e));
+        }
+        if self.r.below(3) == 0 {
+            // an allocation: collections with this frame inlined
+            self.line("local tt = { r, y, tostring(r) }");
+            self.line("r = tt[1] + #tt[3]");
+        }
+        if i > 0 && self.r.below(2) == 0 {
+            // a nested call
+            let j = self.r.below(i as u64);
+            self.line(&format!("r = r + f{}(y, x)", j));
+        }
+        self.in_fn = false;
         self.line("if r ~= r or r > 100000 or r < -100000 then r = 1 end");
         self.line("return r");
         self.depth -= 1;
@@ -211,7 +248,13 @@ pub fn generate(seed: u64, input: (&str, &str, &str)) -> String {
     g.line("local t = {}");
     g.line("local s = \"\"");
     g.line("local sum = 0");
-    let nf = g.r.below(3) as usize;
+    g.line("local function rec(n, x)");
+    g.line("  if n <= 0 then return x end");
+    g.line("  local r = rec(n - 1, x + n)");
+    g.line("  if r ~= r or r > 100000 or r < -100000 then r = 1 end");
+    g.line("  return r");
+    g.line("end");
+    let nf = g.r.below(4) as usize;
     for i in 0..nf {
         g.func(i);
         g.nfun += 1;

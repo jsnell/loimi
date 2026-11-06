@@ -427,24 +427,37 @@ fn mini_traces_fuzz() {
     let mut failures = Vec::new();
     let mut ran = 0;
     let mut ok = 0;
+    // inlined calls the traces bound to their callees (LOIMI_JIT_STATS)
+    let mut bound = 0;
     for v in &progs {
         for p in v {
             let want = program(&bt.normal).arg(p).output().unwrap();
             ok += want.status.success() as usize;
-            for (exe, extra) in [(&bt.normal, None), (&bt.forced, None), (&bt.forced, Some(("LOIMI_TRACE_FAILS", "1")))] {
+            // (and with a collection at every safepoint: inside inlined
+            // calls too)
+            for (exe, extra, stress) in [(&bt.normal, None, false), (&bt.normal, None, true), (&bt.forced, None, false), (&bt.forced, Some(("LOIMI_TRACE_FAILS", "1")), false)] {
                 let mut cmd = program(exe);
-                cmd.arg(p).env("LOIMI_JIT", "1").env("LOIMI_JIT_HOT", "2");
+                cmd.arg(p).env("LOIMI_JIT", "1").env("LOIMI_JIT_HOT", "2").env("LOIMI_JIT_STATS", "1");
+                if stress {
+                    cmd.arg("stress");
+                }
                 if let Some((k, v)) = extra {
                     cmd.env(k, v);
                 }
                 let got = cmd.output().unwrap();
                 ran += 1;
+                let err = String::from_utf8_lossy(&got.stderr);
+                bound += err
+                    .lines()
+                    .find_map(|l| l.strip_prefix("jit: traces: ").and_then(|r| r.split(", ").find_map(|x| x.strip_suffix(" callees bound"))).and_then(|n| n.parse::<usize>().ok()))
+                    .unwrap_or(0);
                 if got.stdout != want.stdout || got.status.code() != want.status.code() {
                     failures.push(format!(
-                        "{} ({}{}): differs from the interpreter\n--- interpreter ({:?})\n{}--- traces ({:?})\n{}{}",
+                        "{} ({}{}{}): differs from the interpreter\n--- interpreter ({:?})\n{}--- traces ({:?})\n{}{}",
                         p.display(),
                         exe.display(),
                         extra.map(|e| format!(", {}={}", e.0, e.1)).unwrap_or_default(),
+                        if stress { ", gc stress" } else { "" },
                         want.status.code(),
                         String::from_utf8_lossy(&want.stdout),
                         got.status.code(),
@@ -462,6 +475,7 @@ fn mini_traces_fuzz() {
     }
     assert!(failures.is_empty(), "{} of {} runs failed (programs kept in {}):\n\n{}", failures.len(), ran, dir.display(), failures.join("\n\n"));
     assert!(nt >= n as usize / 3, "only {} traces from {} programs", nt, n);
+    assert!(bound > 0, "no trace inlined a call");
     // (programs that fail in the interpreter test less)
     assert!(ok * 4 >= progs.len() * inputs.len() * 3, "only {} of {} programs ran without error", ok, progs.len() * inputs.len());
 }
@@ -536,8 +550,10 @@ fn build_traces(tag: &str, src: &Path, inputs: &[PathBuf], env: &[(&str, &str)])
     let reg = build("regions", &[format!("--trace-regions={}", rec.display())], &[("LOIMI_TRACE_MAXTOTAL", "400000")]);
     let prof = run_all(&reg, "LOIMI_TRACE_PROFILE", "prof");
     let tflag = [format!("--traces={}", prof.display())];
-    let normal = build("traces", &tflag, &[("LOIMI_TRACE_MIN", "1")]);
-    let forced = build("traces-forced", &tflag, &[("LOIMI_TRACE_MIN", "1"), ("LOIMI_TRACE_MINFRAC", "0.5"), ("LOIMI_TRACE_CHECK", "1")]);
+    // (calls inlined whatever their callees call, which the default
+    // declines for speed: collections inside inlined frames)
+    let normal = build("traces", &tflag, &[("LOIMI_TRACE_MIN", "1"), ("LOIMI_TRACE_INLINE_WRITERS", "1")]);
+    let forced = build("traces-forced", &tflag, &[("LOIMI_TRACE_MIN", "1"), ("LOIMI_TRACE_INLINE_WRITERS", "1"), ("LOIMI_TRACE_MINFRAC", "0.5"), ("LOIMI_TRACE_CHECK", "1")]);
     for p in [&jit, &reg] {
         let _ = std::fs::remove_file(p);
     }

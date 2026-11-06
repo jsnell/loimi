@@ -1,0 +1,77 @@
+-- Calls in hot loops, for traces through calls (docs/design/trace-tier.md
+-- section 12): the traces inline the callees; this checks guards on the
+-- callee's identity, exits inside inlined frames, collections inside
+-- them, nested and recursive calls, and multiple results.
+
+local function sq(x) return x * x end
+local function add(a, b) return a + b end
+
+-- a small callee, monomorphic: inlined
+local s = 0
+for i = 1, 3000 do s = s + sq(i % 100) end
+print(s)
+
+-- nested calls: a callee that calls another
+local function hyp(a, b) return add(sq(a), sq(b)) end
+s = 0
+for i = 1, 3000 do s = (s + hyp(i % 7, i % 11)) % 100003 end
+print(s)
+
+-- the callee changes after the trace bound it: the guard on its identity
+local f = sq
+s = 0
+for i = 1, 4000 do
+  if i == 2500 then f = function(x) return x + 1 end end
+  s = (s + f(i % 50)) % 1000003
+end
+print(s)
+
+-- a rare branch in the callee: an exit inside the inlined frame
+local function pick(x)
+  if x % 997 == 0 then return -x end
+  return x * 2
+end
+s = 0
+for i = 1, 5000 do s = s + pick(i) end
+print(s)
+
+-- the callee allocates: collections with the inlined frame on the stack
+local function pair(a, b) return { a, b, tostring(a) .. "/" .. tostring(b) } end
+local total, last = 0, nil
+for i = 1, 4000 do
+  local p = pair(i, i * 2)
+  total = total + p[1] + p[2] + #p[3]
+  last = p
+end
+print(total, last[3])
+
+-- recursion inside the callee: the recursive call leaves the trace
+local function depth(n) if n <= 0 then return 0 end return 1 + depth(n - 1) end
+s = 0
+for i = 1, 2000 do s = s + depth(i % 5) end
+print(s)
+
+-- several results, and fewer arguments than parameters
+local function two(a, b) return a, (b or 0) + 1 end
+local u, v = 0, 0
+for i = 1, 3000 do
+  local x, y = two(i)
+  u = u + x
+  v = v + y
+end
+print(u, v)
+
+-- a method call on a table, the callee reads upvalues
+local k = 3
+local obj = { n = 0 }
+function obj:bump(d) self.n = self.n + d * k end
+for i = 1, 3000 do obj:bump(i % 4) end
+print(obj.n)
+-- expect: 9850500
+-- expect: 43899
+-- expect: 59495
+-- expect: 24960135
+-- expect: 24040341	4000/8000
+-- expect: 4000
+-- expect: 4501500	3000
+-- expect: 13500
