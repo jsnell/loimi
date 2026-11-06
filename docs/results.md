@@ -463,6 +463,25 @@ Scheme stays out: over five runs, folded or not, it averages 0.3%
 slower, with tak and fib slower in every run (a `movq` to the
 accumulator on ADD/SUB/MUL's integer paths).
 
+## Traces through calls (2026-11-06)
+
+Not a run of the suites: the trace tier's Mini benchmarks
+([design/trace-tier.md §12](design/trace-tier.md#12-cheaper-exits-and-traces-through-calls-m4-in-part)),
+`--jit-stencils` with ahead-of-time traces from a profile of the 14
+programs against the same binary's JIT, user+sys CPU seconds, minimum
+of 7 interleaved runs.
+
+| | M1 | now, `--align-functions=64` | 128 |
+|---|---:|---:|---:|
+| trace / JIT, geometric mean | 0.932 | **0.858** | 0.862 |
+| JIT A/A | 0.998 | 0.996 | 1.000 |
+| trace off / JIT | 1.004 | 1.003 | 1.004 |
+
+Exits that write back only dirty slots took nbody from 1.11 to 0.76;
+inlining monomorphic calls took spectral_norm from 1.00 to 0.64. No
+program is slower than the JIT; binary_trees, fib, `interp`,
+string_build, closures and oo_methods are at 0.99–1.01.
+
 ## Per suite
 
 ### mini

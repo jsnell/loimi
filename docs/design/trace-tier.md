@@ -2,7 +2,9 @@
 
 **Status: M1 built** (§11): `loimi build --jit-stencils
 --trace-regions=REC` and `--traces=PROF` make ahead-of-time traces from a
-profile, with the generator in the compiler (`src/tracegen.rs`). §1–§10
+profile, with the generator in the compiler (`src/tracegen.rs`). **Then
+cheaper exits and traces through calls** (§12, M4 in part): Mini at 0.858
+of the JIT by geometric mean (M1: 0.932), no program slower. §1–§10
 describe the experiment as it was run; its hooks were replaced
 (`LOIMI_TRACE_DUMP` is `LOIMI_TRACE_RECORD`, `LOIMI_TRACE_IR` is
 `--traces`, `loimi_trace_blacklist` is `loimi_trace_failing`).
@@ -916,4 +918,287 @@ programs, and loses on one:
 - **Not done in M1**, for M2: linking traces to inner-loop traces (the
   outer loops of mandelbrot and nbody), side traces, `promote` for inline
   caches, the `Num` assume, retagged FORLOOP, dirty-set writeback and
-  per-guard snapshots (nbody), traces through calls (M4).
+  per-guard snapshots (nbody), traces through calls (M4). The last two
+  are §12.
+
+## 12. Cheaper exits, and traces through calls (M4, in part)
+
+After M1 two things kept the tier from paying: nbody's trace was slower
+than the JIT (1.11), and the seven programs whose loops call Mini
+functions got no trace. This section is the work on both: (A) exits
+and guards that copy only what they must, and a way to decline a trace;
+(B) calls inlined into traces where the profile shows one callee.
+Results in §12.6.
+
+### 12.1 Exits and guards copy what they must (A)
+
+Window copies are expanded once the whole function is emitted
+(`expand_markers`), from markers the steps leave: `@@DIRTY j` after a
+store to window slot `j`, `@@USE j` before a load, `@@SNAP` at a guarded
+step's head, `@@GUARD` in a guard's exit, `@@COPY` for writebacks and
+reloads. Two flow analyses over the function's blocks decide each
+copy:
+
+- **Dirty slots** (forward): the slots that may differ from memory, set
+  by stores, cleared by writebacks and reloads. A writeback (before an
+  exit or a call that may read the registers) copies only those. On a
+  loop the set at the header is everything the loop body stores, so an
+  exit writes back the slots the trace writes, not every slot it reads.
+- **Per-step snapshots**: a step's snapshot holds the slots it stores
+  to; a guard restores the slots dirty at the step's start and those the
+  step stores to, as they were at its start. Before, every guarded step
+  copied the whole window into the snapshot, so with 25 slots and 25
+  guarded steps SROA kept 25 old values alive per step (nbody's spills).
+- **Live slots** (backward): a reload (at the entry, and after a call
+  that may write) loads only the slots read before they are written
+  (`@@USE`, snapshots, guard restores, writebacks of dirty slots).
+
+nbody's inner loop went from 1.11 of the JIT to 0.75 (0.76 in
+§12.6); mandelbrot and fannkuch gained a few percent too.
+
+**Declining a trace.** The report now gives iterations per entry (the
+loop's runs over its entries, from the region's counts), and
+`LOIMI_TRACE_MINRUN=x` declines traces under `x`. It is off by default:
+after the copies above, the short-trip traces measured are all faster
+than the JIT (nbody's inner loop runs 1.5 iterations per entry and is
+0.76; fannkuch's 1.1 and wins too), so no threshold separates good from
+bad. Two other rules decline traces where the cost is known (§12.4).
+
+### 12.2 Profiles of calls
+
+Inlining a call needs three things the M1 profile did not have.
+
+- **Where dynamic jumps went.** A region counts, at each dispatch to a
+  computed pc (the stencils' jumps through the table or to compiled
+  code through `loimi_jit_entries`: calls, returns, `redo`), where it
+  went: `loimi_trace_site` records up to four targets per site (code
+  object by length and hash of its words, offset, count). The profile
+  has them as `site`/`to` lines after the counts. The hashes are taken
+  when the profile is written, not at the first visit: quickening
+  rewrites words after the first calls, and the trace builder matches
+  the targets against the recordings, written at exit too.
+- **The callee's branches.** Each small code object gets an *entry
+  region*: its instructions outside loops, from word 0, counted like a
+  loop's (`LOIMI_TRACE_INLINE_SIZE` instructions, 64, and
+  `LOIMI_TRACE_INLINE_LINES` lines of IR, 40,000, at most). Loop regions
+  are made first; entry regions have a budget of their own
+  (`LOIMI_TRACE_MAXTOTAL` each).
+- **What happens after a return.** A return lands mid-loop, at the
+  instruction after the call, which in M1 ran in compiled code until the
+  loop came round: the region never saw it. Regions now have an entry
+  at every instruction: a trampoline per instruction
+  (`loimi.trace.rN.eX`) enters the region with its pc in the `insn`
+  argument, and the region dispatches on it. A region is installed at
+  every instruction's home, so any jump into its range is counted (this
+  also profiles loops that are entered mid-body after an exit).
+
+### 12.3 Inlined frames
+
+The trace's path is chosen as in M1, the hottest successor at each
+step, with two more kinds of successor: a **call**, to word 0 of a code
+object with an entry region, if one target had at least 90% of the
+site's calls, it is not on the frame stack already (recursion stays an
+exit) and frames nest at most `LOIMI_TRACE_INLINE` (4) deep; and a
+**return** to the calling frame, at the target after the call. Each
+inlined call is a frame; a step is a (frame, pc) node. An edge from an
+instruction to itself (`redo`, as Mini's returns do after closing
+upvalues) goes round the step and is not on the path.
+
+- **Frames are real.** The CALL step is the stencil, so it pushes the
+  vm's frame (Mini: `fp.resume`, `cl`, `base`, `nres`, `k`) and the
+  return pops it, as the JIT does. Exits, guards, the debugger and the
+  collector see the frames they would see without the trace: an exit
+  inside an inlined frame dispatches at that frame's pc with its
+  registers, and nothing is materialized. LLVM forwards the stores of
+  the push to the loads of the pop.
+- **One window.** An inlined frame's registers are the trace's at an
+  offset (`%fN.regs = %tr.regs + roff`), known from the call step's
+  analysis (the `regs` it passes on); the window caches all frames'
+  slots, so arguments and results stay in SSA values across calls.
+- **The callee's identity.** The callee's code address is a heap
+  address, different per run. Each inlined frame has a slot
+  (`@loimi.trace.slot.NAME[k]`) with the address the trace last bound;
+  a call compares the dispatch's target with it. On a miss the trace
+  calls `loimi_trace_bind`, which binds the slot if the target is where
+  the inlined code object is entered (its length, the hash of its words,
+  its baked-in pool constants: a callee descriptor per frame) and
+  leaves the trace either way, so no path into the inlined frame passes
+  a call to the runtime and LLVM keeps its facts about memory. A word
+  change, recompile or drop of the callee unbinds it (clears the slot,
+  bumps the trace's `gen`). A different callee at the site leaves the
+  trace through the dispatch it was going to make (with the frame
+  pushed); it is not a guard failure.
+- **Returns** compare the dispatch's target with the calling frame's
+  pc after the call (the frame's code address is a phi at its first
+  step); a different target leaves.
+- **Dispatch code off the path.** The loads that only compute a
+  dispatch's handler (the table, `loimi_jit_entries`) are emitted on the
+  path that leaves; left in place, LLVM kept them on the path through
+  every return (spectral_norm 0.74 instead of 0.63).
+
+### 12.4 What a call costs in a trace
+
+Two stencil patterns of Mini's calls do not suit the window, and both
+are generic problems:
+
+- **Stores at unknown offsets.** CALL clears the callee's registers
+  past its arguments in a loop bounded by the prototype's register
+  count, a load from the heap. M1 handled an access at an unknown offset
+  by keeping the whole window in memory (a `select` between a window slot
+  and memory). A switch over the window's slots instead keeps the window
+  in SSA values but cost an indirect jump per cleared register and
+  spilled every slot around the loop. Now such a store writes the dirty
+  slots back and the rest of the step works on memory, as after a call
+  that may write; the next step reloads the live slots. A load at an
+  unknown offset writes the dirty slots back and reads memory.
+- **Heap pointers into the window.** M1 assumed the running frame's
+  registers are reached only through `regs`, the context or a frame.
+  With inlining that is false: an inlined closure's upvalue may be open
+  on a register of a frame below, which the window caches (a loop
+  calling a closure over one of its locals read the stale register: a
+  micro-benchmark caught it, `trace_calls.mini` and the fuzz programs
+  cover it now). In inlined frames, every access of the window's
+  value type through a pointer the analysis cannot place is checked
+  against the window's range. Where nothing before it in the step has an
+  effect, a hit is a guard (the interpreter runs the instruction; a
+  trace whose callee keeps doing it is blacklisted, which is the right
+  outcome: the JIT is faster there); after an effect, the access writes
+  the dirty slots back, goes to memory and reloads. The check is a
+  subtraction and a compare that is never taken; a switch over the
+  slots there instead cost oo_methods 9% (every slot live at every
+  table access).
+- **Calls that may write, in callees.** A step that calls a function
+  that may write (Mini's CLOSURE calls `find_upval`, a return that
+  closes upvalues calls `close_upvals`, allocation of tables) writes the
+  window back before and reloads after, and keeps the values live
+  across the call in callee-saved registers or spill slots. A trace
+  whose inlined frames do that on their usual path is declined
+  (`LOIMI_TRACE_INLINE_WRITERS=1` keeps it): closures' main loop, with
+  11 inlined calls that create closures, measured 1.45 of the JIT at
+  first and 1.09 after the changes above. The fraction of such steps
+  does not separate good traces from bad (sieve's best trace has one in
+  two steps), which is why the rule is about inlined frames.
+
+### 12.5 Recursion, and `interp`
+
+- **Recursive calls are exits.** fib has no loop, and binary_trees'
+  loops call recursive functions whose usual path (the leaves) is not
+  what the loop's call site runs: a path through one level would fail at
+  the first recursive call. The design's options (a trace from a
+  function's entry that calls itself through its own entry, unrolling
+  one level) keep the frame chain in memory and save only dispatch
+  between straight-line stencils, which the JIT already lays out; they
+  were not built.
+- **`interp`'s dispatch loop** (856,000 lines of IR as a region) could
+  be profiled in chunks under the budget, now that regions have an
+  entry at every instruction. It was not, because the trace would not
+  pay: the loop is an `if` chain over 13 opcodes and the hottest arm
+  (PUSH) is 24% of its iterations, so a one-path trace fails its first
+  guard three times in four and is blacklisted. It needs side traces
+  (M3), not a smaller region.
+
+### 12.6 Results
+
+Machine and method as in §11.5: user+sys CPU seconds, minimum of 7
+interleaved runs, every output checked, a JIT A/A pair and the trace
+binary with `LOIMI_TRACE=0` as controls; all 14 programs recorded,
+region-profiled and traced again by the final compiler (147 regions, 63
+of them entry regions, 2.3 million lines of IR, 3.3 minutes to build;
+30 traces, 8 of them through calls). `--align-functions=64`, then all
+three binaries rebuilt at 128:
+
+| program | JIT | trace | trace off | trace/JIT | (medians) | at 128 | M1 | traces |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| binary_trees | 0.769 | 0.772 | 0.778 | 1.00 | 1.01 | 1.02 | 1.00 | none (recursion) |
+| closures | 0.416 | 0.417 | 0.421 | 1.00 | 1.00 | 1.04 | 1.00 | 3 (2 inline map's and fold's callee; twice/bump inlined, blacklisted; main loop declined) |
+| fannkuch | 1.006 | 0.671 | 1.006 | **0.67** | 0.67 | 0.69 | 0.73 | 3 |
+| fib | 0.743 | 0.732 | 0.732 | 0.99 | 0.97 | 1.01 | 0.98 | none (recursion, no loop) |
+| hash_strings | 0.881 | 0.783 | 0.880 | **0.89** | 0.90 | 0.87 | 0.98 | 4 |
+| interp | 0.624 | 0.632 | 0.628 | 1.01 | 1.00 | 1.01 | 1.06 | none (too large; §12.5) |
+| mandelbrot | 0.373 | 0.239 | 0.391 | **0.64** | 0.62 | 0.62 | 0.66 | 2 |
+| nbody | 0.384 | 0.291 | 0.388 | **0.76** | 0.75 | 0.73 | 1.11 | 2 |
+| oo_methods | 0.541 | 0.533 | 0.536 | 0.99 | 0.98 | 1.02 | 1.00 | 1 (inlines `apply` and `deposit`); the shapes loop's calls are polymorphic |
+| queens | 0.753 | 0.697 | 0.756 | 0.93 | 0.91 | 0.94 | 0.92 | 1 |
+| sieve | 0.590 | 0.503 | 0.582 | **0.85** | 0.87 | 0.85 | 0.88 | 3 |
+| sort | 0.724 | 0.590 | 0.708 | **0.81** | 0.83 | 0.84 | 0.86 | 9 (2 inline a comparator, blacklisted: upvalue in the window) |
+| spectral_norm | 0.837 | 0.535 | 0.845 | **0.64** | 0.63 | 0.62 | 1.00 | 2 (inline `A`) |
+| string_build | 0.790 | 0.792 | 0.791 | 1.00 | 1.00 | 1.00 | 0.99 | none |
+
+**Geometric mean: 0.858 of the JIT at 64, 0.862 at 128** (M1: 0.932).
+The controls: JIT A/A 0.996, trace-off/JIT 1.003 (1.000 and 1.004 at
+128). What each part did:
+
+- **(A)** alone took the suite from 0.932 to 0.881 (nbody 1.11 → 0.75,
+  mandelbrot 0.66 → 0.62, fannkuch 0.73 → 0.67) and made no trace slower
+  than the JIT.
+- **(B)** made spectral_norm 0.64 (its inner loops inline `A(i, j)`) and
+  inlined comparators and small methods elsewhere. In closures,
+  oo_methods and sort the inlined traces are neutral or blacklist
+  themselves (an upvalue open on a window register), and closures' main
+  loop is declined (§12.4); binary_trees, fib, `interp` and
+  string_build get nothing (§12.5).
+
+**Stop rule (the goal was 0.85 by geometric mean, stopping if a serious
+attempt at calls could not get under 0.90): not met: 0.858 (0.862 at 128), between the goal and the line.**
+Calls pay where the callee is arithmetic on registers, which the window
+keeps in SSA values across the call: spectral_norm went from 1.00 to
+0.64. Elsewhere in this suite Mini's calls do heap work that a trace
+does exactly as the stencils do: method lookups through inline caches
+(oo_methods), closure creation and upvalue boxes (closures), allocation
+(binary_trees), and an inlined frame adds the window's costs around it
+(a writeback before each call that may write, a reload after, checks of
+heap pointers). Three programs need things this milestone does not
+have: recursion that is not in a loop (fib, binary_trees), side traces
+(`interp`, oo_methods' polymorphic shapes loop), and allocation removal
+for closures that do not escape. Without the four programs that get no
+trace at all the geometric mean is 0.81.
+
+### 12.7 Tests
+
+- `mini_traces` traces `examples/mini/tests/trace_calls.mini` with the
+  rest: small and nested callees inlined, a callee that changes after
+  the trace bound it (the identity check), a rare branch in a callee (an
+  exit inside an inlined frame), a callee that allocates (collections
+  with inlined frames on the stack, in the GC stress and verify modes),
+  recursion inside a callee, several results and missing arguments, a
+  method that reads an upvalue.
+- `mini_traces_fuzz`: the generator makes callees that branch (rarely or
+  often, by the input), allocate, and call each other, call sites whose
+  callee is a different function one time in 5–17 (an identity miss
+  past the 90% threshold), and a recursive function; each program also
+  runs with a collection at every safepoint. The test asserts that some
+  trace bound an inlined callee. Both tests build their traces with
+  `LOIMI_TRACE_INLINE_WRITERS=1`, so callees that allocate are inlined
+  there.
+- The forced builds (`LOIMI_TRACE_MINFRAC=0.5`, `LOIMI_TRACE_CHECK=1`)
+  put guards inside inlined frames too.
+- ASan (by hand, as in §11.6): Mini built with `--sanitize=address`
+  and traces of the 14 benchmarks' profiles, with
+  `LOIMI_TRACE_INLINE_WRITERS=1` (31 traces: closures' main loop too,
+  11 inlined calls that allocate). mandelbrot, nbody, sieve, fannkuch,
+  sort, queens, hash_strings, spectral_norm, closures and oo_methods ran
+  correct and without reports (closures bound 14 callees), and Mini's
+  scripts without reports.
+- Found on the way: the open-upvalue alias (§12.4), site hashes taken
+  before quickening (§12.2), `redo` edges taken for the path (§12.3),
+  and entry regions crowding loops out of a bounded profiling build.
+
+### 12.8 Other vms
+
+MiniJS runs unchanged: nbody, fannkuch, spectral_norm, bitops and sort
+recorded, profiled and traced (20 traces), every output equal to the
+JIT's. Its spectral_norm inlines its calls: 0.57 of its JIT (5 runs);
+nbody 0.92, sort 0.96, bitops 0.97; fannkuch's traces did not install
+(their words did not match the code at run time) and it runs at 1.00.
+
+### 12.9 Knobs
+
+Build time, in the environment: `LOIMI_TRACE_INLINE=n` (4; 0: calls are
+exits and regions have no entry regions), `LOIMI_TRACE_INLINE_SIZE` (64
+instructions) and `LOIMI_TRACE_INLINE_LINES` (40,000 lines) for entry
+regions, `LOIMI_TRACE_MONO=x` (0.9: lower inlines polymorphic sites;
+0.6 made oo_methods 1.14), `LOIMI_TRACE_INLINE_WRITERS=1`,
+`LOIMI_TRACE_MINRUN=x` (off). `LOIMI_TRACE_ONLY` now also restricts
+traces. `LOIMI_TRACE_REPORT=1` gives per trace its iterations per entry,
+inlined calls and steps that call writers; `=2` also the path of loops
+that got none. `LOIMI_JIT_STATS=1` counts callees bound.

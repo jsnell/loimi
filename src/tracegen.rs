@@ -2635,7 +2635,7 @@ pub struct Options {
     /// ... or more lines of IR (LOIMI_TRACE_INLINE_LINES).
     pub inline_lines: usize,
     /// A call site is inlined if this fraction of its calls went to one
-    /// code object.
+    /// code object (LOIMI_TRACE_MONO).
     pub mono: f64,
     /// Keep traces whose inlined calls call functions that may write on
     /// their usual path (LOIMI_TRACE_INLINE_WRITERS=1; by default they are
@@ -2663,7 +2663,7 @@ impl Options {
             inline_depth: var("LOIMI_TRACE_INLINE").and_then(|v| v.parse().ok()).unwrap_or(4),
             inline_size: var("LOIMI_TRACE_INLINE_SIZE").and_then(|v| v.parse().ok()).unwrap_or(64),
             inline_lines: var("LOIMI_TRACE_INLINE_LINES").and_then(|v| v.parse().ok()).unwrap_or(40_000),
-            mono: 0.9,
+            mono: var("LOIMI_TRACE_MONO").and_then(|v| v.parse().ok()).unwrap_or(0.9),
             inline_writers: var("LOIMI_TRACE_INLINE_WRITERS").is_some_and(|v| v != "0"),
         }
     }

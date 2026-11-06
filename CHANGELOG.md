@@ -197,6 +197,21 @@ implementation; `git log` has the details.
   stop rule. `--jit-stencils` builds also take `--sanitize=address`
   and `--gc-check-roots` now
   ([design/trace-tier.md §11](docs/design/trace-tier.md#11-m1-as-built-ahead-of-time-traces-from-a-profile)).
+- **Traces through calls, and cheaper exits** (trace tier, M4 in
+  part): exits write back only the window slots that may differ from
+  memory, guards restore only what their step stored, reloads load only
+  live slots (nbody 1.11 → 0.76 of the JIT). Profiling regions record
+  where calls and returns go and have an entry at every instruction;
+  small functions get entry regions; a trace's path goes into a call
+  whose site called one function (90%), which is inlined with its frame
+  pushed and popped as the JIT does (exits inside it need nothing
+  reconstructed), its registers in the trace's window and its code
+  address bound at run time by its words and constants. Recursion stays
+  an exit; traces whose inlined callees call functions that may write
+  are declined (`LOIMI_TRACE_INLINE_WRITERS=1` keeps them). Mini: 0.858
+  of the JIT by geometric mean (M1 0.932; spectral_norm 0.64), no
+  program slower
+  ([design/trace-tier.md §12](docs/design/trace-tier.md#12-cheaper-exits-and-traces-through-calls-m4-in-part)).
 - **JIT (`--jit-stencils`)**: jumps to a `Vm.Resume` count toward
   compiling like calls (Prolog enters clauses from its try chains that
   way, and their code was never compiled), and the registry of code
