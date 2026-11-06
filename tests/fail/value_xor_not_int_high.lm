@@ -1,0 +1,4 @@
+// `V.Num.xor` exists only under `int_high` (the plain nanbox float is its bits).
+// error: no constant `xor` for `V.Num`: `V` is not `nanbox(int_high)`
+value V repr nanbox { Num(f64) unboxed, Int(i48), Nil }
+fn main() { let w = V.Num.xor; }

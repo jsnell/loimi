@@ -1,0 +1,87 @@
+// `V.Num.xor` under `nanbox(int_high)`: the word of an f64 with bits `b`
+// is `rotl(b, 16) ^ V.Num.xor`, so a float-first fast path reads a word
+// as a double with `rotr(w ^ xor, 16)` before testing it, and every
+// tagged word (an Int, a pointer, Nil, a Bool) reads as a NaN. In the
+// classic and the packed layouts (where `Int`, declared after
+// the pointers, has another block and so another `xor`).
+import std.io;
+struct Obj { id: i64 }
+
+value V repr nanbox(int_high) {
+    Num(f64) unboxed,
+    Int(i48),
+    Nil,
+    Bool(bool),
+    A(*Obj),
+}
+
+#[allow(value_layout)]
+value P repr nanbox(int_high) {
+    Num(f64) unboxed,
+    Nil block 0,
+    Bool(bool) block 1,
+    A(*Obj), B(*Obj), C(*Obj), D(*Obj), E(*Obj), F(*Obj),
+    Int(i48),
+}
+
+fn dbl(w: u64, k: u64) -> f64 {
+    let x = w ^ k;
+    f64.from_bits((x >> 16) | (x << 48))
+}
+fn word(d: f64, k: u64) -> u64 {
+    let b = d.to_bits();
+    ((b << 16) | (b >> 48)) ^ k
+}
+
+/// Float first: add the words as doubles, and only on a NaN test them.
+fn add(a: V, b: V) -> V {
+    let r = dbl(a as u64, V.Num.xor) + dbl(b as u64, V.Num.xor);
+    if r == r { return word(r, V.Num.xor) as V; }
+    match (a, b) {
+        (Int(x), Int(y)) => V.Int(x + y),
+        _ => V.Nil,
+    }
+}
+
+fn show(v: V) {
+    match v {
+        Num(x) => { io.print("num "); io.print_f64(x); }
+        Int(x) => { io.print("int "); io.print_int(x as i64); }
+        Nil => io.print("nil"),
+        Bool(b) => { io.print("bool "); io.print_bool(b); }
+        A(p) => { io.print("a "); io.print_int(p.id); }
+    }
+    io.println("");
+}
+
+fn nan(d: f64) -> bool { d != d }
+
+fn main() {
+    show(add(V.Num(1.5), V.Num(2.25)));
+    show(add(V.Num(-0.0), V.Num(-0.0)));
+    show(add(V.Int(40), V.Int(2)));
+    show(add(V.Num(1.0), V.Int(2)));
+    show(add(V.Nil, V.Num(1.0)));
+    // Round trips, and the tagged words read as NaNs.
+    io.print_bool(dbl(V.Num(0.1) as u64, V.Num.xor) == 0.1); io.println("");
+    io.print_bool(word(-3.5, V.Num.xor) as V == V.Num(-3.5)); io.println("");
+    var o = Obj { id: 7 };
+    io.print_bool(nan(dbl(V.Int(0) as u64, V.Num.xor)) and nan(dbl(V.Int(-1) as u64, V.Num.xor))
+        and nan(dbl(V.Nil as u64, V.Num.xor)) and nan(dbl(V.Bool(true) as u64, V.Num.xor))
+        and nan(dbl(V.A(&o) as u64, V.Num.xor)));
+    io.println("");
+    // The packed layout.
+    io.print_bool(dbl(P.Num(2.5) as u64, P.Num.xor) == 2.5 and word(2.5, P.Num.xor) as P == P.Num(2.5)
+        and nan(dbl(P.Int(5) as u64, P.Num.xor)) and nan(dbl(P.Nil as u64, P.Num.xor))
+        and nan(dbl(P.F(&o) as u64, P.Num.xor)) and P.Num.xor != V.Num.xor);
+    io.println("");
+}
+// expect: num 3.75
+// expect: num -0
+// expect: int 42
+// expect: nil
+// expect: nil
+// expect: true
+// expect: true
+// expect: true
+// expect: true
