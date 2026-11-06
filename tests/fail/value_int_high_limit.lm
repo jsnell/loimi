@@ -1,0 +1,4 @@
+// Under `int_high` the unboxed float is not the words below a limit.
+// error: `V` is `nanbox(int_high)`: its unboxed variant `Num` is not the words below a limit
+value V repr nanbox(int_high) { Num(f64) unboxed, Int(i48), Nil }
+fn main() { let w = V.Num.limit; }

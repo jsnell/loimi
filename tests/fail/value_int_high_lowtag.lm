@@ -1,0 +1,4 @@
+// `int_high` is a nanbox option.
+// error: unknown option `int_high` for `repr lowtag`
+value V repr lowtag(int_high) { Int(i48), Nil }
+fn main() { let v = V.Nil; }

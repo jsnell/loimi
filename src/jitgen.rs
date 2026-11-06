@@ -140,6 +140,7 @@ pub fn const_variants(p: &Program, vi: usize) -> Vec<ConstVariant> {
                 }
                 _ => (low(v.shift), v.tag, false),
             };
+            let Some((mask, value, ult)) = on_word(d, (mask, value, ult)) else { continue };
             out.push(ConstVariant { op: k, name: format!("{}.v.{}", o.name, v.name), field: o.consts[0], mask, value, ult });
         }
     }
@@ -166,7 +167,7 @@ pub fn const_immediates(p: &Program, vi: usize) -> Vec<(u64, u64, bool)> {
         if !scalar {
             continue;
         }
-        out.push(match d.repr {
+        let t = match d.repr {
             ValueRepr::NanBox if v.unboxed => (0, d.num_limit, true),
             ValueRepr::NanBox if v.sub.is_some() => continue,
             ValueRepr::NanBox => {
@@ -180,9 +181,25 @@ pub fn const_immediates(p: &Program, vi: usize) -> Vec<(u64, u64, bool)> {
             }
             ValueRepr::LowTag => (low(v.shift), v.tag, false),
             ValueRepr::Boxed => return Vec::new(),
-        });
+        };
+        if let Some(t) = on_word(d, t) {
+            out.push(t);
+        }
     }
     out
+}
+
+/// A (mask, value, ult) test of the layout's word as a test of the stored
+/// word. `nanbox(int_high)` stores `rotl(c, 16) ^ k`: a mask test rotates
+/// (the mask covers the high 16 bits of `c`, so `^ k` stays inside it);
+/// the unboxed variant's `c < limit` is no test of the stored bits, so it
+/// has none (no stencil variant; traces load such constants).
+fn on_word(d: &ValueDef, t: (u64, u64, bool)) -> Option<(u64, u64, bool)> {
+    match d.int_high {
+        None => Some(t),
+        Some(_) if t.2 => None,
+        Some(k) => Some((t.0.rotate_left(16), crate::values::int_high_word(k, t.1), false)),
+    }
 }
 
 /// The vm that `--jit-stencils` compiles: the program's only tail-call vm.

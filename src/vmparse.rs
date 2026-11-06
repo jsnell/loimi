@@ -805,6 +805,16 @@ impl Parser {
         let name = self.ident()?;
         self.expect_kw("repr")?;
         let repr = self.ident()?;
+        let mut repr_opts = Vec::new();
+        if self.eat("(") {
+            while !self.is(")") {
+                repr_opts.push(self.ident()?);
+                if !self.eat(",") {
+                    break;
+                }
+            }
+            self.expect(")")?;
+        }
         self.expect("{")?;
         let mut variants = Vec::new();
         while !self.is("}") {
@@ -833,7 +843,7 @@ impl Parser {
             }
         }
         self.expect("}")?;
-        Ok(ValueDecl { name, repr, variants, is_pub, scan_raw: None })
+        Ok(ValueDecl { name, repr, repr_opts, variants, is_pub, scan_raw: None })
     }
 }
 

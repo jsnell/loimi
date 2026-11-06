@@ -264,6 +264,18 @@ implementation; `git log` has the details.
 
 ### Values
 
+- **`repr nanbox(int_high)`**: the layout's words rotated left by 16
+  bits, so the integer variant's word is `payload << 16` with zero low
+  bits. Checked `+`/`-` of two `Int(i48)` are `add; jo` on the words
+  (`shl; shl; add; jo; shr; or` before), `*` is `sar; imul; jo`,
+  compares are word compares, pointer payloads are `w >> 16`; floats
+  pay `xor; ror` to decode and `rol; xor` to encode. Opt-in; refused
+  with `#[scan_raw_words]`; `V.Num.limit` does not exist under it.
+  Python uses it: suite 0.932 (align 64) and 0.942 (128) of the plain
+  nanbox's time, integer benchmarks 0.87–0.97, nbody 0.99–1.01
+  ([language.md §2](docs/language.md#2-value-types-declared-representations),
+  [lowering.md §2](docs/lowering.md#2-values-nanbox-lowtag-boxed);
+  [design/speed-audit.md](docs/design/speed-audit.md), item 7).
 - **`#[scan_raw_words]`** on a value type: a checked guarantee that words
   below 2^48 (raw pointers, small integers) read as reference-free
   variants, for scanners of mixed frames

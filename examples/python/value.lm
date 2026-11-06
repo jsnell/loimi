@@ -68,7 +68,7 @@ pub object Long { n: i64, s: i64, big: ?Gc<Limbs> }
 
 /// The hot variants first, in whole 48-bit blocks; the rest share one
 /// (`block 45`: told apart by the low 3 bits of the pointer).
-pub value Value repr nanbox {
+pub value Value repr nanbox(int_high) {
     Float(f64) unboxed,
     Int(i48),
     Nil block 0,

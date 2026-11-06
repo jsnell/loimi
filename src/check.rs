@@ -469,6 +469,7 @@ impl<'a> Checker<'a> {
                             repr: ValueRepr::NanBox,
                             variants: vec![],
                             num_limit: 0,
+                            int_high: None,
                             layout: "",
                         });
                         self.define(m, &v.name, Def::Value(id), v.is_pub)?;

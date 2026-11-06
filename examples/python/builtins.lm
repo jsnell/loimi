@@ -709,7 +709,9 @@ pub fn call(c: *Ctx, id: u32, args: *Value, n: u64, kw: Value) -> Result<Value, 
             let h = ops.hash_key(c, args[0])?;
             Ok(value.int_val(&c.heap, (h as i64) >> 4))
         }
-        Id => Ok(value.int_val(&c.heap, ((args[0] as u64) & 0xffffffffffff) as i64)),
+        // The word's payload: `nanbox(int_high)` keeps it above the 16-bit
+        // low tag (an object's address, for heap values).
+        Id => Ok(value.int_val(&c.heap, ((args[0] as u64) >> 16) as i64)),
         Ord => {
             let s = want_str(c, args[0])?;
             if s.data.len == 0 { return Err(exc(c, Exc.TypeError, "ord() expected a character, but string of length 0 found")); }

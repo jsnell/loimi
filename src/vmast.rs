@@ -257,6 +257,8 @@ pub struct ValueVariant {
 pub struct ValueDecl {
     pub name: Ident,
     pub repr: Ident,
+    /// `repr nanbox(int_high)`: the options in parentheses.
+    pub repr_opts: Vec<Ident>,
     pub variants: Vec<ValueVariant>,
     pub is_pub: bool,
     /// `#[scan_raw_words]`: the layout must read every word below 2^48 as a

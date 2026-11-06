@@ -1,0 +1,4 @@
+// `int_high` needs an integer variant with a whole 48-bit block.
+// error: `int_high` puts an integer variant's payload in the high 48 bits, but `V` has no integer variant with a 48-bit block
+value V repr nanbox(int_high) { Num(f64) unboxed, Nil, Bool(bool) }
+fn main() { let v = V.Nil; }

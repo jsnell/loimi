@@ -1,0 +1,29 @@
+// `--explain-values` for `nanbox(int_high)`: the classic layout's words
+// rotated left by 16 bits and xored with Int's block tag (0xFFF9), so
+// `Int` has the zero low tag, the others nonzero low 16 bits, and the
+// unboxed float is decoded before its test.
+// args: --explain-values
+struct Obj { id: i64 }
+
+value V repr nanbox(int_high) {
+    Num(f64) unboxed,
+    Int(i48),
+    Nil,
+    Bool(bool),
+    A(*Obj),
+}
+
+fn main() {}
+// expect: value main.V repr nanbox(int_high): classic layout, 4 tagged variants
+// expect:   every tagged variant has a 48-bit block, 0xFFF9.. in declaration order
+// expect:   int_high: each word is that layout's word rotated left by 16 bits and xored with 0xFFF9: `Int` is its payload << 16 (low 16 bits zero; checked + - * are `add; jo` on the words), every other variant has nonzero low 16 bits, a pointer payload is `word >> 16`
+// expect:   int_high costs: `Num` is decoded with `xor; ror` and encoded with `rol; xor`, and its test decodes before the compare; `V.Num.limit` does not exist
+// expect:   Num(f64)    unboxed: the words w with rotr(w ^ 0xFFF9, 16) below 0xFFF9_0000_0000_0000 (the f64's bits)
+// expect:   Int(i48)    block 48           mask 0x0000_0000_0000_FFFF  tag 0x0000_0000_0000_0000  words 0x0000_0000_0000_0000 | payload << 16
+// expect:   Nil         block 48           mask 0x0000_0000_0000_FFFF  tag 0x0000_0000_0000_0003  words 0x0000_0000_0000_0003 | payload << 16
+// expect:   Bool(bool)  block 48           mask 0x0000_0000_0000_FFFF  tag 0x0000_0000_0000_0002  words 0x0000_0000_0000_0002 | payload << 16
+// expect:   A(*Obj)     block 48           mask 0x0000_0000_0000_FFFF  tag 0x0000_0000_0000_0005  words 0x0000_0000_0000_0005 | payload << 16
+// expect:   tuple patterns: elements whose variants have the same block width merge into one test, ((a ^ tag) | (b ^ tag') | ..) & mask == 0:
+// expect:     block 48: Int, Nil, Bool, A
+// expect:     unboxed:  Num  (umax(decoded a, b, ..) < 0xFFF9_0000_0000_0000)
+// expect:   elements from different lines do not merge (their tags sit at different bits): one test per line, and-ed
