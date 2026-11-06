@@ -24,6 +24,7 @@ mod rtgen;
 mod safety;
 mod tir;
 mod tirwalk;
+mod tracegen;
 mod values;
 mod vmacc;
 mod vmast;
@@ -79,6 +80,13 @@ struct Opts {
     /// `--jit-stencils`: build the copy-and-patch JIT prototype in
     /// (docs/design/copy-and-patch.md); `LOIMI_JIT=1` turns it on at run time.
     jit: bool,
+    /// `--trace-regions=REC[,REC..]` (with `--jit-stencils`): a profiling
+    /// build, every loop of the recordings as a counted region
+    /// (tracegen.rs, docs/design/trace-tier.md).
+    trace_regions: Vec<PathBuf>,
+    /// `--traces=PROF[,PROF..]` (with `--jit-stencils`): ahead-of-time
+    /// traces of the profiled loops.
+    traces: Vec<PathBuf>,
     /// `loimi test`: replace `main` with a runner of the `#[test]`
     /// functions (`test_main`), and run it.
     test: bool,
@@ -295,6 +303,11 @@ struct JitParts {
     stencils: String,
     ops: Vec<(u32, String)>,
     nops: u32,
+    /// For traces (tracegen.rs): the vm's dispatch table symbol, opcode
+    /// width, and the encodings of immediate constants.
+    table: String,
+    op_bits: u32,
+    imm: Vec<(u64, u64, bool)>,
 }
 
 /// LLVM options for clang (`-mllvm`) when the program has a `goto`-mode vm.
@@ -495,7 +508,7 @@ fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, O
         for (j, cv) in jitgen::const_variants(&prog, vi).into_iter().enumerate() {
             ops.push((nops + 1 + j as u32, cv.name));
         }
-        Some((ops, nops))
+        Some((ops, nops, format!("vm.{}.table", vd.name), vd.op_bits as u32, jitgen::const_immediates(&prog, vi)))
     } else {
         None
     };
@@ -513,7 +526,7 @@ fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, O
         },
     );
     let (mut ir, stencils) = cg.generate_with_stencils();
-    let jit = jit.map(|(ops, nops)| JitParts { stencils, ops, nops });
+    let jit = jit.map(|(ops, nops, table, op_bits, imm)| JitParts { stencils, ops, nops, table, op_bits, imm });
     // Runtime thread-locals are emitted initial-exec: one offset from the
     // thread pointer, fixed at load time. A shared object that may be
     // dlopen'ed cannot rely on static TLS space, so it uses a dynamic
@@ -659,6 +672,40 @@ fn build_stencils(ir: &mut String, jit: &JitParts, clang: &str, cpu_flag: &[Stri
     Ok(rt)
 }
 
+/// `--trace-regions=REC` (a profiling build: every loop of the
+/// recordings, counted) or `--traces=PROF` (traces of the profiled
+/// loops): append the generated functions and their table to `ir`.
+/// `LOIMI_TRACE_REPORT=1` lists what was generated.
+fn add_traces(ir: &mut String, jit: &JitParts, opts: &Opts) -> Result<(), String> {
+    let read = |p: &PathBuf| std::fs::read_to_string(p).map_err(|e| format!("cannot read {}: {}", p.display(), e));
+    let vm = tracegen::VmInfo { table: &jit.table, op_bits: jit.op_bits, imm: &jit.imm };
+    let topts = tracegen::Options::from_env();
+    let (text, report, what) = if !opts.trace_regions.is_empty() {
+        let mut codes = Vec::new();
+        for p in &opts.trace_regions {
+            codes.extend(tracegen::parse_recording(&read(p)?).map_err(|e| format!("{}: {}", p.display(), e))?);
+        }
+        let (t, r) = tracegen::regions(ir, &jit.stencils, &vm, &codes, &topts).map_err(|e| format!("--trace-regions: {}", e))?;
+        (t, r, "region")
+    } else {
+        let sh = tracegen::stencil_hash(&jit.stencils);
+        let mut profs = Vec::new();
+        for p in &opts.traces {
+            profs.extend(tracegen::parse_profile(&read(p)?, sh).map_err(|e| format!("{}: {}", p.display(), e))?);
+        }
+        let (t, r) = tracegen::traces(ir, &jit.stencils, &vm, &profs, &topts).map_err(|e| format!("--traces: {}", e))?;
+        (t, r, "trace")
+    };
+    if std::env::var_os("LOIMI_TRACE_REPORT").is_some_and(|v| v != "0") {
+        eprint!("{}", report);
+    }
+    if !report.lines().any(|l| l.starts_with(what)) {
+        eprintln!("warning: no {}s: the {} has no loop that qualifies (LOIMI_TRACE_REPORT=1 says why)", what, if what == "region" { "recording" } else { "profile" });
+    }
+    ir.push_str(&text);
+    Ok(())
+}
+
 /// The sanitizer runtime (`asan` or `tsan`) to link explicitly, if
 /// clang's own is missing. `Ok(None)`: clang links its runtime itself.
 /// Otherwise GCC's shared libasan/libtsan (same instrumentation ABI), or
@@ -760,6 +807,8 @@ fn parse_args() -> Result<Opts, String> {
         header_prefix: String::new(),
         tls: None,
         jit: false,
+        trace_regions: vec![],
+        traces: vec![],
         test: false,
         update: false,
         // `LOIMI_TARGET`: a default for `--target` (for running whole test
@@ -829,6 +878,8 @@ fn parse_args() -> Result<Opts, String> {
             "--gc-check-roots" => o.gc_check_roots = true,
             "--explain-values" => o.explain_values = true,
             "--jit-stencils" => o.jit = true,
+            s if s.starts_with("--trace-regions=") => o.trace_regions.extend(s["--trace-regions=".len()..].split(',').filter(|x| !x.is_empty()).map(PathBuf::from)),
+            s if s.starts_with("--traces=") => o.traces.extend(s["--traces=".len()..].split(',').filter(|x| !x.is_empty()).map(PathBuf::from)),
             "--update" if o.test => o.update = true,
             "--list" if o.test => o.run_args.push(a.clone()),
             "--sanitize=address" => o.sanitize_address = true,
@@ -889,6 +940,12 @@ fn parse_args() -> Result<Opts, String> {
     }
     if o.jit && (o.kind != OutKind::Exe || o.sanitize_address || o.sanitize_thread || o.dispatch.is_some_and(|d| d != tir::Dispatch::TailCall)) {
         return Err("--jit-stencils builds executables with tail-call dispatch, without sanitizers".into());
+    }
+    if (!o.trace_regions.is_empty() || !o.traces.is_empty()) && !o.jit {
+        return Err("--trace-regions and --traces need --jit-stencils (traces are entered by the JIT)".into());
+    }
+    if !o.trace_regions.is_empty() && !o.traces.is_empty() {
+        return Err("--trace-regions (a profiling build) and --traces (a trace build) are separate builds".into());
     }
     if o.jit && o.gc_check_roots {
         return Err("--gc-check-roots cannot be combined with --jit-stencils".into());
@@ -995,17 +1052,12 @@ fn compiler_main() -> ExitCode {
     } else {
         None
     };
-    // LOIMI_TRACE_IR=file (with --jit-stencils): append generated trace
-    // functions to the program's IR (an experiment, docs/design/trace-tier.md).
-    if jit_rt.is_some() {
-        if let Some(p) = std::env::var_os("LOIMI_TRACE_IR") {
-            match std::fs::read_to_string(&p) {
-                Ok(t) => ir.push_str(&t),
-                Err(e) => {
-                    eprintln!("error: LOIMI_TRACE_IR: {}", e);
-                    return ExitCode::from(1);
-                }
-            }
+    // `--trace-regions` / `--traces`: stitched loop functions, appended
+    // to the program's IR (tracegen.rs, docs/design/trace-tier.md).
+    if let (Some(j), true) = (&jit, !opts.trace_regions.is_empty() || !opts.traces.is_empty()) {
+        if let Err(e) = add_traces(&mut ir, j, &opts) {
+            eprintln!("error: {}", e);
+            return ExitCode::from(1);
         }
     }
     let ll = tmpdir.join(format!("{}.ll", stem));
