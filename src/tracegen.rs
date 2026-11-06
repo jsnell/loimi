@@ -498,6 +498,8 @@ struct Module<'a> {
     program_syms: HashSet<&'a str>,
     types: HashSet<&'a str>,
     ro: RefCell<HashMap<String, bool>>,
+    /// The handlers' state register types (from a stencil's signature).
+    sig: Vec<String>,
 }
 
 impl<'a> Module<'a> {
@@ -509,6 +511,7 @@ impl<'a> Module<'a> {
             program_syms: HashSet::new(),
             types: HashSet::new(),
             ro: RefCell::new(HashMap::new()),
+            sig: Vec::new(),
         };
         for (text, program) in [(ir, true), (stencils, false)] {
             let mut cur: Option<(&str, Vec<&str>)> = None;
@@ -524,6 +527,11 @@ impl<'a> Module<'a> {
                 }
                 if line.starts_with("define ") {
                     if let Some(n) = first_global(line) {
+                        if !program && m.sig.is_empty() && n.starts_with("__jit.op.") {
+                            if let (Some(a), Some(b)) = (line.find('('), line.find(')')) {
+                                m.sig = split_top(&line[a + 1..b], b',').iter().filter(|x| !x.ends_with("%insn")).map(|x| x[..x.len() - last_tok(x).len()].trim().to_string()).collect();
+                            }
+                        }
                         m.heads.insert(n, line);
                         if program {
                             m.program_syms.insert(n);
@@ -697,6 +705,24 @@ struct Trace<'a> {
     at: BTreeMap<usize, usize>,
     /// Pool constants baked in: (index, value).
     kchk: BTreeSet<(u64, u64)>,
+    /// The handlers' state registers (the context, the state, the
+    /// accumulators): their types, and which are pc and the register file.
+    sig: Vec<String>,
+    pc_idx: usize,
+    regs_idx: Option<usize>,
+    const_idx: Option<usize>,
+}
+
+/// The name of state register i of step prefix p (`sN.`): pc and the
+/// register file have their own.
+fn state_name(p: &str, i: usize, pc_idx: usize, regs_idx: Option<usize>) -> String {
+    if i == pc_idx {
+        format!("%{}pc", p)
+    } else if Some(i) == regs_idx {
+        "%tr.regs".to_string()
+    } else {
+        format!("%{}st{}", p, i)
+    }
 }
 
 fn field(w: u32, shift: u32, bits: u32, signed: bool) -> i64 {
@@ -757,8 +783,22 @@ fn loops(m: &Module, code: &Code) -> BTreeMap<usize, usize> {
 }
 
 impl<'a> Trace<'a> {
-    fn new(m: &'a Module<'a>, code: &'a Code, table: &'a str, op_bits: u32, imm: &'a [(u64, u64, bool)], h: usize) -> Trace<'a> {
-        Trace { m, code, table, op_mask: mask(op_bits), imm, h, steps: Vec::new(), at: BTreeMap::new(), kchk: BTreeSet::new() }
+    fn new(m: &'a Module<'a>, code: &'a Code, vm: &'a VmInfo, h: usize) -> Trace<'a> {
+        Trace {
+            m,
+            code,
+            table: vm.table,
+            op_mask: mask(vm.op_bits),
+            imm: vm.imm,
+            h,
+            steps: Vec::new(),
+            at: BTreeMap::new(),
+            kchk: BTreeSet::new(),
+            sig: m.sig.clone(),
+            pc_idx: vm.pc_idx,
+            regs_idx: vm.regs_idx,
+            const_idx: vm.const_idx,
+        }
     }
 
     /// Whether a recorded constant may be baked in as a literal: an
@@ -791,10 +831,11 @@ impl<'a> Trace<'a> {
                             n += 1;
                             let pre = format!("c{}.", n);
                             let args: Vec<&str> = c.args.iter().map(|a| a.1).collect();
-                            if args.len() != 6 {
+                            let mut params: Vec<String> = (0..self.sig.len()).map(|i| format!("p{}", i)).collect();
+                            params.push("insn".into());
+                            if args.len() != params.len() {
                                 return Err(format!("cold block {} has {} arguments", c.callee, args.len()));
                             }
-                            let params = ["p0", "p1", "p2", "p3", "p4", "insn"];
                             out.push(format!("  br label %{}entry", pre));
                             skip_ret = true;
                             for &cl in cb {
@@ -848,12 +889,10 @@ impl<'a> Trace<'a> {
                 if self.m.types.contains(nm) {
                     return format!("%{}", if q { format!("\"{}\"", nm) } else { nm.to_string() });
                 }
+                if let Some(i) = nm.strip_prefix('p').and_then(|d| d.parse::<usize>().ok()).filter(|&i| i < self.sig.len()) {
+                    return state_name(&p, i, self.pc_idx, self.regs_idx);
+                }
                 match nm {
-                    "p0" => format!("%{}ctx", p),
-                    "p1" => format!("%{}pc", p),
-                    "p2" => "%tr.regs".to_string(),
-                    "p3" => format!("%{}k", p),
-                    "p4" => format!("%{}fp", p),
                     "insn" => i32s(word).to_string(),
                     _ if q => format!("%\"{}{}\"", p, nm),
                     _ => format!("%{}{}", p, nm),
@@ -923,7 +962,8 @@ impl<'a> Trace<'a> {
                             // runs) or not recorded: load it from the pool
                             *kp += 1;
                             let g = format!("%{}kp{}", p, kp);
-                            pre.push(format!("  {} = getelementptr inbounds i64, ptr %{}k, i64 {}", g, p, idx));
+                            let Some(ki) = self.const_idx else { return Err("a constant hole without a constant pool".into()) };
+                            pre.push(format!("  {} = getelementptr inbounds i64, ptr {}, i64 {}", g, state_name(p, ki, self.pc_idx, self.regs_idx), idx));
                             ("p", g)
                         }
                     }
@@ -1070,7 +1110,7 @@ fn val_of(vals: &HashMap<String, Val>, v: &str) -> Val {
         if v.ends_with(".pc") && v.matches('.').count() == 1 {
             return Val::Pc;
         }
-        if (v.ends_with(".ctx") || v.ends_with(".fp")) && v.matches('.').count() == 1 {
+        if v.rsplit_once('.').is_some_and(|(a, b)| b.starts_with("st") && b[2..].bytes().all(|c| c.is_ascii_digit()) && !a.contains('.')) {
             return Val::Frame;
         }
         return Val::Bot;
@@ -1239,8 +1279,8 @@ struct Emit {
     out: Vec<String>,
     cur: String,
     ctr: usize,
-    /// step pc -> incoming (block, ctx, k, fp, iteration count)
-    heads_in: BTreeMap<usize, Vec<(String, String, String, String, String)>>,
+    /// step pc -> incoming (block, state registers, iteration count)
+    heads_in: BTreeMap<usize, Vec<(String, Vec<String>, String)>>,
 }
 
 impl Emit {
@@ -1306,6 +1346,17 @@ impl<'t, 'a> FnGen<'t, 'a> {
         g
     }
 
+    /// The function's parameter for state register i.
+    fn param(&self, i: usize) -> String {
+        if i == self.t.pc_idx {
+            "%tr.pc".into()
+        } else if Some(i) == self.t.regs_idx {
+            "%tr.regs".into()
+        } else {
+            format!("%tr.s{}", i)
+        }
+    }
+
     fn window_slot(&mut self, j: usize) -> String {
         let g = self.e.fresh("ws");
         self.e.line(format!("  {} = getelementptr inbounds i64, ptr %lregs, i64 {}", g, j));
@@ -1342,30 +1393,46 @@ impl<'t, 'a> FnGen<'t, 'a> {
         self.e.line(format!("  store i64 {}, ptr {}", b, g));
     }
 
-    /// Leaves through `callee` (a handler or the table's entry) with the
+    /// Leaves through `callee` (a handler or the table's entry) with
+    /// `args` (the state registers, then the instruction word), the
     /// window written back if this block is in window mode.
-    fn exit_call(&mut self, callee: &str, args: &[String; 6], window: bool) {
+    fn exit_call(&mut self, callee: &str, args: &[String], window: bool) {
         if window {
             self.writeback();
         }
         self.flush_iters();
-        self.e.line(format!(
-            "  musttail call preserve_nonecc void {}(ptr {}, ptr {}, ptr {}, ptr {}, ptr {}, i32 {})",
-            callee, args[0], args[1], args[2], args[3], args[4], args[5]
-        ));
+        let n = self.t.sig.len();
+        let mut a: Vec<String> = (0..n).map(|i| format!("{} {}", self.t.sig[i], args[i])).collect();
+        a.push(format!("i32 {}", args[n]));
+        self.e.line(format!("  musttail call preserve_nonecc void {}({})", callee, a.join(", ")));
         self.e.line("  ret void".into());
     }
 
-    /// Dispatches through the table at `pcv`.
-    fn exit_dispatch(&mut self, ctx: &str, pcv: &str, regs: &str, k: &str, fp: &str, window: bool) {
+    /// Dispatches through the table at the pc of `state`.
+    fn exit_dispatch(&mut self, state: &[String], window: bool) {
+        let pcv = state[self.t.pc_idx].clone();
         let (w, o, oz, g, h) = (self.e.fresh("w"), self.e.fresh("o"), self.e.fresh("oz"), self.e.fresh("g"), self.e.fresh("h"));
         self.e.line(format!("  {} = load i32, ptr {}", w, pcv));
         self.e.line(format!("  {} = and i32 {}, {}", o, w, self.t.op_mask));
         self.e.line(format!("  {} = zext i32 {} to i64", oz, o));
         self.e.line(format!("  {} = getelementptr inbounds ptr, ptr @\"{}\", i64 {}", g, self.t.table, oz));
         self.e.line(format!("  {} = load ptr, ptr {}", h, g));
-        let args = [ctx.to_string(), pcv.to_string(), regs.to_string(), k.to_string(), fp.to_string(), w.clone()];
+        let mut args = state.to_vec();
+        args.push(w);
         self.exit_call(&h, &args, window);
+    }
+
+    /// Runs the instruction at the pc of `state`, whose word is `word`,
+    /// in the interpreter: through the table at the word's op, not the
+    /// word in memory (an enter word, which at the loop header leads back
+    /// into this trace).
+    fn exit_interp(&mut self, state: &[String], word: u32) {
+        let (g, h) = (self.e.fresh("g"), self.e.fresh("h"));
+        self.e.line(format!("  {} = getelementptr inbounds ptr, ptr @\"{}\", i64 {}", g, self.t.table, word as u64 & self.t.op_mask));
+        self.e.line(format!("  {} = load ptr, ptr {}", h, g));
+        let mut args = state.to_vec();
+        args.push(i32s(word).to_string());
+        self.exit_call(&h, &args, false);
     }
 
     fn pc_of(&mut self, t: usize) -> String {
@@ -1374,12 +1441,15 @@ impl<'t, 'a> FnGen<'t, 'a> {
         pcv
     }
 
-    /// Continues at step t if `regs` is still the trace's file (and,
-    /// after calls that may rewrite code, the trace still valid);
-    /// otherwise exits there.
-    fn goto_head(&mut self, t: usize, regs: &str, ctx: &str, k: &str, fp: &str, window: bool, check_gen: bool) {
-        let mut cond = self.e.fresh("same");
-        self.e.line(format!("  {} = icmp eq ptr {}, %tr.regs", cond, regs));
+    /// Continues at step t with `state` if `regs` is still the trace's
+    /// file (and, after calls that may rewrite code, the trace still
+    /// valid); otherwise exits there.
+    fn goto_head(&mut self, t: usize, state: &[String], window: bool, check_gen: bool) {
+        let mut cond = "true".to_string();
+        if let Some(ri) = self.t.regs_idx {
+            cond = self.e.fresh("same");
+            self.e.line(format!("  {} = icmp eq ptr {}, %tr.regs", cond, state[ri]));
+        }
         if check_gen {
             let g = self.st_gep(ST_GEN);
             let (gv, ok, both) = (self.e.fresh("gen"), self.e.fresh("ok"), self.e.fresh("ok"));
@@ -1404,10 +1474,11 @@ impl<'t, 'a> FnGen<'t, 'a> {
         };
         self.e.line(format!("  br label %s{}.head", t));
         let cur = self.e.cur.clone();
-        self.e.heads_in.entry(t).or_default().push((cur, ctx.to_string(), k.to_string(), fp.to_string(), it));
+        self.e.heads_in.entry(t).or_default().push((cur, state.to_vec(), it));
         self.e.label(&no);
-        let pcv = self.pc_of(t);
-        self.exit_dispatch(ctx, &pcv, regs, k, fp, window);
+        let mut st = state.to_vec();
+        st[self.t.pc_idx] = self.pc_of(t);
+        self.exit_dispatch(&st, window);
     }
 
     fn counter(&mut self, idx: usize) {
@@ -1590,9 +1661,6 @@ impl<'t, 'a> FnGen<'t, 'a> {
             self.copy_window("%lregs", "%snap");
         }
         self.e.line(format!("  br label %{}{}", p, st.blocks[0].0));
-        let ctx = format!("%{}ctx", p);
-        let kk = format!("%{}k", p);
-        let fpp = format!("%{}fp", p);
         let mut table_geps: HashSet<String> = HashSet::new();
         let mut table_fns: HashSet<String> = HashSet::new();
         let mut guard_ix = 0;
@@ -1639,11 +1707,12 @@ impl<'t, 'a> FnGen<'t, 'a> {
                 }
                 if rhs.starts_with("musttail call") {
                     let c = parse_call(rhs).ok_or_else(|| format!("step {}: bad musttail", pc))?;
-                    let a: Vec<String> = c.args.iter().map(|x| x.1.to_string()).collect();
-                    if a.len() != 6 {
-                        return Err(format!("step {}: a continuation with {} arguments", pc, a.len()));
+                    let args: Vec<String> = c.args.iter().map(|x| x.1.to_string()).collect();
+                    let ns = self.t.sig.len();
+                    if args.len() != ns + 1 {
+                        return Err(format!("step {}: a continuation with {} arguments", pc, args.len()));
                     }
-                    let args: [String; 6] = [a[0].clone(), a[1].clone(), a[2].clone(), a[3].clone(), a[4].clone(), a[5].clone()];
+                    let state: Vec<String> = args[..ns].to_vec();
                     skip_ret = true;
                     if c.global {
                         if let Some(t) = cont_target(self.t.code, pc, c.callee) {
@@ -1651,11 +1720,12 @@ impl<'t, 'a> FnGen<'t, 'a> {
                             match t {
                                 Some(t) if on[b] && self.internal(pc, t) => {
                                     self.edges.push((pc, idx, t));
-                                    self.goto_head(t, &args[2], &args[0], &args[3], &args[4], window, rewrites);
+                                    self.goto_head(t, &state, window, rewrites);
                                 }
                                 Some(t) => {
-                                    let pcv = self.pc_of(t);
-                                    self.exit_dispatch(&args[0], &pcv, &args[2], &args[3], &args[4], window);
+                                    let mut st2 = state.clone();
+                                    st2[self.t.pc_idx] = self.pc_of(t);
+                                    self.exit_dispatch(&st2, window);
                                 }
                                 None => return Err(format!("step {}: a jump outside the code", pc)),
                             }
@@ -1668,7 +1738,7 @@ impl<'t, 'a> FnGen<'t, 'a> {
                         // a dispatch through the table (an inlined cold
                         // block's `next`): to the next step(s) by pc
                         let (x1, x2, dd) = (self.e.fresh("dp"), self.e.fresh("db"), self.e.fresh("doff"));
-                        self.e.line(format!("  {} = ptrtoint ptr {} to i64", x1, args[1]));
+                        self.e.line(format!("  {} = ptrtoint ptr {} to i64", x1, args[self.t.pc_idx]));
                         self.e.line(format!("  {} = ptrtoint ptr %tr.pc to i64", x2));
                         self.e.line(format!("  {} = sub i64 {}, {}", dd, x1, x2));
                         let targets: Vec<usize> = match self.kind {
@@ -1687,7 +1757,7 @@ impl<'t, 'a> FnGen<'t, 'a> {
                                 self.counter(ei);
                             }
                             self.edges.push((pc, ei, t));
-                            self.goto_head(t, &args[2], &args[0], &args[3], &args[4], window, rewrites);
+                            self.goto_head(t, &state, window, rewrites);
                         }
                         self.e.label(&xl);
                     }
@@ -1799,7 +1869,6 @@ impl<'t, 'a> FnGen<'t, 'a> {
                 self.e.line(l.clone());
             }
         }
-        let _ = (&ctx, &kk, &fpp);
         Ok(())
     }
 
@@ -1874,7 +1943,7 @@ impl Options {
         Options {
             check: var("LOIMI_TRACE_CHECK").is_some_and(|v| v != "0"),
             min_iters: var("LOIMI_TRACE_MIN").and_then(|v| v.parse().ok()).unwrap_or(1000),
-            min_frac: var("LOIMI_TRACE_MINFRAC").and_then(|v| v.parse().ok()).unwrap_or(0.001),
+            min_frac: var("LOIMI_TRACE_MINFRAC").and_then(|v| v.parse().ok()).unwrap_or(0.0),
             fail_limit: 1024,
             only: var("LOIMI_TRACE_ONLY").map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect()).unwrap_or_default(),
             verbose: var("LOIMI_TRACE_REPORT").is_some_and(|v| v == "2"),
@@ -1888,6 +1957,13 @@ pub struct VmInfo<'a> {
     /// The dispatch table's symbol (`vm.NAME.table`).
     pub table: &'a str,
     pub op_bits: u32,
+    /// The handler arguments (context, state, accumulators) that are pc
+    /// and the register file (`regs`, if the vm has one).
+    pub nstate: usize,
+    pub pc_idx: usize,
+    pub regs_idx: Option<usize>,
+    /// The constant pool's state register (`const` operands).
+    pub const_idx: Option<usize>,
     /// Constant-pool values that are immediates (no heap pointer):
     /// (mask, value, ult) as `jit_variant`.
     pub imm: &'a [(u64, u64, bool)],
@@ -1945,6 +2021,9 @@ impl<'t, 'a> FnGen<'t, 'a> {
     /// The window: every register slot a step accesses at a constant
     /// offset (as an 8-byte value), up to the largest.
     fn window_size(&self) -> usize {
+        if self.t.regs_idx.is_none() {
+            return 0;
+        }
         let mut nr = 0;
         for &pc in &self.order {
             let st = &self.t.steps[self.t.at[&pc]];
@@ -1994,9 +2073,11 @@ impl<'t, 'a> FnGen<'t, 'a> {
             self.e.line(format!("  br label %{}", lc));
             self.e.label(&lc);
             self.copy_window("%snap", "%tr.regs");
-            let p = format!("%s{}.", pc);
+            let p = format!("s{}.", pc);
             self.flushed = true;
-            self.exit_dispatch(&format!("{}ctx", p), &format!("{}pc", p), "%tr.regs", &format!("{}k", p), &format!("{}fp", p), false);
+            let state: Vec<String> = (0..self.t.sig.len()).map(|i| state_name(&p, i, self.t.pc_idx, self.t.regs_idx)).collect();
+            let word = self.t.code.w[*pc];
+            self.exit_interp(&state, word);
         }
         // phis
         let first = self.t.h;
@@ -2005,23 +2086,26 @@ impl<'t, 'a> FnGen<'t, 'a> {
         for l in out {
             if let Some(pc) = l.strip_prefix("@@PHIS ") {
                 let pc: usize = pc.parse().unwrap();
-                let p = format!("%s{}.", pc);
+                let p = format!("s{}.", pc);
                 let mut ins = self.e.heads_in.get(&pc).cloned().unwrap_or_default();
+                let n = self.t.sig.len();
+                let params: Vec<String> = (0..n).map(|i| self.param(i)).collect();
                 if pc == first {
-                    ins.insert(0, ("entry".into(), "%tr.ctx".into(), "%tr.k".into(), "%tr.fp".into(), "0".into()));
+                    ins.insert(0, ("entry".into(), params.clone(), "0".into()));
                 }
+                let carried: Vec<usize> = (0..n).filter(|&i| i != self.t.pc_idx && Some(i) != self.t.regs_idx).collect();
                 if ins.is_empty() {
-                    for nm in ["ctx", "k", "fp"] {
-                        res.push(format!("  {}{} = getelementptr i8, ptr %tr.{}, i64 0", p, nm, nm));
+                    for &i in &carried {
+                        res.push(format!("  {} = bitcast {} {} to {}", state_name(&p, i, self.t.pc_idx, self.t.regs_idx), self.t.sig[i], params[i], self.t.sig[i]));
                     }
                     continue;
                 }
-                for (j, nm) in [(1, "ctx"), (2, "k"), (3, "fp")] {
-                    let v: Vec<String> = ins.iter().map(|x| format!("[ {}, %{} ]", [&x.1, &x.2, &x.3][j - 1], x.0)).collect();
-                    res.push(format!("  {}{} = phi ptr {}", p, nm, v.join(", ")));
+                for &i in &carried {
+                    let v: Vec<String> = ins.iter().map(|x| format!("[ {}, %{} ]", x.1[i], x.0)).collect();
+                    res.push(format!("  {} = phi {} {}", state_name(&p, i, self.t.pc_idx, self.t.regs_idx), self.t.sig[i], v.join(", ")));
                 }
                 if pc == first && self.kind == Kind::Trace {
-                    let v: Vec<String> = ins.iter().map(|x| format!("[ {}, %{} ]", x.4, x.0)).collect();
+                    let v: Vec<String> = ins.iter().map(|x| format!("[ {}, %{} ]", x.2, x.0)).collect();
                     res.push(format!("  %tr.it = phi i64 {}", v.join(", ")));
                 }
             } else {
@@ -2029,10 +2113,12 @@ impl<'t, 'a> FnGen<'t, 'a> {
             }
         }
         let mut f = String::new();
+        let ps: Vec<String> = (0..self.t.sig.len()).map(|i| format!("{} {}", self.t.sig[i], self.param(i))).collect();
         let _ = writeln!(
             f,
-            "define internal preserve_nonecc void @\"loimi.trace.{}\"(ptr %tr.ctx, ptr %tr.pc, ptr %tr.regs, ptr %tr.k, ptr %tr.fp, i32 %tr.insn) nounwind{} \"no-builtin-memset\" \"no-builtin-memcpy\" \"no-builtin-memmove\" {{",
+            "define internal preserve_nonecc void @\"loimi.trace.{}\"({}, i32 %tr.insn) nounwind{} \"no-builtin-memset\" \"no-builtin-memcpy\" \"no-builtin-memmove\" {{",
             self.name,
+            ps.join(", "),
             if self.kind == Kind::Region { " noinline optnone" } else { "" }
         );
         f.push_str("entry:\n");
@@ -2080,7 +2166,7 @@ struct GenFn {
 /// The function `kind` for loop h of `code`, over `order`.
 #[allow(clippy::too_many_arguments)]
 fn generate_fn(m: &Module, vm: &VmInfo, code: &Code, h: usize, order: &[usize], kind: Kind, name: &str, index: usize, succ: HashMap<usize, usize>, prof: Option<Prof>, opts: &Options) -> Result<GenFn, String> {
-    let mut t = Trace::new(m, code, vm.table, vm.op_bits, vm.imm, h);
+    let mut t = Trace::new(m, code, vm, h);
     for (i, &pc) in order.iter().enumerate() {
         let st = t.build_step(pc).map_err(|e| format!("instruction {} ({}): {}", pc, code.op[pc].as_deref().unwrap_or("?"), e))?;
         t.steps.push(st);
@@ -2215,6 +2301,14 @@ fn finish(m: &Module, out: Out, stencil_hash: u64) -> Result<String, String> {
     Ok(s)
 }
 
+/// The stencils' arguments must be the vm's state registers.
+fn check_sig(m: &Module, vm: &VmInfo) -> Result<(), String> {
+    if m.sig.len() != vm.nstate || m.sig.get(vm.pc_idx).map(|s| s.as_str()) != Some("ptr") || vm.regs_idx.is_some_and(|r| m.sig.get(r).map(|s| s.as_str()) != Some("ptr")) {
+        return Err(format!("the stencils take {:?}, not the vm's {} state registers", m.sig, vm.nstate));
+    }
+    Ok(())
+}
+
 /// A hash of the stencils: profiles name the build they came from.
 pub fn stencil_hash(stencils: &str) -> u64 {
     fnv_str(FNV0, stencils)
@@ -2228,6 +2322,7 @@ fn region_fingerprint(stencil_hash: u64, code: &Code, h: usize) -> u64 {
 /// counted region. Returns the IR to append and a report.
 pub fn regions(ir: &str, stencils: &str, vm: &VmInfo, codes: &[Code], opts: &Options) -> Result<(String, String), String> {
     let m = Module::new(ir, stencils);
+    check_sig(&m, vm)?;
     let sh = stencil_hash(stencils);
     let mut out = Out { defs: String::new(), entries: Vec::new(), globals: Vec::new() };
     let mut report = String::new();
@@ -2260,6 +2355,7 @@ pub fn regions(ir: &str, stencils: &str, vm: &VmInfo, codes: &[Code], opts: &Opt
 /// as a trace. Returns the IR to append and a report.
 pub fn traces(ir: &str, stencils: &str, vm: &VmInfo, profs: &[ProfRegion], opts: &Options) -> Result<(String, String), String> {
     let m = Module::new(ir, stencils);
+    check_sig(&m, vm)?;
     let sh = stencil_hash(stencils);
     let mut out = Out { defs: String::new(), entries: Vec::new(), globals: Vec::new() };
     let mut report = String::new();

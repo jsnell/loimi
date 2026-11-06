@@ -308,6 +308,10 @@ struct JitParts {
     table: String,
     op_bits: u32,
     imm: Vec<(u64, u64, bool)>,
+    /// Handler arguments: their names (context, state, accumulators).
+    state_names: Vec<String>,
+    pc_idx: usize,
+    const_idx: Option<usize>,
 }
 
 /// LLVM options for clang (`-mllvm`) when the program has a `goto`-mode vm.
@@ -508,7 +512,7 @@ fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, O
         for (j, cv) in jitgen::const_variants(&prog, vi).into_iter().enumerate() {
             ops.push((nops + 1 + j as u32, cv.name));
         }
-        Some((ops, nops, format!("vm.{}.table", vd.name), vd.op_bits as u32, jitgen::const_immediates(&prog, vi)))
+        Some((ops, nops, format!("vm.{}.table", vd.name), vd.op_bits as u32, jitgen::const_immediates(&prog, vi), vd.state_names.clone(), vd.pc_idx, vd.const_base))
     } else {
         None
     };
@@ -526,7 +530,7 @@ fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, O
         },
     );
     let (mut ir, stencils) = cg.generate_with_stencils();
-    let jit = jit.map(|(ops, nops, table, op_bits, imm)| JitParts { stencils, ops, nops, table, op_bits, imm });
+    let jit = jit.map(|(ops, nops, table, op_bits, imm, state_names, pc_idx, const_idx)| JitParts { stencils, ops, nops, table, op_bits, imm, state_names, pc_idx, const_idx });
     // Runtime thread-locals are emitted initial-exec: one offset from the
     // thread pointer, fixed at load time. A shared object that may be
     // dlopen'ed cannot rely on static TLS space, so it uses a dynamic
@@ -678,7 +682,15 @@ fn build_stencils(ir: &mut String, jit: &JitParts, clang: &str, cpu_flag: &[Stri
 /// `LOIMI_TRACE_REPORT=1` lists what was generated.
 fn add_traces(ir: &mut String, jit: &JitParts, opts: &Opts) -> Result<(), String> {
     let read = |p: &PathBuf| std::fs::read_to_string(p).map_err(|e| format!("cannot read {}: {}", p.display(), e));
-    let vm = tracegen::VmInfo { table: &jit.table, op_bits: jit.op_bits, imm: &jit.imm };
+    let vm = tracegen::VmInfo {
+        table: &jit.table,
+        op_bits: jit.op_bits,
+        imm: &jit.imm,
+        nstate: jit.state_names.len(),
+        pc_idx: jit.pc_idx,
+        regs_idx: jit.state_names.iter().position(|n| n == "regs"),
+        const_idx: jit.const_idx,
+    };
     let topts = tracegen::Options::from_env();
     let (text, report, what) = if !opts.trace_regions.is_empty() {
         let mut codes = Vec::new();
