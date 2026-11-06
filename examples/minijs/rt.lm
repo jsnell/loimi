@@ -564,13 +564,13 @@ pub fn Ctx.get(c: *Ctx, v0: V, k: u64) -> Result<V, V> {
     match v {
         O(o) => Ok(c.m.get_chain(o, k) ?? V.Undef),
         A(a) => {
-            if k == c.k_length { return Ok(V.Int(a.len as i48)); }
+            if k == c.k_length { return Ok(V.Int(a.len as i32)); }
             let i = c.key_index(k);
             if i >= 0 { return Ok(if (i as u64) < a.len { a.ptr[i as u64] } else { V.Undef }); }
             Ok(c.proto_get(c.arr_proto(), k))
         }
         S(s) => {
-            if k == c.k_length { return Ok(V.Int(s.data.len as i48)); }
+            if k == c.k_length { return Ok(V.Int(s.data.len as i32)); }
             let i = c.key_index(k);
             if i >= 0 { return Ok(if (i as u64) < s.data.len { V.S(c.char_str(s.data[i as u64])) } else { V.Undef }); }
             Ok(c.proto_get(c.str_proto(), k))

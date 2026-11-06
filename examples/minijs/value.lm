@@ -174,9 +174,9 @@ pub object Proto {
 /// Ten tagged variants: the packed layout, where the narrow variants get
 /// narrow blocks, pinned with `block N` so that a new variant cannot change
 /// them silently (`loimi build --explain-values`).
-pub value V repr nanbox(int_high) {
+pub value V repr nanbox {
     Num(f64) unboxed,
-    Int(i48),
+    Int(i32) block 32,
     S(Gc<Str>),
     O(Gc<Obj>),
     A(Gc<Arr>),
@@ -241,27 +241,10 @@ impl hash.Hash for V;
 
 // ── numbers ─────────────────────────────────────────────────────────
 
-/// A word read as a double, for the float-first fast paths (ADD_F and
-/// the like add two registers before testing them): `nanbox(int_high)`
-/// stores an f64 with bits `b` as `rotl(b, 16) ^ V.Num.xor`, and every
-/// other variant's word reads as a NaN.
-#[inline(always)]
-pub fn fbits(v: V) -> f64 {
-    let x = (v as u64) ^ V.Num.xor;
-    f64.from_bits((x >> 16) | (x << 48))
-}
-
-/// The word of a double that is not a NaN (`fbits` inverted).
-#[inline(always)]
-pub fn fword(r: f64) -> V {
-    let b = r.to_bits();
-    (((b << 16) | (b >> 48)) ^ V.Num.xor) as V
-}
-
-/// A number value: Int when `x` is integral, fits in an i48 and is not -0.
+/// A number value: Int when `x` is integral, fits in an i32 and is not -0.
 pub fn number(x: f64) -> V {
-    if x >= -140737488355328.0 and x <= 140737488355327.0 {
-        let i = x as i48;
+    if x >= -2147483648.0 and x <= 2147483647.0 {
+        let i = x as i32;
         if i as f64 == x and (i != 0 or 1.0 / x > 0.0) { return V.Int(i); }
     }
     V.Num(x)

@@ -119,8 +119,7 @@ fn is_str(v: V) -> bool {
 #[inline(always)]
 fn int32(v: V) -> i32 {
     match v {
-        // ToInt32 of an integer: its low 32 bits.
-        Int(i) => i as i32,
+        Int(i) => i,
         Num(x) => if x >= -2147483648.0 and x <= 2147483647.0 { x as i32 } else { value.to_int32(x) },
         _ => value.to_int32(value.to_number(v)),
     }
@@ -129,10 +128,10 @@ fn int32(v: V) -> i32 {
 /// x / y for two Ints: integral quotients stay Int (no -0: a zero
 /// quotient of a nonzero divisor with x == 0 needs y > 0).
 #[inline(always)]
-fn int_div(x: i48, y: i48) -> V {
+fn int_div(x: i32, y: i32) -> V {
     let r = x as f64 / y as f64;
-    if r >= -140737488355328.0 and r <= 140737488355327.0 {
-        let q = r as i48;
+    if r >= -2147483648.0 and r <= 2147483647.0 {
+        let q = r as i32;
         if q as f64 == r and (q != 0 or y > 0) { return V.Int(q); }
     }
     V.Num(r)
@@ -143,7 +142,7 @@ fn int_div(x: i48, y: i48) -> V {
 #[inline(always)]
 fn i32_of(v: V) -> (i32, bool) {
     match v {
-        Int(i) => (i as i32, true),
+        Int(i) => (i, true),
         Num(x) => if x > -9.2e18 and x < 9.2e18 or x != x { ((x as i64) as i32, true) } else { (0, false) },
         _ => (0, false),
     }
@@ -155,18 +154,18 @@ fn bitop(op: i64, a: V, b: V) -> V {
     let x = int32(a);
     let y = int32(b);
     match op {
-        0 => V.Int((x & y) as i48),
-        1 => V.Int((x | y) as i48),
-        2 => V.Int((x ^ y) as i48),
-        3 => V.Int((((x as u32) << ((y & 31) as u32)) as i32) as i48),
-        4 => V.Int((x >> (y & 31)) as i48),
+        0 => V.Int(x & y),
+        1 => V.Int(x | y),
+        2 => V.Int(x ^ y),
+        3 => V.Int(((x as u32) << ((y & 31) as u32)) as i32),
+        4 => V.Int(x >> (y & 31)),
         _ => value.number((((x as u32) >> ((y & 31) as u32)) as f64)),
     }
 }
 
 fn neg(a: V) -> V {
     match a {
-        Int(x) => if x == 0 or x == -140737488355328 { V.Num(-(x as f64)) } else { V.Int(0 - x) },
+        Int(x) => if x == 0 or x == -2147483648 { V.Num(-(x as f64)) } else { V.Int(0 - x) },
         _ => V.Num(-value.to_number(a)),
     }
 }
@@ -442,7 +441,7 @@ pub vm JS {
     sync { ctx.fp = fp; }
 
     op LOADK(dst: reg, c: kst) : ABx { dst = c; next }
-    op LOADI(dst: reg, v: simm) : AsBx { dst = Int(v as i48); next }
+    op LOADI(dst: reg, v: simm) : AsBx { dst = Int(v as i32); next }
     op LOADU(dst: reg) : ABC { dst = Undef; next }
     op LOADNULL(dst: reg) : ABC { dst = Null; next }
     op LOADBOOL(dst: reg, b: imm) : ABC { dst = Bool(b != 0); next }
@@ -736,13 +735,13 @@ pub vm JS {
     }
 
     op GETINDEX(dst: reg, tgt: reg, key: reg) : ABC {
-        if let (A(a), Int(i)) = (tgt, key) and (i as u64) < a.len {
-            dst = a.ptr[i as u64];
+        if let (A(a), Int(i)) = (tgt, key) and (i as u32 as u64) < a.len {
+            dst = a.ptr[i as u32 as u64];
             next
         }
-        if let (S(s), Int(i)) = (tgt, key) and (i as u64) < s.data.len {
+        if let (S(s), Int(i)) = (tgt, key) and (i as u32 as u64) < s.data.len {
             // One-character strings of ASCII bytes are made at startup.
-            if let Some(c) = ctx.ascii_str(s.data.ptr[i as u64]) { dst = S(c); next }
+            if let Some(c) = ctx.ascii_str(s.data.ptr[i as u32 as u64]) { dst = S(c); next }
         }
         cold {
             if let R(r) = tgt { tgt = S(value.flatten(r)); redo }
@@ -751,8 +750,8 @@ pub vm JS {
         }
     }
     op SETINDEX(tgt: reg, key: reg, val: reg) : ABC {
-        if let (A(a), Int(i)) = (tgt, key) and (i as u64) < a.len {
-            a.ptr[i as u64] = val;
+        if let (A(a), Int(i)) = (tgt, key) and (i as u32 as u64) < a.len {
+            a.ptr[i as u32 as u64] = val;
             value.abar(a);
             next
         }
@@ -763,9 +762,9 @@ pub vm JS {
         }
     }
     op GETLEN(dst: reg, tgt: reg) : ABC {
-        if let A(a) = tgt { dst = Int(a.len as i48); next }
-        if let S(s) = tgt { dst = Int(s.data.len as i48); next }
-        if let R(r) = tgt { dst = Int(r.len as i48); next }
+        if let A(a) = tgt { dst = Int(a.len as i32); next }
+        if let S(s) = tgt { dst = Int(s.data.len as i32); next }
+        if let R(r) = tgt { dst = Int(r.len as i32); next }
         cold { dst = ctx.get(tgt, ctx.k_length)?; next }
     }
     op DELPROP(dst: reg, tgt: reg, key: reg) : ABC {
@@ -825,8 +824,8 @@ pub vm JS {
                 }
             }
             #fname {
-                let r = value.fbits(a) sym value.fbits(b);
-                if likely(r == r) { dst = value.fword(r); next }
+                let r = f64.from_bits(a as u64) sym f64.from_bits(b as u64);
+                if likely(r == r) { dst = r.to_bits() as V; next }
                 cold {
                     match (a, b) {
                         (Num(x), Num(y)) => { dst = Num(x sym y); next }
@@ -842,15 +841,15 @@ pub vm JS {
             }
             #ifname {
                 if let Int(x) = a {
-                    let r = x as f64 sym value.fbits(b);
-                    if likely(r == r) { dst = value.fword(r); next }
+                    let r = x as f64 sym f64.from_bits(b as u64);
+                    if likely(r == r) { dst = r.to_bits() as V; next }
                 }
                 become #fname; refuse(fp.cl); redo
             }
             #finame {
                 if let Int(y) = b {
-                    let r = value.fbits(a) sym y as f64;
-                    if likely(r == r) { dst = value.fword(r); next }
+                    let r = f64.from_bits(a as u64) sym y as f64;
+                    if likely(r == r) { dst = r.to_bits() as V; next }
                 }
                 become #fname; refuse(fp.cl); redo
             }
@@ -868,8 +867,8 @@ pub vm JS {
             cold { dst = arith(ctx, 3, a, b)?; next }
         }
         DIV_F {
-            let r = value.fbits(a) / value.fbits(b);
-            if likely(r == r) { dst = value.fword(r); next }
+            let r = f64.from_bits(a as u64) / f64.from_bits(b as u64);
+            if likely(r == r) { dst = r.to_bits() as V; next }
             match (a, b) {
                 (Int(x), Int(y)) => { dst = int_div(x, y); next }
                 (Int(x), Num(y)) => { dst = Num(x as f64 / y); next }
@@ -885,8 +884,8 @@ pub vm JS {
     /// filled by the emitter (compile.lm): a multiply, not an `idiv`.
     cache ModK = math.Divisor;
     op MODK(dst: reg, a: reg, b: kst) : ABC + ModK {
-        if let Int(y) = b and y > 0 and (y as u64) == (cache.d as u64) {
-            if let Int(x) = a and x >= 0 { dst = Int((&cache).urem(x as u64) as i48); next }
+        if let Int(y) = b and y > 0 and (y as u32) == cache.d {
+            if let Int(x) = a and x >= 0 { dst = Int((&cache).urem(x as u64) as i32); next }
             var xi: i64 = 0;
             var ok = false;
             if let Int(x) = a { xi = x as i64; ok = true; }
@@ -896,7 +895,7 @@ pub vm JS {
             }
             if ok {
                 let r = (&cache).rem_trunc(xi);
-                if r != 0 or xi > 0 { dst = Int(r as i48); next }
+                if r != 0 or xi > 0 { dst = Int(r as i32); next }
             }
         }
         cold {
@@ -918,7 +917,7 @@ pub vm JS {
             }
             if ok {
                 let r = xi % (y as i64);
-                if r != 0 or xi > 0 { dst = Int(r as i48); next }
+                if r != 0 or xi > 0 { dst = Int(r as i32); next }
             }
         }
         cold {
@@ -933,9 +932,9 @@ pub vm JS {
     }
     /// R[dst] = R[a] + sc (a small signed constant).
     op ADDI(dst: reg, a: reg, sc: simm) : ABsC {
-        if let Int(x) = a and let Some(r) = x.add_checked(sc as i48) { dst = Int(r); next }
+        if let Int(x) = a and let Some(r) = x.add_checked(sc as i32) { dst = Int(r); next }
         if let Num(x) = a { dst = Num(x + sc as f64); next }
-        cold { dst = arith(ctx, 0, a, Int(sc as i48))?; next }
+        cold { dst = arith(ctx, 0, a, Int(sc as i32))?; next }
     }
     op NEG(dst: reg, a: reg) : ABC {
         if let Num(x) = a { dst = Num(-x); next }
@@ -953,8 +952,8 @@ pub vm JS {
     op NOT(dst: reg, a: reg) : ABC { dst = Bool(!value.truthy(a)); next }
     op TYPEOF(dst: reg, a: reg) : ABC { dst = type_of(ctx, a); next }
     op BNOT(dst: reg, a: reg) : ABC {
-        if let Int(x) = a { dst = Int((!(x as i32)) as i48); next }
-        dst = Int((!int32(a)) as i48);
+        if let Int(x) = a { dst = Int(!x); next }
+        dst = Int(!int32(a));
         next
     }
     // The K forms take an Int constant (`h << 5`, `x | 0`, `i & 255`).
@@ -963,26 +962,25 @@ pub vm JS {
         ("BANDK", 0, kst), ("BORK", 1, kst), ("BXORK", 2, kst), ("SHLK", 3, kst), ("SHRK", 4, kst), ("USHRK", 5, kst),
     ] {
         op #name(dst: reg, a: reg, b: bkind) : ABC {
-            // Ints are ToInt32-ed first (their low 32 bits).
-            if let (Int(xw), Int(yw)) = (a, b) {
-                let (x, y) = (xw as i32, yw as i32);
-                if code == 0 { dst = Int((x & y) as i48); next }
-                if code == 1 { dst = Int((x | y) as i48); next }
-                if code == 2 { dst = Int((x ^ y) as i48); next }
-                if code == 3 { dst = Int((((x as u32) << ((y & 31) as u32)) as i32) as i48); next }
-                if code == 4 { dst = Int((x >> (y & 31)) as i48); next }
-                dst = Int(((x as u32) >> ((y & 31) as u32)) as i48);
-                next
+            if let (Int(x), Int(y)) = (a, b) {
+                if code == 0 { dst = Int(x & y); next }
+                if code == 1 { dst = Int(x | y); next }
+                if code == 2 { dst = Int(x ^ y); next }
+                if code == 3 { dst = Int(((x as u32) << ((y & 31) as u32)) as i32); next }
+                if code == 4 { dst = Int(x >> (y & 31)); next }
+                if x >= 0 { dst = Int(((x as u32) >> ((y & 31) as u32)) as i32); next }
             }
             let (x, okx) = i32_of(a);
             let (y, oky) = i32_of(b);
             if okx and oky {
-                if code == 0 { dst = Int((x & y) as i48); next }
-                if code == 1 { dst = Int((x | y) as i48); next }
-                if code == 2 { dst = Int((x ^ y) as i48); next }
-                if code == 3 { dst = Int((((x as u32) << ((y & 31) as u32)) as i32) as i48); next }
-                if code == 4 { dst = Int((x >> (y & 31)) as i48); next }
-                dst = Int(((x as u32) >> ((y & 31) as u32)) as i48);
+                if code == 0 { dst = Int(x & y); next }
+                if code == 1 { dst = Int(x | y); next }
+                if code == 2 { dst = Int(x ^ y); next }
+                if code == 3 { dst = Int(((x as u32) << ((y & 31) as u32)) as i32); next }
+                if code == 4 { dst = Int(x >> (y & 31)); next }
+                let u = (x as u32) >> ((y & 31) as u32);
+                if u <= 2147483647 { dst = Int(u as i32); next }
+                dst = Num(u as f64);
                 next
             }
             cold { dst = bitop(code, a, b); next }
@@ -1080,7 +1078,7 @@ pub vm JS {
     ] {
         op #name(pol: imm, a: reg, sc: simm) : ABsC then JMP {
             let want = pol != 0;
-            let c = sc as i48;
+            let c = sc as i32;
             if let Int(xi) = a { branch(icmp == want, then.target) }
             if let Num(xf) = a { branch(fcmp == want, then.target) }
             cold {
@@ -1292,8 +1290,8 @@ pub vm JS {
         /// s.charCodeAt(i)
         CALL_CCA {
             if regs[base] == ctx.f_cca and let S(s) = regs[base + 1] and let Int(i) = regs[base + 2]
-                    and (i as u64) < s.data.len {
-                regs[base] = Int(s.data[i as u64] as i48);
+                    and (i as u32 as u64) < s.data.len {
+                regs[base] = Int(s.data[i as u32 as u64] as i32);
                 next
             }
             cold {
@@ -1304,8 +1302,8 @@ pub vm JS {
         /// s.charAt(i)
         CALL_CHARAT {
             if regs[base] == ctx.f_charat and let S(s) = regs[base + 1] and let Int(i) = regs[base + 2]
-                    and (i as u64) < s.data.len {
-                if let Some(c) = ctx.ascii_str(s.data.ptr[i as u64]) { regs[base] = S(c); next }
+                    and (i as u32 as u64) < s.data.len {
+                if let Some(c) = ctx.ascii_str(s.data.ptr[i as u32 as u64]) { regs[base] = S(c); next }
             }
             cold {
                 if regs[base] != ctx.f_charat { become CALL; redo }
@@ -1319,7 +1317,7 @@ pub vm JS {
                 a.ptr[a.len] = regs[base + 2];
                 gc.barrier(st as *u8);
                 a.len += 1;
-                regs[base] = Int(a.len as i48);
+                regs[base] = Int(a.len as i32);
                 next
             }
             cold {
@@ -1336,7 +1334,7 @@ pub vm JS {
                 if let Num(d) = x and d > -2147483648.0 and d < 2147483647.0 {
                     var i = d as i64;
                     if (i as f64) > d { i -= 1; }
-                    if i != 0 or d > 0.0 { regs[base] = Int(i as i48); next }
+                    if i != 0 or d > 0.0 { regs[base] = Int(i as i32); next }
                 }
             }
             cold {
