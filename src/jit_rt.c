@@ -164,6 +164,8 @@ static void report(void) {
     fprintf(stderr, "jit: %llu code objects registered, %zu kept\n", (unsigned long long)st.registered, nrecs);
 }
 
+static void trace_setup(void);
+
 __attribute__((constructor)) static void jit_init(void) {
     const char *e = getenv("LOIMI_JIT");
     enabled = e && *e && strcmp(e, "0") != 0;
@@ -200,6 +202,7 @@ __attribute__((constructor)) static void jit_init(void) {
      * attributing profiler samples to stencils. */
     const char *m = getenv("LOIMI_JIT_MAP");
     if (enabled && m && *m) mapf = fopen(m, "w");
+    if (enabled) trace_setup();
     inited = 1;
 }
 
@@ -346,6 +349,8 @@ static struct rec *lookup(const uint32_t *pc) {
 }
 
 static void trace_forget(struct rec *r);
+static void trace_touch(struct rec *r, uint64_t i);
+static void trace_install(struct rec *r);
 
 static void free_compiled(struct rec *r) {
     trace_forget(r);
@@ -714,6 +719,7 @@ static int recompile(struct rec *r) {
     uint64_t n = r->n;
     uint8_t **oh = r->home, *ofl = r->fl;
     int32_t *oent = r->ent;
+    trace_forget(r);
     for (uint64_t i = 0; i < n; i++)
         if (ofl[i] & F_ENTRY) r->code[i] = r->w[i];
     r->home = NULL;
@@ -778,11 +784,15 @@ void loimi_jit_become(uint32_t *p, uint32_t opc) {
     }
     uint64_t i = (uint64_t)(p - r->code);
     if (r->fl[i] & F_INTERP) {
+        if (((*p & ~OPMASK) | opc) != *p) trace_touch(r, i);
         r->w[i] = *p = (*p & ~OPMASK) | opc;
         return;
     }
     uint32_t old = word_at(r, i), nw = (old & ~OPMASK) | opc;
     if (nw == old) return;
+    /* traces over this word go first (their header's code is restored
+     * before it may be retargeted below) */
+    trace_touch(r, i);
     r->w[i] = nw;
     if (!(r->fl[i] & F_ENTRY)) *p = nw;
     int k = r->home[i] ? rewrite(r, i, 1) : 0;
@@ -804,6 +814,8 @@ void loimi_jit_become(uint32_t *p, uint32_t opc) {
     } else {
         sync_entries(r);
     }
+    /* the words may now be those a trace was made for */
+    trace_install(r);
 }
 
 /* `Vm.real_word` (and so the generated host readers of code words:
@@ -830,6 +842,7 @@ uint32_t loimi_jit_word(uint32_t w) {
 void loimi_jit_invalidate(uint32_t *code) {
     struct rec *r = nrecs ? lookup(code) : NULL;
     if (!r || r->state != S_COMPILED) return;
+    trace_forget(r);
     for (uint64_t i = 0; i < r->n; i++)
         if (r->fl[i] & F_ENTRY) {
             r->code[i] = r->w[i];
@@ -864,119 +877,264 @@ void loimi_jit_rewritten(uint32_t *code) {
         }
     }
     sync_entries(r);
+    trace_install(r);
 }
 
-/* Trace-tier experiment (docs/design/trace-tier.md): loop functions
- * generated ahead of time from stencils by a script, linked in with
- * LOIMI_TRACE_IR at build time. Each names its code object by length and
- * word hash and its loop header; after a compile of a matching object,
- * the header's home jumps to it. Absent unless linked in (weak). */
-struct loimi_trace { uint64_t nwords, lo, hi, hash, header; void *fn; uint64_t *counts; uint64_t ncounts; const char *name; };
+/* Traces (docs/design/trace-tier.md, src/tracegen.rs): loop functions
+ * stitched from the stencils at build time, from a recording
+ * (`--trace-regions`: every loop, counted, for a profile) or a profile
+ * (`--traces`: the hot path around each hot loop). Each names its code
+ * object by length, a hash of the instruction words in its range and the
+ * pool constants it baked in, and its loop header. When a matching code
+ * object is compiled, the header's home jumps to the function, and its
+ * enter word's entry points there, so compiled code and the interpreter
+ * both enter it. A word change in its range (`become`, `Vm.optimize`,
+ * `Vm.deopt`, the debugger's breakpoints), a recompile and too many
+ * guard failures uninstall it; the function checks its `gen` after
+ * calls that may rewrite code, so a running copy leaves too.
+ *
+ * Environment: LOIMI_TRACE=0 installs nothing (the A/B switch);
+ * LOIMI_TRACE_RECORD=file writes the recording (each compile's words,
+ * ops and patched constants); LOIMI_TRACE_PROFILE=file writes a region
+ * build's block counts at exit; LOIMI_TRACE_FAILS=n: guard failures
+ * between blacklist checks (default 1024). Absent unless linked in
+ * (weak). */
+struct loimi_trace {
+    uint64_t nwords, lo, hi, hash, header;
+    void *fn;
+    uint64_t *counts, ncounts;
+    const char *name;
+    /* [0] invalidations (gen), [1] guard failures, [2] iterations, [3]
+     * failures at which to call loimi_trace_failing */
+    uint64_t *state;
+    const uint64_t *kchk; /* (pool index, bits) pairs it baked in */
+    uint64_t nk;
+    const char *rec; /* regions: the recording of the code, for profiles */
+    uint64_t fingerprint;
+};
 extern const struct loimi_trace loimi_traces[] __attribute__((weak));
 extern const int64_t loimi_ntraces __attribute__((weak));
+extern const int64_t loimi_trace_build __attribute__((weak));
 static const uint32_t *last_hot;
-static FILE *trace_dumpf;
-/* Installed traces (by index in loimi_traces): where, and what the home
- * held before; `banned` after too many guard failures. */
-#define MAX_TRACES 64
-static struct { struct rec *r; uint8_t *home, *body; uint8_t saved[5]; int banned; } inst[MAX_TRACES];
+static FILE *trace_recf;
+static int trace_off, trace_inited;
+static uint64_t trace_fail_every = 1024;
+static uint8_t *trace_banned;
+static struct {
+    uint64_t installs, uninstalls, blacklisted;
+} tst;
+/* Installed traces: trace t at r's header, what its home held, and the
+ * body it ran. */
+struct inst {
+    int64_t t;
+    struct rec *r;
+    uint8_t saved[5];
+    uint8_t *body;
+};
+static struct inst *insts;
+static size_t ninsts, capinsts;
 
-static void trace_forget(struct rec *r) {
-    for (int t = 0; t < MAX_TRACES; t++)
-        if (inst[t].r == r) inst[t].r = NULL;
+static int64_t ntraces(void) { return &loimi_ntraces ? loimi_ntraces : 0; }
+
+/* Put the header's code back and forget installation i. */
+static void uninstall(size_t i) {
+    struct inst *in = &insts[i];
+    const struct loimi_trace *tr = &loimi_traces[in->t];
+    struct rec *r = in->r;
+    uint64_t h = tr->header;
+    if (r->home) {
+        memcpy(WR(r->home[h]), in->saved, 5);
+        r->body[h] = in->body;
+        if (r->ent[h] >= 0) loimi_jit_entries[r->ent[h]] = in->body;
+    }
+    tr->state[0]++;
+    tst.uninstalls++;
+    if (debug) fprintf(stderr, "jit: %p+%llu: trace %s uninstalled\n", (void *)r->code, (unsigned long long)h, tr->name);
+    insts[i] = insts[--ninsts];
 }
 
-/* Called by a trace's guard exits once they have failed too often (a
- * trace without side traces would exit on every iteration): put the
- * stencil code back, and do not install the trace again. */
-void loimi_trace_blacklist(const char *name) {
-    for (int64_t t = 0; &loimi_ntraces && t < loimi_ntraces && t < MAX_TRACES; t++) {
-        if (loimi_traces[t].name != name) continue;
-        inst[t].banned = 1;
-        struct rec *r = inst[t].r;
-        if (!r) continue;
-        uint64_t h = loimi_traces[t].header;
-        memcpy(WR(inst[t].home), inst[t].saved, 5);
-        r->body[h] = inst[t].body;
-        if (r->ent[h] >= 0) loimi_jit_entries[r->ent[h]] = inst[t].body;
-        inst[t].r = NULL;
-        if (debug) fprintf(stderr, "jit: %p+%llu: trace %s blacklisted\n", (void *)r->code, (unsigned long long)h, name);
+/* r's compiled code goes (a recompile or a drop). */
+static void trace_forget(struct rec *r) {
+    for (size_t i = 0; i < ninsts;)
+        if (insts[i].r == r) uninstall(i);
+        else i++;
+}
+
+/* Word i of r changes: uninstall the traces whose range holds it. */
+static void trace_touch(struct rec *r, uint64_t i) {
+    for (size_t j = 0; j < ninsts;) {
+        const struct loimi_trace *tr = &loimi_traces[insts[j].t];
+        if (insts[j].r == r && tr->lo <= i && i < tr->hi) uninstall(j);
+        else j++;
     }
 }
 
 /* FNV-1a of the instruction words in [lo, hi) (not cache words). */
-static uint64_t words_hash(const struct rec *r, const int64_t *map, uint64_t lo, uint64_t hi) {
+static uint64_t words_hash(const struct rec *r, uint64_t lo, uint64_t hi) {
     uint64_t h = 1469598103934665603ull;
     for (uint64_t i = lo; i < hi && i < r->n; i++) {
-        if (map[i] < 0) continue;
+        if (!r->home[i]) continue;
         h ^= r->w[i];
         h *= 1099511628211ull;
     }
     return h;
 }
 
-static void trace_report(void) {
+/* Called by a trace's guard exits every LOIMI_TRACE_FAILS failures:
+ * without side traces, a trace whose guards keep failing exits on every
+ * iteration, so once more than one iteration in 8 has failed it is
+ * dropped for good (the stencils run the loop). */
+void loimi_trace_failing(int64_t t) {
+    const struct loimi_trace *tr = &loimi_traces[t];
+    uint64_t *s = tr->state;
+    s[3] = s[1] + trace_fail_every;
+    if (s[1] * 8 <= s[2]) return;
+    trace_banned[t] = 1;
+    tst.blacklisted++;
+    if (debug) fprintf(stderr, "jit: trace %s blacklisted (%llu failures in %llu iterations)\n", tr->name, (unsigned long long)s[1], (unsigned long long)s[2]);
+    for (size_t i = 0; i < ninsts;)
+        if (insts[i].t == t) uninstall(i);
+        else i++;
+}
+
+/* `LOIMI_TRACE_CHECK=1` builds: a trace accessed p, which the generator
+ * could not place, with the window [regs, regs + n) cached. */
+void loimi_trace_check(const uint64_t *p, const uint64_t *regs, int64_t n) {
+    if (p >= regs && p < regs + n) {
+        fprintf(stderr, "jit: a trace accessed register %lld through a pointer it did not know (not through regs)\n", (long long)(p - regs));
+        abort();
+    }
+}
+
+static void trace_profile(void) {
     const char *p = getenv("LOIMI_TRACE_PROFILE");
     FILE *f = p && *p ? fopen(p, "w") : NULL;
     if (!f) return;
-    for (int64_t t = 0; t < loimi_ntraces; t++) {
+    fprintf(f, "loimi-trace-profile 1 %016llx\n", (unsigned long long)(&loimi_trace_build ? loimi_trace_build : 0));
+    for (int64_t t = 0; t < ntraces(); t++) {
         const struct loimi_trace *tr = &loimi_traces[t];
-        fprintf(f, "trace %s\n", tr->name);
-        for (uint64_t i = 0; i < tr->ncounts; i++) fprintf(f, "%llu %llu\n", (unsigned long long)i, (unsigned long long)tr->counts[i]);
+        if (!tr->rec || !tr->ncounts) continue;
+        uint64_t any = 0;
+        for (uint64_t i = 0; i < tr->ncounts; i++) any |= tr->counts[i];
+        if (!any) continue;
+        fprintf(f, "region %016llx %llu\n%scounts %llu\n", (unsigned long long)tr->fingerprint, (unsigned long long)tr->header, tr->rec,
+                (unsigned long long)tr->ncounts);
+        for (uint64_t i = 0; i < tr->ncounts; i++)
+            if (tr->counts[i]) fprintf(f, "c %llu %llu\n", (unsigned long long)i, (unsigned long long)tr->counts[i]);
+        fprintf(f, "end\n");
     }
     fclose(f);
 }
 
-/* LOIMI_TRACE_DUMP=file: the compiled code object's words, stencils and
- * patched constants (the recording the trace generator reads). */
-static void trace_hook(struct rec *r, const uint32_t *sts, const int64_t *map) {
-    static int init, off;
-    if (!init) {
-        init = 1;
-        const char *d = getenv("LOIMI_TRACE_DUMP");
-        if (d && *d) trace_dumpf = fopen(d, "w");
-        const char *o = getenv("LOIMI_TRACE");
-        off = o && strcmp(o, "0") == 0;
-        if (&loimi_ntraces && getenv("LOIMI_TRACE_PROFILE")) atexit(trace_report);
+static void trace_report(void) {
+    fprintf(stderr, "jit: traces: %lld linked, %llu installs, %llu uninstalls, %llu blacklisted\n", (long long)ntraces(),
+            (unsigned long long)tst.installs, (unsigned long long)tst.uninstalls, (unsigned long long)tst.blacklisted);
+    for (int64_t t = 0; t < ntraces(); t++) {
+        const uint64_t *s = loimi_traces[t].state;
+        if (s[0] || s[1] || s[2])
+            fprintf(stderr, "jit:   trace %s: %llu iterations, %llu guard failures, %llu invalidations%s\n", loimi_traces[t].name,
+                    (unsigned long long)s[2], (unsigned long long)s[1], (unsigned long long)s[0], trace_banned[t] ? ", blacklisted" : "");
     }
-    if (trace_dumpf) {
-        uint64_t h = words_hash(r, map, 0, r->n);
-        int64_t hot = last_hot && last_hot >= r->code && last_hot < r->code + r->n ? last_hot - r->code : -1;
-        fprintf(trace_dumpf, "code %p %llu %016llx hot %lld\n", (void *)r->code, (unsigned long long)r->n, (unsigned long long)h, (long long)hot);
-        for (uint64_t pc = 0; pc < r->n; pc++) {
-            if (map[pc] < 0) {
-                fprintf(trace_dumpf, "w %llu %08x -\n", (unsigned long long)pc, r->w[pc]);
-                continue;
-            }
-            fprintf(trace_dumpf, "w %llu %08x %s\n", (unsigned long long)pc, r->w[pc], loimi_jit_opnames[r->w[pc] & OPMASK]);
-            const struct jit_stencil *sp = &loimi_jit_stencils[sts[pc]];
-            for (uint32_t k = 0; k < sp->nreloc && r->pool; k++) {
-                const struct jit_reloc *rl = &loimi_jit_relocs[sp->reloc + k];
-                if (rl->kind != K_CONST) continue;
-                unsigned o = rl->arg & 255;
-                uint64_t c = (uint64_t)r->pool[field(r->w[pc + o], rl->arg)];
-                fprintf(trace_dumpf, "k %llu %u.%u.%u %016llx\n", (unsigned long long)pc, o, (unsigned)(rl->arg >> 8) & 255,
-                        (unsigned)(rl->arg >> 16) & 255, (unsigned long long)c);
-            }
-        }
-        fflush(trace_dumpf);
-    }
-    if (off || !&loimi_ntraces) return;
-    for (int64_t t = 0; t < loimi_ntraces; t++) {
+}
+
+static void record_all(void);
+
+static void trace_setup(void) {
+    trace_inited = 1;
+    const char *d = getenv("LOIMI_TRACE_RECORD");
+    if (d && *d && (trace_recf = fopen(d, "w"))) atexit(record_all);
+    const char *o = getenv("LOIMI_TRACE");
+    trace_off = o && strcmp(o, "0") == 0;
+    const char *fe = getenv("LOIMI_TRACE_FAILS");
+    if (fe && atoll(fe) > 0) trace_fail_every = (uint64_t)atoll(fe);
+    if (!ntraces()) return;
+    trace_banned = calloc((size_t)ntraces(), 1);
+    for (int64_t t = 0; t < ntraces(); t++) loimi_traces[t].state[3] = trace_fail_every;
+    if (getenv("LOIMI_TRACE_PROFILE")) atexit(trace_profile);
+    if (stats) atexit(trace_report);
+}
+
+/* Install every trace that matches r's words (after a compile, or after
+ * rewrites that kept the compiled code). */
+static void trace_install(struct rec *r) {
+    if (!trace_inited) trace_setup();
+    if (trace_off || !r->home || r->rewriting) return;
+    for (int64_t t = 0; t < ntraces(); t++) {
         const struct loimi_trace *tr = &loimi_traces[t];
-        if (tr->nwords != r->n || tr->hash != words_hash(r, map, tr->lo, tr->hi) || !r->home[tr->header]) continue;
-        if (t < MAX_TRACES) {
-            if (inst[t].banned) continue;
-            inst[t].r = r;
-            inst[t].home = r->home[tr->header];
-            inst[t].body = r->body[tr->header];
-            memcpy(inst[t].saved, r->home[tr->header], 5);
+        uint64_t h = tr->header;
+        if (trace_banned[t] || tr->nwords != r->n || !r->home[h] || (r->fl[h] & F_INTERP)) continue;
+        int dup = 0;
+        for (size_t i = 0; i < ninsts; i++) dup |= insts[i].r == r && loimi_traces[insts[i].t].header == h;
+        if (dup || tr->hash != words_hash(r, tr->lo, tr->hi)) continue;
+        int ok = !tr->nk || r->pool;
+        for (uint64_t j = 0; ok && j < tr->nk; j++) ok = r->pool[tr->kchk[2 * j]] == tr->kchk[2 * j + 1];
+        if (!ok) continue;
+        if (ninsts == capinsts) {
+            capinsts = capinsts ? 2 * capinsts : 16;
+            insts = realloc(insts, capinsts * sizeof *insts);
         }
-        jmp5(r->home[tr->header], tr->fn);
-        r->body[tr->header] = (uint8_t *)tr->fn;
-        if (r->ent[tr->header] >= 0) loimi_jit_entries[r->ent[tr->header]] = tr->fn;
-        if (debug) fprintf(stderr, "jit: %p+%llu: trace %s\n", (void *)r->code, (unsigned long long)tr->header, tr->name);
+        struct inst *in = &insts[ninsts++];
+        in->t = t;
+        in->r = r;
+        in->body = r->body[h];
+        memcpy(in->saved, r->home[h], 5);
+        jmp5(r->home[h], tr->fn);
+        r->body[h] = (uint8_t *)tr->fn;
+        if (r->ent[h] >= 0) loimi_jit_entries[r->ent[h]] = tr->fn;
+        tst.installs++;
+        if (debug) fprintf(stderr, "jit: %p+%llu: trace %s\n", (void *)r->code, (unsigned long long)h, tr->name);
     }
+}
+
+/* The recording of compiled code object r: its words (the real ones,
+ * not enter words), the op of each instruction, and the constants its
+ * stencils patch in. */
+static void record_code(struct rec *r) {
+    uint64_t h = words_hash(r, 0, r->n);
+    int64_t hot = last_hot && last_hot >= r->code && last_hot < r->code + r->n ? last_hot - r->code : -1;
+    fprintf(trace_recf, "code %p %llu %016llx hot %lld\n", (void *)r->code, (unsigned long long)r->n, (unsigned long long)h, (long long)hot);
+    for (uint64_t pc = 0; pc < r->n; pc++) {
+        if (!r->home[pc]) {
+            fprintf(trace_recf, "w %llu %08x -\n", (unsigned long long)pc, r->w[pc]);
+            continue;
+        }
+        fprintf(trace_recf, "w %llu %08x %s\n", (unsigned long long)pc, r->w[pc], loimi_jit_opnames[r->w[pc] & OPMASK]);
+        const struct jit_stencil *sp = &loimi_jit_stencils[stencil_in(r, r->w[pc])];
+        for (uint32_t k = 0; k < sp->nreloc && r->pool; k++) {
+            const struct jit_reloc *rl = &loimi_jit_relocs[sp->reloc + k];
+            if (rl->kind != K_CONST) continue;
+            unsigned o = rl->arg & 255;
+            uint64_t c = (uint64_t)r->pool[field(r->w[pc + o], rl->arg)];
+            fprintf(trace_recf, "k %llu %u.%u.%u %016llx\n", (unsigned long long)pc, o, (unsigned)(rl->arg >> 8) & 255,
+                    (unsigned)(rl->arg >> 16) & 255, (unsigned long long)c);
+        }
+    }
+    fprintf(trace_recf, "end\n");
+}
+
+/* At exit, every compiled code object again: rewrites after the last
+ * compile (quickening that retargeted instead of recompiling) are in
+ * the steady state the traces should be made for. */
+static void record_tree(struct rec *t) {
+    if (!t) return;
+    record_tree(t->left);
+    if (t->state == S_COMPILED && t->home && !t->rewriting) record_code(t);
+    record_tree(t->right);
+}
+static void record_all(void) {
+    record_tree(recs);
+    fclose(trace_recf);
+    trace_recf = NULL;
+}
+
+/* After a compile: the recording, then the traces. */
+static void trace_hook(struct rec *r) {
+    if (!trace_inited) trace_setup();
+    if (trace_recf) {
+        record_code(r);
+        fflush(trace_recf);
+    }
+    trace_install(r);
 }
 
 /* Compile code object r from its words (none of them enter words). With
@@ -1059,7 +1217,7 @@ static int compile(struct rec *r, const int32_t *oent) {
             if (map[pc] >= 0) map_line(r->body[pc], lens[pc], sts[pc]);
         fflush(mapf);
     }
-    trace_hook(r, sts, map);
+    trace_hook(r);
     if (debug) {
         fprintf(stderr, "jit: compiled %p (%llu words) at %p\n", (void *)code, (unsigned long long)n, (void *)dst);
         for (uint64_t pc = 0; pc < n; pc++) {

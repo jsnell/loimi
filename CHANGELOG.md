@@ -184,6 +184,19 @@ implementation; `git log` has the details.
   the code (a 256-byte stack array up to 2048 words, else calloc'd)
   instead of zeroing 64 KiB per call: Prolog's `assertz`, which verifies
   each new clause, spent half its time there.
+- **Ahead-of-time traces** (trace tier M1): `LOIMI_TRACE_RECORD=file`
+  on a `--jit-stencils` run, a profiling build `--trace-regions=REC`
+  run with `LOIMI_TRACE_PROFILE=file`, and `--traces=PROF` stitch the
+  hot loops' stencils into one LLVM function each (the generator is in
+  the compiler, `src/tracegen.rs`); the JIT enters them at the loop
+  header. Guards re-run an instruction in the interpreter where the
+  `redo_effect` rules allow; traces uninstall on word changes and
+  blacklist themselves when more than 1 iteration in 8 fails. Mini:
+  0.932 of the JIT by geometric mean (mandelbrot 0.66, fannkuch 0.73;
+  nbody 1.11; loops through calls get none), under the milestone's 10%
+  stop rule. `--jit-stencils` builds also take `--sanitize=address`
+  and `--gc-check-roots` now
+  ([design/trace-tier.md §11](docs/design/trace-tier.md#11-m1-as-built-ahead-of-time-traces-from-a-profile)).
 - **JIT (`--jit-stencils`)**: jumps to a `Vm.Resume` count toward
   compiling like calls (Prolog enters clauses from its try chains that
   way, and their code was never compiled), and the registry of code

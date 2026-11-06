@@ -146,6 +146,45 @@ pub fn const_variants(p: &Program, vi: usize) -> Vec<ConstVariant> {
     out
 }
 
+/// The encodings of vm `vi`'s constant-pool values that hold no heap
+/// pointer, as (mask, value, ult) tests on the bits (as `ConstVariant`):
+/// traces (tracegen.rs) bake such constants into their code, and load
+/// the others (addresses differ between runs) from the pool.
+pub fn const_immediates(p: &Program, vi: usize) -> Vec<(u64, u64, bool)> {
+    let vd = &p.vms[vi];
+    let Some(b) = vd.const_base else { return Vec::new() };
+    let Ty::Ptr(elem) = &vd.state_tys[b] else { return Vec::new() };
+    let Ty::Value(vix) = **elem else { return Vec::new() };
+    let d = &p.values[vix as usize];
+    let low = crate::values::low_mask;
+    let mut out = Vec::new();
+    for v in &d.variants {
+        let scalar = match &v.payload {
+            None | Some(Ty::Bool) | Some(Ty::Int(_)) | Some(Ty::F64) | Some(Ty::F32) => true,
+            _ => false,
+        };
+        if !scalar {
+            continue;
+        }
+        out.push(match d.repr {
+            ValueRepr::NanBox if v.unboxed => (0, d.num_limit, true),
+            ValueRepr::NanBox if v.sub.is_some() => continue,
+            ValueRepr::NanBox => {
+                let pm = match &v.payload {
+                    None => 0,
+                    Some(Ty::Bool) => 1,
+                    Some(Ty::Int(it)) if (it.bits as u32) < v.shift => low(it.bits as u32),
+                    Some(_) => low(v.shift),
+                };
+                (!pm, if v.shift >= 64 { 0 } else { v.tag << v.shift }, false)
+            }
+            ValueRepr::LowTag => (low(v.shift), v.tag, false),
+            ValueRepr::Boxed => return Vec::new(),
+        });
+    }
+    out
+}
+
 /// The vm that `--jit-stencils` compiles: the program's only tail-call vm.
 pub fn jit_vm(p: &Program) -> Result<usize, String> {
     let vms: Vec<usize> = (0..p.vms.len()).filter(|&i| p.vms[i].dispatch == Dispatch::TailCall).collect();

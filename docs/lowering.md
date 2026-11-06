@@ -1013,7 +1013,8 @@ emitted only when this mode references them (`is_lazy` in
 src/codegen.rs), so a default build's IR does not change. The checks
 assume that the shadow stack holds only objects of the heap being
 collected: with several heaps on one thread, a frame of a nested run
-into another heap is reported. Not combinable with `--jit-stencils`.
+into another heap is reported. With `--jit-stencils` (and traces) the
+stencils are generated in this mode too.
 The rooting fuzzer (`fuzz_gc_roots` in tests/fuzz.rs, generator in
 tests/fuzz/rootgen.rs) builds its programs in this mode.
 

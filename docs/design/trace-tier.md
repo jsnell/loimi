@@ -1,5 +1,12 @@
 # Design note: a trace tier stitched from stencils (experiment, 2026-11-06)
 
+**Status: M1 built** (§11): `loimi build --jit-stencils
+--trace-regions=REC` and `--traces=PROF` make ahead-of-time traces from a
+profile, with the generator in the compiler (`src/tracegen.rs`). §1–§10
+describe the experiment as it was run; its hooks were replaced
+(`LOIMI_TRACE_DUMP` is `LOIMI_TRACE_RECORD`, `LOIMI_TRACE_IR` is
+`--traces`, `loimi_trace_blacklist` is `loimi_trace_failing`).
+
 **Question.** Is there a "moral equivalent of a tracing JIT" for
 Loimi's interpreters? That means compiling the common path through a
 hot loop as one unit, with automatic fallback to the interpreter when a
@@ -606,3 +613,307 @@ LOIMI_JIT=1 $S/mini-mandtr bench/mini/programs/mandelbrot.lua
 
 nbody: `--code 0 --header 23`; sieve: `--header 32` and `--header 23`,
 merged; fannkuch: `--header 40`.
+
+## 11. M1 as built: ahead-of-time traces from a profile
+
+M1 turned the experiment into a compiler mode. The generator is
+`src/tracegen.rs`, in Rust and in the compiler; the hooks in
+`src/jit_rt.c` became a supported runtime; `tools/trace-exp/` stays as
+the experiment's record.
+
+### 11.1 Workflow
+
+Any vm that builds with `--jit-stencils` (one tail-call vm, x86-64
+Linux) can use it. Three steps, each a plain build or run:
+
+```sh
+# 1. record: any JIT build, run on the workload
+loimi build vm.lm --release --jit-stencils -o vm-jit
+LOIMI_JIT=1 LOIMI_TRACE_RECORD=prog.rec ./vm-jit prog
+# 2. profile: every loop of the recording as a counted region
+loimi build vm.lm --release --jit-stencils --trace-regions=prog.rec -o vm-prof
+LOIMI_JIT=1 LOIMI_TRACE_PROFILE=prog.prof ./vm-prof prog
+# 3. traces of the loops that ran often enough
+loimi build vm.lm --release --jit-stencils --traces=prog.prof -o vm-fast
+LOIMI_JIT=1 ./vm-fast prog
+```
+
+- **The recording** (`LOIMI_TRACE_RECORD`) lists each compiled code
+  object: its real words, the op of each instruction, and the constants
+  its stencils patch in. It is written at each compile and again at
+  exit, so quickening that retargeted instead of recompiling is in it
+  (the last entry per code object wins).
+- **The profile** (`LOIMI_TRACE_PROFILE`) is self-contained: per region
+  that ran, its fingerprint, the code's recording and the block counts.
+  It names the build it came from (a hash of the stencils); a profile
+  of another build of the vm or compiler is an error.
+- Several recordings or profiles can be given (`--traces=a,b`), or
+  concatenated: a region profiled by several runs sums its counts.
+- Runtime switches: `LOIMI_TRACE=0` installs nothing (the A/B switch in
+  one binary); `LOIMI_TRACE_FAILS=n` sets how many guard failures pass
+  between blacklist checks; `LOIMI_JIT_STATS=1` adds a line per trace
+  (iterations, guard failures, invalidations).
+- Build-time knobs (environment): `LOIMI_TRACE_REPORT=1` lists the
+  regions and traces made and why loops got none (`=2` also lists the
+  guards); `LOIMI_TRACE_MIN=n` (default 1000) is the number of times the
+  hot path must have closed; `LOIMI_TRACE_MAXLINES=n` (default 150,000)
+  skips loops whose function would be larger; `LOIMI_TRACE_MINFRAC=x`
+  (default 0) takes blocks run in under that fraction of their
+  instruction's runs off the trace (testing: guards that fail);
+  `LOIMI_TRACE_CHECK=1` checks every access the generator could not
+  place (below); `LOIMI_TRACE_ONLY` / `LOIMI_TRACE_SKIP` restrict
+  regions to some loops or leave instructions out (bisection);
+  `LOIMI_TRACE_DEBUG=1` annotates accesses in the IR.
+
+**Why three steps.** Branch directions inside handlers are only known
+by running the handlers' blocks, and the stencils are machine code
+without counters. The middle build compiles each loop as a region whose
+every block counts, which is the experiment's method, made automatic.
+A one-build alternative (counters in the stencils, with a hole for a
+per-instruction counter base) would also need counters in the
+interpreter's outlined cold blocks, which the stencils call; it is left
+for M3, where a recording variant of the handlers replaces both.
+
+**Why Rust.** The generator works on the compiler's own unoptimized
+handler IR, which the compiler already has in memory (the program's IR
+and the stencils), in a format it controls. In the compiler it needs no
+files, no Python, and no `--keep-ll`; it knows the vm's state layout
+(which arguments are `pc`, the register file, the constant pool, the
+accumulators) and the encodings of immediate constants from the vm
+declaration instead of Mini's NaN-box ranges. It parses IR lines with a
+small hand-written parser (no regex crate), about 2,400 lines.
+
+### 11.2 Loop selection
+
+Loops are found in the code, not from the JIT's hot counter (which named
+the wrong loop for nbody, sieve and fannkuch in the experiment): every
+target of a backward continuation of a stencil (`next` or a label jump
+with `target <= pc`) is a header, its loop runs to its last back edge.
+A region is that range without the ranges of inner loops, whose headers
+are exits (they have regions of their own). The trace is the hottest
+path from the header by the region's edge counts; a loop gets a trace if
+that path closes at the header at least `LOIMI_TRACE_MIN` times. A path
+that leaves the loop first (an outer loop whose hot path goes into an
+inner one) gets none: linking to inner traces is M2.
+
+### 11.3 The register window
+
+The experiment replaced `regs` with a local array everywhere. That was
+wrong in ways its four loops did not show: a handler that compares
+`regs + a` with a pointer from memory (Mini's `CLOSE`) compared an
+address on the stack; after a native, `regs = fp.base` switched the
+code to memory with the window still dirty; dynamic offsets
+(`SETLIST`, call arguments) indexed past the array; and handlers pass
+the address of their `regs` variable to vm functions (`for_count`).
+M1 keeps `regs` the real register file and treats the window as a cache
+of `regs[0..NR)`:
+
+- A per-step analysis computes constants (fields, words, pool
+  constants) and register-file offsets over the handler's locals,
+  flow-sensitively (locals passed by reference to a call are reset by
+  it; a local that ever holds `regs` holds a register-file pointer
+  whatever is stored in it). A load or store at a constant offset in
+  the window uses the window slot; other constant offsets use memory;
+  unknown offsets choose at run time. `NR` is the largest constant slot
+  any step accesses, plus one.
+- Each block is in *window mode* (the window is the truth) or *real
+  mode*. A call that may write memory (not a pure intrinsic, a
+  read-only function, or one of the runtime's collector, lock or
+  `become`) is preceded by a writeback and starts real mode: memory is
+  the truth until the step's end, where the trace continues only if
+  `regs` is still its register file and then reloads the window. A
+  window-mode edge into a real-mode block writes back on the edge.
+  Read-only calls given a pointer that reaches the register file (one
+  into it, or to `ctx`, a frame, or a local holding one of those) are
+  preceded by a writeback; read-only calls given heap objects are not
+  (nbody's write-barrier tests, three per iteration, cost it 15% when
+  they were). Read-only is decided before the collector's exemption. So the collector, natives and nested runs see
+  the interpreter's state, and a stack that moves during a call (Mini's
+  coroutine stacks grow) is never written back to.
+- Assumptions: within a step, the stitched code reaches the window's
+  slots only through `regs`, and functions reach the running frame's
+  registers only through `regs`, the context or a frame (not through
+  heap objects); other paths to the register file go through calls that
+  may write, which are preceded by a writeback. `LOIMI_TRACE_CHECK=1` checks every access through a pointer the
+  analysis cannot place (`loimi_trace_check` aborts if it is in the
+  window); the Mini suite passes with it (§11.6).
+- In traces, writebacks, reloads and guard snapshots copy the slots
+  some emitted step names, one by one; SROA promotes each slot. A
+  `memcpy` of the whole window was tried first: SROA left the slots no
+  step names as memory slices and copied them at every step's snapshot
+  (mandelbrot 1.73 of the JIT instead of 0.64). Regions (profiling
+  builds) and traces with an access at an unknown offset (the
+  window is memory there anyway) use one `memcpy` per copy, which
+  shrank the regions' IR fivefold.
+
+### 11.4 Guards, exits and invalidation
+
+- **Guards** follow the `redo_effect` rules (`lowering.md` §10,
+  `redocheck.rs`): a branch from an on-trace block to an off-trace one
+  is a guard if nothing on an on-trace path from the step's start has an
+  effect a re-execution would repeat: a store outside the step's locals,
+  the window and its own instruction (cache words, `become`), an atomic,
+  or a call that may store, with the collector, the lock and `become`
+  exempt as in `redocheck.rs` (allocation is a collector call). Window
+  stores are undone by the guard, which writes back the window as it
+  was at the step's start (a snapshot SROA keeps in registers). After an
+  effect, the untaken code stays and all its continuations exit with
+  the effect done.
+- A guard runs the instruction again in the interpreter through the
+  dispatch table at the **real word's** op, not the word in memory: at
+  the loop header that is the enter word, which leads back into the
+  trace (the first version looped there until the blacklist ended it).
+- **Blacklisting** is by rate: every `LOIMI_TRACE_FAILS` (1024) guard
+  failures the trace calls the runtime, which drops it for good if more
+  than one iteration in 8 failed (iterations are counted in a register
+  and added up at exits). Loop exits are not guards: blocks that ran in
+  the profile stay on the trace and leave by exits.
+- **Installation** needs the code's length, a hash of the instruction
+  words in the trace's range, and each baked-in pool constant to match
+  (pool constants that are heap pointers are loaded, not baked; a
+  constant is an immediate if its bits match an encoding of the
+  constant pool's value type with no pointer payload). A trace is
+  installed after each compile, after rewrites that kept the compiled
+  code (`become` by retargeting, `Vm.optimize`), and per code object, so
+  two code objects with the same words each get it.
+- **Uninstalling**: a word change in a trace's range (`become`,
+  `Vm.optimize`/`deopt` through `loimi_jit_invalidate`) uninstalls it
+  first, then the rewrite proceeds on the restored header; a recompile
+  or drop uninstalls it (the old code's header is restored too, for
+  copies still running). Each uninstall bumps the trace's `gen`; a trace
+  that made a call that may rewrite code checks `gen` before going on
+  to the next step and exits if it changed.
+- **Debugger and polls**: polls are in the handlers and come along
+  (`poll gc` collects with a writeback; `poll gil` hands over the lock
+  after one). `--cfg debug` builds cannot use `--jit-stencils` (`on
+  break` is not supported there), so traces are off under the debugger.
+- **Code not in the profile** (other programs, code loaded later, a
+  changed script) matches no trace and runs on the stencils.
+- **State**: the vm's handler arguments come from its declaration, so
+  the accumulator of `docs/language.md` §7.4 (`vacc`, Mini) is carried
+  through the trace in SSA like the context and frame registers, live
+  into every step and out at every exit; accumulator variants
+  (`ADD_F__RAR`, `JGTKN__A`) stitch like any op.
+
+### 11.5 Results (Mini, 14 benchmarks)
+
+Machine: the shared 8-core x86-64 box, load average about 4.5 (other
+agents building and testing). User+sys CPU seconds, minimum of 7
+interleaved runs, `--release --align-functions=64`, every output
+checked. Master at 102aa44 (value accumulators) merged.
+
+- *interp*: Mini's default build. *JIT*: `--jit-stencils`,
+  `LOIMI_JIT=1`. *JIT A/A*: the same binary again (noise control).
+- *trace*: `--traces` from one profile of all 14 programs (each
+  recorded, region-profiled and traced by the workflow of §11.1), with
+  `LOIMI_JIT=1`; *trace off*: the same binary with `LOIMI_TRACE=0`.
+
+| program | interp | JIT | JIT A/A | trace | trace off | trace/JIT | (medians) | trace/interp | traces installed |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| binary_trees | 0.837 | 0.689 | 0.688 | 0.691 | 0.710 | 1.00 | 1.08 | 0.83 | none (calls) |
+| closures | 0.467 | 0.367 | 0.365 | 0.365 | 0.366 | 1.00 | 1.03 | 0.78 | none (calls) |
+| fannkuch | 1.147 | 0.900 | 0.899 | 0.658 | 0.898 | **0.73** | 0.74 | 0.57 | 3 |
+| fib | 0.947 | 0.679 | 0.660 | 0.666 | 0.672 | 0.98 | 0.96 | 0.70 | none (recursion) |
+| hash_strings | 1.060 | 0.817 | 0.787 | 0.800 | 0.816 | 0.98 | 0.98 | 0.75 | 4 |
+| interp | 0.765 | 0.560 | 0.580 | 0.594 | 0.585 | 1.06 | 1.03 | 0.78 | none (too large) |
+| mandelbrot | 0.628 | 0.363 | 0.362 | 0.238 | 0.366 | **0.66** | 0.65 | 0.38 | 2 |
+| nbody | 0.502 | 0.365 | 0.366 | 0.404 | 0.364 | 1.11 | 1.10 | 0.81 | 1 |
+| oo_methods | 0.762 | 0.509 | 0.514 | 0.510 | 0.511 | 1.00 | 1.01 | 0.67 | none (calls) |
+| queens | 0.958 | 0.731 | 0.726 | 0.674 | 0.729 | 0.92 | 0.93 | 0.70 | 1 |
+| sieve | 0.727 | 0.579 | 0.575 | 0.508 | 0.574 | 0.88 | 0.87 | 0.70 | 3 |
+| sort | 0.836 | 0.657 | 0.663 | 0.561 | 0.658 | 0.86 | 0.86 | 0.67 | 7 |
+| spectral_norm | 1.170 | 0.804 | 0.802 | 0.803 | 0.804 | 1.00 | 1.00 | 0.69 | none (calls) |
+| string_build | 0.764 | 0.743 | 0.744 | 0.738 | 0.739 | 0.99 | 1.01 | 0.97 | none |
+| **geometric mean** | | | | | | **0.932** | | **0.700** | |
+
+JIT/interp is 0.752; the A/A pair is 0.998 and trace-off/JIT 1.004, so
+noise is about 1% here (single programs: up to 4%, `fib`, `interp`).
+
+**Stop rule (§8, M1): the gain over the JIT is 6.8% by geometric mean,
+under the 10% the rule asks for.** The tier does what the experiment
+measured where it applies: mandelbrot 0.66 (experiment 0.63),
+fannkuch 0.73 (0.82), sieve 0.88 (0.87), plus sort 0.86 and queens
+0.92, which the experiment did not try. But it applies to 7 of the 14
+programs, and loses on one:
+
+- **Calls end traces.** binary_trees, closures, fib, oo_methods and
+  spectral_norm spend their time in loops whose hot path calls a Mini
+  function (an exit: the path "leaves the loop", §11.2) or in recursion.
+  `interp`'s dispatch loop is too large (856,000 lines of IR as a
+  region, over the 150,000 budget). These seven are 1.00 by design;
+  without them the geometric mean is 0.86.
+- **nbody is 1.11, where the experiment had 0.73.** Its trace runs 1–4
+  iterations per entry, and the code is tight but spills: about 25 live
+  window slots, a snapshot of them at each of 25 guarded steps, and a
+  writeback of all of them at each exit. Two cheaper fixes were made
+  and measured on the way (named-slot copies instead of a `memcpy`:
+  nbody 1.38 → 1.26; read-only write-barrier tests without writeback:
+  1.26 → 1.11). The rest is M2's dirty-set writeback and
+  snapshots of only the slots a guard's step changes.
+
+### 11.6 Tests
+
+- `mini_traces` (tests/golden.rs): the benchmarks and scripts recorded,
+  profiled (a bounded profiling build) and traced; then every script and
+  conformance test, in every GC mode (normal, stress, generational
+  verify), with the JIT at threshold 2 and the traces; the benchmarks'
+  outputs; then all of it again with traces whose guards fail
+  (`LOIMI_TRACE_MINFRAC=0.5`: a block run in under half of its
+  instruction's runs is off the trace) and checked accesses
+  (`LOIMI_TRACE_CHECK=1`), with blacklisting at the default rate and at
+  every failure (`LOIMI_TRACE_FAILS=1`). The conformance tests' code is
+  not profiled: they test that code without a profile runs without
+  traces.
+- `mini_traces_fuzz` (tests/golden.rs, generator tests/fuzz/traceprog.rs):
+  10 random Mini programs (loops of arithmetic that changes type with the
+  input, table reads and writes, string building, closures over loop
+  variables, calls, `break`s, nested loops), profiled with one input and
+  run with three, with traces, with failing guards and with blacklisting
+  at every failure; the output must be the interpreter's. The input is a
+  string constant, which traces load from the pool, so the same code
+  object takes each input.
+- ASan: Mini built with `--jit-stencils --sanitize=address --traces`
+  (benchmark profiles; trace functions instrumented, stencils not) ran
+  mandelbrot, nbody, sieve, fannkuch, sort, queens and hash_strings with
+  their traces, correct and without reports, and the scripts without
+  reports. Neither combination was rejected for a reason the code or
+  history gives, so both are allowed now; ASan is not in `cargo test`
+  (the ASan trace build takes 10 minutes on this machine).
+- `--gc-check-roots` with `--jit-stencils`: Mini's scripts in every GC
+  mode with the JIT at threshold 1 print what the same binary's
+  interpreter prints (159 runs, stderr included). Traces were not run in
+  this mode (its stencils differ, so it needs its own recording and
+  profile).
+- During the work the tests caught: dispatching a header guard's
+  re-execution through the enter word (an endless re-entry), heap
+  constants named by Mini's state order (`%k`), branches with `!prof`
+  metadata, locals passed by reference (`for_count(&regs, ..)`), the
+  experiment's window bugs (§11.3).
+
+### 11.7 Other vms
+
+- **MiniJS** works unchanged: nbody, fannkuch, spectral_norm, bitops
+  and sort recorded, profiled and traced (21 traces; installed in
+  nbody, fannkuch, bitops and sort); every output equal to the JIT's.
+  Its handlers return `i64` (`%r = musttail call ..; ret i64 %r`), which
+  the generator now follows.
+- **Scheme and Prolog** were not run through the workflow in this
+  milestone. Prolog has no `regs` state register: the generator then
+  keeps no window (every access is memory), which is supported but
+  untested.
+
+### 11.8 Costs and what remains
+
+- **Build time.** A trace build takes as long as a JIT build plus LLVM
+  on the traces (35 s for Mini with 21 traces). A *profiling* build is
+  slow: 36 regions (500,000 lines of handler IR) took 3.4 minutes. They
+  were `optnone` first, which is worse: in an `-O3` module such
+  functions still get the optimizing register allocator, superlinear
+  in their thousands of locals (9.3 minutes; one region alone compiles
+  in under 2 s). The tests bound it (`LOIMI_TRACE_MAXTOTAL`). Compiling
+  regions in a module of their own at `-O0`, or counters in the
+  stencils instead of regions, is for M2/M3.
+- **Not done in M1**, for M2: linking traces to inner-loop traces (the
+  outer loops of mandelbrot and nbody), side traces, `promote` for inline
+  caches, the `Num` assume, retagged FORLOOP, dirty-set writeback and
+  per-guard snapshots (nbody), traces through calls (M4).
