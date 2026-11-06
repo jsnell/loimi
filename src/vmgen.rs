@@ -158,6 +158,7 @@ pub fn handler_prologue(g: &mut FnGen) {
     }
     if let (VmRole::Handler(k), None, None) = (f.vm_role, &g.cold, &g.stencil) {
         if !combined {
+            prof_op(g, k, false);
             count_op(g, k);
         }
     }
@@ -215,6 +216,7 @@ pub fn epilogue(g: &mut FnGen) {
         }
         g.label(label);
         if let VmRole::Handler(k) = hf.vm_role {
+            prof_op(g, k, true);
             count_op(g, k);
         }
         g.val(hf.body.as_ref().unwrap());
@@ -453,6 +455,7 @@ fn state_args(g: &mut FnGen, vd: &VmDef) -> String {
 /// Tail-call `callee` (a handler-like function) with the current state:
 /// the target is already stored in the pc slot.
 pub fn tail_to(g: &mut FnGen, vd: &VmDef, callee: &str, insn: &str) {
+    prof_cold_exit(g);
     let hg = g.vm.clone().unwrap();
     let args = format!("{}, i{} {}", state_args(g, vd), vd.word.bits, insn);
     let rt = ret_llty(g.p(), &vd.ret);
@@ -475,6 +478,7 @@ pub fn tail_to(g: &mut FnGen, vd: &VmDef, callee: &str, insn: &str) {
 }
 
 fn dispatch(g: &mut FnGen, target: &str) {
+    prof_cold_exit(g);
     let hg = g.vm.clone().unwrap();
     let p = g.p();
     let vd = &p.vms[hg.vm as usize];
@@ -533,10 +537,31 @@ pub fn word_place(g: &mut FnGen, off: u32) -> String {
 pub fn vm_expr(g: &mut FnGen, e: &TExpr, v: &TVm) -> String {
     match v {
         TVm::Cold(b) => {
-            count_cold(g, e.span);
+            let at = cold_index(g, e.span);
+            count_cold(g, at);
             if can_outline(g, b) {
-                outline(g, b);
+                let sym = outline(g, b);
+                // `--vm-prof`: the outlined function is marked by its address.
+                if let (Some((vm, idx)), Some(sym), true) = (at, sym, g.cg.opts.vm_prof) {
+                    let key = prof_key(g.cg, vm, PROF_COLD, idx);
+                    g.cg.prof_fn_marks.insert(sym, key);
+                }
                 return g.poison(&e.ty);
+            }
+            if let Some((vm, idx)) = at {
+                let key = prof_key(g.cg, vm, PROF_COLD, idx);
+                prof_mark(g, key);
+            }
+            if at.is_some() && g.cg.opts.vm_prof {
+                g.prof_cold += 1;
+                g.cg.decls.insert("declare void @llvm.sideeffect()");
+                g.emit("call void @llvm.sideeffect() cold");
+                let v = g.val(b);
+                g.prof_cold -= 1;
+                if !g.terminated {
+                    prof_end(g, at.unwrap().0);
+                }
+                return v;
             }
             // A cold call-site attribute on a no-op intrinsic: the block is
             // treated as unlikely, and no machine code is emitted.
@@ -550,6 +575,7 @@ pub fn vm_expr(g: &mut FnGen, e: &TExpr, v: &TVm) -> String {
         }
         TVm::Exit(x) => {
             let v = g.val(x);
+            prof_cold_exit(g);
             let rt = ret_llty(g.p(), &x.ty);
             let p = g.p();
             if returns_through_slot(p, g.f()) {
@@ -565,6 +591,7 @@ pub fn vm_expr(g: &mut FnGen, e: &TExpr, v: &TVm) -> String {
         }
         TVm::Raise(x) => {
             let v = g.val(x);
+            prof_cold_exit(g);
             raise_value(g, &v, &x.ty);
             g.poison(&e.ty)
         }
@@ -789,7 +816,9 @@ fn can_outline(g: &FnGen, b: &TExpr) -> bool {
     }
 }
 
-fn outline(g: &mut FnGen, b: &TExpr) {
+/// Returns the cold function's symbol, unless emitting a stencil (which
+/// calls the handler's).
+fn outline(g: &mut FnGen, b: &TExpr) -> Option<String> {
     let p = g.p();
     let f = g.f();
     let vd = &p.vms[g.vm.as_ref().unwrap().vm as usize];
@@ -850,8 +879,10 @@ fn outline(g: &mut FnGen, b: &TExpr) {
     tail_to(g, vd, &format!("@\"{}\"", sym), &w);
     if stencil_sym.is_none() {
         let count = g.jit_count;
-        g.cg.cold_queue.push((g.fid, body, captured, sym, count));
+        g.cg.cold_queue.push((g.fid, body, captured, sym.clone(), count));
+        return Some(sym);
     }
+    None
 }
 
 /// `jump` in a JIT build. In the interpreter: hot counting (on backward
@@ -963,13 +994,14 @@ fn shared_slot(g: &mut FnGen, fid: FnId, i: usize, t: &Ty) -> String {
     name
 }
 
-/// `--vm-stats`: count an entry into the cold block at `span` (one
-/// counter per block and op or vm function it is generated in).
-fn count_cold(g: &mut FnGen, span: crate::diag::Span) {
-    if !g.cg.opts.vm_stats {
-        return;
+/// The index of the cold block at `span` among its vm's labelled cold
+/// blocks (one per block and op or vm function it is generated in), for
+/// `--vm-stats` (a counter) and `--vm-prof` (a location), with its vm.
+fn cold_index(g: &mut FnGen, span: crate::diag::Span) -> Option<(u32, usize)> {
+    if !g.cg.opts.vm_stats && !g.cg.opts.vm_prof {
+        return None;
     }
-    let Some(vm) = g.f().vm else { return };
+    let vm = g.f().vm?;
     let p = g.p();
     let vd = &p.vms[vm as usize];
     let key = (g.fid, span);
@@ -982,6 +1014,11 @@ fn count_cold(g: &mut FnGen, span: crate::diag::Span) {
                 _ => format!("fn {}", crate::check::short_name(&f.name)),
             };
             let label = format!("{} (cold block at {})", owner, g.cg.location(span));
+            let op = match f.vm_role {
+                VmRole::Handler(k) => k as i32,
+                _ => -1,
+            };
+            g.cg.cold_owner[vm as usize].push(op);
             let list = &mut g.cg.cold_stats[vm as usize];
             list.push(label);
             let i = list.len() - 1;
@@ -989,10 +1026,109 @@ fn count_cold(g: &mut FnGen, span: crate::diag::Span) {
             i
         }
     };
+    Some((vm, idx))
+}
+
+/// `--vm-stats`: count an entry into cold block `at` (`cold_index`).
+fn count_cold(g: &mut FnGen, at: Option<(u32, usize)>) {
+    if !g.cg.opts.vm_stats {
+        return;
+    }
+    let Some((vm, idx)) = at else { return };
+    let p = g.p();
+    let vd = &p.vms[vm as usize];
     let cp = g.inst(format!("getelementptr inbounds i64, ptr @\"{}.stats.cold\", i64 {}", vd.symbol, idx));
     let c = g.inst(format!("load i64, ptr {}", cp));
     let c1 = g.inst(format!("add i64 {}, 1", c));
     g.emit(format!("store i64 {}, ptr {}", c1, cp));
+}
+
+/// `--vm-prof` location kinds (`prof_rt.c`): an op's handler, a cold
+/// block, the end of a cold block (`prof_end`).
+pub const PROF_OP: u64 = 0;
+pub const PROF_COLD: u64 = 1;
+pub const PROF_RESUME: u64 = 3;
+
+/// `--vm-prof`: the key of a location, `tag:32 vm:8 kind:4 index:20`.
+pub fn prof_key(cg: &crate::codegen::Codegen, vm: u32, kind: u64, idx: usize) -> u64 {
+    (prof_tag(cg) << 32) | ((vm as u64 & 0xff) << 24) | (kind << 20) | (idx as u64 & 0xfffff)
+}
+
+/// `--vm-prof`: a tag for this program's vms, so that the marks of
+/// several programs in one process (libraries linked into a host) stay
+/// apart.
+fn prof_tag(cg: &crate::codegen::Codegen) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for vd in &cg.p.vms {
+        for b in vd.symbol.bytes().chain(vd.ops.iter().flat_map(|o| o.name.bytes())) {
+            h = (h ^ b as u64).wrapping_mul(0x100000001b3);
+        }
+    }
+    (h ^ (h >> 32)) & 0xffff_ffff
+}
+
+/// `--vm-prof`: mark the address of the code that follows as location
+/// `key`: an empty inline asm that records the address in section
+/// `loimi_prof_marks` (no instructions). Not in JIT builds, whose
+/// stencil module copies handler code; their handlers are functions,
+/// marked by address.
+fn prof_mark(g: &mut FnGen, key: u64) {
+    if !g.cg.opts.vm_prof || g.cg.opts.jit || g.stencil.is_some() {
+        return;
+    }
+    let word = match g.cg.opts.arch {
+        crate::codegen::Arch::X86_64 => ".quad",
+        _ => ".xword",
+    };
+    g.emit(format!(
+        "call void asm sideeffect \"1:\\0A.pushsection loimi_prof_marks,\\22aw\\22\\0A.balign 8\\0A{w} 1b\\0A{w} {}\\0A.popsection\", \"\"()",
+        key,
+        w = word
+    ));
+}
+
+/// `--vm-prof`: where an inline cold block's code ends (before each of
+/// its exits, and where it falls through), the code that follows is its
+/// op's again: LLVM lays out the op's other blocks after the cold block.
+/// The sampler takes the op from the op mark before the cold block's.
+fn prof_end(g: &mut FnGen, vm: u32) {
+    let key = prof_key(g.cg, vm, PROF_RESUME, 0);
+    prof_mark(g, key);
+}
+
+/// `prof_end` before an exit (dispatch, tail call, exit, raise) inside
+/// an inline cold block.
+fn prof_cold_exit(g: &mut FnGen) {
+    if g.prof_cold > 0 {
+        if let Some(vm) = g.f().vm {
+            prof_end(g, vm);
+        }
+    }
+}
+
+/// `--vm-prof`: at the start of op `k`'s handler, store `pc` where the
+/// sampler reads it. In goto and switch modes (one function holds all
+/// handlers) also mark the code and store the op: LLVM merges and copies
+/// blocks between handlers there, so the op that runs, not the mark
+/// before the sample, says whose code it is; marks then tell its cold
+/// blocks from the rest. (Tail-call handlers are marked by their
+/// address.)
+fn prof_op(g: &mut FnGen, k: u32, combined: bool) {
+    if !g.cg.opts.vm_prof || g.stencil.is_some() {
+        return;
+    }
+    let vm = g.f().vm.unwrap();
+    if combined {
+        let key = prof_key(g.cg, vm, PROF_OP, k as usize);
+        prof_mark(g, key);
+        g.emit(format!("store i32 {}, ptr @loimi.prof.op", ((vm as u64) << 20 | k as u64) + 1));
+    }
+    let p = g.p();
+    let vd = &p.vms[vm as usize];
+    let f = g.f();
+    let pc_slot = g.slots[f.vm_state[vd.pc_idx] as usize].clone();
+    let pc = g.inst(format!("load ptr, ptr {}", pc_slot));
+    g.emit(format!("store ptr {}, ptr @loimi.prof.pc", pc));
 }
 
 /// `--vm-stats`: count this op and the (previous op, this op) pair.
@@ -1194,6 +1330,75 @@ done:
         cg.decls.insert(format!("declare void @{}(ptr, ptr, i64, ptr, ptr, i64, ptr, i64)", stats_rt_sym("suggest")));
     }
 }
+
+/// `--vm-prof`: what the sampler (`prof_rt.c`) needs to name
+/// locations, between `PROF_BEGIN` and `PROF_END` lines (a JIT build
+/// moves it past the stencil module, which must not see it):
+/// - per vm, a `struct prof_vm` in section `loimi_prof_vms`: tag, name,
+///   op names, cold block labels (as `--vm-stats` prints them) and the
+///   getter of the thread's last `pc`;
+/// - the functions marked by address, as `struct prof_mark`s in section
+///   `loimi_prof_marks`, where `prof_mark`'s inline asm records the rest.
+/// The thread-local `pc` itself goes with the other globals.
+pub fn emit_prof(cg: &mut crate::codegen::Codegen) -> String {
+    let mut out = String::new();
+    if !cg.opts.vm_prof {
+        return out;
+    }
+    let _ = writeln!(cg.globals, "@loimi.prof.pc = internal thread_local(initialexec) global ptr null");
+    let _ = writeln!(cg.globals, "@loimi.prof.op = internal thread_local(initialexec) global i32 0");
+    let _ = writeln!(out, "{}", PROF_BEGIN);
+    let mut used = Vec::new();
+    let p = cg.p;
+    let nvms = p.vms.len();
+    for (vi, vd) in p.vms.iter().enumerate() {
+        let tag = prof_key(cg, vi as u32, 0, 0);
+        let name = cg.string_const(format!("{}\0", vd.name).as_bytes());
+        let ops: Vec<String> = vd.ops.iter().map(|o| format!("ptr {}", cg.string_const(format!("{}\0", o.name).as_bytes()))).collect();
+        let colds: Vec<String> = cg.cold_stats[vi].clone().iter().map(|l| format!("ptr {}", cg.string_const(format!("{}\0", l).as_bytes()))).collect();
+        let _ = writeln!(out, "@\"loimi.prof.ops.{}\" = internal constant [{} x ptr] [{}]", vi, ops.len(), ops.join(", "));
+        let _ = writeln!(
+            out,
+            "@\"loimi.prof.colds.{}\" = internal constant [{} x ptr] {}",
+            vi,
+            colds.len().max(1),
+            if colds.is_empty() { "zeroinitializer".to_string() } else { format!("[{}]", colds.join(", ")) }
+        );
+        let owners: Vec<String> = cg.cold_owner[vi].iter().map(|o| format!("i32 {}", o)).collect();
+        let _ = writeln!(
+            out,
+            "@\"loimi.prof.owners.{}\" = internal constant [{} x i32] {}",
+            vi,
+            owners.len().max(1),
+            if owners.is_empty() { "zeroinitializer".to_string() } else { format!("[{}]", owners.join(", ")) }
+        );
+        let _ = writeln!(
+            out,
+            "@\"loimi.prof.vm.{vi}\" = internal global {{ i64, ptr, i64, i64, ptr, ptr, ptr, i64, ptr, ptr, i64 }} {{ i64 {tag}, ptr {name}, i64 {}, i64 {}, ptr @\"loimi.prof.ops.{vi}\", ptr @\"loimi.prof.colds.{vi}\", ptr @loimi.prof.pc_addr, i64 {nvms}, ptr @loimi.prof.op_addr, ptr @\"loimi.prof.owners.{vi}\", i64 {vi} }}, section \"loimi_prof_vms\", align 8",
+            ops.len(),
+            colds.len(),
+        );
+        used.push(format!("ptr @\"loimi.prof.vm.{}\"", vi));
+    }
+    for (i, (sym, key)) in cg.prof_marks.iter().enumerate() {
+        let _ = writeln!(out, "@\"loimi.prof.fm.{}\" = internal global {{ ptr, i64 }} {{ ptr @\"{}\", i64 {} }}, section \"loimi_prof_marks\", align 8", i, sym, key);
+        used.push(format!("ptr @\"loimi.prof.fm.{}\"", i));
+    }
+    let _ = writeln!(out, "define internal ptr @loimi.prof.pc_addr() {{\n  ret ptr @loimi.prof.pc\n}}");
+    let _ = writeln!(out, "define internal ptr @loimi.prof.op_addr() {{\n  ret ptr @loimi.prof.op\n}}");
+    if !used.is_empty() {
+        let _ = writeln!(out, "@llvm.compiler.used = appending global [{} x ptr] [{}], section \"llvm.metadata\"", used.len(), used.join(", "));
+    }
+    let _ = writeln!(out, "{}", PROF_END);
+    out
+}
+
+/// The lines around `emit_prof`'s part of the module.
+pub const PROF_BEGIN: &str = "; loimi.prof begin";
+pub const PROF_END: &str = "; loimi.prof end";
+
+/// The C source of the `--vm-prof` runtime.
+pub const PROF_RT: &str = include_str!("prof_rt.c");
 
 /// `std.prof`'s access to the counters, defined when the program
 /// declares it: `loimi_vm_stats_count()` is the number of vms counted (0

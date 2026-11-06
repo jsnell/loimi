@@ -1,0 +1,74 @@
+// args: --vm-prof
+// matrix: dispatch
+// env: LOIMI_PROF_HZ=4000
+// `--vm-prof` samples the program and prints, at exit, where the time
+// went: per op handler and cold block (named as by `--vm-stats`), per
+// function, and per guest pc. SPIN spends most of the time in its
+// handler, SLOW in its cold block, CALL in a function it calls
+// (tests/golden.rs `vm_prof_ranks` checks the order).
+// expect-stderr: == vm prof:
+// expect-stderr: self (where the samples landed):
+// expect-stderr: by vm location, with what it calls
+// expect-stderr: by guest pc
+// expect-stderr: SPIN
+// expect-stderr: SLOW (cold block at
+// expect-stderr: vm_prof.lm:44:13)
+// expect-stderr: main.churn
+// expect: done
+import std.io;
+
+struct C { n: i64 }
+
+#[inline(never)]
+fn churn(n: i64) -> i64 {
+    var x = n;
+    var i: i64 = 0;
+    while i < 60000 { x = (x * 1103515245 + 12345) % 2147483648; i += 1; }
+    return x;
+}
+
+vm V {
+    context ctx: *C;
+    state { pc: *u32, r: *i64 }
+    operand reg = r[it];
+    operand imm = it;
+    encoding fixed(u32) { format A { op: 8, a: 8, b: 8, c: 8 } }
+
+    op SPIN(x: reg, k: imm) : A {
+        var i: i64 = 0;
+        while i < 200000 { x = (x * 31 + i) % 1000003; i += 1; }
+        next
+    }
+    op SLOW(x: reg, k: imm) : A {
+        if x >= 0 {
+            cold {
+                var i: i64 = 0;
+                while i < 100000 { x = (x * 17 + i) % 1000033; i += 1; }
+            }
+        }
+        next
+    }
+    op CALL(x: reg, k: imm) : A { x = churn(x); next }
+    op LOOP(x: reg, k: imm) : A {
+        ctx.n -= 1;
+        if ctx.n > 0 { jump pc - 3 }
+        next
+    }
+    op RET(x: reg) : A { exit x }
+    entry run(c: *C, code: *u32, regs: *i64) -> i64 { ctx = c; pc = code; r = regs; jump pc }
+}
+
+fn main() {
+    var code: [u32; 8] = [0; 8];
+    var at: u64 = 0;
+    let s = code[..];
+    at = V.emit.SPIN(s, at, 0, 0);
+    at = V.emit.SLOW(s, at, 1, 0);
+    at = V.emit.CALL(s, at, 2, 0);
+    at = V.emit.LOOP(s, at, 0, 0);
+    at = V.emit.RET(s, at, 0);
+    var regs: [i64; 4] = [1, 2, 3, 0];
+    var c = C { n: 400 };
+    let r = V.run(&c, &code[0], &regs[0]);
+    if r >= 0 { io.println("done"); }
+}

@@ -48,6 +48,7 @@ struct Opts {
     dispatch: Option<tir::Dispatch>,
     keep_ll: bool,
     vm_stats: bool,
+    vm_prof: bool,
     /// `--gc-check-roots`: validate every reference the collector marks.
     gc_check_roots: bool,
     /// `--explain-values`: print each value type's layout and stop.
@@ -199,7 +200,7 @@ enum Tls {
 }
 
 const USAGE: &str = "\
-usage: loimi build <file.lm> [-o out] [--release | -O] [--emit-llvm] [--dispatch=tailcall|goto|switch] [--vm-stats] [--align-functions=N] [--no-branch-align]
+usage: loimi build <file.lm> [-o out] [--release | -O] [--emit-llvm] [--dispatch=tailcall|goto|switch] [--vm-stats] [--vm-prof] [--align-functions=N] [--no-branch-align]
                   [--sanitize=address|thread] [-W error | -Werror | --deny-warnings] [-W hot_gc] [-W handler_frame]
                   [--lib | --shared] [--header out.h [--header-prefix p]] [--tls=initial-exec|local-dynamic|global-dynamic] [--jit-stencils]
                   [--trace-regions=REC,..]   (with --jit-stencils: a profiling build, every loop of LOIMI_TRACE_RECORD recordings counted)
@@ -211,6 +212,7 @@ usage: loimi build <file.lm> [-o out] [--release | -O] [--emit-llvm] [--dispatch
                   [--explain-values]   (print each value type's encoding and which tuple tests merge, then stop)
                   [--target=aarch64-linux-gnu|x86_64-linux-gnu [--sysroot=DIR]]   (cross-compile; links with lld)
                   [--cpu=NAME]   (x86-64, x86-64-v2, x86-64-v3, native, ..: clang's -march (-mcpu on AArch64); default: the baseline)
+                  [--vm-prof]   (link a sampling profiler: time per handler, cold block, function and guest pc, printed at exit; docs/language.md section 7.3)
                   [--vm-profile=FILE|none]   (lay out vm handlers by FILE, --vm-stats output or op names, instead of the vm's #[profile(..)]; docs/lowering.md section 12)
        loimi run <file.lm> [build options] [-- args...]
                   (LOIMI_RUNNER=\"qemu-aarch64 -L DIR\" runs the program under that command)
@@ -524,6 +526,7 @@ fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, O
         codegen::Options {
             overflow_checks: !opts.release,
             vm_stats: opts.vm_stats,
+            vm_prof: opts.vm_prof,
             library,
             jit: opts.jit,
             arch: opts.target.as_ref().map_or(codegen::Arch::host(), |t| t.arch),
@@ -813,6 +816,7 @@ fn parse_args() -> Result<Opts, String> {
         dispatch: None,
         keep_ll: false,
         vm_stats: false,
+        vm_prof: false,
         gc_check_roots: false,
         explain_values: false,
         sanitize_address: false,
@@ -895,6 +899,7 @@ fn parse_args() -> Result<Opts, String> {
                 o.max_errors = n.parse().map_err(|_| format!("--max-errors takes a number, not `{}`", n))?;
             }
             "--vm-stats" => o.vm_stats = true,
+            "--vm-prof" => o.vm_prof = true,
             "--gc-check-roots" => o.gc_check_roots = true,
             "--explain-values" => o.explain_values = true,
             "--jit-stencils" => o.jit = true,
@@ -1048,6 +1053,16 @@ fn compiler_main() -> ExitCode {
     let clang = clang_cmd();
     let arch = opts.target.as_ref().map_or(codegen::Arch::host(), |t| t.arch);
     let cpu_flag: Vec<String> = opts.cpu.iter().map(|c| c.flag(arch)).collect();
+    // `--vm-prof`'s tables name the program's functions: the stencil
+    // module (made from this IR) must not see them.
+    let prof_ir = match (jit.is_some(), ir.find(vmgen::PROF_BEGIN), ir.find(vmgen::PROF_END)) {
+        (true, Some(a), Some(b)) => {
+            let block = ir[a..b + vmgen::PROF_END.len()].to_string();
+            ir.replace_range(a..b + vmgen::PROF_END.len(), "");
+            block
+        }
+        _ => String::new(),
+    };
     let jit_rt = match &jit {
         Some(j) => match build_stencils(&mut ir, j, &clang, &cpu_flag, &tmpdir, &stem) {
             Ok(p) => Some(p),
@@ -1057,6 +1072,18 @@ fn compiler_main() -> ExitCode {
             }
         },
         None => None,
+    };
+    ir.push_str(&prof_ir);
+    // `--vm-prof`: the sampler.
+    let prof_rt = if opts.vm_prof {
+        let p = tmpdir.join("loimi_prof_rt.c");
+        if let Err(e) = std::fs::write(&p, vmgen::PROF_RT) {
+            eprintln!("error: cannot write {}: {}", p.display(), e);
+            return ExitCode::from(1);
+        }
+        Some(p)
+    } else {
+        None
     };
     // `--vm-stats`: the runtime for sequences longer than pairs.
     let stats_rt = if opts.vm_stats {
@@ -1166,7 +1193,7 @@ fn compiler_main() -> ExitCode {
     // C runtime sources. A static library compiles each to its own
     // object (`-c` takes one input per `-o`), all archived together.
     let mut extra_objs = Vec::new();
-    for rt in jit_rt.iter().chain(stats_rt.iter()) {
+    for rt in jit_rt.iter().chain(stats_rt.iter()).chain(prof_rt.iter()) {
         if opts.kind == OutKind::Static {
             let o = rt.with_extension("o");
             let ok = Command::new(&clang)

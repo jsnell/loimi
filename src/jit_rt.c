@@ -571,10 +571,16 @@ static const char *stencil_name(uint32_t s, int *variant) {
     return loimi_jit_opnames[s < loimi_jit_nops ? s : loimi_jit_variants[s - loimi_jit_nops - 1].op];
 }
 
-static void map_line(uint8_t *a, uint32_t len, uint32_t s) {
+/* `--vm-prof` (prof_rt.c), if linked in: told about every compiled
+ * instruction, as the map is. */
+extern void loimi_prof_jit(const void *lo, const void *hi, const char *name, int variant, const void *pc) __attribute__((weak));
+
+/* Instruction `pc`'s code: LOIMI_JIT_MAP's line and the profiler. */
+static void map_line(uint8_t *a, uint32_t len, uint32_t s, const uint32_t *pc) {
     int v;
     const char *nm = stencil_name(s, &v);
-    fprintf(mapf, "%lx %lx %s%s\n", (unsigned long)(uintptr_t)a, (unsigned long)(uintptr_t)(a + len), nm, v ? "*" : "");
+    if (mapf) fprintf(mapf, "%lx %lx %s%s\n", (unsigned long)(uintptr_t)a, (unsigned long)(uintptr_t)(a + len), nm, v ? "*" : "");
+    if (loimi_prof_jit) loimi_prof_jit(a, a + len, nm, v, pc);
 }
 
 static uint32_t new_entry(void *native, uint32_t *at) {
@@ -690,9 +696,9 @@ static uint8_t *make_copy(struct rec *r, uint64_t i, uint32_t w) {
     }
     r->alts[r->nalts++] = (struct alt){i, w, at};
     st.copies++;
-    if (mapf) {
-        map_line(at, len, s);
-        fflush(mapf);
+    if (mapf || loimi_prof_jit) {
+        map_line(at, len, s, &r->code[i]);
+        if (mapf) fflush(mapf);
     }
     return at;
 }
@@ -1346,10 +1352,10 @@ static int compile(struct rec *r, const int32_t *oent) {
         for (uint64_t pc = 0; pc < n; pc++)
             if (r->home[pc]) r->ent[pc] = oent[pc];
     sync_entries(r);
-    if (mapf) {
+    if (mapf || loimi_prof_jit) {
         for (uint64_t pc = 0; pc < n; pc++)
-            if (map[pc] >= 0) map_line(r->body[pc], lens[pc], sts[pc]);
-        fflush(mapf);
+            if (map[pc] >= 0) map_line(r->body[pc], lens[pc], sts[pc], &code[pc]);
+        if (mapf) fflush(mapf);
     }
     trace_hook(r);
     if (debug) {

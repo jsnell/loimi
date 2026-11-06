@@ -14,6 +14,9 @@ pub struct Options {
     pub overflow_checks: bool,
     /// Count executed ops and op pairs; print a report at exit.
     pub vm_stats: bool,
+    /// `--vm-prof`: a sampling profiler linked in (`prof_rt.c`); vm code
+    /// is marked by location and stores `pc` at each op.
+    pub vm_prof: bool,
     /// Building a library (`--lib`, `--shared`): no `main` wrapper.
     pub library: bool,
     /// `--jit-stencils`: hooks for the copy-and-patch JIT, and stencils.
@@ -87,8 +90,16 @@ pub struct Codegen<'p> {
     /// block) pair.
     pub cold_stats: Vec<Vec<String>>,
     pub cold_stat_index: std::collections::HashMap<(FnId, Span), usize>,
+    /// Per vm, the op each labelled cold block is in (-1: a vm function).
+    pub cold_owner: Vec<Vec<i32>>,
     /// The same for counting copies (`--jit-stencils`).
     pub cold_count_jc: u32,
+    /// `--vm-prof`: outlined cold functions, by symbol, and their
+    /// location keys (`vmgen::prof_key`).
+    pub prof_fn_marks: std::collections::HashMap<String, u64>,
+    /// `--vm-prof`: functions marked by their address (tail-call
+    /// handlers, outlined cold blocks): symbol and key.
+    pub prof_marks: Vec<(String, u64)>,
     /// Thread-local argument slots of shared `-> never` vm functions already defined.
     pub tls_defined: std::collections::HashSet<String>,
     /// Per function: immutable f64 locals bound only from the unboxed
@@ -210,7 +221,10 @@ impl<'p> Codegen<'p> {
             cold_count: 0,
             cold_stats: vec![Vec::new(); p.vms.len()],
             cold_stat_index: std::collections::HashMap::new(),
+            cold_owner: vec![Vec::new(); p.vms.len()],
             cold_count_jc: 0,
+            prof_fn_marks: Default::default(),
+            prof_marks: Vec::new(),
             tls_defined: Default::default(),
             tramps: Default::default(),
             loop_md: String::new(),
@@ -454,6 +468,7 @@ impl<'p> Codegen<'p> {
         crate::gcgen::emit_runtime(&mut self);
         crate::rtgen::emit_runtime(&mut self);
         crate::vmgen::emit_stats(&mut self);
+        let prof = crate::vmgen::emit_prof(&mut self);
         self.decls.insert("declare void @llvm.trap() noreturn");
         let _ = writeln!(self.globals, "@loimi.argc = internal global i32 0");
         let _ = writeln!(self.globals, "@loimi.argv = internal global ptr null");
@@ -480,6 +495,10 @@ impl<'p> Codegen<'p> {
             let _ = writeln!(out, "!{} = !{{!\"llvm.loop.unroll.disable\"}}", LOOP_MD + 2);
             out.push_str(&self.loop_md);
         }
+        out.push_str(&prof);
+        if self.opts.vm_prof {
+            out = with_uwtable(&out);
+        }
         // std types few programs use: defined only if something refers to them.
         for (name, line) in lazy_types {
             if out.contains(&name) {
@@ -489,6 +508,45 @@ impl<'p> Codegen<'p> {
         }
         (out, std::mem::take(&mut self.stencils))
     }
+}
+
+/// `--vm-prof`: every function defined in `ir` with the `uwtable`
+/// attribute (unwind tables, no code change), so that the sampler walks
+/// the stack from a runtime function to the handler that called it.
+fn with_uwtable(ir: &str) -> String {
+    let mut out = String::with_capacity(ir.len() + ir.len() / 64);
+    for line in ir.lines() {
+        out.push_str(&uwtable_line(line).unwrap_or_else(|| line.to_string()));
+        out.push('\n');
+    }
+    out
+}
+
+/// A `define` line with ` uwtable` after its parameter list.
+fn uwtable_line(line: &str) -> Option<String> {
+    if !line.starts_with("define ") || line.contains(" uwtable") {
+        return None;
+    }
+    let b = line.as_bytes();
+    let mut i = line.find('@')? + 1;
+    if b.get(i) == Some(&b'"') {
+        i += 1 + line[i + 1..].find('"')? + 1;
+    }
+    i += line[i..].find('(')?;
+    let mut depth = 0;
+    for (j, &c) in b.iter().enumerate().skip(i) {
+        match c {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(format!("{} uwtable{}", &line[..=j], &line[j + 1..]));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 struct LoopTarget {
@@ -522,6 +580,9 @@ pub struct FnGen<'a, 'p> {
     pub stencil: Option<crate::jitgen::StencilGen>,
     /// Emitting the counting copy of this function (`--jit-stencils`).
     pub jit_count: bool,
+    /// `--vm-prof`: inline cold blocks being emitted, innermost last
+    /// (`vmgen::prof_end`).
+    pub prof_cold: u32,
     /// A `#[track_caller]` function: its caller's location is in
     /// `%caller.ptr` and `%caller.len` (`store_caller`).
     caller_saved: bool,
@@ -545,6 +606,7 @@ impl<'a, 'p> FnGen<'a, 'p> {
             pending: vec![],
             stencil: None,
             jit_count: false,
+            prof_cold: 0,
             caller_saved: false,
         }
     }
@@ -859,6 +921,20 @@ impl<'a, 'p> FnGen<'a, 'p> {
             }
             _ => String::new(),
         };
+        // `--vm-prof`: tail-call handlers and outlined cold blocks are
+        // marked by their address.
+        if self.cg.opts.vm_prof && self.stencil.is_none() {
+            let key = match (&cold, f.vm, f.vm_role) {
+                (Some(_), _, _) => self.cg.prof_fn_marks.get(&symbol).copied(),
+                (None, Some(v), VmRole::Handler(k)) if p.vms[v as usize].dispatch == crate::tir::Dispatch::TailCall => {
+                    Some(crate::vmgen::prof_key(self.cg, v, crate::vmgen::PROF_OP, k as usize))
+                }
+                _ => None,
+            };
+            if let Some(key) = key {
+                self.cg.prof_marks.push((symbol.clone(), key));
+            }
+        }
         let mut out = String::new();
         let _ = writeln!(
             out,
