@@ -255,6 +255,15 @@ the function holding every handler per pair (docs/results.md,
 chameneos does more besides switching (upvalue reads, string
 compares), where LuaJIT's interpreter stays ahead.
 
+**Quickened switch sites** (2026-11-06, speed audit item 11): a CALL
+that switched threads in the run quickens to CALL_RESUME, CALL_WRAP or
+CALL_YIELD (CALL is a family), which test for the same call and switch
+on the hot path instead of in CALL's native cold block, and go back to
+CALL when the test fails. chameneos 0.925, coroutine_ring 0.961, sieve
+0.944 of the build before (minimum of 11 interleaved runs, align 64);
+chameneos is now 0.91 of LuaJIT `-joff`. The other 14 benchmarks:
+0.994 by geometric mean.
+
 **Stacks in host memory instead of the heap** (the GC hooks of items 4-6,
 2026-11-03): best of 5, interleaved, both builds `--align-functions=64`,
 new/old: chameneos 1.000, coroutine_ring 0.996, sieve 0.986. On the 14

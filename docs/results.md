@@ -505,6 +505,27 @@ slower with the port: re-fusing after property quickening forms
 `GETMETHOD_P_CALL` and two `GETPROP_IN` supers, with 10% fewer
 dispatches. The load facts change no hot handler of Mini or MiniJS.
 
+## SWITCH to the target; coroutine switch sites (2026-11-06)
+
+Not a run of the suites: speed-audit items 13 and 11
+([design/speed-audit.md](design/speed-audit.md)), Mini, tail-call,
+user+sys CPU, minimum of 11 interleaved runs (the 14 programs: 7, the
+JIT suite: 5), against the commit before each change, with an A/A copy
+of the baseline in the same interleave.
+
+| Change | Benchmark | 64 | A/A | 128 |
+|---|---|---:|---:|---:|
+| SWITCH straight to its target, `real_word` inline, computed jumps enter compiled code | interp | 0.977 | 0.998 | 0.947 |
+| same, `LOIMI_JIT=1` (21 runs) | interp | 0.998 | 0.991 | 1.002 |
+| same, `LOIMI_JIT=1` | 14 programs | 0.997 | 0.995 | |
+| CALL_RESUME, CALL_WRAP, CALL_YIELD members and supers | chameneos | 0.925 | 1.002 | 0.919 |
+| same | coroutine_ring | 0.961 | 1.002 | 0.971 |
+| same | coroutine sieve | 0.944 | 1.003 | 0.927 |
+| same | 14 programs | 0.994 | 1.001 | 0.993 |
+
+Against LuaJIT `-joff` in the same interleave: chameneos 0.91 (it was
+1.0), coroutine_ring 0.89, sieve 0.88.
+
 ## Per suite
 
 ### mini

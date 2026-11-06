@@ -8,6 +8,24 @@ implementation; `git log` has the details.
 
 ### `vm` declarations and dispatch
 
+- **JIT: handlers may read other instructions' words; computed jumps
+  enter compiled code.** `Vm.real_word` maps a JIT enter word through
+  an inline load from the runtime's table (`loimi_jit_words`) instead
+  of a C call, so an op can decode the word at a computed pc in the
+  interpreter and in its stencil; a stencil's `jump` to a computed pc
+  that is none of its labels goes straight to that instruction's
+  compiled code, or to the interpreter there. Mini's SWITCH now jumps
+  to its arm's target, not to the JMP (it crashed `--jit-stencils`
+  before): interp 0.977 (align 64) and 0.947 (128), 1.00 under the JIT
+  ([design/speed-audit.md](docs/design/speed-audit.md), item 13).
+- **Coroutine switching (item 11): Mini's switch sites quickened; no
+  primitive.** Mini's CALL is a family whose CALL_RESUME, CALL_WRAP and
+  CALL_YIELD members switch threads on the hot path: chameneos 0.925,
+  coroutine_ring 0.961, coroutine sieve 0.944, the 14 programs 0.994;
+  chameneos is 0.91 of LuaJIT `-joff`. A `switch_state`/`suspend`
+  primitive was measured not to pay: it could save two dependent loads
+  per switch; the remaining cost is Mini's own bookkeeping
+  ([design/speed-audit.md](docs/design/speed-audit.md), item 11).
 - **Re-fusion after `become`**: `refuse fp.cl.proto.code;` in a vm
   names the code the running instruction is in; after every `become`
   of an op that some super names, the handler calls the generated

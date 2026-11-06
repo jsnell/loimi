@@ -1164,79 +1164,113 @@ pub vm Mini {
     }
 
     /// R[base .. base+nres-1] = R[base](R[base+1] .. R[base+nargs]).
-    /// nres is at least 1.
-    op CALL(base: callbase, nargs: nargs, nres: nres) : ABC {
-        let f = regs[base];
-        if let F(cl) = f {
-            // No GC check: entering a function allocates nothing.
-            let p = cl.proto;
-            let callee = regs + base + 1;
-            let n = p.nregs as u64;
-            if callee + n > ctx.stack_end or fp + 1 >= ctx.frames_end {
-                // A coroutine's stacks grow; the main stack does not.
-                cold {
-                    fp = grow(ctx, fp, callee + n)?;
-                    regs = fp.base;
-                    redo
-                }
-            }
-            var i = nargs as u64;
-            while i < n {
-                callee[i] = Nil;
-                i += 1;
-            }
-            fp.resume = pc + 1;
-            fp = fp + 1;
-            fp.cl = cl;
-            fp.base = callee;
-            fp.nres = nres as u32;
-            k = p.consts.data.ptr;
-            fp.k = k;
-            regs = callee;
-            poll gil; poll pause; jump p.code
-        }
-        if let Native(id) = f {
-            cold {
-                // coroutine.resume and coroutine.yield switch threads in
-                // this run when they can; the native reports the rest.
-                if id == coro.RESUME and nargs != 0 and let Co(co) = regs[base + 1] and !coro.is_wrap(co) and coro.can_switch(ctx, co) {
-                    switch_in(co, regs + base + 2, nargs as u64 - 1, base as u64, nres as u64, false)
-                }
-                if id == coro.YIELD and ctx.cur.inrun and ctx.base == ctx.frames {
-                    switch_out(regs + base + 1, nargs as u64, base as u64, nres as u64)
-                }
-                // math.sqrt and math.floor of a number, for one result,
-                // without the native call (nbody, sort).
-                if nres == 1 and nargs != 0 {
-                    let x = regs[base + 1];
-                    if id == lib.M_SQRT and let Num(d) = x { regs[base] = Num(d.sqrt()); next }
-                    if id == lib.M_FLOOR {
-                        if let Int(_) = x { regs[base] = x; next }
-                        // Truncate and adjust (libm's floor is a call).
-                        if let Num(d) = x and d >= -2147483648.0 and d < 2147483648.0 {
-                            let t = d as i32;
-                            regs[base] = Int(if (t as f64) > d { t - 1 } else { t });
-                            next
-                        }
+    /// nres is at least 1. A site whose call switched threads in this run
+    /// (coroutine.resume, a wrap function, coroutine.yield) quickens to
+    /// CALL_RESUME, CALL_WRAP or CALL_YIELD, which switch on the hot path
+    /// instead of in the native cold block (speed audit item 11:
+    /// chameneos 0.92, coroutine_ring and the coroutine sieve 0.95), and
+    /// go back to CALL when their test fails.
+    family CALL(base: callbase, nargs: nargs, nres: nres) : ABC {
+        generic {
+            let f = regs[base];
+            if let F(cl) = f {
+                // No GC check: entering a function allocates nothing.
+                let p = cl.proto;
+                let callee = regs + base + 1;
+                let n = p.nregs as u64;
+                if callee + n > ctx.stack_end or fp + 1 >= ctx.frames_end {
+                    // A coroutine's stacks grow; the main stack does not.
+                    cold {
+                        fp = grow(ctx, fp, callee + n)?;
+                        regs = fp.base;
+                        redo
                     }
                 }
-                if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
-                let v = call_native(ctx, id, regs + base + 1, nargs as u64, true)?;
-                // coroutine.yield: its values are this CALL's arguments.
-                if ctx.yielded { ctx.xfer = regs + base + 1; yield_exit(base as u64, nres as u64) }
-                native_results(base as u64, nres as u64, v)
+                var i = nargs as u64;
+                while i < n {
+                    callee[i] = Nil;
+                    i += 1;
+                }
+                fp.resume = pc + 1;
+                fp = fp + 1;
+                fp.cl = cl;
+                fp.base = callee;
+                fp.nres = nres as u32;
+                k = p.consts.data.ptr;
+                fp.k = k;
+                regs = callee;
+                poll gil; poll pause; jump p.code
             }
-        }
-        if let Co(w) = f and let Some(co) = w.wrap {
-            cold {
-                if coro.can_switch(ctx, co) { switch_in(co, regs + base + 1, nargs as u64, base as u64, nres as u64, true) }
-                if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
-                let v = coro.resume(ctx, co, regs + base + 1, nargs as u64, true)?;
-                if ctx.yielded { yield_exit(base as u64, nres as u64) }
-                native_results(base as u64, nres as u64, v)
+            if let Native(id) = f {
+                cold {
+                    // coroutine.resume and coroutine.yield switch threads in
+                    // this run when they can; the native reports the rest.
+                    if id == coro.RESUME and nargs != 0 and let Co(co) = regs[base + 1] and !coro.is_wrap(co) and coro.can_switch(ctx, co) {
+                        become CALL_RESUME;
+                        switch_in(co, regs + base + 2, nargs as u64 - 1, base as u64, nres as u64, false)
+                    }
+                    if id == coro.YIELD and ctx.cur.inrun and ctx.base == ctx.frames {
+                        become CALL_YIELD;
+                        switch_out(regs + base + 1, nargs as u64, base as u64, nres as u64)
+                    }
+                    // math.sqrt and math.floor of a number, for one result,
+                    // without the native call (nbody, sort).
+                    if nres == 1 and nargs != 0 {
+                        let x = regs[base + 1];
+                        if id == lib.M_SQRT and let Num(d) = x { regs[base] = Num(d.sqrt()); next }
+                        if id == lib.M_FLOOR {
+                            if let Int(_) = x { regs[base] = x; next }
+                            // Truncate and adjust (libm's floor is a call).
+                            if let Num(d) = x and d >= -2147483648.0 and d < 2147483648.0 {
+                                let t = d as i32;
+                                regs[base] = Int(if (t as f64) > d { t - 1 } else { t });
+                                next
+                            }
+                        }
+                    }
+                    if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
+                    let v = call_native(ctx, id, regs + base + 1, nargs as u64, true)?;
+                    // coroutine.yield: its values are this CALL's arguments.
+                    if ctx.yielded { ctx.xfer = regs + base + 1; yield_exit(base as u64, nres as u64) }
+                    native_results(base as u64, nres as u64, v)
+                }
             }
+            if let Co(w) = f and let Some(co) = w.wrap {
+                cold {
+                    if coro.can_switch(ctx, co) {
+                    become CALL_WRAP;
+                    switch_in(co, regs + base + 1, nargs as u64, base as u64, nres as u64, true)
+                }
+                    if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
+                    let v = coro.resume(ctx, co, regs + base + 1, nargs as u64, true)?;
+                    if ctx.yielded { yield_exit(base as u64, nres as u64) }
+                    native_results(base as u64, nres as u64, v)
+                }
+            }
+            cold { raise error(ctx, "attempt to call a ", f) }
         }
-        cold { raise error(ctx, "attempt to call a ", f) }
+        /// A site that called coroutine.resume and switched in this run:
+        /// the same test as CALL's, without the native cold block.
+        CALL_RESUME {
+            if let Native(id) = regs[base] and id == coro.RESUME and nargs != 0 and let Co(co) = regs[base + 1] and !coro.is_wrap(co) and coro.can_switch(ctx, co) {
+                switch_in(co, regs + base + 2, nargs as u64 - 1, base as u64, nres as u64, false)
+            }
+            cold { become CALL; redo }
+        }
+        /// A site that called a wrap function and switched in this run.
+        CALL_WRAP {
+            if let Co(w) = regs[base] and let Some(co) = w.wrap and coro.can_switch(ctx, co) {
+                switch_in(co, regs + base + 1, nargs as u64, base as u64, nres as u64, true)
+            }
+            cold { become CALL; redo }
+        }
+        /// A site that called coroutine.yield and switched in this run.
+        CALL_YIELD {
+            if let Native(id) = regs[base] and id == coro.YIELD and ctx.cur.inrun and ctx.base == ctx.frames {
+                switch_out(regs + base + 1, nargs as u64, base as u64, nres as u64)
+            }
+            cold { become CALL; redo }
+        }
     }
     /// After a native returned `v` to CALL: store its results in
     /// R[base .. base+nres-1].
@@ -1454,6 +1488,11 @@ pub vm Mini {
         MOVE, MOVE;
         // Overlaps another super, but runs outside MOVE; MOVE: 6% of string_build's ops.
         MOVE, MOVE, CALL;
+        // The quickened coroutine switches: `resume(co)` with `resume` a
+        // local (chameneos, coroutine_ring) and `yield()` from an upvalue.
+        MOVE, MOVE, CALL_RESUME;
+        MOVE, CALL_RESUME;
+        GETUPVAL, CALL_YIELD;
         GETINDEX, GETINDEX;
         // Overlaps another super, but runs outside GETINDEX; GETINDEX: 14% of queens' and sort's ops.
         GETUPVAL, GETINDEX;

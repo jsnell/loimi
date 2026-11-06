@@ -517,11 +517,11 @@ Tried and dropped:
 
 Next candidates:
 
-- `SWITCH` straight to the target, if the JIT runtime learns to exit to
-  (or compile) a JMP's target from a computed jump.
+- `SWITCH` straight to the target: done (45).
 - GETINDEX_GETINDEX is now 20% of interp and keeps its stack frame
   (register pressure from two inlined hash probes).
-- Coroutine resume/yield cold blocks (31% of chameneos), the intern
+- Coroutine resume/yield cold blocks (31% of chameneos; now hot
+  family members, 46), the intern
   table's probe miss (string_build), LEN and CONCAT frames: as before.
 
 ## Value accumulators (2026-11-06)
@@ -594,6 +594,34 @@ Next candidates:
     alignments. What the unselected accumulator does change is `xmm0`
     saved around the C calls of a few hot handlers (GETGLOBAL,
     NEWTABLE, CONCAT, POW) and a `xorps` on computed jumps.
+
+## SWITCH to the target; quickened coroutine switches (2026-11-06)
+
+Speed audit items 13 and 11 (`docs/design/speed-audit.md`). User+sys
+CPU, minimum of 11 interleaved runs, against the build before; A/A in
+brackets.
+
+45. **SWITCH straight to its arm** (item 42's next candidate). SWITCH
+    decodes the JMP it picks and jumps to its target: one dispatch
+    less. The `--jit-stencils` crash was that decode reading a compiled
+    JMP's enter word; `Vm.real_word` is now an inline table load and
+    computed jumps enter compiled code directly (item 13). Where the
+    JMP is compiled, SWITCH jumps to it (its code is one direct `jmp`).
+    interp 0.977 (0.998) at align 64, 0.947 at 128; under the JIT 1.00.
+46. **Coroutine switches on the hot path** (item 11). CALL is a family;
+    a site that switched threads in the run quickens to CALL_RESUME,
+    CALL_WRAP or CALL_YIELD, which switch without the native cold
+    block, and fall back with `become CALL; redo`. Supers
+    `MOVE, MOVE, CALL_RESUME`, `MOVE, CALL_RESUME`, `GETUPVAL,
+    CALL_YIELD`. chameneos 0.925 (align 128: 0.919), coroutine_ring
+    0.961 (0.971), sieve 0.944 (0.927); the 14 programs 0.994 (A/A
+    1.001). chameneos is 0.91 of LuaJIT `-joff`, coroutine_ring 0.89,
+    sieve 0.88.
+
+Tried, as an upper bound (not correct in general): the switch's
+bookkeeping cut to the minimum (no barriers, status, open upvalues or
+retired stacks) on top of 46: chameneos 0.860, coroutine_ring 0.873,
+sieve 0.902 of the build before 46.
 
 ## Int(i48): measured, not adopted
 

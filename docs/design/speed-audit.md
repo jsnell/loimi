@@ -85,9 +85,9 @@ one, else an estimate.
 | 8 | **Re-fusion on `become`**, and supers from a profile file | Mini and MiniJS call `refuse` (a whole-function `optimize`) by hand after quickening; doing so gave mandelbrot −6% and nbody −5%. Lox, Python and Scheme don't do it. **Built 2026-11-06** as `refuse CODE;` (item 8, "As built"): Lox zoo 0.88, suite 0.973; Python and Scheme no gain | measured: Lox 0.97; others 1.00 | S |
 | 9 | **A value-stack and frame runtime** (`std.rt.ValueStack`): high-water-mark clearing across coroutines, nested runs and the debugger | Built by hand in MiniJS, Scheme and Python; for Scheme it gave fib 0.81 and tak 0.85. Mini's three attempts failed: the unsafe upper bound was fib 0.92, the safe attempt 0.995–1.003. Python's frames do 8 stores | 1–2% for Mini and Lox; mostly ergonomic for the rest | M |
 | 10 | **Adaptive quickening**: warmup and backoff counters on families (CPython's PEP 659) | No interpreter counts; all specialize on first execution. There is no measured flip-flop yet, so measure first | 0–2% (est.) | S |
-| 11 | **Coroutine and generator switching** as a vm primitive (`suspend`, state snapshot and restore) | Mini's resume/yield cold blocks are 31% of chameneos, the one Mini benchmark slower than LuaJIT `-joff` (1.06). Python generators copy every register on YIELD and resume | 10–30% on coroutine benchmarks; niche | M |
+| 11 | **Coroutine and generator switching** as a vm primitive (`suspend`, state snapshot and restore) | Mini's resume/yield cold blocks are 31% of chameneos, the one Mini benchmark slower than LuaJIT `-joff` (1.06). Python generators copy every register on YIELD and resume. **Prototyped 2026-11-06** (item 11, "Prototype results"): quickened CALL members (no language change) kept in Mini; the primitive is a no-go | measured: chameneos 0.925, coroutine_ring 0.96, sieve 0.944 (Mini change); primitive's bound ≤ 2 loads per switch | M |
 | 12 | **Trailing immediate words in formats** (`roadmap.md` Q10) | wasm keeps CONST64 and table and segment indices in cache words, bounds-checked on every execution | ~1% for wasm; niche | M |
-| 13 | **JIT stencils: computed jumps that exit to the target** | Mini's SWITCH straight to its target was 4% faster on interp (interpreter) but crashes `--jit-stencils` | 4% on one benchmark | S |
+| 13 | **JIT stencils: computed jumps that exit to the target** | Mini's SWITCH straight to its target was 4% faster on interp (interpreter) but crashes `--jit-stencils`. **Built 2026-11-06** (item 13, "As built"): the crash was a decode of an enter word; `Vm.real_word` is now an inline table load, and computed jumps enter the target's compiled code | measured: interp 0.977 (align 64), 0.947 (128); JIT 1.00 | S |
 | 14 | **An optimizing tier** over loops or traces: register allocation, hoisted guards, deoptimization from shared frames | LuaJIT's remaining 2–4× (`copy-and-patch.md` §7). Bound by hand: 0.56–0.68 of the JIT's time on mandelbrot's loop | large on numeric loops | L+ |
 
 **Prototype first: 2, 1 and 3** (section 3 has the experiments).
@@ -1794,6 +1794,71 @@ Risks:
 
 **Niche:** Mini and Python today.
 
+#### Prototype results (2026-11-06): the quickened sites pay; the primitive does not
+
+**Measured by hand, in three steps** (Mini, tail-call, user+sys CPU,
+minimum of 9–11 interleaved runs, `--align-functions=64`, against the
+build before; the coroutine benchmarks of `bench/mini/coroutines`):
+
+| build | chameneos | coroutine_ring | sieve |
+|---|---:|---:|---:|
+| A/A | 1.002 | 1.002 | 1.003 |
+| switch tests copied into CALL's hot path (not a family) | 0.948 | 0.962 | 0.996 |
+| CALL a family: `CALL_RESUME`, `CALL_YIELD` | 0.924 | 0.959 | 1.001 |
+| + supers of them (`MOVE, MOVE, CALL_RESUME`, ...) | 0.908 | 0.948 | 1.013 |
+| + `CALL_WRAP` (sieve resumes through wrap functions) | 0.923 | 0.948 | 0.946 |
+| **upper bound:** + Mini's switch bookkeeping cut to the minimum (unsafe: no barriers, no status, no open upvalues, no retired stacks) | 0.860 | 0.873 | 0.902 |
+
+The switch was 15M resumes and yields in chameneos (137M ops), about
+35–40 cycles each. Quickening the sites takes off about 7 (the cold
+block's entry, frame and spills, and the native-id tests); the rest is
+the mispredicted jump to the other thread's pc and Mini's own
+bookkeeping, about 20 loads and stores per switch (the context's
+eight stack fields, the saved frame, resume point and result
+registers, status, barriers).
+
+**Kept: the quickened sites, a Mini change** (no language change;
+families, `become` and `refuse` already exist). `CALL` is a family: a
+site whose call switched in the run (`coroutine.resume`, a wrap
+function, `coroutine.yield`) quickens to `CALL_RESUME`, `CALL_WRAP` or
+`CALL_YIELD`, which repeat CALL's test and switch on the hot path, and
+`become CALL; redo` when it fails. Three supers keep the fused forms
+(`MOVE, MOVE, CALL_RESUME`, `MOVE, CALL_RESUME`, `GETUPVAL,
+CALL_YIELD`). Final, against the commit before (A/A in brackets;
+minimum of 11 runs):
+
+| | align 64 | align 128 |
+|---|---:|---:|
+| chameneos | 0.925 (1.002) | 0.919 |
+| coroutine_ring | 0.961 (1.002) | 0.971 |
+| sieve | 0.944 (1.003) | 0.927 |
+| the 14 programs, geomean (7 runs) | 0.994 (1.001) | 0.993 |
+
+chameneos is now 0.91 of LuaJIT `-joff` (0.357 s against 0.391 s; it
+was 1.0), coroutine_ring 0.89 and sieve 0.88. Chameneos gains under
+10%, the prototype's stop rule.
+
+**Not built: `switch_state` and `suspend`.** What a state snapshot can
+save is the vm state registers' part of a switch. Mini's state is
+`pc, regs, k, fp`, and `regs` and `k` follow from `fp`: a snapshot
+would save the two dependent loads `fp.base` and `fp.k`, which are not
+on the critical path (the next dispatch waits on `pc`). The rest of
+the bound above is Mini's semantics (which thread is running, its
+stacks' bounds, open upvalues, the generational barrier for stacks
+written without barriers), which a vm primitive would have to store
+too; Mini could shrink it by hand, at most to the unsafe row (another
+6–9%), not by a language feature. GC roots, debugger and JIT need
+nothing new: the switch stays ordinary vm control flow (`jump` to a
+`Mini.Resume`, which compiled code takes as a resume jump), and
+`mini_jit_stencils` and the trace tests pass with the new members.
+
+**Python generators** were not changed. Their switch is already on the
+hot path (FORITER resumes, YIELD suspends; no cold block), and the
+register copy is the design (the window is reused by the next call), not
+something a snapshot removes. On nqueens FORITER is 10.9% of samples
+and YIELD 1.9% (`--vm-prof`), FORITER including its non-generator
+iterations: the copy is a few percent at most.
+
 ### 12. Trailing immediate words
 
 **Evidence.**
@@ -1843,6 +1908,61 @@ existing exit path), instead of assuming a jump target is a
 
 **Cost: S** in `jit_rt.c`. **Niche:** one benchmark, and the JIT line
 is paused (`copy-and-patch.md` §13).
+
+#### As built (2026-11-06)
+
+**Why it crashed.** Not the jump: a stencil's jump to a computed pc
+that is none of the op's labels already went through the dispatch
+table, which reaches compiled code through the target's enter word.
+The direct SWITCH crashed because it *read* the JMP it picks, and the
+JIT had replaced that compiled JMP's word with an enter word
+(`ENTER | index << 8`): SWITCH decoded the index as a jump offset. The
+generated field getter (`Mini.sJ_sj`) was correct, because it maps
+through `Vm.real_word`, but that was a C call into the runtime
+(`loimi_jit_word`, a treap lookup): interp under the JIT took 1.33×
+as long with it.
+
+**What changed** (`jit_rt.c`, `vmexpand.rs`, `codegen.rs`, `vmgen.rs`):
+- **`Vm.real_word` is an inline load.** The runtime keeps
+  `loimi_jit_words`, the real word per entry index (the enter word
+  itself while the entry is not in the code), updated wherever it
+  writes, rewrites (`become`) or restores an enter word. `real_word` is
+  `if opcode(w) == ENTER { loimi_jit_words[w >> op_bits] } else { w }`,
+  and the load is IR the compiler emits (`loimi_jit_real_word`), not a
+  call. So a handler may read another instruction's word in the
+  interpreter and in its stencil; host readers (disassembler, verifier)
+  use the same table. `loimi_jit_word` and its per-entry back pointers
+  are gone.
+- **Computed jumps enter compiled code directly.** In a stencil, a
+  `jump` whose target is computed from pc but is none of the op's label
+  candidates tests the target's word: an enter word goes straight to
+  its compiled code (one indirect jump instead of two, the table's
+  `jit_enter` and the entry), anything else to the interpreter at that
+  pc. This is the exit of the proposal. MiniJS's SWITCHI takes it too.
+- **Test:** `tests/run/vm_jit_switch_target.lm` (`matrix: jit`), an op
+  that decodes the JMP it picks and jumps to its target, compiled at
+  the first backward jump, and host reads of the words afterwards.
+
+**Mini's SWITCH** decodes a real JMP and jumps to its target. When the
+JMP's word is an enter word (compiled), it jumps to the JMP instead,
+whose code is one direct `jmp` to the target's: decoding through
+`real_word` there measured 1.02 against the JMP (two more dependent
+loads before the mispredicted jump). User+sys CPU, minimum of 11 (JIT:
+21) interleaved runs; base is the commit before, built by its own
+compiler; A/A in brackets:
+
+| interp | align 64 | align 128 |
+|---|---:|---:|
+| interpreter | 0.977 (0.998) | 0.947 (1.012) |
+| JIT (`LOIMI_JIT=1`) | 0.998 (0.991) | 1.002 |
+| JIT, 14 programs, geomean (5 runs) | 0.997 (0.995) | |
+
+So the interpreter gains 2–5% on interp and the JIT neither gains nor
+loses: in compiled code the JMP was already a direct `jmp`, so there is
+no dispatch to save, and the computed jump's mispredict dominates.
+The compiler changes alone (old Mini, new compiler) measured 1.006 on
+interp under the JIT. Wasm's BR_TABLE was not changed (item text:
+nothing to gain).
 
 ### 14. An optimizing tier
 
