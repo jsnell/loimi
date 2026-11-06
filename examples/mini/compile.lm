@@ -68,10 +68,10 @@ fn LexTables.free(t: *LexTables) {
     t.strings.free();
 }
 
-/// Integers outside Mini's 32-bit range become floats.
+/// Integers outside Mini's 48-bit range become floats.
 fn num_value(n: num.Number) -> V {
     match n {
-        Int(i) => if i >= -2147483648 and i <= 2147483647 { V.Int(i as i32) } else { V.Num(i as f64) },
+        Int(i) => if i >= -140737488355328 and i <= 140737488355327 { V.Int(i as i48) } else { V.Num(i as f64) },
         Float(f) => V.Num(f),
     }
 }
@@ -515,7 +515,7 @@ fn Parser.singlevar(p: *Parser, name: str) -> E {
 }
 
 fn small_int(v: V) -> ?i32 {
-    if let Int(i) = v and i >= -32768 and i <= 32767 { return Some(i); }
+    if let Int(i) = v and i >= -32768 and i <= 32767 { return Some(i as i32); }
     None
 }
 
@@ -861,7 +861,7 @@ fn swappable(op: T) -> bool {
 /// also of nil, true, false and strings if `any`.
 fn Parser.kindex(p: *Parser, e: E, any: bool) -> ?u32 {
     let k = match e {
-        I(i) => p.constant(V.Int(i)),
+        I(i) => p.constant(V.Int(i as i48)),
         K(k) => {
             let v = p.fs.consts.get(k);
             let num = v is Int | Num;
@@ -1276,7 +1276,7 @@ fn Parser.statement_inner(p: *Parser) {
                                 Nil => V.Nil,
                                 True => V.Bool(true),
                                 False => V.Bool(false),
-                                I(k) => V.Int(k),
+                                I(k) => V.Int(k as i48),
                                 K(k) => p.fs.consts.get(k),
                                 _ => V.Nil,
                             };

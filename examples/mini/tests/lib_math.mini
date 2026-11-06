@@ -1,7 +1,7 @@
 print(math.floor(3.7), math.floor(-3.7), math.floor(5), math.floor(-0.5), math.floor(2.0))
 print(math.ceil(3.2), math.ceil(-3.2), math.ceil(5), math.ceil(-0.5), math.ceil(7.0))
--- Results outside the 32-bit integer range stay floats (SPEC §2.1, §5);
--- Lua 5.4, with 64-bit integers, prints the next two lines without ".0".
+-- Results in the implementation's 48-bit integer range are integers
+-- (SPEC §2.1, §5), as in Lua 5.4 with its 64-bit integers.
 print(math.floor(1e10), math.ceil(-1e10), math.floor(1099511627776.5))
 print(math.floor(2147483647.5), math.floor(-2147483648.5), math.ceil(2147483646.5))
 print(math.floor(1 / 0), math.ceil(-1 / 0))
@@ -18,8 +18,8 @@ print(math.huge > 1e308, -math.huge < -1e308, math.pi)
 print(math.floor(3.7) + 1, math.max(1, 2) * 3)
 -- expect: 3	-4	5	-1	2
 -- expect: 4	-3	5	0	7
--- expect: 10000000000.0	-10000000000.0	1099511627776.0
--- expect: 2147483647	-2147483649.0	2147483647
+-- expect: 10000000000	-10000000000	1099511627776
+-- expect: 2147483647	-2147483649	2147483647
 -- expect: inf	-inf
 -- expect: 5	5	0	2.5	3.25	0.0
 -- expect: 4.0	1.4142135623731	0.0

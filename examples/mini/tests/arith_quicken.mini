@@ -13,6 +13,6 @@ for i = 1, 3 do s = s .. add(i, 0.5) end
 print(s)
 -- expect: 3.5	3.5	3	4.0	3.5
 -- expect: 1.5	1.5	2.0	0.5
--- expect: 7	7.5	2147483657.0	7
+-- expect: 7	7.5	2147483657	7
 -- expect: 0.25	2.0	inf	-0.25
 -- expect: x1.52.53.5

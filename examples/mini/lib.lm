@@ -181,7 +181,7 @@ fn out(s: str) {
 fn out_value(v: V) {
     match v {
         S(s) => out(s.data),
-        Int(i) => { printf("%d\0".ptr, i); }
+        Int(i) => { printf("%lld\0".ptr, i as i64); }
         _ => {
             var b = text.StrBuf.new();
             value.write_value(&b, v);
@@ -294,7 +294,7 @@ fn to_str(h: *gc.Heap, v: V) -> Gc<Str> {
 
 /// An Int if `x` fits Mini's integer range, else a float.
 fn int_or_float(x: i64) -> V {
-    if x >= -2147483648 and x <= 2147483647 { V.Int(x as i32) } else { V.Num(x as f64) }
+    if x >= -140737488355328 and x <= 140737488355327 { V.Int(x as i48) } else { V.Num(x as f64) }
 }
 
 fn key(i: i64) -> V { int_or_float(i) }
@@ -415,7 +415,7 @@ fn math_round(h: *gc.Heap, args: *V, n: u64, fname: str, up: bool) -> Result<V, 
     if let Int(_) = arg(args, n, 0) { return Ok(args[0]); }
     let x = check_num(h, args, n, 0, fname)?;
     let r = if up { ceil(x) } else { x.floor() };
-    if r >= -2147483648.0 and r <= 2147483647.0 { return Ok(V.Int(r as i32)); }
+    if r >= -140737488355328.0 and r <= 140737488355327.0 { return Ok(V.Int(r as i48)); }
     Ok(V.Num(r))
 }
 
@@ -490,7 +490,7 @@ fn str_byte(h: *gc.Heap, args: *V, n: u64) -> Result<V, V> {
     let i = pos_start(p, len);
     let j = pos_end(p, len);
     if i > j { return Ok(V.Nil); }
-    Ok(V.Int(s.data[(i - 1) as u64] as i32))
+    Ok(V.Int(s.data[(i - 1) as u64] as i48))
 }
 
 fn str_char(h: *gc.Heap, args: *V, n: u64) -> Result<V, V> {
