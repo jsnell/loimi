@@ -2180,7 +2180,10 @@ impl<'t, 'a> FnGen<'t, 'a> {
             self.t.ret,
             self.name,
             ps.join(", "),
-            if self.kind == Kind::Region { " noinline optnone" } else { "" }
+            // regions are optimized too: `optnone` keeps every local, and the
+            // optimizing register allocator, which `optnone` functions still
+            // get in an -O3 module, took 2.75 times as long on them
+            if self.kind == Kind::Region { " noinline" } else { "" }
         );
         f.push_str("entry:\n");
         for a in &self.allocas {

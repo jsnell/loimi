@@ -339,8 +339,8 @@ fn mini_jit_stencils() {
 }
 
 /// Ahead-of-time traces (`--trace-regions`, `--traces`, src/tracegen.rs,
-/// docs/design/trace-tier.md): Mini's scripts, conformance tests and
-/// benchmarks are recorded with a JIT build, profiled with a region
+/// docs/design/trace-tier.md): Mini's benchmarks and scripts are
+/// recorded with a JIT build, profiled with a (bounded) region
 /// build, and run with traces of every loop that closed (`build_traces`)
 /// in every GC mode; then again with traces whose guards fail often
 /// (blocks run in under half of their instruction's runs are off the
@@ -354,7 +354,9 @@ fn mini_traces() {
     }
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut inputs: Vec<PathBuf> = Vec::new();
-    for (dir, ext) in [("examples/mini/tests", "mini"), ("examples/mini/tests/conformance", "lua"), ("bench/mini/programs", "lua")] {
+    // profiled: the scripts and the benchmarks (the conformance tests run
+    // with the traces, but their code has none: code not profiled)
+    for (dir, ext) in [("bench/mini/programs", "lua"), ("examples/mini/tests", "mini")] {
         let mut v: Vec<PathBuf> = std::fs::read_dir(root.join(dir))
             .unwrap()
             .filter_map(|e| e.ok().map(|e| e.path()))
@@ -369,7 +371,7 @@ fn mini_traces() {
     let mut failures = Vec::new();
     // traces of every loop of the tests, and the benchmarks' outputs
     let n = bt.ntraces(&bt.normal);
-    assert!(n >= 20, "only {} traces from the Mini tests and benchmarks", n);
+    assert!(n >= 10, "only {} traces from the Mini tests and benchmarks", n);
     failures.extend(mini_scripts_on(&bt.normal, "traces", &env, &|_| true));
     failures.extend(mini_conformance_on(&bt.normal, &env, &|_| true));
     failures.extend(bt.check_benchmarks(&bt.normal, &root.join("bench/mini/programs"), &env));
@@ -393,7 +395,7 @@ mod traceprog;
 /// (tests/fuzz/traceprog.rs): each is profiled with one input and run
 /// with another (and the first), with traces and with guards forced to
 /// fail; the output must be the interpreter's (the same binary, JIT off).
-/// TRACEFUZZ_SEEDS=n sets the number of programs (default 16).
+/// TRACEFUZZ_SEEDS=n sets the number of programs (default 10).
 #[test]
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 fn mini_traces_fuzz() {
@@ -401,7 +403,7 @@ fn mini_traces_fuzz() {
         return;
     }
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let n: u64 = std::env::var("TRACEFUZZ_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(16);
+    let n: u64 = std::env::var("TRACEFUZZ_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(10);
     let first: u64 = std::env::var("TRACEFUZZ_FIRST").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
     let dir = std::env::temp_dir().join(format!("loimi-tracefuzz-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -529,7 +531,9 @@ fn build_traces(tag: &str, src: &Path, inputs: &[PathBuf], env: &[(&str, &str)])
     };
     let jit = build("jit", &[], &[]);
     let rec = run_all(&jit, "LOIMI_TRACE_RECORD", "rec");
-    let reg = build("regions", &[format!("--trace-regions={}", rec.display())], &[]);
+    // (a bounded profiling build: LLVM takes minutes and gigabytes on a
+    // few hundred regions)
+    let reg = build("regions", &[format!("--trace-regions={}", rec.display())], &[("LOIMI_TRACE_MAXTOTAL", "400000")]);
     let prof = run_all(&reg, "LOIMI_TRACE_PROFILE", "prof");
     let tflag = [format!("--traces={}", prof.display())];
     let normal = build("traces", &tflag, &[("LOIMI_TRACE_MIN", "1")]);

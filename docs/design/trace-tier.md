@@ -725,16 +725,26 @@ of `regs[0..NR)`:
   window-mode edge into a real-mode block writes back on the edge.
   Read-only calls given a pointer that reaches the register file (one
   into it, or to `ctx`, a frame, or a local holding one of those) are
-  preceded by a writeback. So the collector, natives and nested runs see
+  preceded by a writeback; read-only calls given heap objects are not
+  (nbody's write-barrier tests, three per iteration, cost it 15% when
+  they were). Read-only is decided before the collector's exemption. So the collector, natives and nested runs see
   the interpreter's state, and a stack that moves during a call (Mini's
   coroutine stacks grow) is never written back to.
-- Assumption: within a step, the stitched code reaches the window's
-  slots only through `regs`; other paths to the register file go through
-  calls. `LOIMI_TRACE_CHECK=1` checks every access through a pointer the
+- Assumptions: within a step, the stitched code reaches the window's
+  slots only through `regs`, and functions reach the running frame's
+  registers only through `regs`, the context or a frame (not through
+  heap objects); other paths to the register file go through calls that
+  may write, which are preceded by a writeback. `LOIMI_TRACE_CHECK=1` checks every access through a pointer the
   analysis cannot place (`loimi_trace_check` aborts if it is in the
   window); the Mini suite passes with it (§11.6).
-- Writebacks and reloads are one `memcpy` each, which SROA splits into
-  the promoted slots' stores and loads (the regions' IR shrank fivefold).
+- In traces, writebacks, reloads and guard snapshots copy the slots
+  some emitted step names, one by one; SROA promotes each slot. A
+  `memcpy` of the whole window was tried first: SROA left the slots no
+  step names as memory slices and copied them at every step's snapshot
+  (mandelbrot 1.73 of the JIT instead of 0.64). Regions (profiling
+  builds) and traces with an access at an unknown offset (the
+  window is memory there anyway) use one `memcpy` per copy, which
+  shrank the regions' IR fivefold.
 
 ### 11.4 Guards, exits and invalidation
 
@@ -784,3 +794,120 @@ of `regs[0..NR)`:
   through the trace in SSA like the context and frame registers, live
   into every step and out at every exit; accumulator variants
   (`ADD_F__RAR`, `JGTKN__A`) stitch like any op.
+
+### 11.5 Results (Mini, 14 benchmarks)
+
+Machine: the shared 8-core x86-64 box, load average about 4.5 (other
+agents building and testing). User+sys CPU seconds, minimum of 7
+interleaved runs, `--release --align-functions=64`, every output
+checked. Master at 102aa44 (value accumulators) merged.
+
+- *interp*: Mini's default build. *JIT*: `--jit-stencils`,
+  `LOIMI_JIT=1`. *JIT A/A*: the same binary again (noise control).
+- *trace*: `--traces` from one profile of all 14 programs (each
+  recorded, region-profiled and traced by the workflow of §11.1), with
+  `LOIMI_JIT=1`; *trace off*: the same binary with `LOIMI_TRACE=0`.
+
+| program | interp | JIT | JIT A/A | trace | trace off | trace/JIT | (medians) | trace/interp | traces installed |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| binary_trees | 0.837 | 0.689 | 0.688 | 0.691 | 0.710 | 1.00 | 1.08 | 0.83 | none (calls) |
+| closures | 0.467 | 0.367 | 0.365 | 0.365 | 0.366 | 1.00 | 1.03 | 0.78 | none (calls) |
+| fannkuch | 1.147 | 0.900 | 0.899 | 0.658 | 0.898 | **0.73** | 0.74 | 0.57 | 3 |
+| fib | 0.947 | 0.679 | 0.660 | 0.666 | 0.672 | 0.98 | 0.96 | 0.70 | none (recursion) |
+| hash_strings | 1.060 | 0.817 | 0.787 | 0.800 | 0.816 | 0.98 | 0.98 | 0.75 | 4 |
+| interp | 0.765 | 0.560 | 0.580 | 0.594 | 0.585 | 1.06 | 1.03 | 0.78 | none (too large) |
+| mandelbrot | 0.628 | 0.363 | 0.362 | 0.238 | 0.366 | **0.66** | 0.65 | 0.38 | 2 |
+| nbody | 0.502 | 0.365 | 0.366 | 0.404 | 0.364 | 1.11 | 1.10 | 0.81 | 1 |
+| oo_methods | 0.762 | 0.509 | 0.514 | 0.510 | 0.511 | 1.00 | 1.01 | 0.67 | none (calls) |
+| queens | 0.958 | 0.731 | 0.726 | 0.674 | 0.729 | 0.92 | 0.93 | 0.70 | 1 |
+| sieve | 0.727 | 0.579 | 0.575 | 0.508 | 0.574 | 0.88 | 0.87 | 0.70 | 3 |
+| sort | 0.836 | 0.657 | 0.663 | 0.561 | 0.658 | 0.86 | 0.86 | 0.67 | 7 |
+| spectral_norm | 1.170 | 0.804 | 0.802 | 0.803 | 0.804 | 1.00 | 1.00 | 0.69 | none (calls) |
+| string_build | 0.764 | 0.743 | 0.744 | 0.738 | 0.739 | 0.99 | 1.01 | 0.97 | none |
+| **geometric mean** | | | | | | **0.932** | | **0.700** | |
+
+JIT/interp is 0.752; the A/A pair is 0.998 and trace-off/JIT 1.004, so
+noise is about 1% here (single programs: up to 4%, `fib`, `interp`).
+
+**Stop rule (§8, M1): the gain over the JIT is 6.8% by geometric mean,
+under the 10% the rule asks for.** The tier does what the experiment
+measured where it applies: mandelbrot 0.66 (experiment 0.63),
+fannkuch 0.73 (0.82), sieve 0.88 (0.87), plus sort 0.86 and queens
+0.92, which the experiment did not try. But it applies to 7 of the 14
+programs, and loses on one:
+
+- **Calls end traces.** binary_trees, closures, fib, oo_methods and
+  spectral_norm spend their time in loops whose hot path calls a Mini
+  function (an exit: the path "leaves the loop", §11.2) or in recursion.
+  `interp`'s dispatch loop is too large (856,000 lines of IR as a
+  region, over the 150,000 budget). These seven are 1.00 by design;
+  without them the geometric mean is 0.86.
+- **nbody is 1.11, where the experiment had 0.73.** Its trace runs 1–4
+  iterations per entry, and the code is tight but spills: about 25 live
+  window slots, a snapshot of them at each of 25 guarded steps, and a
+  writeback of all of them at each exit. Two cheaper fixes were made
+  and measured on the way (named-slot copies instead of a `memcpy`:
+  nbody 1.38 → 1.26; read-only write-barrier tests without writeback:
+  1.26 → 1.11). The rest is M2's dirty-set writeback and
+  snapshots of only the slots a guard's step changes.
+
+### 11.6 Tests
+
+- `mini_traces` (tests/golden.rs): the benchmarks and scripts recorded,
+  profiled (a bounded profiling build) and traced; then every script and
+  conformance test, in every GC mode (normal, stress, generational
+  verify), with the JIT at threshold 2 and the traces; the benchmarks'
+  outputs; then all of it again with traces whose guards fail
+  (`LOIMI_TRACE_MINFRAC=0.5`: a block run in under half of its
+  instruction's runs is off the trace) and checked accesses
+  (`LOIMI_TRACE_CHECK=1`), with blacklisting at the default rate and at
+  every failure (`LOIMI_TRACE_FAILS=1`). The conformance tests' code is
+  not profiled: they test that code without a profile runs without
+  traces.
+- `mini_traces_fuzz` (tests/golden.rs, generator tests/fuzz/traceprog.rs):
+  10 random Mini programs (loops of arithmetic that changes type with the
+  input, table reads and writes, string building, closures over loop
+  variables, calls, `break`s, nested loops), profiled with one input and
+  run with three, with traces, with failing guards and with blacklisting
+  at every failure; the output must be the interpreter's. The input is a
+  string constant, which traces load from the pool, so the same code
+  object takes each input.
+- ASan: Mini built with `--jit-stencils --sanitize=address --traces`
+  (benchmark profiles; trace functions instrumented, stencils not) ran
+  mandelbrot, nbody, sieve, fannkuch, sort, queens and hash_strings with
+  their traces, correct and without reports, and the scripts without
+  reports. `--gc-check-roots` builds with `--jit-stencils` now; see
+  §11.7 for what ran.
+- During the work the tests caught: dispatching a header guard's
+  re-execution through the enter word (an endless re-entry), heap
+  constants named by Mini's state order (`%k`), branches with `!prof`
+  metadata, locals passed by reference (`for_count(&regs, ..)`), the
+  experiment's window bugs (§11.3).
+
+### 11.7 Other vms
+
+- **MiniJS** works unchanged: nbody, fannkuch, spectral_norm, bitops
+  and sort recorded, profiled and traced (21 traces; installed in
+  nbody, fannkuch, bitops and sort); every output equal to the JIT's.
+  Its handlers return `i64` (`%r = musttail call ..; ret i64 %r`), which
+  the generator now follows.
+- **Scheme and Prolog** were not run through the workflow in this
+  milestone. Prolog has no `regs` state register: the generator then
+  keeps no window (every access is memory), which is supported but
+  untested.
+
+### 11.8 Costs and what remains
+
+- **Build time.** A trace build takes as long as a JIT build plus LLVM
+  on the traces (35 s for Mini with 21 traces). A *profiling* build is
+  slow: 36 regions (500,000 lines of handler IR) took 3.4 minutes. They
+  were `optnone` first, which is worse: in an `-O3` module such
+  functions still get the optimizing register allocator, superlinear
+  in their thousands of locals (9.3 minutes; one region alone compiles
+  in under 2 s). The tests bound it (`LOIMI_TRACE_MAXTOTAL`). Compiling
+  regions in a module of their own at `-O0`, or counters in the
+  stencils instead of regions, is for M2/M3.
+- **Not done in M1**, for M2: linking traces to inner-loop traces (the
+  outer loops of mandelbrot and nbody), side traces, `promote` for inline
+  caches, the `Num` assume, retagged FORLOOP, dirty-set writeback and
+  per-guard snapshots (nbody), traces through calls (M4).

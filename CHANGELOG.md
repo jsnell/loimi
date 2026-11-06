@@ -189,7 +189,9 @@ implementation; `git log` has the details.
   header. Guards re-run an instruction in the interpreter where the
   `redo_effect` rules allow; traces uninstall on word changes and
   blacklist themselves when more than 1 iteration in 8 fails. Mini:
-  TRACE_CHANGELOG. `--jit-stencils` builds also take `--sanitize=address`
+  0.932 of the JIT by geometric mean (mandelbrot 0.66, fannkuch 0.73;
+  nbody 1.11; loops through calls get none), under the milestone's 10%
+  stop rule. `--jit-stencils` builds also take `--sanitize=address`
   and `--gc-check-roots` now
   ([design/trace-tier.md §11](docs/design/trace-tier.md#11-m1-as-built-ahead-of-time-traces-from-a-profile)).
 - **JIT (`--jit-stencils`)**: jumps to a `Vm.Resume` count toward
