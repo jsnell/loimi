@@ -1,7 +1,8 @@
 # Design note: a speed audit (features for faster interpreters)
 
 Status: **proposal; nothing in it is built.** Written 2026-11-06 against
-master at 0813bc1.
+master at 0813bc1. Item 2 has since been prototyped and dropped (its
+"Prototype results").
 
 > Have we exhausted the possibilities for language improvements that
 > can be used to write faster interpreters or runtimes?
@@ -73,7 +74,7 @@ one, else an estimate.
 | # | Proposal | Evidence | Gain | Cost |
 |---|---|---|---|---|
 | 1 | **Accumulators for `value` types** (GC-safe, write-through or spilled at sync points), f32 accumulators, selection past non-interfering ops | Only wasm can use accumulators; it got 0.91, and 0.79 with supers. The five nanbox VMs (Mini, MiniJS, Lox, Python, Scheme) cannot (`vmacc.rs:267`). The latency probe puts an 8% bound on one cached register (`copy-and-patch.md` §13). Store-to-load chains appear in mandelbrot, nbody and spectral_norm | 2–5% on numeric benchmarks in 5 VMs (est.) | M |
-| 2 | **Cheaper operand decoding and dispatch**: pre-scaled byte-offset fields, then offset-threaded dispatch (a handler offset in the word, no table load) | `F64_MUL` is 14 instructions: 6 decode, 3 work, 5 dispatch. wasm3's is 5 (`roadmap.md` Q11). Every interpreter pays this on every op | 2–6% on handler-bound code (est.), all VMs | M, then L |
+| 2 | **Cheaper operand decoding and dispatch**: pre-scaled byte-offset fields, then offset-threaded dispatch (a handler offset in the word, no table load) | `F64_MUL` is 14 instructions: 6 decode, 3 work, 5 dispatch. wasm3's is 5 (`roadmap.md` Q11). Every interpreter pays this on every op. **Prototyped 2026-11-06: no gain on x86-64** (item 2, "Prototype results") | measured: 1.00 (step 1); 1.01, slower (step 2) | M, then L |
 | 3 | **Division by a verified constant**: `std.math.Divisor` (Granlund–Montgomery) and a verify-time hook that fills it | Prolog crypt: MOD/IDIV 27% of samples. MiniJS closures: MODK's `idiv` 8%. Mini built a magic-number IC by hand (`vm.lm:833`), and recomputing the magic on a miss cost 12%. Python slicing: `idiv` 14% (special-cased by hand) | 5–20% on 3–4 benchmarks; ~0.5% suite | S |
 | 4 | **Load facts**: `dereferenceable`/`nonnull`/invariant loads on pointers and `const` operand kinds | Listed in Mini's "remaining compiler issues" (`RESULTS.md:579`). Dependent-load chains: Python GETATTR 14–26%, MiniJS GETPROP_IN. GETINDEX_GETINDEX (20% of interp) keeps a frame | unknown; 0–3% (est.) | S |
 | 5 | **Smaller objects**: typed small-object chunks with no per-object header (BiBoP), or an 8-byte header for fixed-size types | Every object has a 16-byte header. A Scheme pair is 32 bytes against Guile's 16, and CAR alone is 12–15% of nboyer. Size sensitivity, measured: +8 bytes per object cost MiniJS binary_trees 6% and Python float 6% | 3–10% on allocation- and memory-bound benchmarks in 6 VMs (est.) | L |
@@ -210,6 +211,232 @@ stores in the variants) and the selector. Risks:
 
 **General:** five interpreters, numeric code first.
 
+#### Prototype results (2026-11-06)
+
+**Verdict: go.** Mandelbrot measured 0.85 with an untraced accumulator
+and 0.91 with a GC-safe one (write-through), against a 0.95 threshold.
+Both results held at both function alignments. nbody and spectral_norm
+did not gain. The suite geomean moved less than 1%. Build the
+write-through version first, with the accumulator held in an f64
+register. Details follow.
+
+**What was built.** The prototype is a patch, not committed:
+`proto-value-acc.patch` in the session scratch directory
+(`proto-acc-x7m3/`). It is about 140 lines, gated by
+`LOIMI_PROTO_VALUE_ACC` and `LOIMI_PROTO_ACC_WT` at build time and by
+`--cfg proto_acc*`. It changes the following.
+- **`vmacc.rs`.**
+  - A `value` kind may go to a `u64` accumulator, which holds the
+    word's bits, or to an `f64` accumulator, which holds them as
+    `f64.from_bits`.
+  - `accumulate` may name family members. Their variants stay members of
+    the family, so `become` still works.
+  - With `_WT`, a variant that writes the accumulator also stores the
+    slot.
+- **`vmexpand.rs`.** `Vm.acc_base(op)` is new. `Vm.accumulate` first
+  resets every variant to its base op and splits supers. This makes it
+  idempotent, so it can run again after quickening.
+- **Mini.**
+  - `accumulator vacc: u64|f64 for reg;`.
+  - The `accumulate` list: `ADD_F`, `SUB_F`, `MUL_F`, `ADDK_F`,
+    `SUBK_F`, `MULK_F`, `DIV`, `DIVK`, and `JLT`, `JLTK`, `JGTK` with
+    their `N` forms. That is 76 variants.
+  - `refuse` calls `Mini.accumulate(code, proto.first_temp)` before
+    `optimize`. `first_temp` is the most locals ever active at once,
+    tracked in `add_local`.
+  - Ten `#[forward]` supers over the variants. They mirror the existing
+    pairs, so mandelbrot's loop keeps its six dispatches.
+  - `MINI_PROTO_NOGC=1` sets the heap threshold to 2^62.
+- **Allocation without GC.** mandelbrot, nbody and spectral_norm
+  allocate nothing in their loops (8 MB RSS either way). The worst
+  benchmark was binary_trees at 1.55 GB, within the 2.5 GB limit, so no
+  input was shrunk. Every build matched all 14 `.expected` outputs.
+
+**Quickening complicates selection.** The `_F` members exist only
+after a site's first run (`become` in the generic member), so selection
+has to run again inside the handler that quickens. Two hazards follow,
+and any design must handle them:
+1. **The next op may have just become a reader.** After `refuse`, the
+   instruction after the quickening op may be a variant that reads the
+   accumulator, but the quickening op wrote only its slot. The prototype
+   also writes `vacc` in the generic member's `become` paths.
+2. **`redo` may re-run a reader.** The `_IF`/`_FI` members `redo`
+   after `become`, and the word they re-run may now be a variant that
+   reads an accumulator that was never written. The prototype finishes
+   the op in place instead. That also keeps `_IF`/`_FI` out of the
+   list: a variant cannot `become` a member whose operand kinds differ.
+
+**Timings.** Times are user+sys CPU, the minimum of 5 interleaved runs,
+with `MINI_PROTO_NOGC=1` for every build including base, so collection
+never runs. Load average was 2.7–4.1 on 8 cores, from two other agents.
+Ratios are against base built from the same tree:
+
+| build | mandelbrot | nbody | spectral_norm | suite geomean (14) | worst non-float |
+|---|---:|---:|---:|---:|---|
+| A/A (base vs base copy) | 1.000 | 0.998 | 0.999 | 1.001 | ±0.8% |
+| u64 acc, no supers on variants | 0.983 | 0.982 | 1.017 | 0.999 | sort 1.045, queens 1.030 |
+| u64 acc + supers | 0.921 | 0.978 | 1.005 | 0.993 | sort 1.046, queens 1.031 |
+| **f64 acc + supers** (raw bound) | **0.855** | 0.972 | 1.017 | 0.991 | oo_methods 1.028 |
+| u64 write-through + supers | 0.956 | 0.983 | 1.010 | 0.998 | queens 1.036 |
+| **f64 write-through + supers** (GC-safe) | **0.914** | 0.966 | 1.027 | 0.994 | fannkuch 1.033 |
+| f64 write-through, every slot (`first_temp` 0) | 0.904 | 0.976 | 1.028 | 0.996 | fannkuch 1.013 |
+
+`--align-functions=128` rerun of the same configurations:
+- f64 acc + supers: mandelbrot 0.852, nbody 1.004, spectral_norm 1.009.
+- f64 write-through + supers: mandelbrot 0.910, nbody 0.996,
+  spectral_norm 1.012.
+- u64 acc + supers: mandelbrot 0.922, queens 1.037, sort 1.015.
+- Every other benchmark stayed within ±1%, except binary_trees with
+  write-through (1.025).
+
+So:
+- **mandelbrot gains for real.**
+- **nbody's 2–3% is placement:** it is 1.00 at 128.
+- **spectral_norm is 1–3% slower** in every build.
+- **interp's 0.96–0.98 at 64 is placement too:** it is 0.996 at 128.
+
+**`--vm-stats` hit rates** (share of dispatches that are a variant or a
+super containing one, in the first_temp builds):
+- **mandelbrot: 73.5%.** Five dispatches of the six-dispatch inner loop
+  carry a variant: `MULK_F__AR_MUL_F__AAR`, `ADD_F__RAR_SUB_F__ARR`,
+  `ADD_F__RAR_MUL_F`, `MUL_F_ADD_F__ARR` and `JGTKN__A`, at 14.7% each.
+  Without supers on variants, the variants break up the existing
+  `#[forward]` supers. Dispatches then rise from 6 to 9 per iteration,
+  which is why "no supers" gains only 1.7%.
+- **nbody: 25%.** `GETFIELD_MUL_F__ARR`, `MUL_F__ARR_SUB_F__RRA` and
+  `ADD_F__RRA_SETFIELD` at 8.3% each. Most of its chains already ran
+  inside `#[forward]` supers (`MUL_F_ADD_F__f2`, `GETFIELD_SUB_F__f2`).
+- **spectral_norm: 8.3%.** `MUL_F__ARR_ADD_F__RRA` replaces
+  `MUL_F_ADD_F__f2`, which already forwarded. Its hot ops are integer
+  `ADD`/`MUL` and the `_IF`/`_FI` members, which are not in the list.
+- **The other 11 benchmarks: 0%.** Their changes come from the extra
+  state register alone.
+- **Chaining locals too** (write-through makes this correct, `first_temp`
+  0): mandelbrot's `zi*zi` feeds `zrq + ziq`
+  (`MUL_F__ARR_ADD_F__ARA`). That is a further 1%.
+
+**Assembly** (hot path, dispatch included):
+- **`MUL_F`, slot form:** 18 instructions: decode 7, `mulsd`, NaN test
+  2, store, dispatch 4.
+- **`MUL_F__AAR`, u64 accumulator:** 14. It includes a `movq` from
+  `%rsi` to `%xmm0` and a `movq` back, so a GPR accumulator costs two
+  cross-domain moves of 1–3 cycles each on the critical path.
+- **`MUL_F__AAR`, f64 accumulator:** 13, with the accumulator in
+  `%xmm0` and no `movq`.
+- **`MUL_F__AAR`, f64 write-through:** 15. It adds back one decode and
+  the store, both off the critical path.
+- **Supers:** `ADD_F__RAR_SUB_F__ARR` is 30 instructions against 33 for
+  `ADD_F_SUB_F`.
+
+**Every plain handler changed.** The tail-call build's jump through
+the table was `jmp *T(,%rax,8)`. With the u64 accumulator it becomes
+`mov T(,%rax,8),%rax; jmp *%rax`. One more argument register stops LLVM
+from folding the load into the `jmp`, and the instruction word moves
+from `%esi` to `%edx`. That is the likely cause of queens +3–4% and
+sort +1–5% in the u64 builds, which run no variant at all. An f64
+accumulator takes no GPR. Its builds keep queens and sort at 1.00, and
+their plain-handler costs are within ±1% at 128. So the register class
+matters as much as the variants.
+
+**Design for the real feature** (traced, safe):
+- **Register class.** `accumulator vacc: V for reg;` where `V` is a
+  `value` type, held in an f64 register for nanbox values. Floats are
+  already the raw word there, and the integer paths pay a `movq` only
+  in variants. Low-tagged VMs, or a declared class (`.. in u64`), use a
+  GPR. Measure that before choosing it, because of the dispatch fold
+  above.
+- **GC safety: write-through.** The collector is non-moving (sticky
+  mark bits, `roadmap.md` Q2), so a slot written through roots the
+  object, and the accumulator copy stays valid without tracing. Nothing
+  in the GC, `raise`, the debugger, `Vm.deopt` or the JIT needs to know.
+  It cost 6 points of mandelbrot (0.855 to 0.914) and stays under 0.95.
+  - **Spill-at-sync** gets the rest. A reader variant stores the
+    accumulator to its slot (the `__acc` field still names it) before
+    any `poll`, `uses gc` call, `raise`, `cold` block, `become` or
+    `redo`. A writer writes the accumulator only at `next`, and nothing
+    syncs after that. It is safe on a non-moving heap because the value
+    is only ever live between two adjacent ops. Keep it as a later
+    option (`#[accumulate(spill)]`).
+- **Write-through makes selection unconditional.** With the slot always
+  current, a reader is correct whenever it follows its writer and is not
+  a jump target. The "read once" promise and `first_temp` are no longer
+  needed, and locals chain too (`first_temp` 0 was correct on all 14
+  benchmarks and slightly faster). This matters for Scheme, whose
+  compiler cannot give a `first_temp`: let-bound values share registers
+  with temporaries.
+- **Polls, `redo`, raises, the debugger.**
+  - Polls and raises: with write-through, the register file is always
+    truthful at op boundaries.
+  - `redo`: the accumulator holds the reader's source while nothing
+    overwrote it, so `redo` stays correct. One case needs handling:
+    `redo` after `become` re-runs a different word. The generator
+    should make `become` write the op's result (or the source it is
+    about to re-read) to the accumulator. Simpler: re-selection inside
+    a handler (`refuse`) leaves the current op and the next op
+    unchanged until the next entry.
+  - The debugger: `set_break` and `step` act on base ops. Breaking at a
+    reader is fine with write-through, since the reader re-reads the
+    accumulator, which still holds the value.
+- **Idempotent selection.** Keep the prototype's `Vm.acc_base`, and the
+  reset at the start of `Vm.accumulate`, so `refuse` can call it. Mini
+  needs this because its float members appear only after quickening.
+- **f32.** Wasm needs a second float accumulator (`sacc: f32 for rs`).
+  An f64 one would convert at both ends (FRICTION 722). It is a small
+  extension of `prim`'s class check, untested here.
+- **Selection past ops that do not touch the slot.** wasm3's
+  `PreserveRegisterIfOccupied` keeps the value across such ops. In
+  Mini's loops the hot pairs were all adjacent: mandelbrot's chains
+  are, and nbody's breaks are `GETFIELD` loads that need their own slot.
+  So the prototype gives no evidence for it. Defer it.
+- **Opcode budget.** Mini's 8-bit opcode field held 76 variants and 10
+  supers. The first try, with 134 variants (all `_IF`/`_FI` members,
+  every compare form), did not fit, and `Resume.placeholder` vanishes
+  when every opcode is taken. Real lists must stay selective, or Mini
+  must widen its opcode field.
+- **Supers over variants are required.** Without them the variants
+  break up the existing `#[forward]` supers and give back most of the
+  gain: 0.983 against 0.921, u64. `--vm-stats` already suggests supers
+  over variants. The default `#[profile]` flow should regenerate them.
+
+**Which other interpreters gain.** These estimates come from `--vm-stats`
+dispatch profiles. The stats and binaries are in
+`proto-acc-x7m3/profiles/` in the scratch directory. "Share" is the
+fraction of dispatches that would be a variant, counting both ends of a
+single-use chain pair:
+
+| VM | benchmark | share | notes |
+|---|---|---:|---|
+| MiniJS | nbody | ~35% (~47% with SETPROP readers) | `MUL_F_MUL_F__f1`→`SUB_F`/`ADD_F`, and `ADD_F`/`SUB_F`→`SETPROP_IN` (6% each). No `#[forward]` super covers these yet. Likely the best case after mandelbrot |
+| MiniJS | raytrace, richards, fannkuch | 0–5% | chains broken by `GETPROP` |
+| MiniJS | spectral_norm | ~0% (`_F` only) | the hot ops are generic integer `ADD`/`MUL`/`DIV` |
+| Python | nbody | ~31% (~42% with SETINDEX) | `MUL`→`SUB`/`IADD`→`SETINDEX` temp chains. Python's arithmetic is generic (no `_F` members) and may allocate (Long), so it needs the traced, write-through form. `first_temp` is exact: locals are activated once at entry |
+| Python | chaos, float, raytrace | 6–18% | |
+| Scheme | mbrot | ~50% | 7 of 13 loop dispatches. Needs write-through selection, since there is no `first_temp` |
+| Scheme | nucleic, fft | 12–24% | |
+| Scheme | fibfp, sumfp, fib, tak | 0% | fibfp/sumfp want a float-constant `SUBK`/`LTK` instead: `LOADK` is 33% |
+| Lox | whole suite | ≤5% | no float kernels; the results feed calls, returns and globals |
+
+Mini's mandelbrot (73% share) gained 9–15%, and nbody (25% share, mostly
+already forwarded) gained nothing. So expect gains only where the
+chains are not already inside `#[forward]` supers:
+- MiniJS nbody and Python nbody: about 3–6%.
+- Scheme mbrot: 5–10%.
+- Scheme nucleic and fft, and Python chaos: 1–3%.
+- Lox: nothing.
+
+These are estimates; the suite-wide effect stays below 1% per VM.
+
+**Recommendation.** Build it: f64-class value accumulators,
+write-through, with `Vm.accumulate` idempotent and run from `refuse`.
+Two things come with it:
+- `become` must leave the accumulator holding its result.
+- `--vm-stats` must suggest supers over the variants.
+
+Try MiniJS nbody first, then Python nbody, and Scheme mbrot with
+unconditional selection. Spill-at-sync, selection past non-interfering
+ops and GPR accumulators come later, each only if a measurement asks
+for it.
+
 ### 2. Cheaper operand decoding and dispatch
 
 **Evidence.**
@@ -312,6 +539,165 @@ Step 2 is L. Risks:
 
 **General:** every interpreter for step 1, and those with u64 words for
 step 2 (wasm, Stak; Mini and MiniJS would need wider words).
+
+#### Prototype results (2026-11-06): no gain, no-go
+
+Both steps were built by hand on `examples/wasm` and measured. **Neither
+helps on x86-64.** Pre-scaling changes nothing, and offset threading is
+1% slower. The stop rule (< 2% on PolyBench) applies to both, so step 3
+(an estimate for other interpreters) was not run.
+
+**Setup.**
+- **Machine.** i7-6700 (Skylake), LLVM 19, tail-call dispatch,
+  `--align-functions=64`.
+- **Timing.** user+sys CPU, the minimum of interleaved runs: 7 rounds of
+  the tuning set (the seven programs of `programs.sh`) and 11 of
+  PolyBench (30 kernels). The order of the binaries rotates each round.
+- **Control.** The A/A binary is a byte-identical copy of the baseline,
+  run in the same interleave.
+- **Load.** The load average was 2.4–4.3 on 8 cores, from two other
+  benchmark jobs.
+- **Correctness.** Each variant passed `polybench.sh --check` (30/30),
+  the full spec suite (52,800 commands, 0 failed) and the ten programs'
+  expected output.
+
+**Results** (geometric means, ratio to the baseline):
+
+| Build | Tuning set (7) | PolyBench (30) |
+|---|---:|---:|
+| A/A control | 0.997 | 1.000 |
+| Step 1: pre-scaled slot fields | 0.998 | 1.003 |
+| A/A control (second run) | 0.998 | 0.999 |
+| Step 2: offset-threaded dispatch | 1.004 | 1.008 |
+| A/A control, `--align-functions=128` | 1.001 | 1.000 |
+| Step 2, `--align-functions=128` | 1.010 | 1.010 |
+
+- **Noise.** Single benchmarks move ±1–2% in the A/A runs.
+- **Step 1.** The per-program swings (binarytrees 0.94, fannkuchredux
+  1.03) are placement effects, and they cancel in the means.
+- **Step 2.** It is slower on 22 of the 30 kernels at both alignments.
+
+**Step 1: pre-scaled slot fields.**
+
+What was built:
+- **Operand kinds.** The 16 slot kinds of `vm.lm` became byte offsets:
+  `*(((regs as *u8) + it) as *f64)`, verified by `(it & 7) == 0` and
+  `it < nslots * 8`.
+- **Encoder.** A pass after `W.accumulate` in `compile.lm` multiplies
+  every slot-kind field by 8. It finds the fields through
+  `W.operand_kind`/`operand_bits`.
+- **Limits.** `bulk` gets slot indices back with `>> 3`. The R4
+  tee-fusions' 12-bit fields drop to 512 slots.
+
+The asm is the evidence:
+
+- **Totals.** 19,022 instructions over 1,094 handlers become 19,054.
+  30 handlers lost one, 39 gained one, and `I8X16_SHUFFLE` gained 23.
+  Every hot handler is unchanged: `F64_MUL` 14, `F64_ADD` 14,
+  `F64_LOAD__AR` 15, `F64_LOAD` 18, `I32_ADDK` 13, `MOV` 11,
+  `F64_LOAD_F64_MUL` 28.
+- **Why: the scale is free on x86-64.** It is part of the addressing
+  mode, so `(%r14,%rax,8)` becomes `(%r14,%rax,1)` at the same cost.
+- **The decode does not shrink.** The "6 decode" instructions of
+  `F64_MUL` are the field extraction:
+  - field `a` (bits 16–31): `shr $16, %ecx`, a 32-bit shift that also
+    clears the bits above;
+  - field `b`: `mov; shr $32; movzwl`;
+  - field `c` (the top 16 bits): `mov; shr $48`.
+
+  A byte offset still has to be shifted out of the word and
+  zero-extended, so it needs the same instructions.
+
+wasm3 saves these instructions because its slot offset is a whole code
+word, not because the offset is scaled. AArch64 also scales for free
+(`ldr d0, [x, x, lsl #3]`). Some older cores charge a cycle for a
+scaled register offset, but that was not measured.
+
+**Step 2: offset-threaded dispatch.**
+
+What was built:
+- **The IR patch.** On the `--keep-ll` IR of the tail-call build, every
+  `getelementptr @"vm.W.table", op` followed by `load ptr` (1,218 sites)
+  became `getelementptr i64, @"vm.W.op.MOV", op`. The target is then
+  `base + 8 * op`, and `MOV` is the lowest handler.
+- **Rewriting the code.** `rt.lm` runs a pass after `W.optimize`, and
+  over the HALT and RESTORE stubs. It rewrites each instruction word's
+  16-bit opcode, and each super part's, to
+  `(table[op] - base) / 8`. The pass is `loimi_proto_xlate`, defined in
+  the patch, and it aborts if a handler is out of reach.
+- **Reach.** The handlers span 0x403000–0x45ad80 (360 KiB), and the
+  reach is 512 KiB.
+
+The asm (`F64_MUL`, and every other handler):
+
+```
+before:  mov 0x8(%r13),%rcx; add $0x8,%r13; movzwl %cx,%eax; mov 0x47cd50(,%rax,8),%rax; jmp *%rax
+after:   mov 0x8(%r13),%rcx; add $0x8,%r13; movzwl %cx,%eax; lea 0x403000(,%rax,8),%rax;  jmp *%rax
+```
+
+The instruction count is the same (19,022 in both builds, every handler
+the same). The only change is that a load µop (ports 2/3) became an ALU
+µop (ports 1/5 for `lea`).
+
+**Why it gives nothing.**
+- **The table load is off the critical path.** The indirect jump is
+  predicted, so the next handler starts before the load resolves, and
+  the load only confirms the prediction. Removing it does not shorten
+  the path.
+- **It costs an ALU slot.** These handlers are ALU-heavy (the shifts
+  and moves of the decode), and the 2 load ports are not saturated
+  (about 4 loads per 4–5 cycles). The extra ALU µop is a slight loss.
+- **The earlier trade went the same way.** Narrow field loads (more
+  loads, fewer ALU ops) measured 1.044, above. Both directions are worse
+  than the current mix.
+
+What a load-free and extraction-free dispatch would need is wasm3's
+layout: the handler address as a whole code word, with operands in
+their own words. That doubles the code words and moves a load from the
+table to the stream, and it is not a field-format change. Not tried.
+After this result it is not ranked either: the predicted indirect jump
+is what makes our dispatch cheap, and wasm3's per-op advantage was
+traced to its `fp0`/`r0` registers (now accumulators), not to its
+dispatch (wasm FRICTION, "Float benchmarks against wasm3").
+
+**What the JIT removes, then.** The JIT's 0.76–0.83 does not come from
+the table load. It comes from the indirect jump itself (straight-line
+stencils), the `pc` advance and the field extraction (operands are
+patched in as constants). None of these is reachable by a change to the
+interpreter's word format.
+
+**Design sketch, kept for the record.** It is not recommended on this
+evidence; revisit only on a core where the table load is measured to
+matter (for example AArch64 hardware), with the same prototype.
+- **Surface.** `#[dispatch(tailcall, threaded)]`, for `u64` encodings
+  with an op field of at least 16 bits.
+- **Encoding.** A final pass over verified, optimized code
+  (`Verified<Vm>` keeps it a proof) maps each word's opcode to
+  `(handler - base) >> k`, with `base` a symbol emitted first in
+  `.text.hot.<vm>`. `k = 3` reaches 512 KiB. `k = 6` reaches 4 MiB but
+  costs a `shl`, one instruction more than today.
+- **Readers of opcodes.** `Vm.opcode`, `op_size`, `op_name`, the
+  disassembler and `Vm.deopt` would decode through an inverse map
+  (offset to opcode, a sorted array or a 64 Ki table). The verifier
+  runs before the pass, so it is unchanged.
+- **`become`.** It would write the handler offset, through a generated
+  `Vm.OP_X` offset table.
+- **Serialization.** Code words would need a relocation pass back to
+  opcodes.
+- **`#[profile]` ordering.** Every handler, hot or cold, must stay
+  inside the window from `base`. A link-time check is needed.
+- **Instrumentation variants.** These need handler blocks at identical
+  offsets from a per-variant base, or table dispatch in variant builds.
+- **`--jit-stencils`.** Its enter words, and the rewrite back to real
+  words, would be offsets as well.
+- **Other modes.** goto and switch modes are out of scope. So are u32
+  vms: Mini, MiniJS, Lox, Python, Scheme, Prolog, regex and Stak all
+  have 8-bit op fields, which have no room for an offset.
+- **Cost.** L. **Measured gain on x86-64:** −1%.
+
+**Prototype code.** It is not committed. It is a hand patch plus an IR
+rewrite outside the compiler, so there is nothing clean to put behind a
+flag.
 
 ### 3. Division by a verified constant
 
@@ -1001,8 +1387,8 @@ little. In order:
 
 | Experiment | Item | Effort | Stop if |
 |---|---|---|---|
-| Pre-scaled slot offsets in `examples/wasm` by hand (encoder `* 8`, operand kinds as byte offsets) | 2 | half a day | PolyBench and wasm geomean move < 2% |
-| Offset-threaded dispatch by IR patch on the wasm tail-call build | 2 | 1–2 days | < 3% on top of the above |
+| Pre-scaled slot offsets in `examples/wasm` by hand (encoder `* 8`, operand kinds as byte offsets) | 2 | half a day | PolyBench and wasm geomean move < 2% (**done:** 1.003 and 0.998; stopped) |
+| Offset-threaded dispatch by IR patch on the wasm tail-call build | 2 | 1–2 days | < 3% on top of the above (**done:** 1.008 and 1.004, slower; stopped) |
 | Mini float members with a raw `u64` accumulator, no collection (heap budget raised) | 1 | 1 day | mandelbrot, nbody and spectral_norm all > 0.95 |
 | Mini's `mod_magic` in Prolog's MOD/IDIV with constant divisors | 3 | 1 hour | crypt < 5% faster (unlikely) |
 | `dereferenceable` and `!invariant.load` added to Python's GETATTR IR | 4 | 1 day | deltablue, go and richards < 2% |
