@@ -16,6 +16,7 @@
 // The compiler allocates in the GC heap but never collects.
 
 import std.mem;
+import std.math;
 import std.map;
 import std.text;
 import std.bc;
@@ -818,7 +819,14 @@ g.closure(n.fun, dst);
                         Shl => g.emit(JS.SHLK(d, x, y)),
                         Shr => g.emit(JS.SHRK(d, x, y)),
                         UShr => g.emit(JS.USHRK(d, x, y)),
-                        _ => g.emit(JS.MODK(d, x, y)),
+                        _ => {
+                            // The divisor, prepared once (vm.lm, MODK).
+                            let at = g.emit(JS.MODK(d, x, y));
+                            if let Int(kk) = kv and let Some(dv) = math.Divisor.new(kk as i64) {
+                                dv.store(g.fs.code.words()[at + 1..at + 1 + JS.CW_ModK]);
+                            }
+                            at
+                        }
                     };
                     g.reset(m);
                     return;
