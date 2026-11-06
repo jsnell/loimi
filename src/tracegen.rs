@@ -1414,6 +1414,27 @@ const ST_GEN: usize = 0;
 const ST_FAILS: usize = 1;
 const ST_ITERS: usize = 2;
 const ST_LIMIT: usize = 3;
+/// [4]: side traces: nonzero once the runtime dropped it (its parent then
+/// leaves where it would enter it).
+const ST_OFF: usize = 4;
+
+/// The shape of a trace: the steps each step continues to inside the
+/// function, which trace (0: the root, k: side trace k) each step is in,
+/// the edges where side traces start, the steps where loops inside the
+/// trace close (iterations are counted there too), and per trace its name
+/// and index in the runtime's table (sides[0]: the root).
+#[derive(Default)]
+struct Shape {
+    succ: HashMap<Node, Vec<Node>>,
+    owner: HashMap<Node, usize>,
+    side_entry: HashMap<(Node, Node), usize>,
+    heads: HashSet<Node>,
+    /// Edges into a loop inside the trace from outside it: the window is
+    /// written back there, so the loop's guards and exits restore only
+    /// what it changed (not everything the trace changed before it).
+    loop_entries: HashSet<(Node, Node)>,
+    sides: Vec<(String, usize)>,
+}
 
 struct Emit {
     out: Vec<String>,
@@ -1454,8 +1475,12 @@ struct FnGen<'t, 'a> {
     index: usize,
     /// The path (trace) or the region's instructions, in order.
     order: Vec<Node>,
-    /// Trace: the next step of each.
-    succ: HashMap<Node, Node>,
+    /// Trace: the steps each continues to in the function (its path's
+    /// next, and the first steps of side traces and loop exits from it),
+    /// which side trace each step is in, and where side traces start.
+    shape: Shape,
+    /// The step being emitted.
+    cur_node: Node,
     prof: Option<Prof>,
     nr: usize,
     e: Emit,
@@ -1465,6 +1490,8 @@ struct FnGen<'t, 'a> {
     sites: Vec<usize>,
     blockmap: Vec<(usize, String)>,
     edges: Vec<(usize, usize, usize)>,
+    /// Regions: static exits (pc, counter, target pc).
+    exits: Vec<(usize, usize, usize)>,
     check: bool,
     nguards: usize,
     neffect: usize,
@@ -1745,9 +1772,10 @@ impl<'t, 'a> FnGen<'t, 'a> {
             return;
         }
         let g = self.st_gep(ST_ITERS);
-        let (a, b) = (self.e.fresh("it"), self.e.fresh("it"));
+        let (a, b, n) = (self.e.fresh("it"), self.e.fresh("it"), self.e.fresh("itv"));
+        self.e.line(format!("  {} = load i64, ptr %tr.itp", n));
         self.e.line(format!("  {} = load i64, ptr {}", a, g));
-        self.e.line(format!("  {} = add i64 {}, %tr.it", b, a));
+        self.e.line(format!("  {} = add i64 {}, {}", b, a, n));
         self.e.line(format!("  store i64 {}, ptr {}", b, g));
     }
 
@@ -1835,23 +1863,37 @@ impl<'t, 'a> FnGen<'t, 'a> {
             self.e.line(format!("  {} = and i1 {}, {}", both, cond, ok));
             cond = both;
         }
+        if let Some(&k) = self.shape.side_entry.get(&(self.cur_node, t)) {
+            // the first step of side trace k: unless the runtime dropped it
+            // (its guards failed too often), when this is an exit again
+            let sname = self.shape.sides[k].0.clone();
+            let (g, v, ok, both) = (self.e.fresh("sp"), self.e.fresh("soff"), self.e.fresh("son"), self.e.fresh("ok"));
+            self.e.line(format!("  {} = getelementptr inbounds i64, ptr {}, i64 {}", g, self.st(&sname), ST_OFF));
+            self.e.line(format!("  {} = load i64, ptr {}", v, g));
+            self.e.line(format!("  {} = icmp eq i64 {}, 0", ok, v));
+            self.e.line(format!("  {} = and i1 {}, {}", both, cond, ok));
+            cond = both;
+        }
         let go = self.e.fresh("go")[1..].to_string();
         let no = self.e.fresh("leave")[1..].to_string();
         self.e.line(format!("  br i1 {}, label %{}, label %{}", cond, go, no));
         self.e.label(&go);
         if !window {
             self.reload();
+        } else if self.shape.loop_entries.contains(&(self.cur_node, t)) {
+            self.writeback();
         }
-        let it = if t == Node::new(0, self.t.h) && self.kind == Kind::Trace {
-            let n = self.e.fresh("itn");
-            self.e.line(format!("  {} = add i64 %tr.it, 1", n));
-            n
-        } else {
-            "%tr.it".to_string()
-        };
+        if self.kind == Kind::Trace && (t == Node::new(0, self.t.h) || self.shape.heads.contains(&t)) {
+            // an iteration (of the loop or of a loop inside it): what the
+            // runtime compares guard failures with
+            let (a, b) = (self.e.fresh("it"), self.e.fresh("itn"));
+            self.e.line(format!("  {} = load i64, ptr %tr.itp", a));
+            self.e.line(format!("  {} = add i64 {}, 1", b, a));
+            self.e.line(format!("  store i64 {}, ptr %tr.itp", b));
+        }
         self.e.line(format!("  br label %{}head", t.prefix()));
         let cur = self.e.cur.clone();
-        self.e.heads_in.entry(t).or_default().push((cur, state.to_vec(), it, base.clone()));
+        self.e.heads_in.entry(t).or_default().push((cur, state.to_vec(), String::new(), base.clone()));
         self.e.label(&no);
         let mut st = state.to_vec();
         st[self.t.pc_idx] = self.pc_of(t, base.as_deref());
@@ -1871,7 +1913,7 @@ impl<'t, 'a> FnGen<'t, 'a> {
     fn internal(&self, from: Node, t: usize) -> bool {
         let t = Node::new(from.f, t);
         match self.kind {
-            Kind::Trace => self.succ.get(&from) == Some(&t),
+            Kind::Trace => self.shape.succ.get(&from).is_some_and(|v| v.contains(&t)),
             Kind::Region => self.t.at.contains_key(&t) && self.order.contains(&t),
         }
     }
@@ -1964,6 +2006,7 @@ impl<'t, 'a> FnGen<'t, 'a> {
 
     fn emit_step_inner(&mut self, st: &Step) -> Result<(), String> {
         let node = st.node;
+        self.cur_node = node;
         let pc = st.pc;
         let p = node.prefix();
         let nb = st.blocks.len();
@@ -2236,6 +2279,11 @@ impl<'t, 'a> FnGen<'t, 'a> {
                                     self.goto_head(Node::new(node.f, t), &state, window, rewrites, None);
                                 }
                                 Some(t) => {
+                                    if self.kind == Kind::Region {
+                                        // (a static exit: its count is the
+                                        // block's, for side traces and links)
+                                        self.exits.push((pc, idx, t));
+                                    }
                                     let mut st2 = state.clone();
                                     st2[self.t.pc_idx] = self.pc_of(Node::new(node.f, t), None);
                                     self.exit_dispatch(&st2, window);
@@ -2249,9 +2297,10 @@ impl<'t, 'a> FnGen<'t, 'a> {
                     }
                     let dispatch = table_fns.contains(c.callee) || entry_fns.contains(c.callee);
                     if self.kind == Kind::Trace && dispatch && on[b] {
-                        // a dispatch to a computed pc: the next step if it
-                        // is there (a jump, a call, a return)
-                        if let Some(&nx) = self.succ.get(&node) {
+                        // a dispatch to a computed pc: the next steps if it
+                        // is one of them (a jump, a call, a return), hottest
+                        // first
+                        for nx in self.shape.succ.get(&node).cloned().unwrap_or_default() {
                             self.transition(node, nx, &args, &state, window, rewrites)?;
                         }
                         // `redo`: to this step again
@@ -2265,30 +2314,6 @@ impl<'t, 'a> FnGen<'t, 'a> {
                         let site = self.sites.len();
                         self.sites.push(pc);
                         self.e.line(format!("  call void @loimi_trace_site(ptr @\"loimi.trace.sites.{}\", i64 {}, ptr {})", self.name, site, args[self.t.pc_idx]));
-                    }
-                    if self.kind == Kind::Region && table_fns.contains(c.callee) && on[b] {
-                        // a dispatch through the table (an inlined cold
-                        // block's `next`): to the next step(s) by pc
-                        let (x1, x2, dd) = (self.e.fresh("dp"), self.e.fresh("db"), self.e.fresh("doff"));
-                        self.e.line(format!("  {} = ptrtoint ptr {} to i64", x1, args[self.t.pc_idx]));
-                        self.e.line(format!("  {} = ptrtoint ptr %tr.base to i64", x2));
-                        self.e.line(format!("  {} = sub i64 {}, {}", dd, x1, x2));
-                        let targets: Vec<usize> = self.order.iter().map(|n| n.pc).collect();
-                        let xl = self.e.fresh("dexit")[1..].to_string();
-                        let cases: Vec<(i64, String, usize)> = targets.iter().map(|&t| (4 * t as i64, self.e.fresh("dedge")[1..].to_string(), t)).collect();
-                        let sw: Vec<String> = cases.iter().map(|(c, l, _)| format!("i64 {}, label %{}", c, l)).collect();
-                        self.e.line(format!("  switch i64 {}, label %{} [ {} ]", dd, xl, sw.join(" ")));
-                        for (_, el, t) in cases {
-                            self.e.label(&el);
-                            let ei = self.blockmap.len();
-                            self.blockmap.push((pc, format!("{}@{}", lab, t)));
-                            if self.kind == Kind::Region {
-                                self.counter(ei);
-                            }
-                            self.edges.push((pc, ei, t));
-                            self.goto_head(Node::new(0, t), &state, window, rewrites, None);
-                        }
-                        self.e.label(&xl);
                     }
                     self.exit_call(c.callee, &args, window);
                     continue;
@@ -2411,9 +2436,11 @@ impl<'t, 'a> FnGen<'t, 'a> {
                         // metadata after the labels (`, !prof !3`) stays
                         let last = parts[2].trim();
                         let suffix = &last[last.find([',', ' ']).unwrap_or(last.len())..];
+                        let mut tbs = Vec::new();
                         for part in &parts[1..] {
                             let tok = part.trim().split([',', ' ']).next().unwrap_or("");
                             let tb = st.blocks.iter().position(|bb| format!("%{}{}", p, bb.0) == tok).ok_or_else(|| format!("step {}: bad branch `{}`", pc, rhs))?;
+                            tbs.push(tb);
                             if guard_edges.contains(&(b, tb)) {
                                 guard_ix += 1;
                                 let g = format!("guard.{}.{}.{}", pc, node.f, guard_ix);
@@ -2427,7 +2454,35 @@ impl<'t, 'a> FnGen<'t, 'a> {
                                 labs.push(tok.to_string());
                             }
                         }
-                        self.e.line(format!("  {}label {}, label {}{}", parts[0], labs[0], labs[1], suffix));
+                        // In traces, the profile says which way the branch
+                        // goes (guards: never the guard's way). Without it
+                        // LLVM takes each guard for a coin toss, so a loop
+                        // that passes a few seems to run once, and registers
+                        // go to the code around it (spills in mandelbrot's
+                        // inner loop when the outer loops were in the trace).
+                        let mut head = parts[0].to_string();
+                        if self.kind == Kind::Trace && !suffix.contains("!prof") && tbs.len() == 2 {
+                            let cnt = |tb: usize| -> u64 {
+                                if guard_edges.contains(&(b, tb)) {
+                                    return 0;
+                                }
+                                self.prof.as_ref().and_then(|pr| pr.raw.get(&(node.f, pc, st.blocks[tb].0.clone())).copied()).unwrap_or(0)
+                            };
+                            let (c0, c1) = (cnt(tbs[0]), cnt(tbs[1]));
+                            let dir = if c0 > 0 && c0 >= 32 * c1 {
+                                Some(true)
+                            } else if c1 > 0 && c1 >= 32 * c0 {
+                                Some(false)
+                            } else {
+                                None
+                            };
+                            if let (Some(d), Some(cond)) = (dir, parts[0].strip_prefix("br i1 ").map(|c| c.trim().trim_end_matches(',').trim())) {
+                                let x = self.e.fresh("exp");
+                                self.e.line(format!("  {} = call i1 @llvm.expect.i1(i1 {}, i1 {})", x, cond, d));
+                                head = format!("br i1 {}, ", x);
+                            }
+                        }
+                        self.e.line(format!("  {}label {}, label {}{}", head, labs[0], labs[1], suffix));
                         continue;
                     }
                 }
@@ -2642,6 +2697,21 @@ pub struct Options {
     /// declined: Mini's closures, whose calls create closures and close
     /// upvalues, measured 1.46 of the JIT with them).
     pub inline_writers: bool,
+    /// Side traces per trace, at most (LOIMI_TRACE_SIDES; 0: none).
+    pub max_sides: usize,
+    /// An exit is the start of a side trace if it ran this many times
+    /// (LOIMI_TRACE_SIDE_MIN) and this fraction of the root's iterations
+    /// (LOIMI_TRACE_SIDE_FRAC).
+    pub side_min: u64,
+    pub side_frac: f64,
+    /// The steps of a trace and its side traces, in lines of stencil IR,
+    /// at most (LOIMI_TRACE_SIDE_LINES): side traces past it are left out.
+    pub side_lines: usize,
+    /// Paths go through the loops inside the loop (LOIMI_TRACE_NEST=0:
+    /// they end there, as in M1).
+    pub nest: bool,
+    /// The longest walk (steps) when forming a path.
+    pub max_walk: usize,
 }
 
 impl Options {
@@ -2665,6 +2735,12 @@ impl Options {
             inline_lines: var("LOIMI_TRACE_INLINE_LINES").and_then(|v| v.parse().ok()).unwrap_or(40_000),
             mono: var("LOIMI_TRACE_MONO").and_then(|v| v.parse().ok()).unwrap_or(0.9),
             inline_writers: var("LOIMI_TRACE_INLINE_WRITERS").is_some_and(|v| v != "0"),
+            max_sides: var("LOIMI_TRACE_SIDES").and_then(|v| v.parse().ok()).unwrap_or(32),
+            side_min: var("LOIMI_TRACE_SIDE_MIN").and_then(|v| v.parse().ok()).unwrap_or(1000),
+            side_frac: var("LOIMI_TRACE_SIDE_FRAC").and_then(|v| v.parse().ok()).unwrap_or(0.01),
+            side_lines: var("LOIMI_TRACE_SIDE_LINES").and_then(|v| v.parse().ok()).unwrap_or(60_000),
+            nest: var("LOIMI_TRACE_NEST").is_none_or(|v| v != "0"),
+            max_walk: 1000,
         }
     }
 }
@@ -2710,14 +2786,15 @@ fn span_hi(m: &Module, code: &Code, pc: usize) -> usize {
 
 impl<'t, 'a> FnGen<'t, 'a> {
     #[allow(clippy::too_many_arguments)]
-    fn new(t: &'t mut Trace<'a>, kind: Kind, name: String, index: usize, order: Vec<Node>, succ: HashMap<Node, Node>, prof: Option<Prof>, check: bool) -> Self {
+    fn new(t: &'t mut Trace<'a>, kind: Kind, name: String, index: usize, order: Vec<Node>, shape: Shape, prof: Option<Prof>, check: bool) -> Self {
         FnGen {
             t,
             kind,
             name,
             index,
             order,
-            succ,
+            shape,
+            cur_node: Node::new(0, 0),
             prof,
             nr: 0,
             e: Emit { out: Vec::new(), cur: String::new(), ctr: 0, heads_in: BTreeMap::new() },
@@ -2725,6 +2802,7 @@ impl<'t, 'a> FnGen<'t, 'a> {
             guards: Vec::new(),
             blockmap: Vec::new(),
             edges: Vec::new(),
+            exits: Vec::new(),
             check,
             nguards: 0,
             neffect: 0,
@@ -2790,8 +2868,14 @@ impl<'t, 'a> FnGen<'t, 'a> {
             self.e.label(g);
             // this entry's iterations first: the runtime compares them
             self.flush_iters();
-            let f = self.st_gep(ST_FAILS);
-            let l = self.st_gep(ST_LIMIT);
+            // the failure counts of the (side) trace the step is in
+            let (oname, oindex) = match self.shape.owner.get(node).copied().unwrap_or(0) {
+                0 => (self.name.clone(), self.index),
+                k => self.shape.sides[k].clone(),
+            };
+            let (f, l) = (self.e.fresh("stp"), self.e.fresh("stp"));
+            self.e.line(format!("  {} = getelementptr inbounds i64, ptr {}, i64 {}", f, self.st(&oname), ST_FAILS));
+            self.e.line(format!("  {} = getelementptr inbounds i64, ptr {}, i64 {}", l, self.st(&oname), ST_LIMIT));
             let (f0, f1, lv, hit) = (self.e.fresh("gf"), self.e.fresh("gf"), self.e.fresh("gl"), self.e.fresh("gh"));
             let (lb, lc) = (self.e.fresh("gb")[1..].to_string(), self.e.fresh("gc")[1..].to_string());
             self.e.line(format!("  {} = load i64, ptr {}", f0, f));
@@ -2801,7 +2885,7 @@ impl<'t, 'a> FnGen<'t, 'a> {
             self.e.line(format!("  {} = icmp uge i64 {}, {}", hit, f1, lv));
             self.e.line(format!("  br i1 {}, label %{}, label %{}", hit, lb, lc));
             self.e.label(&lb);
-            self.e.line(format!("  call void @loimi_trace_failing(i64 {})", self.index));
+            self.e.line(format!("  call void @loimi_trace_failing(i64 {})", oindex));
             self.e.line(format!("  br label %{}", lc));
             self.e.label(&lc);
             let p = node.prefix();
@@ -2842,12 +2926,11 @@ impl<'t, 'a> FnGen<'t, 'a> {
                 }
                 if node.f > 0 && ins.iter().any(|x| x.3.is_some()) {
                     // the first step of an inlined frame: its code's address
-                    let v: Vec<String> = ins.iter().map(|x| format!("[ {}, %{} ]", x.3.as_deref().unwrap_or("poison"), x.0)).collect();
-                    res.push(format!("  {} = phi ptr {}", Self::frame_base(node.f), v.join(", ")));
-                }
-                if node == first && self.kind == Kind::Trace {
-                    let v: Vec<String> = ins.iter().map(|x| format!("[ {}, %{} ]", x.2, x.0)).collect();
-                    res.push(format!("  %tr.it = phi i64 {}", v.join(", ")));
+                    // (the frame is entered only by its call: other edges
+                    // come from inside it)
+                    let fb = Self::frame_base(node.f);
+                    let v: Vec<String> = ins.iter().map(|x| format!("[ {}, %{} ]", x.3.as_deref().unwrap_or(&fb), x.0)).collect();
+                    res.push(format!("  {} = phi ptr {}", fb, v.join(", ")));
                 }
             } else {
                 res.push(l);
@@ -2873,6 +2956,8 @@ impl<'t, 'a> FnGen<'t, 'a> {
         }
         let _ = writeln!(f, "  %lregs = alloca [{} x i64], align 8", self.nr);
         let _ = writeln!(f, "  %snap = alloca [{} x i64], align 8", self.nr);
+        // this entry's iterations (SROA keeps the count in a register)
+        f.push_str("  %tr.itp = alloca i64, align 8\n  store i64 0, ptr %tr.itp\n");
         self.e.out.clear();
         if self.kind == Kind::Region {
             // entered at any of its instructions (`loimi.trace.NAME.eX`
@@ -2888,9 +2973,6 @@ impl<'t, 'a> FnGen<'t, 'a> {
             self.e.line(format!("  {} = getelementptr i64, ptr %tr.regs, i64 {}", frame_regs(f), o));
         }
         self.reload();
-        if self.kind == Kind::Region {
-            self.e.line("  %tr.it = add i64 0, 0".into());
-        }
         let g = self.st_gep(ST_GEN);
         self.e.line(format!("  %tr.gen0 = load i64, ptr {}", g));
         let entry = std::mem::take(&mut self.e.out);
@@ -2920,6 +3002,7 @@ struct GenFn {
     ir: String,
     blockmap: Vec<(usize, String)>,
     edges: Vec<(usize, usize, usize)>,
+    exits: Vec<(usize, usize, usize)>,
     sites: Vec<usize>,
     kchk: Vec<BTreeSet<(u64, u64)>>,
     nr: usize,
@@ -2931,11 +3014,13 @@ struct GenFn {
     lines: usize,
 }
 
-/// A frame of a path: its code and the frame that called it.
+/// A frame of a path: its code, the frame that called it and the call
+/// (a step of the parent).
 #[derive(Clone, Copy)]
 struct PathFrame<'a> {
     code: &'a Code,
     parent: Option<usize>,
+    call: Option<Node>,
 }
 
 /// The register-file offset (in slots) that step `st`, a call, gives the
@@ -2972,18 +3057,18 @@ fn call_regs(st: &Step, prof: Option<&Prof>, regs_idx: Option<usize>, nsig: usiz
 
 /// The function `kind` for loop h of frame 0's code, over `order`.
 #[allow(clippy::too_many_arguments)]
-fn generate_fn(m: &Module, vm: &VmInfo, frames: &[PathFrame], h: usize, order: &[Node], kind: Kind, name: &str, index: usize, succ: HashMap<Node, Node>, prof: Option<Prof>, opts: &Options) -> Result<GenFn, String> {
+fn generate_fn(m: &Module, vm: &VmInfo, frames: &[PathFrame], h: usize, order: &[Node], kind: Kind, name: &str, index: usize, shape: Shape, prof: Option<Prof>, opts: &Options) -> Result<GenFn, String> {
     let mut t = Trace::new(m, frames[0].code, vm, h);
     for pf in &frames[1..] {
         t.frames.push(Frame { code: pf.code, parent: pf.parent, roff: None, kchk: BTreeSet::new() });
     }
-    for (i, &n) in order.iter().enumerate() {
+    for &n in order {
         if t.frames[n.f].roff.is_none() {
-            // an inlined frame: its register file is where the call passes it
-            let o = match i.checked_sub(1) {
-                Some(j) => call_regs(&t.steps[j], prof.as_ref(), t.regs_idx, t.sig.len())?,
-                None => return Err("a path that starts in an inlined frame".into()),
-            };
+            // an inlined frame: its register file is where the call passes
+            // it (the call is a step before the frame's in the order)
+            let call = frames[n.f].call.ok_or("an inlined frame without its call")?;
+            let j = *t.at.get(&call).ok_or_else(|| format!("frame {}'s call ({}) is not before it", n.f, call.pc))?;
+            let o = call_regs(&t.steps[j], prof.as_ref(), t.regs_idx, t.sig.len())?;
             if o as usize >= MAX_WINDOW {
                 return Err(format!("frame {}'s registers start at {}, past the largest window", n.f, o));
             }
@@ -2991,10 +3076,10 @@ fn generate_fn(m: &Module, vm: &VmInfo, frames: &[PathFrame], h: usize, order: &
         }
         let code = t.frames[n.f].code;
         let st = t.build_step(n).map_err(|e| format!("instruction {} ({}){}: {}", n.pc, code.op[n.pc].as_deref().unwrap_or("?"), if n.f > 0 { format!(" of frame {}", n.f) } else { String::new() }, e))?;
+        t.at.insert(n, t.steps.len());
         t.steps.push(st);
-        t.at.insert(n, i);
     }
-    let mut g = FnGen::new(&mut t, kind, name.to_string(), index, order.to_vec(), succ, prof, opts.check);
+    let mut g = FnGen::new(&mut t, kind, name.to_string(), index, order.to_vec(), shape, prof, opts.check);
     let ir = g.emit()?;
     let lines = ir.bytes().filter(|&b| b == b'\n').count();
     if lines > opts.max_lines {
@@ -3004,6 +3089,7 @@ fn generate_fn(m: &Module, vm: &VmInfo, frames: &[PathFrame], h: usize, order: &
         ir,
         blockmap: std::mem::take(&mut g.blockmap),
         edges: std::mem::take(&mut g.edges),
+        exits: std::mem::take(&mut g.exits),
         sites: std::mem::take(&mut g.sites),
         kchk: Vec::new(),
         nr: g.nr,
@@ -3053,11 +3139,12 @@ struct Out {
     globals: Vec<String>,
 }
 
-const ENTRY_TY: &str = "{ i64, i64, i64, i64, i64, ptr, ptr, i64, ptr, ptr, ptr, i64, ptr, i64, ptr, i64, ptr, i64, ptr }";
+const ENTRY_TY: &str = "{ i64, i64, i64, i64, i64, ptr, ptr, i64, ptr, ptr, ptr, i64, ptr, i64, ptr, i64, ptr, i64, ptr, i64 }";
 const CALLEE_TY: &str = "{ i64, i64, i64, ptr, i64 }";
-/// Per dynamic exit of a region: [0] runs, then 4 targets of (pc, runs,
-/// words, hash of the words, offset) (`loimi_trace_site`).
-const SITE_WORDS: usize = 22;
+/// Per dynamic exit of a region: [0] runs, then 16 targets of (pc, runs,
+/// words, hash of the words, offset) (`loimi_trace_site`; a jump table has
+/// a target per case).
+const SITE_WORDS: usize = 82;
 
 /// What `add_entry` needs besides the function: frame 0's instructions,
 /// the counters, the recording (regions), the dynamic exits (regions),
@@ -3087,7 +3174,7 @@ fn add_entry(out: &mut Out, m: &Module, code: &Code, h: usize, name: &str, info:
         let v: Vec<String> = k.iter().flat_map(|(i, v)| [format!("i64 {}", i), format!("i64 {}", *v as i64)]).collect();
         format!("[{} x i64] [{}]", v.len().max(1), if v.is_empty() { "i64 0".to_string() } else { v.join(", ") })
     };
-    out.globals.push(format!("@\"loimi.trace.st.{}\" = internal global [4 x i64] [i64 0, i64 0, i64 0, i64 {}]", name, fail_limit));
+    out.globals.push(format!("@\"loimi.trace.st.{}\" = internal global [5 x i64] [i64 0, i64 0, i64 0, i64 {}, i64 0]", name, fail_limit));
     out.globals.push(format!("@\"loimi.trace.counts.{}\" = internal global [{} x i64] zeroinitializer", name, info.ncounts.max(1)));
     out.globals.push(format!("@\"loimi.trace.sites.{}\" = internal global [{} x i64] zeroinitializer", name, (info.nsites * SITE_WORDS).max(1)));
     out.globals.push(format!("@\"loimi.trace.name.{}\" = private constant [{} x i8] c\"{}\\00\"", name, name.len() + 1, name));
@@ -3113,7 +3200,7 @@ fn add_entry(out: &mut Out, m: &Module, code: &Code, h: usize, name: &str, info:
         None => "ptr null".to_string(),
     };
     out.entries.push(format!(
-        "{} {{ i64 {}, i64 {}, i64 {}, i64 {}, i64 {}, ptr @\"{}\", ptr @\"loimi.trace.counts.{n}\", i64 {}, ptr @\"loimi.trace.name.{n}\", ptr @\"loimi.trace.st.{n}\", ptr @\"loimi.trace.k.{n}\", i64 {}, {}, i64 {}, ptr @\"loimi.trace.sites.{n}\", i64 {}, ptr @\"loimi.trace.callees.{n}\", i64 {}, ptr @\"loimi.trace.slot.{n}\" }}",
+        "{} {{ i64 {}, i64 {}, i64 {}, i64 {}, i64 {}, ptr @\"{}\", ptr @\"loimi.trace.counts.{n}\", i64 {}, ptr @\"loimi.trace.name.{n}\", ptr @\"loimi.trace.st.{n}\", ptr @\"loimi.trace.k.{n}\", i64 {}, {}, i64 {}, ptr @\"loimi.trace.sites.{n}\", i64 {}, ptr @\"loimi.trace.callees.{n}\", i64 {}, ptr @\"loimi.trace.slot.{n}\", i64 -1 }}",
         ENTRY_TY,
         code.n,
         lo,
@@ -3127,6 +3214,20 @@ fn add_entry(out: &mut Out, m: &Module, code: &Code, h: usize, name: &str, info:
         fingerprint as i64,
         info.nsites,
         info.callees.len(),
+        n = name,
+    ));
+}
+
+/// A side trace's entry (`NAME` = `tN.sK`, `parent` the root's index): its
+/// counts and the flag the root reads (`ST_OFF`); it is not installed, its
+/// steps are in the root's function.
+fn add_side_entry(out: &mut Out, name: &str, parent: usize, fail_limit: u64) {
+    out.globals.push(format!("@\"loimi.trace.st.{}\" = internal global [5 x i64] [i64 0, i64 0, i64 0, i64 {}, i64 0]", name, fail_limit));
+    out.globals.push(format!("@\"loimi.trace.name.{}\" = private constant [{} x i8] c\"{}\\00\"", name, name.len() + 1, name));
+    out.entries.push(format!(
+        "{} {{ i64 0, i64 0, i64 0, i64 0, i64 0, ptr null, ptr null, i64 0, ptr @\"loimi.trace.name.{n}\", ptr @\"loimi.trace.st.{n}\", ptr null, i64 0, ptr null, i64 0, ptr null, i64 0, ptr null, i64 0, ptr null, i64 {} }}",
+        ENTRY_TY,
+        parent,
         n = name,
     ));
 }
@@ -3253,7 +3354,7 @@ pub fn regions(ir: &str, stencils: &str, vm: &VmInfo, codes: &[Code], opts: &Opt
             let index = out.entries.len();
             let nodes: Vec<Node> = order.iter().map(|&pc| Node::new(0, pc)).collect();
             let k = (what == "entry") as usize;
-            match generate_fn(&m, vm, &[PathFrame { code, parent: None }], h, &nodes, Kind::Region, &name, index, HashMap::new(), None, opts) {
+            match generate_fn(&m, vm, &[PathFrame { code, parent: None, call: None }], h, &nodes, Kind::Region, &name, index, Shape::default(), None, opts) {
                 Ok(g) if lines[k] + g.lines > opts.max_total => {
                     let _ = writeln!(report, "no region for code {:016x} {} {}: the {} regions so far have {} lines of IR (LOIMI_TRACE_MAXTOTAL={})", code.hash, what, h, what, lines[k], opts.max_total);
                 }
@@ -3295,10 +3396,13 @@ pub fn regions(ir: &str, stencils: &str, vm: &VmInfo, codes: &[Code], opts: &Opt
 }
 
 /// A profiled region rebuilt (for its numbering) with its counts: the
-/// edges between its instructions, the targets of its dynamic exits per
-/// instruction, and the block counts.
+/// edges between its instructions, its static exits, the targets of its
+/// dynamic exits per instruction, and the block counts.
 struct RegionData {
     edges: BTreeMap<(usize, usize), u64>,
+    /// Static continuations that leave the region (into an inner loop, out
+    /// of the loop): (pc, target) -> runs.
+    exits: BTreeMap<(usize, usize), u64>,
     /// pc -> (runs, targets)
     sites: HashMap<usize, (u64, Vec<Target>)>,
     blocks: HashMap<(usize, String), u64>,
@@ -3308,25 +3412,35 @@ struct RegionData {
     around: u64,
 }
 
+/// The instructions of profiled region `pr` in this build (a loop's, or a
+/// code object's entry region).
+fn region_pcs(m: &Module, pr: &ProfRegion, skip: &[usize]) -> Result<Vec<usize>, String> {
+    let lp = loops(m, &pr.code);
+    if lp.contains_key(&pr.header) {
+        Ok(region_order(&pr.code, &lp, pr.header, skip))
+    } else if pr.header == 0 {
+        entry_order(&pr.code, &lp).ok_or_else(|| "not an entry region in this build".to_string())
+    } else {
+        Err("not a loop in this build".into())
+    }
+}
+
 fn region_data(m: &Module, vm: &VmInfo, pr: &ProfRegion, opts: &Options) -> Result<RegionData, String> {
     let code = &pr.code;
     let h = pr.header;
-    let lp = loops(m, code);
-    let order = if lp.contains_key(&h) {
-        region_order(code, &lp, h, &opts.skip)
-    } else if h == 0 {
-        entry_order(code, &lp).ok_or("not an entry region in this build")?
-    } else {
-        return Err("not a loop in this build".into());
-    };
+    let order = region_pcs(m, pr, &opts.skip)?;
     let nodes: Vec<Node> = order.iter().map(|&pc| Node::new(0, pc)).collect();
-    let probe = generate_fn(m, vm, &[PathFrame { code, parent: None }], h, &nodes, Kind::Region, "probe", 0, HashMap::new(), None, opts)?;
+    let probe = generate_fn(m, vm, &[PathFrame { code, parent: None, call: None }], h, &nodes, Kind::Region, "probe", 0, Shape::default(), None, opts)?;
     if probe.blockmap.len() != pr.counts.len() {
         return Err(format!("{} counters, the build has {}: build the profiling binary again", pr.counts.len(), probe.blockmap.len()));
     }
     let mut edges: BTreeMap<(usize, usize), u64> = BTreeMap::new();
     for &(f, i, t) in &probe.edges {
         *edges.entry((f, t)).or_default() += pr.counts[i];
+    }
+    let mut exits: BTreeMap<(usize, usize), u64> = BTreeMap::new();
+    for &(f, i, t) in &probe.exits {
+        *exits.entry((f, t)).or_default() += pr.counts[i];
     }
     let mut sites: HashMap<usize, (u64, Vec<Target>)> = HashMap::new();
     for (i, &pc) in probe.sites.iter().enumerate() {
@@ -3349,10 +3463,11 @@ fn region_data(m: &Module, vm: &VmInfo, pr: &ProfRegion, opts: &Options) -> Resu
     }
     let hruns = probe.blockmap.iter().position(|(pc, _)| *pc == h).map(|i| pr.counts[i]).unwrap_or(0);
     let around: u64 = probe.edges.iter().filter(|e| e.2 == h).map(|e| pr.counts[e.1]).sum();
-    Ok(RegionData { edges, sites, blocks, first_count, hruns, around })
+    Ok(RegionData { edges, exits, sites, blocks, first_count, hruns, around })
 }
 
 /// Where a trace's path goes next.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum Next {
     /// To pc in the same frame.
     Same(usize),
@@ -3362,9 +3477,356 @@ enum Next {
     Call(usize),
 }
 
+/// A frame of a trace being formed: the profile whose code it runs (frame
+/// 0: the loop's region; others: the callee's entry region), its caller and
+/// the call's pc there.
+#[derive(Clone, Copy, PartialEq)]
+struct FrameRec {
+    pi: usize,
+    parent: Option<usize>,
+    call_pc: usize,
+}
+
+/// A trace being formed (docs/design/trace-tier.md section 13): its
+/// frames, its steps in order, the edges between them with their counts,
+/// which (side) trace each step is in, the loops closed inside it, and the
+/// side traces (the edge each starts at, its count).
+#[derive(Clone, Default)]
+struct Graph {
+    frames: Vec<FrameRec>,
+    nodes: Vec<Node>,
+    set: HashSet<Node>,
+    succ: HashMap<Node, Vec<(Node, u64)>>,
+    owner: HashMap<Node, usize>,
+    heads: HashSet<Node>,
+    side_entry: HashMap<(Node, Node), usize>,
+    /// Per side trace (1..): (from, first step, count, steps).
+    sides: Vec<(Node, Node, u64, usize)>,
+}
+
+impl Graph {
+    fn add_node(&mut self, n: Node, owner: usize) {
+        if self.set.insert(n) {
+            self.nodes.push(n);
+            self.owner.insert(n, owner);
+        }
+    }
+    fn add_edge(&mut self, a: Node, b: Node, n: u64) {
+        let v = self.succ.entry(a).or_default();
+        if !v.iter().any(|x| x.0 == b) {
+            v.push((b, n));
+        }
+    }
+    fn has_edge(&self, a: Node, b: Node) -> bool {
+        self.succ.get(&a).is_some_and(|v| v.iter().any(|x| x.0 == b))
+    }
+}
+
+/// What forming traces needs: the profiles, their regions' data (made on
+/// demand), the regions of each code object, and the entry regions by
+/// code.
+struct Former<'p> {
+    m: &'p Module<'p>,
+    vm: &'p VmInfo<'p>,
+    profs: &'p [ProfRegion],
+    opts: &'p Options,
+    data: HashMap<usize, Result<RegionData, String>>,
+    /// code key -> (profile, its instructions)
+    by_code: HashMap<u64, Vec<(usize, BTreeSet<usize>)>>,
+    entries: HashMap<(usize, u64), usize>,
+    /// The trace's header (frame 0).
+    h: usize,
+}
+
+impl<'p> Former<'p> {
+    fn rd(&mut self, pi: usize) -> Result<&RegionData, String> {
+        let (m, vm, profs, opts) = (self.m, self.vm, self.profs, self.opts);
+        self.data.entry(pi).or_insert_with(|| region_data(m, vm, &profs[pi], opts)).as_ref().map_err(|e| e.clone())
+    }
+
+    /// The profiled region of `code` that has pc (a loop's, without its
+    /// inner loops, or the code's entry region), if its data is good.
+    fn region_of(&mut self, code: &Code, pc: usize) -> Option<usize> {
+        let pi = self.by_code.get(&code.key())?.iter().find(|(_, pcs)| pcs.contains(&pc))?.0;
+        self.rd(pi).ok()?;
+        Some(pi)
+    }
+
+    fn code(&self, g: &Graph, f: usize) -> &'p Code {
+        &self.profs[g.frames[f].pi].code
+    }
+
+    fn depth(g: &Graph, f: usize) -> usize {
+        let (mut d, mut f) = (0, f);
+        while let Some(p) = g.frames[f].parent {
+            d += 1;
+            f = p;
+        }
+        d
+    }
+
+    /// Where the path may go from `node`, with counts: edges in its
+    /// region, static exits to other regions of its code (an inner loop,
+    /// the code after the loop), dynamic jumps in its code, a return to
+    /// the calling frame, calls of profiled code objects (monomorphic
+    /// sites only if `mono`).
+    fn cands(&mut self, g: &Graph, node: Node, mono: bool) -> Vec<(u64, Next)> {
+        let code = self.code(g, node.f);
+        let Some(ri) = self.region_of(code, node.pc) else { return Vec::new() };
+        let mut out: Vec<(u64, Next)> = Vec::new();
+        let mut add = |n: u64, nx: Next| match out.iter_mut().find(|x| x.1 == nx) {
+            Some(x) => x.0 += n,
+            None => out.push((n, nx)),
+        };
+        let (edges, exits, site) = {
+            let rd = self.rd(ri).unwrap();
+            let r = (node.pc, 0)..=(node.pc, usize::MAX);
+            let e: Vec<(usize, u64)> = rd.edges.range(r.clone()).map(|(k, n)| (k.1, *n)).collect();
+            let x: Vec<(usize, u64)> = rd.exits.range(r).map(|(k, n)| (k.1, *n)).collect();
+            (e, x, rd.sites.get(&node.pc).cloned())
+        };
+        // (an edge to the instruction itself, `redo`, is not a path: the
+        // step goes around itself)
+        for (t, n) in edges {
+            if t != node.pc && n > 0 {
+                add(n, Next::Same(t));
+            }
+        }
+        for (t, n) in exits {
+            if t != node.pc && n > 0 && self.region_of(code, t).is_some() {
+                add(n, Next::Same(t));
+            }
+        }
+        if let Some((total, targets)) = site {
+            let depth = Self::depth(g, node.f);
+            if let Some(pf) = g.frames[node.f].parent {
+                // a return: to the calling frame, after the call
+                let pcode = self.code(g, pf);
+                let call_pc = g.frames[node.f].call_pc;
+                let mut rets: Vec<&Target> = targets.iter().filter(|t| t.n == pcode.n && t.hash == pcode.hash).collect();
+                rets.sort_by_key(|t| (t.off <= call_pc, t.off));
+                if let Some(t) = rets.first() {
+                    if t.count > 0 {
+                        add(t.count, Next::Ret(t.off));
+                    }
+                }
+            }
+            for t in &targets {
+                if t.count == 0 {
+                    continue;
+                }
+                // a jump to a computed pc in the same code (a jump table)
+                if t.n == code.n && t.hash == code.hash && t.off != node.pc && g.frames[node.f].parent.is_none_or(|pf| (self.code(g, pf).n, self.code(g, pf).hash) != (t.n, t.hash)) {
+                    if self.region_of(code, t.off).is_some() {
+                        add(t.count, Next::Same(t.off));
+                    }
+                    continue;
+                }
+                let Some(&ei) = self.entries.get(&(t.n, t.hash)) else { continue };
+                let recursive = {
+                    let mut f = Some(node.f);
+                    let mut r = false;
+                    while let Some(x) = f {
+                        let c = self.code(g, x);
+                        r |= (c.n, c.hash) == (t.n, t.hash);
+                        f = g.frames[x].parent;
+                    }
+                    r
+                };
+                // monomorphic: the site called this code (nearly) always
+                if t.off == 0 && !recursive && depth < self.opts.inline_depth && (!mono || (t.count as f64) >= self.opts.mono * (total as f64)) {
+                    add(t.count, Next::Call(ei));
+                }
+            }
+        }
+        out
+    }
+
+    /// The step `nx` leads to from `cur`, if its frame exists (a call
+    /// whose frame is not made yet: None).
+    fn peek(g: &Graph, cur: Node, nx: Next) -> Option<Node> {
+        match nx {
+            Next::Same(t) => Some(Node::new(cur.f, t)),
+            Next::Ret(t) => Some(Node::new(g.frames[cur.f].parent.unwrap(), t)),
+            Next::Call(ei) => g.frames.iter().position(|fr| *fr == FrameRec { pi: ei, parent: Some(cur.f), call_pc: cur.pc }).map(|f| Node::new(f, 0)),
+        }
+    }
+
+    /// ... making the frame of a call.
+    fn materialize(g: &mut Graph, cur: Node, nx: Next) -> Node {
+        if let Some(n) = Self::peek(g, cur, nx) {
+            return n;
+        }
+        let Next::Call(ei) = nx else { unreachable!() };
+        g.frames.push(FrameRec { pi: ei, parent: Some(cur.f), call_pc: cur.pc });
+        Node::new(g.frames.len() - 1, 0)
+    }
+
+    /// Follows the hottest path from `first` (the header for the root,
+    /// owner 0; else the first step of side trace `owner`, entered from
+    /// `from`) until it reaches the header (the root) or a step of the
+    /// trace (a side trace rejoins it). A loop on the way (an inner loop)
+    /// is closed and left by its hottest exit. Returns the count of the
+    /// edge that closed the path.
+    fn walk(&mut self, g: &mut Graph, from: Option<Node>, first: Node, owner: usize, n0: u64) -> Result<u64, String> {
+        let root = owner == 0;
+        let header = Node::new(0, self.h);
+        let mut path: Vec<Node> = vec![first];
+        if let Some(f) = from {
+            g.add_edge(f, first, n0);
+        }
+        g.add_node(first, owner);
+        let mut cur = first;
+        // a step that is in the trace already, not this walk's: the end
+        let joins = |g: &Graph, path: &[Node], n: Node| if root { n == header } else { g.set.contains(&n) && !path.contains(&n) };
+        for _ in 0..self.opts.max_walk {
+            let cs = self.cands(g, cur, true);
+            let best = cs.into_iter().max_by_key(|(n, nx)| {
+                (*n, std::cmp::Reverse(match nx {
+                    Next::Same(t) | Next::Ret(t) => *t,
+                    Next::Call(_) => 0,
+                }))
+            });
+            let Some((n, nx)) = best else {
+                return Err(format!("the path leaves the loop after {}{}", cur.pc, if cur.f > 0 { format!(" (in frame {})", cur.f) } else { String::new() }));
+            };
+            let node = Self::materialize(g, cur, nx);
+            if joins(g, &path, node) {
+                g.add_edge(cur, node, n);
+                return Ok(n);
+            }
+            let Some(mut i) = path.iter().position(|&x| x == node) else {
+                g.add_edge(cur, node, n);
+                g.add_node(node, owner);
+                path.push(node);
+                cur = node;
+                continue;
+            };
+            // a loop inside the path (an inner loop): closed at `node`, and
+            // left by the hottest edge out of it
+            if !self.opts.nest {
+                return Err(format!("an inner cycle at {}{}", node.pc, if node.f > 0 { format!(" (in frame {})", node.f) } else { String::new() }));
+            }
+            g.add_edge(cur, node, n);
+            g.heads.insert(node);
+            loop {
+                let mut out: Option<(u64, Node, Next)> = None;
+                for &u in &path[i..] {
+                    for (c, nx) in self.cands(g, u, true) {
+                        let tgt = Self::peek(g, u, nx);
+                        if tgt == Some(u) || tgt.is_some_and(|t| path[i..].contains(&t)) {
+                            continue;
+                        }
+                        if out.as_ref().is_none_or(|o| c > o.0) {
+                            out = Some((c, u, nx));
+                        }
+                    }
+                }
+                let Some((c, u, nx)) = out else {
+                    return Err(format!("an inner loop at {}{} that the path does not leave", node.pc, if node.f > 0 { format!(" (in frame {})", node.f) } else { String::new() }));
+                };
+                let w = Self::materialize(g, u, nx);
+                g.add_edge(u, w, c);
+                if joins(g, &path, w) {
+                    return Ok(c);
+                }
+                if let Some(j) = path.iter().position(|&x| x == w) {
+                    // into an earlier step of this walk: an outer loop
+                    g.heads.insert(w);
+                    i = j;
+                    continue;
+                }
+                g.add_node(w, owner);
+                path.push(w);
+                cur = w;
+                break;
+            }
+        }
+        Err(format!("the path is longer than {} steps", self.opts.max_walk))
+    }
+
+    /// Lines of stencil IR of the instruction at `n` (with its cold
+    /// blocks): what a trace's size is estimated from.
+    fn est_lines(&self, g: &Graph, n: Node) -> usize {
+        let code = self.code(g, n.f);
+        let Some(name) = stencil_name(code, n.pc) else { return 0 };
+        let Some(body) = self.m.bodies.get(name.as_str()) else { return 0 };
+        let mut lines = body.len();
+        for l in body {
+            if let Some(c) = parse_call(def_of(l).1) {
+                if c.global && c.callee.contains(".cold") {
+                    lines += self.m.bodies.get(c.callee).map_or(0, |b| b.len());
+                }
+            }
+        }
+        lines
+    }
+
+    /// Adds side traces to `g` (whose root closed `back` times): the
+    /// hottest edges from its steps that leave it, each the start of a
+    /// walk that rejoins it, while their counts are over the threshold and
+    /// the trace's estimated size within the budget.
+    fn add_sides(&mut self, g: &mut Graph, back: u64) -> Vec<String> {
+        let mut notes = Vec::new();
+        let min = self.opts.side_min.max((self.opts.side_frac * back as f64).ceil() as u64).max(1);
+        let mut tried: HashSet<(Node, Next)> = HashSet::new();
+        let mut lines: usize = g.nodes.iter().map(|&n| self.est_lines(g, n)).sum();
+        while g.sides.len() < self.opts.max_sides {
+            // the hottest edge out of the trace not tried yet
+            let mut best: Option<(u64, Node, Next)> = None;
+            for u in g.nodes.clone() {
+                for (c, nx) in self.cands(g, u, false) {
+                    if c < min || tried.contains(&(u, nx)) {
+                        continue;
+                    }
+                    let tgt = Self::peek(g, u, nx);
+                    if tgt == Some(u) || tgt.is_some_and(|t| g.has_edge(u, t)) {
+                        continue;
+                    }
+                    if best.as_ref().is_none_or(|b| c > b.0) {
+                        best = Some((c, u, nx));
+                    }
+                }
+            }
+            let Some((c, u, nx)) = best else { break };
+            tried.insert((u, nx));
+            let saved = g.clone();
+            let first = Self::materialize(g, u, nx);
+            if g.set.contains(&first) {
+                // into a step of the trace: an edge, no new steps
+                g.add_edge(u, first, c);
+                continue;
+            }
+            let k = g.sides.len() + 1;
+            match self.walk(g, Some(u), first, k, c) {
+                Ok(_) => {
+                    let new: usize = g.nodes.len() - saved.nodes.len();
+                    let add: usize = g.nodes[saved.nodes.len()..].iter().map(|&n| self.est_lines(g, n)).sum();
+                    if lines + add > self.opts.side_lines {
+                        notes.push(format!("side from {} to {} ({} runs): over the size budget (LOIMI_TRACE_SIDE_LINES={})", u.pc, first.pc, c, self.opts.side_lines));
+                        *g = saved;
+                        continue;
+                    }
+                    lines += add;
+                    g.side_entry.insert((u, first), k);
+                    g.sides.push((u, first, c, new));
+                }
+                Err(e) => {
+                    if self.opts.verbose {
+                        notes.push(format!("no side from {} to {} ({} runs): {}", u.pc, first.pc, c, e));
+                    }
+                    *g = saved;
+                }
+            }
+        }
+        notes
+    }
+}
+
 /// `--traces`: per profiled loop that ran often enough, the hottest path
 /// as a trace, through the calls it makes to code that was profiled (an
-/// entry region) where the call site called one code object. Returns the
+/// entry region) where the call site called one code object, and through
+/// the loops inside it; then side traces from its hot exits. Returns the
 /// IR to append and a report.
 pub fn traces(ir: &str, stencils: &str, vm: &VmInfo, profs: &[ProfRegion], opts: &Options) -> Result<(String, String), String> {
     let m = Module::new(ir, stencils);
@@ -3377,20 +3839,25 @@ pub fn traces(ir: &str, stencils: &str, vm: &VmInfo, profs: &[ProfRegion], opts:
             return Err(format!("profile region at {} does not match this build: build the profiling binary again", pr.header));
         }
     }
-    // entry regions by their code (words and hash)
+    // entry regions by their code (words and hash), and every region by
+    // its code
     let mut entries: HashMap<(usize, u64), usize> = HashMap::new();
+    let mut by_code: HashMap<u64, Vec<(usize, BTreeSet<usize>)>> = HashMap::new();
     for (i, pr) in profs.iter().enumerate() {
         if pr.header == 0 && !loops(&m, &pr.code).contains_key(&0) {
             entries.insert((pr.code.n, pr.code.hash), i);
         }
+        if let Ok(pcs) = region_pcs(&m, pr, &opts.skip) {
+            by_code.entry(pr.code.key()).or_default().push((i, pcs.into_iter().collect()));
+        }
     }
-    let mut data: HashMap<usize, Result<RegionData, String>> = HashMap::new();
+    let mut fm = Former { m: &m, vm, profs, opts, data: HashMap::new(), by_code, entries, h: 0 };
     for (pi, pr) in profs.iter().enumerate() {
         let code = &pr.code;
         let h = pr.header;
         let lp = loops(&m, code);
         if !lp.contains_key(&h) {
-            if !entries.values().any(|&e| e == pi) {
+            if !fm.entries.values().any(|&e| e == pi) {
                 let _ = writeln!(report, "no trace for code {:016x} loop {}: not a loop in this build", code.hash, h);
             }
             continue;
@@ -3398,176 +3865,146 @@ pub fn traces(ir: &str, stencils: &str, vm: &VmInfo, profs: &[ProfRegion], opts:
         if !opts.only.is_empty() && !opts.only.contains(&h) {
             continue;
         }
-        let rd0 = data.entry(pi).or_insert_with(|| region_data(&m, vm, pr, opts));
-        if let Err(e) = rd0 {
+        if let Err(e) = fm.rd(pi) {
             if e.contains("build the profiling binary again") {
                 return Err(format!("profile region at {}: {}", h, e));
             }
             let _ = writeln!(report, "no trace for code {:016x} loop {}: {}", code.hash, h, e);
             continue;
         }
-        // the hottest path around the loop: (profile, calling frame, the
-        // call's pc) per frame
-        let mut frames: Vec<(usize, Option<usize>, usize)> = vec![(pi, None, 0)];
-        let mut path = vec![Node::new(0, h)];
+        fm.h = h;
+        // the root: the hottest path around the loop
+        let mut g = Graph { frames: vec![FrameRec { pi, parent: None, call_pc: 0 }], ..Default::default() };
+        let header = Node::new(0, h);
         let mut why = None;
-        let mut back = 0;
-        loop {
-            let last = *path.last().unwrap();
-            let fpi = frames[last.f].0;
-            let rd = match data.entry(fpi).or_insert_with(|| region_data(&m, vm, &profs[fpi], opts)) {
-                Ok(r) => r as &RegionData,
-                Err(e) => {
-                    why = Some(format!("frame {}: {}", last.f, e));
-                    break;
-                }
-            };
-            // (an edge to the instruction itself, `redo`, is not a path:
-            // the step goes around itself)
-            let mut cands: Vec<(u64, Next)> = rd.edges.iter().filter(|((f, t), n)| *f == last.pc && *t != last.pc && **n > 0).map(|((_, t), n)| (*n, Next::Same(*t))).collect();
-            let site = rd.sites.get(&last.pc).cloned();
-            let depth = {
-                let (mut d, mut f) = (0, last.f);
-                while let Some(p) = frames[f].1 {
-                    d += 1;
-                    f = p;
-                }
-                d
-            };
-            if let Some((total, targets)) = site {
-                match frames[last.f].1 {
-                    Some(pf) => {
-                        // a return: to the calling frame, after the call
-                        let pcode = &profs[frames[pf].0].code;
-                        let call_pc = frames[last.f].2;
-                        let mut rets: Vec<&Target> = targets.iter().filter(|t| t.n == pcode.n && t.hash == pcode.hash).collect();
-                        rets.sort_by_key(|t| (t.off <= call_pc, t.off));
-                        if let Some(t) = rets.first() {
-                            cands.push((t.count, Next::Ret(t.off)));
-                        }
-                    }
-                    None => {}
-                }
-                for t in &targets {
-                    let Some(&ei) = entries.get(&(t.n, t.hash)) else { continue };
-                    let recursive = {
-                        let mut f = Some(last.f);
-                        let mut r = false;
-                        while let Some(x) = f {
-                            let c = &profs[frames[x].0].code;
-                            r |= (c.n, c.hash) == (t.n, t.hash);
-                            f = frames[x].1;
-                        }
-                        r
-                    };
-                    // monomorphic: the site called this code (nearly) always
-                    if t.off == 0 && !recursive && depth < opts.inline_depth && (t.count as f64) >= opts.mono * (total as f64) {
-                        cands.push((t.count, Next::Call(ei)));
-                    }
-                }
+        let back = match fm.walk(&mut g, None, header, 0, 0) {
+            Ok(n) => n,
+            Err(e) => {
+                why = Some(e);
+                0
             }
-            let best = cands.into_iter().max_by_key(|(n, nx)| (*n, std::cmp::Reverse(match nx {
-                Next::Same(t) | Next::Ret(t) => *t,
-                Next::Call(_) => 0,
-            })));
-            let Some((n, nx)) = best else {
-                why = Some(format!("the path leaves the loop after {}{}", last.pc, if last.f > 0 { format!(" (in frame {})", last.f) } else { String::new() }));
-                break;
-            };
-            let node = match nx {
-                Next::Same(t) => Node::new(last.f, t),
-                Next::Ret(t) => Node::new(frames[last.f].1.unwrap(), t),
-                Next::Call(ei) => {
-                    frames.push((ei, Some(last.f), last.pc));
-                    Node::new(frames.len() - 1, 0)
-                }
-            };
-            if node == Node::new(0, h) {
-                back = n;
-                break;
-            }
-            if path.contains(&node) {
-                why = Some(format!("an inner cycle at {}{}", node.pc, if node.f > 0 { format!(" (in frame {})", node.f) } else { String::new() }));
-                break;
-            }
-            path.push(node);
-        }
-        let rd0 = data[&pi].as_ref().unwrap();
+        };
+        let (hruns, around) = {
+            let rd0 = fm.rd(pi).unwrap();
+            (rd0.hruns, rd0.around)
+        };
         if why.is_none() && back < opts.min_iters {
             why = Some(format!("{} iterations (fewer than {})", back, opts.min_iters));
         }
         // entries: the header's runs that did not come around the loop
-        let per_entry = back as f64 / (rd0.hruns.saturating_sub(rd0.around).max(1)) as f64;
+        let per_entry = back as f64 / (hruns.saturating_sub(around).max(1)) as f64;
         if why.is_none() && per_entry < opts.min_run {
             why = Some(format!("{:.1} iterations per entry (fewer than LOIMI_TRACE_MINRUN={})", per_entry, opts.min_run));
         }
         if let Some(w) = why {
             let _ = writeln!(report, "no trace for code {:016x} loop {}: {}", code.hash, h, w);
             if opts.verbose {
-                let ps: Vec<String> = path.iter().map(|n| if n.f == 0 { format!("{}", n.pc) } else { format!("f{}/{}", n.f, n.pc) }).collect();
+                let ps: Vec<String> = g.nodes.iter().map(|n| if n.f == 0 { format!("{}", n.pc) } else { format!("f{}/{}", n.f, n.pc) }).collect();
                 let _ = writeln!(report, "  path {}", ps.join(" "));
             }
             continue;
         }
-        // a block is on the trace if it ran a fraction of its step's runs
-        let mut on_blocks = HashMap::new();
-        let mut raw = HashMap::new();
-        for (f, fr) in frames.iter().enumerate() {
-            let rd = data[&fr.0].as_ref().unwrap();
-            for ((pc, lab), n) in &rd.blocks {
-                raw.insert((f, *pc, lab.clone()), *n);
-                if path.contains(&Node::new(f, *pc)) {
+        let root_steps = g.nodes.len();
+        let notes = if opts.max_sides > 0 { fm.add_sides(&mut g, back) } else { Vec::new() };
+        // generated with fewer side traces while it is too large
+        let mut nsides = g.sides.len();
+        let full = g.clone();
+        let made = loop {
+            let g = if nsides == full.sides.len() { full.clone() } else { trim_sides(&full, nsides) };
+            // a block is on the trace if it ran a fraction of its step's runs
+            let mut on_blocks = HashMap::new();
+            let mut raw = HashMap::new();
+            for &n in &g.nodes {
+                let code = fm.code(&g, n.f);
+                let Some(ri) = fm.region_of(code, n.pc) else { continue };
+                let rd = fm.rd(ri).unwrap();
+                for ((pc, lab), c) in &rd.blocks {
+                    if *pc != n.pc {
+                        continue;
+                    }
+                    raw.insert((n.f, *pc, lab.clone()), *c);
                     let mn = ((rd.first_count[pc] as f64) * opts.min_frac).ceil() as u64;
-                    on_blocks.insert((f, *pc, lab.clone()), if *n >= mn.max(1) { *n } else { 0 });
+                    on_blocks.insert((n.f, *pc, lab.clone()), if *c >= mn.max(1) { *c } else { 0 });
                 }
             }
-        }
-        let prof = Prof { blocks: on_blocks, raw, min: 1 };
-        let succ: HashMap<Node, Node> = (0..path.len()).map(|i| (path[i], path[(i + 1) % path.len()])).collect();
-        let pframes: Vec<PathFrame> = frames.iter().map(|f| PathFrame { code: &profs[f.0].code, parent: f.1 }).collect();
-        let name = format!("t{}", out.entries.len());
-        let index = out.entries.len();
-        match generate_fn(&m, vm, &pframes, h, &path, Kind::Trace, &name, index, succ, Some(prof), opts) {
-            Ok(g) if out.lines + g.lines > opts.max_total => {
+            let prof = Prof { blocks: on_blocks, raw, min: 1 };
+            let pframes: Vec<PathFrame> = g.frames.iter().map(|f| PathFrame { code: &profs[f.pi].code, parent: f.parent, call: f.parent.map(|p| Node::new(p, f.call_pc)) }).collect();
+            let name = format!("t{}", out.entries.len());
+            let index = out.entries.len();
+            let mut shape = Shape { owner: g.owner.clone(), side_entry: g.side_entry.clone(), heads: g.heads.clone(), loop_entries: loop_entries(&g, header), ..Default::default() };
+            for (a, v) in &g.succ {
+                let mut v = v.clone();
+                v.sort_by_key(|x| std::cmp::Reverse(x.1));
+                shape.succ.insert(*a, v.into_iter().map(|x| x.0).collect());
+            }
+            shape.sides.push((name.clone(), index));
+            for k in 1..=g.sides.len() {
+                shape.sides.push((format!("{}.s{}", name, k), index + k));
+            }
+            match generate_fn(&m, vm, &pframes, h, &g.nodes, Kind::Trace, &name, index, shape, Some(prof), opts) {
+                Err(e) if e.contains("LOIMI_TRACE_MAXLINES") && nsides > 0 => nsides /= 2,
+                r => {
+                    break (r, g, pframes.iter().map(|f| f.code).collect::<Vec<&Code>>(), name, index);
+                }
+            }
+        };
+        let (r, g, fcodes, name, index) = made;
+        match r {
+            Ok(gf) if out.lines + gf.lines > opts.max_total => {
                 let _ = writeln!(report, "no trace for code {:016x} loop {}: the traces so far have {} lines of IR (LOIMI_TRACE_MAXTOTAL={})", code.hash, h, out.lines, opts.max_total);
             }
-            Ok(g) if g.inlined_writes > 0 && !opts.inline_writers => {
-                let _ = writeln!(report, "no trace for code {:016x} loop {}: {} steps of its inlined calls call functions that may write (LOIMI_TRACE_INLINE_WRITERS=1 keeps it)", code.hash, h, g.inlined_writes);
+            Ok(gf) if gf.inlined_writes > 0 && !opts.inline_writers => {
+                let _ = writeln!(report, "no trace for code {:016x} loop {}: {} steps of its inlined calls call functions that may write (LOIMI_TRACE_INLINE_WRITERS=1 keeps it)", code.hash, h, gf.inlined_writes);
             }
-            Ok(g) => {
-                out.lines += g.lines;
-                out.defs.push_str(&g.ir);
-                let order: Vec<usize> = path.iter().filter(|n| n.f == 0).map(|n| n.pc).collect();
-                let callees = (1..frames.len()).map(|f| (pframes[f].code, 0usize, &g.kchk[f])).collect();
-                let info = EntryInfo { order, ncounts: 0, kchk: &g.kchk[0], rec: None, nsites: 0, callees, fnsym: None };
+            Ok(gf) => {
+                out.lines += gf.lines;
+                out.defs.push_str(&gf.ir);
+                let order: Vec<usize> = g.nodes.iter().filter(|n| n.f == 0).map(|n| n.pc).collect();
+                let callees = (1..g.frames.len()).map(|f| (fcodes[f], 0usize, &gf.kchk[f])).collect();
+                let info = EntryInfo { order, ncounts: 0, kchk: &gf.kchk[0], rec: None, nsites: 0, callees, fnsym: None };
                 add_entry(&mut out, &m, code, h, &name, &info, pr.fingerprint, opts.fail_limit);
-                let ops: Vec<String> = path
-                    .iter()
-                    .map(|n| {
-                        let c = pframes[n.f].code;
-                        let op = c.op[n.pc].as_deref().unwrap_or("?");
-                        if n.f == 0 { format!("{}:{}", n.pc, op) } else { format!("f{}/{}:{}", n.f, n.pc, op) }
-                    })
-                    .collect();
+                for k in 1..=g.sides.len() {
+                    add_side_entry(&mut out, &format!("{}.s{}", name, k), index, opts.fail_limit);
+                }
+                let label = |n: &Node| {
+                    let c = fcodes[n.f];
+                    let op = c.op[n.pc].as_deref().unwrap_or("?");
+                    if n.f == 0 { format!("{}:{}", n.pc, op) } else { format!("f{}/{}:{}", n.f, n.pc, op) }
+                };
+                let ops: Vec<String> = g.nodes[..root_steps.min(g.nodes.len())].iter().map(label).collect();
                 let _ = writeln!(
                     report,
-                    "trace {}: code {:016x} ({} words), loop {}, {} iterations ({:.1} per entry), {} inlined calls, window {}, {} guards, {} steps with effects, {} of {} calling writers: {}",
+                    "trace {}: code {:016x} ({} words), loop {}, {} iterations ({:.1} per entry), {} inlined calls, {} loops inside, {} side traces ({} steps), window {}, {} guards, {} steps with effects, {} of {} calling writers: {}",
                     name,
                     code.hash,
                     code.n,
                     h,
                     back,
                     per_entry,
-                    frames.len() - 1,
-                    g.nr,
-                    g.nguards,
-                    g.neffect,
-                    g.nwrites,
-                    path.len(),
+                    g.frames.len() - 1,
+                    g.heads.len(),
+                    g.sides.len(),
+                    g.nodes.len() - root_steps,
+                    gf.nr,
+                    gf.nguards,
+                    gf.neffect,
+                    gf.nwrites,
+                    g.nodes.len(),
                     ops.join(" ")
                 );
+                for (k, (from, first, c, n)) in g.sides.iter().enumerate() {
+                    let steps: Vec<String> = g.nodes.iter().filter(|x| g.owner.get(x) == Some(&(k + 1))).map(label).collect();
+                    let _ = writeln!(report, "  side {}.s{}: from {} at {} runs, {} steps: {}", name, k + 1, label(from), c, n, steps.join(" "));
+                    let _ = first;
+                }
+                if nsides < full.sides.len() {
+                    let _ = writeln!(report, "  ({} side traces left out: LOIMI_TRACE_MAXLINES)", full.sides.len() - nsides);
+                }
+                for nt in &notes {
+                    let _ = writeln!(report, "  {}", nt);
+                }
                 if opts.verbose {
-                    for gi in &g.guard_info {
+                    for gi in &gf.guard_info {
                         let _ = writeln!(report, "  guard {}", gi);
                     }
                 }
@@ -3578,4 +4015,81 @@ pub fn traces(ir: &str, stencils: &str, vm: &VmInfo, profs: &[ProfRegion], opts:
         }
     }
     Ok((finish(&m, out, sh)?, report))
+}
+
+/// The edges into the loops inside trace `g` (at its heads) from outside
+/// them: from a step the head does not dominate.
+fn loop_entries(g: &Graph, header: Node) -> HashSet<(Node, Node)> {
+    let idx: HashMap<Node, usize> = g.nodes.iter().enumerate().map(|(i, n)| (*n, i)).collect();
+    let n = g.nodes.len();
+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (a, v) in &g.succ {
+        for (b, _) in v {
+            if let (Some(&i), Some(&j)) = (idx.get(a), idx.get(b)) {
+                preds[j].push(i);
+            }
+        }
+    }
+    // dominators, iteratively (traces have hundreds of steps at most)
+    let h = idx[&header];
+    let full: Vec<bool> = vec![true; n];
+    let mut dom: Vec<Vec<bool>> = vec![full; n];
+    dom[h] = vec![false; n];
+    dom[h][h] = true;
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for b in 0..n {
+            if b == h {
+                continue;
+            }
+            let mut d: Vec<bool> = vec![true; n];
+            let mut any = false;
+            for &p in &preds[b] {
+                any = true;
+                for (x, y) in d.iter_mut().zip(&dom[p]) {
+                    *x = *x && *y;
+                }
+            }
+            if !any {
+                d = vec![false; n];
+            }
+            d[b] = true;
+            if d != dom[b] {
+                dom[b] = d;
+                changed = true;
+            }
+        }
+    }
+    let mut out = HashSet::new();
+    for (a, v) in &g.succ {
+        for (b, _) in v {
+            if *b != header && g.heads.contains(b) {
+                if let (Some(&i), Some(&j)) = (idx.get(a), idx.get(b)) {
+                    if !dom[i][j] {
+                        out.insert((*a, *b));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `g` with only its first `n` side traces (their steps, the edges into
+/// and inside them, the frames they made).
+fn trim_sides(g: &Graph, n: usize) -> Graph {
+    let keep = |x: &Node| g.owner.get(x).is_some_and(|&o| o <= n);
+    let mut t = g.clone();
+    t.nodes.retain(keep);
+    t.set.retain(keep);
+    t.owner.retain(|x, _| keep(x));
+    t.succ.retain(|x, _| keep(x));
+    for v in t.succ.values_mut() {
+        v.retain(|x| keep(&x.0));
+    }
+    t.side_entry.retain(|_, k| *k <= n);
+    t.heads.retain(keep);
+    t.sides.truncate(n);
+    t
 }

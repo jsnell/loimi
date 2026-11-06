@@ -921,6 +921,11 @@ struct loimi_trace {
     const struct loimi_callee *callees;
     uint64_t ncallees;
     const uint32_t **slots;
+    /* Side traces (their steps are in their root's function, entered
+     * from its exits): the root's index; else -1. state[4] is set when
+     * the side trace is dropped: the root then leaves where it entered
+     * it. */
+    int64_t parent;
 };
 /* A code object a trace inlines at a call: its words, their hash, the
  * offset the call enters at, the pool constants baked in. */
@@ -1027,18 +1032,25 @@ static uint64_t words_hash(const struct rec *r, uint64_t lo, uint64_t hi) {
     return h;
 }
 
-/* Called by a trace's guard exits every LOIMI_TRACE_FAILS failures:
- * without side traces, a trace whose guards keep failing exits on every
- * iteration, so once more than one iteration in 8 has failed it is
- * dropped for good (the stencils run the loop). */
+/* Called by a trace's guard exits every LOIMI_TRACE_FAILS failures: a
+ * trace whose guards keep failing exits on every iteration, so once more
+ * than one iteration in 8 has failed it is dropped for good (the stencils
+ * run the loop). A side trace's guards count its own failures, against
+ * its root's iterations; it is dropped alone (its root leaves where it
+ * entered it, as before side traces). */
 void loimi_trace_failing(int64_t t) {
     const struct loimi_trace *tr = &loimi_traces[t];
     uint64_t *s = tr->state;
     s[3] = s[1] + trace_fail_every;
-    if (s[1] * 8 <= s[2]) return;
+    uint64_t iters = tr->parent >= 0 ? loimi_traces[tr->parent].state[2] : s[2];
+    if (s[1] * 8 <= iters) return;
     trace_banned[t] = 1;
     tst.blacklisted++;
-    if (debug) fprintf(stderr, "jit: trace %s blacklisted (%llu failures in %llu iterations)\n", tr->name, (unsigned long long)s[1], (unsigned long long)s[2]);
+    if (debug) fprintf(stderr, "jit: trace %s blacklisted (%llu failures in %llu iterations)\n", tr->name, (unsigned long long)s[1], (unsigned long long)iters);
+    if (tr->parent >= 0) {
+        s[4] = 1;
+        return;
+    }
     for (size_t i = 0; i < ninsts;)
         if (insts[i].t == t) uninstall(i);
         else i++;
@@ -1085,13 +1097,16 @@ int loimi_trace_bind(int64_t t, int64_t k, const uint32_t *pc) {
 }
 
 /* Regions (profiling builds): dynamic exit `site` of a region, whose
- * counters start at s, went to pc. Per site: [0] runs, then 4 targets
- * of (pc, runs, words, hash of the words, offset); the code object of
- * pc must be compiled (its words' hash is what traces match). */
+ * counters start at s, went to pc. Per site: [0] runs, then SITE_TARGETS
+ * targets of (pc, runs, words, hash of the words, offset); the code
+ * object of pc must be compiled (its words' hash is what traces match).
+ * 16 targets: a jump table (Mini's SWITCH) has a target per case. */
+#define SITE_TARGETS 16
+#define SITE_WORDS (2 + 5 * SITE_TARGETS)
 void loimi_trace_site(uint64_t *s, int64_t site, const uint32_t *pc) {
-    uint64_t *e = s + 22 * site;
+    uint64_t *e = s + SITE_WORDS * site;
     e[0]++;
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < SITE_TARGETS; i++) {
         uint64_t *x = e + 2 + 5 * i;
         if (x[0] == (uint64_t)(uintptr_t)pc) {
             x[1]++;
@@ -1135,10 +1150,10 @@ static void trace_profile(void) {
         for (uint64_t i = 0; i < tr->ncounts; i++)
             if (tr->counts[i]) fprintf(f, "c %llu %llu\n", (unsigned long long)i, (unsigned long long)tr->counts[i]);
         for (uint64_t i = 0; i < tr->nsites; i++) {
-            const uint64_t *e = tr->sites + 22 * i;
+            const uint64_t *e = tr->sites + SITE_WORDS * i;
             if (!e[0]) continue;
             fprintf(f, "site %llu %llu\n", (unsigned long long)i, (unsigned long long)e[0]);
-            for (int j = 0; j < 4; j++) {
+            for (int j = 0; j < SITE_TARGETS; j++) {
                 uint64_t *x = (uint64_t *)e + 2 + 5 * j;
                 /* the code as it is now (its last recording): rewrites
                  * after the first visit changed its hash */
@@ -1159,11 +1174,18 @@ static void trace_profile(void) {
 }
 
 static void trace_report(void) {
-    fprintf(stderr, "jit: traces: %lld linked, %llu installs, %llu uninstalls, %llu blacklisted, %llu callees bound\n", (long long)ntraces(),
-            (unsigned long long)tst.installs, (unsigned long long)tst.uninstalls, (unsigned long long)tst.blacklisted, (unsigned long long)tst.binds);
+    long long sides = 0;
+    for (int64_t t = 0; t < ntraces(); t++) sides += loimi_traces[t].parent >= 0;
+    fprintf(stderr, "jit: traces: %lld linked, %lld side traces, %llu installs, %llu uninstalls, %llu blacklisted, %llu callees bound\n",
+            (long long)ntraces() - sides, sides, (unsigned long long)tst.installs, (unsigned long long)tst.uninstalls,
+            (unsigned long long)tst.blacklisted, (unsigned long long)tst.binds);
     for (int64_t t = 0; t < ntraces(); t++) {
         const uint64_t *s = loimi_traces[t].state;
-        if (s[0] || s[1] || s[2])
+        if (loimi_traces[t].parent >= 0) {
+            if (s[1])
+                fprintf(stderr, "jit:   side trace %s: %llu guard failures%s\n", loimi_traces[t].name, (unsigned long long)s[1],
+                        trace_banned[t] ? ", blacklisted" : "");
+        } else if (s[0] || s[1] || s[2])
             fprintf(stderr, "jit:   trace %s: %llu iterations, %llu guard failures, %llu invalidations%s\n", loimi_traces[t].name,
                     (unsigned long long)s[2], (unsigned long long)s[1], (unsigned long long)s[0], trace_banned[t] ? ", blacklisted" : "");
     }
@@ -1194,7 +1216,7 @@ static void trace_install(struct rec *r) {
     for (int64_t t = 0; t < ntraces(); t++) {
         const struct loimi_trace *tr = &loimi_traces[t];
         uint64_t h = tr->header;
-        if (trace_banned[t] || tr->nwords != r->n || !r->home[h] || (r->fl[h] & F_INTERP)) continue;
+        if (tr->parent >= 0 || trace_banned[t] || tr->nwords != r->n || !r->home[h] || (r->fl[h] & F_INTERP)) continue;
         int dup = 0;
         for (size_t i = 0; i < ninsts; i++) dup |= insts[i].r == r && loimi_traces[insts[i].t].header == h;
         if (dup || tr->hash != words_hash(r, tr->lo, tr->hi)) continue;
