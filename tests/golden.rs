@@ -338,6 +338,60 @@ fn mini_jit_stencils() {
     mini_conformance_with(&["--jit-stencils"], &env, |_| true);
 }
 
+/// The rows (samples, location) of the `--vm-prof` report's table whose
+/// title starts with `title`.
+fn prof_table(report: &str, title: &str) -> Vec<(u64, String)> {
+    let mut rows = Vec::new();
+    let mut lines = report.lines().skip_while(|l| !l.starts_with(title)).skip(2);
+    for l in lines.by_ref() {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        if f.len() < 4 || !f[1].ends_with('%') || !f[2].ends_with('%') {
+            break;
+        }
+        let name = l.splitn(4, '%').nth(2).unwrap().trim().to_string();
+        rows.push((f[0].parse().unwrap(), name));
+    }
+    rows
+}
+
+/// `--vm-prof` (src/prof_rt.c): in each dispatch mode, tests/run/vm_prof.lm's
+/// SPIN handler, SLOW's cold block and `main.churn` (called by CALL)
+/// rank in that order where the samples land, and CALL takes churn's
+/// place by vm location and guest pc. Mini built with `--jit-stencils`
+/// names its compiled code by stencil.
+#[test]
+fn vm_prof_ranks() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    for mode in ["--dispatch=tailcall", "--dispatch=goto", "--dispatch=switch"] {
+        let out = loimi().arg("run").arg(root.join("tests/run/vm_prof.lm")).args(["--vm-prof", mode]).env("LOIMI_PROF_HZ", "4000").output().unwrap();
+        let report = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "vm_prof.lm {}:\n{}", mode, report);
+        let names = |title: &str| prof_table(&report, title).into_iter().map(|(_, n)| n).take(3).collect::<Vec<_>>();
+        let ok = |ns: &[String], last: &str| ns.len() == 3 && ns[0].ends_with("SPIN") && ns[1].contains("SLOW (cold block at") && ns[2].ends_with(last);
+        assert!(ok(&names("self"), "main.churn"), "vm_prof.lm {}: self table out of order:\n{}", mode, report);
+        assert!(ok(&names("by vm location"), "CALL"), "vm_prof.lm {}: vm table out of order:\n{}", mode, report);
+        assert!(ok(&names("by guest pc"), "CALL"), "vm_prof.lm {}: pc table out of order:\n{}", mode, report);
+    }
+    if cross() || !cfg!(all(target_arch = "x86_64", target_os = "linux")) {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("loimi-vmprof-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let exe = dir.join("mini");
+    let out = loimi().args(["build", "--release", "--jit-stencils", "--vm-prof"]).arg(root.join("examples/mini/main.lm")).arg("-o").arg(&exe).output().unwrap();
+    assert!(out.status.success(), "building mini --jit-stencils --vm-prof failed:\n{}", String::from_utf8_lossy(&out.stderr));
+    let script = dir.join("loop.lua");
+    std::fs::write(&script, "local function f(n)\n  local s = 0\n  for i = 1, n do s = s + i end\n  return s\nend\nprint(f(60000000))\n").unwrap();
+    let out = program(&exe).arg(&script).envs([("LOIMI_JIT", "1"), ("LOIMI_JIT_HOT", "1"), ("LOIMI_PROF_HZ", "4000")]).output().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    let report = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "mini --jit-stencils --vm-prof:\n{}", report);
+    let rows = prof_table(&report, "self");
+    let all: u64 = rows.iter().map(|(n, _)| n).sum();
+    let jit: u64 = rows.iter().filter(|(_, n)| n.ends_with("(jit)")).map(|(n, _)| n).sum();
+    assert!(rows.first().is_some_and(|(_, n)| n.ends_with("(jit)")) && 2 * jit > all, "mini --jit-stencils: JIT code not named:\n{}", report);
+}
+
 /// Ahead-of-time traces (`--trace-regions`, `--traces`, src/tracegen.rs,
 /// docs/design/trace-tier.md): Mini's benchmarks and scripts are
 /// recorded with a JIT build, profiled with a (bounded) region

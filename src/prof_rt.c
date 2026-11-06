@@ -8,22 +8,26 @@
  * named, in the process, and printed as three tables sorted by count:
  *
  *  - self: where the samples landed: an op's handler, a cold block (the
- *    names `--vm-stats` prints), the switch-mode dispatch, a function of
- *    the program (the runtime: the collector, `std`), JIT code (by
- *    stencil), or a shared library's function with the program function
- *    that called it ("libc.so.6:memset <- std.gc.Heap.collect");
+ *    names `--vm-stats` prints), a function of the program (the runtime:
+ *    the collector, `std`), JIT code (by stencil), or a shared library's
+ *    function with the program function that called it
+ *    ("libc.so.6:memset <- std.gc.Heap.collect");
  *  - by vm location, with what it calls: the innermost op or cold block
  *    on the stack, so a collection is charged to the op that allocated;
  *  - by guest pc: the vm's `pc` at the op's entry, with that location.
  *
  * Code locations: the compiler records marks (address, key) in section
- * `loimi_prof_marks`: tail-call handlers and outlined cold blocks by
- * their function's address, and in goto and switch modes (one function
- * for all handlers) the first instruction of each handler and inline
- * cold block, by an empty inline asm. A sample belongs to the last mark
- * at or before it within the same function (from the ELF symbol table).
- * The vms' names are in section `loimi_prof_vms`. Under `--jit-stencils`
- * the JIT calls `loimi_prof_jit` for each instruction it compiles.
+ * `loimi_prof_marks`: functions by their address (tail-call handlers,
+ * outlined cold blocks, and in goto and switch modes the function that
+ * holds all handlers), and inline cold blocks by an empty inline asm at
+ * their first instruction and at their ends (where the op's code
+ * resumes). A sample belongs to the last mark at or before it within the
+ * same function (from the ELF symbol table). In goto and switch modes
+ * each op stores its number on entry, and that op owns the sample unless
+ * the mark is one of its cold blocks: LLVM merges and copies blocks
+ * between the handlers of one function. The vms' names are in
+ * section `loimi_prof_vms`. Under `--jit-stencils` the JIT calls
+ * `loimi_prof_jit` for each instruction it compiles.
  *
  * Environment: LOIMI_PROF=0 turns sampling off; LOIMI_PROF_HZ=n sets the
  * rate (default 1000); LOIMI_PROF_CLOCK=cpu samples the process's CPU
@@ -34,7 +38,8 @@
  * that made it); LOIMI_PROF_OUT=file writes the
  * report there instead of stderr; LOIMI_PROF_TOP=n prints n rows per
  * table (default 30, 0: all); LOIMI_PROF_DEPTH=n keeps n return
- * addresses per sample (default 24, 0: no stack walk). */
+ * addresses per sample (default 24, 0: no stack walk); LOIMI_PROF_DEBUG=1
+ * lists the marks and the stacks of samples outside vm code on stderr. */
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <elf.h>
@@ -59,9 +64,9 @@ struct prof_vm {
     uint64_t nops, ncold;
     const char *const *ops;
     const char *const *colds;
-    void **(*pc_addr)(void);
+    void *(*pc_get)(void);
     uint64_t nvms;
-    uint32_t *(*op_addr)(void); /* goto and switch modes: the op running */
+    uint32_t (*op_get)(void); /* goto and switch modes: the op running */
     const int32_t *owners;      /* per cold block: its op, or -1 */
     uint64_t index;             /* of this vm in its program */
 };
@@ -94,9 +99,10 @@ static uint64_t *chunks[MAX_CHUNKS];
 static uint32_t chunk_used[MAX_CHUNKS];
 static int nchunks;
 static uint64_t nsamples, ndropped;
+static int busy;
 static int depth = 24;
-static void **(*pc_addr)(void);
-static uint32_t *(*op_addr)(void);
+static void *(*pc_get)(void);
+static uint32_t (*op_get)(void);
 static timer_t timer;
 static int timer_ok;
 static long hz = 1000;
@@ -128,8 +134,8 @@ static void on_sample(int sig, siginfo_t *si, void *ctx) {
 #else
     uintptr_t ip = 0;
 #endif
-    void *pc = pc_addr ? *pc_addr() : NULL;
-    uint32_t op = op_addr ? *op_addr() : 0;
+    void *pc = pc_get ? pc_get() : NULL;
+    uint32_t op = op_get ? op_get() : 0;
     void *bt[MAX_DEPTH + 8];
     int n = depth ? backtrace(bt, depth + 8) : 0, k = -1;
     /* The frames above the handler and the signal trampoline. */
@@ -140,6 +146,12 @@ static void on_sample(int sig, siginfo_t *si, void *ctx) {
         }
     int nf = k < 0 ? 0 : n - k;
     if (nf > depth) nf = depth;
+    /* Two threads may take a sample at once: the second drops its own. */
+    if (__atomic_exchange_n(&busy, 1, __ATOMIC_ACQUIRE)) {
+        __atomic_fetch_add(&ndropped, 1, __ATOMIC_RELAXED);
+        errno = saved;
+        return;
+    }
     uint64_t *r = reserve(3 + nf);
     if (r) {
         r[0] = (uint64_t)nf | (uint64_t)op << 32;
@@ -148,8 +160,9 @@ static void on_sample(int sig, siginfo_t *si, void *ctx) {
         for (int i = 0; i < nf; i++) r[3 + i] = (uintptr_t)bt[k + i];
         nsamples++;
     } else {
-        ndropped++;
+        __atomic_fetch_add(&ndropped, 1, __ATOMIC_RELAXED);
     }
+    __atomic_store_n(&busy, 0, __ATOMIC_RELEASE);
     errno = saved;
 }
 
@@ -168,9 +181,9 @@ __attribute__((constructor)) static void prof_start(void) {
     loimi_prof_running_1 = 1;
     mine = 1;
     for (struct prof_vm *v = __start_loimi_prof_vms; v && v < __stop_loimi_prof_vms; v++)
-        if (!pc_addr) {
-            pc_addr = v->pc_addr;
-            op_addr = v->op_addr;
+        if (!pc_get) {
+            pc_get = v->pc_get;
+            op_get = v->op_get;
         }
     hz = env_long("LOIMI_PROF_HZ", 1000);
     if (hz < 1) hz = 1;
@@ -443,7 +456,7 @@ static struct loc locate(uintptr_t a, uint32_t cur) {
             /* One function for all handlers: the op that runs owns the
              * code, unless it is in one of that op's cold blocks (or a vm
              * function's, inlined into it). */
-            if (cur && m->vm->op_addr && ((cur - 1) >> 20) == m->vm->index) {
+            if (cur && m->vm->op_get && ((cur - 1) >> 20) == m->vm->index) {
                 uint64_t op = (cur - 1) & 0xfffff;
                 if (op < m->vm->nops && !(k == KIND_COLD && (m->vm->owners[l.idx] < 0 || (uint64_t)m->vm->owners[l.idx] == op))) {
                     l.kind = L_OP;
@@ -455,7 +468,7 @@ static struct loc locate(uintptr_t a, uint32_t cur) {
         /* Before the first handler of a function that holds them all:
          * the switch, which the running op dispatches through. */
         const struct mark *last = s && s->hi > s->lo ? find_mark(s->hi - 1) : NULL;
-        if (cur && last && last->addr >= s->lo && last->vm->op_addr && ((cur - 1) >> 20) == last->vm->index &&
+        if (cur && last && last->addr >= s->lo && last->vm->op_get && ((cur - 1) >> 20) == last->vm->index &&
             ((cur - 1) & 0xfffff) < last->vm->nops) {
             l.kind = L_OP;
             l.vm = last->vm;
@@ -636,7 +649,7 @@ __attribute__((destructor)) static void prof_report(void) {
     long top = env_long("LOIMI_PROF_TOP", 30);
     fprintf(f, "\n== vm prof: %llu samples, %ld Hz of %s time, %.3f s ==\n", (unsigned long long)nsamples, hz,
             wall ? "wall-clock" : "CPU", secs);
-    if (ndropped) fprintf(f, "(%llu samples dropped: out of buffer)\n", (unsigned long long)ndropped);
+    if (ndropped) fprintf(f, "(%llu samples dropped: out of buffer, or taken on two threads at once)\n", (unsigned long long)ndropped);
     if (nsamples) {
         print_table(f, &self_t, "self (where the samples landed):", "location", nsamples, top);
         print_table(f, &vm_t, "by vm location, with what it calls (the innermost op or cold block on the stack):", "location",

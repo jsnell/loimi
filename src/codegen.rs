@@ -929,6 +929,11 @@ impl<'a, 'p> FnGen<'a, 'p> {
                 (None, Some(v), VmRole::Handler(k)) if p.vms[v as usize].dispatch == crate::tir::Dispatch::TailCall => {
                     Some(crate::vmgen::prof_key(self.cg, v, crate::vmgen::PROF_OP, k as usize))
                 }
+                // Goto and switch: the function that holds the handlers;
+                // the op stored at each handler names its code.
+                (None, Some(v), VmRole::Entry) if p.vms[v as usize].dispatch != crate::tir::Dispatch::TailCall => {
+                    Some(crate::vmgen::prof_key(self.cg, v, crate::vmgen::PROF_RESUME, 0))
+                }
                 _ => None,
             };
             if let Some(key) = key {

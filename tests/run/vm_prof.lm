@@ -68,7 +68,7 @@ fn main() {
     at = V.emit.LOOP(s, at, 0, 0);
     at = V.emit.RET(s, at, 0);
     var regs: [i64; 4] = [1, 2, 3, 0];
-    var c = C { n: 400 };
+    var c = C { n: 250 };
     let r = V.run(&c, &code[0], &regs[0]);
     if r >= 0 { io.println("done"); }
 }

@@ -78,8 +78,8 @@ one, else an estimate.
 | 2 | **Cheaper operand decoding and dispatch**: pre-scaled byte-offset fields, then offset-threaded dispatch (a handler offset in the word, no table load) | `F64_MUL` is 14 instructions: 6 decode, 3 work, 5 dispatch. wasm3's is 5 (`roadmap.md` Q11). Every interpreter pays this on every op. **Prototyped 2026-11-06: no gain on x86-64** (item 2, "Prototype results") | measured: 1.00 (step 1); 1.01, slower (step 2) | M, then L |
 | 3 | **Division by a verified constant**: `std.math.Divisor` (Granlund–Montgomery) and a verify-time hook that fills it | Prolog crypt: MOD/IDIV 27% of samples. MiniJS closures: MODK's `idiv` 8%. Mini built a magic-number IC by hand (`vm.lm:833`), and recomputing the magic on a miss cost 12%. Python slicing: `idiv` 14% (special-cased by hand) | 5–20% on 3–4 benchmarks; ~0.5% suite | S |
 | 4 | **Load facts**: `dereferenceable`/`nonnull`/invariant loads on pointers and `const` operand kinds | Listed in Mini's "remaining compiler issues" (`RESULTS.md:579`). Dependent-load chains: Python GETATTR 14–26%, MiniJS GETPROP_IN. GETINDEX_GETINDEX (20% of interp) keeps a frame | unknown; 0–3% (est.) | S |
-| 5 | **Smaller objects**: typed small-object chunks with no per-object header (BiBoP), or an 8-byte header for fixed-size types | Every object has a 16-byte header. A Scheme pair is 32 bytes against Guile's 16, and CAR alone is 12–15% of nboyer. Size sensitivity, measured: +8 bytes per object cost MiniJS binary_trees 6% and Python float 6% | 3–10% on allocation- and memory-bound benchmarks in 6 VMs (est.) | L |
-| 6 | **A sampling profiler in std** (`std.prof`), mapped to handlers, cold blocks and guest pcs | Every tuning round wrote its own LD_PRELOAD SIGPROF sampler (wasm FRICTION 366, Python FRICTION 618, Mini RESULTS:9). The 64 KiB verifier memset (Prolog sieve 0.54) was found only by sampling | indirect; it finds the next items | S–M |
+| 5 | **Smaller objects**: typed small-object chunks with no per-object header (BiBoP), or an 8-byte header for fixed-size types | Every object has a 16-byte header. A Scheme pair is 32 bytes against Guile's 16, and CAR alone is 12–15% of nboyer. Size sensitivity, measured: +8 bytes per object cost MiniJS binary_trees 6% and Python float 6% | est. 3–10%; **upper bound measured 2026-11-06: 1–3%** on nboyer, sboyer, mperm, earley (16-byte pairs, no collection, faults excluded), 24-byte pairs and Prolog ≈0; RSS halved. No-go (item 5) | L |
+| 6 | **A sampling profiler in std** (`std.prof`), mapped to handlers, cold blocks and guest pcs | Every tuning round wrote its own LD_PRELOAD SIGPROF sampler (wasm FRICTION 366, Python FRICTION 618, Mini RESULTS:9). The 64 KiB verifier memset (Prolog sieve 0.54) was found only by sampling | indirect; it finds the next items. **Built 2026-11-06** (`--vm-prof`, item 6): top entries match the hand sampler within 1 point; costs 3% (tail-call) at 1000 Hz | S–M |
 | 7 | **Shifted-int nanbox option** (Int payload in the high bits, so `add; jo` checks overflow) | Python's i48 overflow check is `shl; shl; add; jo; shr`, costing spectral_norm 5–8%. Mini measured i48 at +4–9% and kept i32 (`RESULTS.md:527`) | 3–8% on integer-heavy code in Python, and i48 for Mini (est.) | M |
 | 8 | **Re-fusion on `become`**, and supers from a profile file | Mini and MiniJS call `refuse` (a whole-function `optimize`) by hand after quickening; doing so gave mandelbrot −6% and nbody −5%. Lox, Python and Scheme don't do it | 1–3% where quickening precedes fusion (est.) | S |
 | 9 | **A value-stack and frame runtime** (`std.rt.ValueStack`): high-water-mark clearing across coroutines, nested runs and the debugger | Built by hand in MiniJS, Scheme and Python; for Scheme it gave fib 0.81 and tak 0.85. Mini's three attempts failed: the unsafe upper bound was fib 0.92, the safe attempt 0.995–1.003. Python's frames do 8 stores | 1–2% for Mini and Lox; mostly ergonomic for the rest | M |
@@ -1094,6 +1094,105 @@ printer all read the header today. Risks:
 **General:** six interpreters (Scheme, Prolog, MiniJS, Python, Lox,
 Mini closures and tables), mostly in allocation-heavy benchmarks.
 
+#### Upper bound measured (2026-11-06): 1–3%, no-go
+
+**Result.** On nboyer, sboyer, mperm and earley, headerless 16-byte
+pairs are 1–3% faster in the mutator: 0.971 at
+`--align-functions=64`, 0.993 at 128. That is under the 5% stop line.
+24-byte pairs (the 8-byte header) gain nothing measurable, and
+Prolog's terms and variables gain nothing. What 16-byte objects do
+buy is memory: half the RSS on the four.
+
+**The hack.** The patch is
+[`speed-audit/item5-arena-pairs.patch`](speed-audit/item5-arena-pairs.patch);
+it is not applied.
+- **Scheme.** `V.P(Gc<Pair>)` is told apart by its NaN-box tag, so
+  nothing reads a pair's header. Every pair allocation (CONS, REVERSE,
+  APPEND2, `cons`, `list`, `append`, the reader) goes through
+  `mk_pair`, which bumps a pointer through 64 KiB blocks of 2 MiB
+  huge-page segments. That is the GC's own segment source.
+- **Per block.** Each block starts with a zero "chunk head". Stores
+  into pairs test that head's flag byte (a mask and a load), as the
+  proposal's per-chunk `LOG` flag would.
+- **Variants.** `CELL` = 16, 24 or 32 bytes. The 24-byte cells write
+  an 8-byte header word. The 32-byte cells write the full header, so
+  they control for the allocation path.
+- **No collection.** Every build runs with the budget raised
+  (`set_max_budget(0)`, growth 400% over a 1 TiB minimum). The stock
+  build is included; `LOIMI_GC_STATS` showed 0 collections in every
+  run.
+- **Prolog.** `Var` and `Cons` (16-byte payloads, 32-byte objects)
+  moved to the same arena, with iterations at a quarter of
+  `iterations.txt` so that RSS stayed under 640 MB.
+
+**Method.** User+sys CPU time and max RSS (`wait4`), minimum of 7–11
+interleaved runs, `--align-functions=64` with a recheck at 128, an A/A
+build, and inputs as `bench/scheme/compare.py`'s (mperm 8, earley 20,
+gcbench 20, paraffins 100, browse 20, so that runs are long enough).
+
+**Total CPU overstates the gain.** With nothing collected, every
+allocated byte is a fresh page that the kernel faults in and zeroes,
+so halving a pair halves that system time. Those numbers (first row
+below) are an artifact of the no-collection setup: the stock build
+*with* collection runs deriv in 0.140 s, against 0.18–0.21 s without.
+
+The fair bound prefaults a pool sized to stock RSS plus 96 MB, so that
+every variant has the same RSS and no faults in the timed loop. It then
+times the benchmark's own elapsed time (rows marked "prefaulted").
+
+| Geometric means against stock | four named: 16 / 24 / 32 | all 21 Scheme: 16 / 24 / 32 | A/A (four / all) |
+|---|---|---|---|
+| align 64, total CPU | 0.913 / 0.959 / 0.970 | 0.939 / 0.968 / 0.996 | 0.975 / 0.992 |
+| align 128, total CPU | 0.966 / 0.988 / 1.017 | 0.958 / 0.979 / 1.013 | 1.000 / 0.999 |
+| align 64, prefaulted | **0.971** / 0.996 / 0.999 | 0.983 / 0.997 / 1.010 | 0.997 / 1.001 |
+| align 128, prefaulted | **0.993** / 1.004 / 1.014 | 0.988 / 0.993 / 1.013 | 0.996 / 1.000 |
+| max RSS, no prefault | 0.50 / 0.73 / 0.97 | 0.63 / 0.82 / 0.99 | |
+
+**Per benchmark.** Prefaulted, 16-byte cells, at align 64 / 128:
+
+| benchmark | 64 | 128 |
+|---|---|---|
+| nboyer | 0.966 | 0.984 |
+| sboyer | 0.968 | 0.999 |
+| mperm | 0.976 | 0.975 |
+| earley | 0.975 | 1.013 |
+| divrec (the most) | 0.891 | 0.900 |
+| paraffins | 0.947 | 0.943 |
+
+16 against 32 bytes (the same allocation path, only the size
+differs) gives the same bound: 0.972 at align 64, 0.979 at 128. A
+same-binary A/A spreads ±1–3% per benchmark.
+
+**Prolog.** At align 64 (30 programs):
+- Total CPU: 0.962 / 0.982 / 1.012 for 16 / 24 / 32-byte cells, A/A
+  0.995, RSS 0.63 / 0.81 / 0.98.
+- Prefaulted (CPU minus a null run with the same pool): 1.006 / 1.005
+  / 1.022, A/A 1.002. The layout gains nothing.
+
+**Not measured: the collector.** With the stock budget, marking and
+sweeping are a large share of the CPU time:
+
+| benchmark | share | collections |
+|---|---|---|
+| nboyer | 16% | 14 |
+| mperm | 23% | 6 |
+| earley | 14% | 18 |
+| paraffins | 24% | |
+| sboyer | 4% | |
+
+A chunk design might mark faster: no header to read, and a bitmap
+that is the mark. Collections would not get much rarer, though: the
+budget is a multiple of the live bytes, which shrinks along with the
+pairs.
+
+**Recommendation: no-go.** The 3–10% in the table was not real for
+time: the layout is worth 1–3% on the benchmarks it was aimed at, and
+not the L-sized change to the allocator, barrier, generational mode,
+weak tables, verifier and debugger. Reopen it only for memory (half
+the RSS on list-heavy programs), or if marking cost becomes the
+target. Measure that first, as GC time saved on nboyer, mperm and
+earley with collection on.
+
 ### 6. A sampling profiler in std
 
 **Evidence.**
@@ -1146,6 +1245,82 @@ map samples to symbols, into a runtime C file linked under a flag, as
 - **Everything else.** None; it is an opt-in build like `--vm-stats`.
 
 **General:** all interpreters, and every future tuning round.
+
+#### As built (2026-11-06): `loimi build --vm-prof`
+
+The flag links `src/prof_rt.c` into the program, as `--vm-stats`
+links `stats_rt.c`; its use is described in
+[language.md §7.3](../language.md#sampling---vm-prof).
+
+**Sampling.** A `SIGPROF` timer runs at 1000 Hz (`LOIMI_PROF_HZ`). It is
+a wall-clock high-resolution timer, because a CPU-time timer fires at
+most once per kernel tick, which is 250 Hz here. Each sample records
+the interrupted instruction from the `ucontext` (x86-64 and AArch64),
+the vm's `pc` and running op, and up to 24 return addresses
+(`backtrace`). The build adds `uwtable` to every function, so the stack
+walk goes from a runtime function back to the handler that called it.
+
+**Naming, in the process at exit.**
+- **Functions** are named from the ELF symbol tables of the loaded
+  objects (`dl_iterate_phdr`; `.symtab`, else `.dynsym`), so no Python
+  or `nm` is needed.
+- **Vm code** is named by marks the compiler records in a section,
+  each an address and a key. Tail-call handlers and outlined cold
+  blocks are marked by their function's address, which costs nothing.
+  Inline cold blocks are marked at their start and at their exits by
+  an empty inline asm (`.pushsection`), with no instructions.
+- **Goto and switch.** Each handler also stores its op's number. LLVM
+  merges and copies blocks between the handlers of the one function,
+  so a mark at each handler's start misplaced code: switch-mode Mini
+  showed `LOADBOOL` at 8% on `binary_trees`. With the stored op, the
+  three modes agree.
+- **JIT.** `jit_rt.c` reports every compiled instruction (start, end,
+  op and the instruction's word) to a weak hook, the data
+  `LOIMI_JIT_MAP` writes. JIT samples get the stencil's name and an
+  exact guest pc.
+
+**Validation against the hand sampler.** The comparison ran
+`sampler3.c`/`prof3.py` and `--vm-prof` on the same binaries, at
+27 kHz and 10 kHz:
+
+| Program | Top 5 | Largest difference |
+|---|---|---|
+| Mini `binary_trees` | same five, in the same order | 0.6 points |
+| Python `richards` | same entries | 1 point |
+| Python `raytrace` | same entries | 0.8 points |
+
+The only other mismatch is a name: the hand sampler's `CALL.cold31` is
+`CALL (cold block at vm.lm:795:13)` here. Goto- and switch-mode
+profiles of Mini's `fannkuch` and `binary_trees` match the tail-call
+profile, which the hand sampler cannot split, because goto and switch
+modes are one function.
+
+**Overhead.** User+sys time, minimum of 5 runs, each program under 4
+environment sizes (stack placements), `--align-functions=64`:
+
+| Build | Instrumentation only (`LOIMI_PROF=0`) | Sampling at 1000 Hz |
+|---|---|---|
+| Mini, tail-call (8 programs) | 1.017 | 1.032 |
+| Python, tail-call (6 programs) | 1.016 | 1.031 |
+| Mini, goto (6 programs) | 1.078 | 1.086 |
+
+- **Instrumentation.** Removing one part at a time shows that the
+  tail-call cost is all the `pc` store. Marks, unwind tables and the
+  report at exit cost nothing measurable.
+- **Mini's `sort`.** Its 12% is where the thread-local slot falls:
+  moving the slot within a padded block gives 1.00 to 1.05. It is an
+  address effect, not work.
+- **Goto mode** stores two words per op (`pc` and the op) inside one
+  large function, and that costs 2–17% (`nbody` most).
+- **Sampling.** Faster sampling costs more: 10 kHz cost 3–9% on Mini,
+  and that cost is the signal, not the stack walk.
+
+**Not built:**
+- the guest-level hook (`prof_location`), because the report runs in a
+  destructor, after the interpreter may have freed its code;
+- folded stacks;
+- per-thread timers (with threads, a sample goes to the running
+  thread).
 
 ### 7. A shifted-int nanbox option
 

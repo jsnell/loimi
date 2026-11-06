@@ -44,7 +44,7 @@ between this design and the compiler.
   [7.1 Inline caches](#71-inline-caches),
   [7.1a The following instruction: `then`](#71a-the-following-instruction-then),
   [7.2 Families and `become`](#72-families-and-become),
-  [7.3 Superinstructions](#73-superinstructions) (`supers` groups, `#[forward]`, `--vm-stats`),
+  [7.3 Superinstructions](#73-superinstructions) (`supers` groups, `#[forward]`, `--vm-stats`, `--vm-prof`),
   [7.4 Accumulators](#74-accumulators) (op selectors),
   [7.5 Relations and data on ops](#75-relations-and-data-on-ops-rel-and-data) (`rel`, `data`)
 - [8. GC integration](#8-gc-integration) (objects, trace hooks, barriers, rooting of traced state)
@@ -3436,6 +3436,107 @@ cold blocks entered:
 That is usually the next question after the op counts: which slow
 paths run, and how often. The counters cost nothing without
 `--vm-stats`; with it, one increment per entry.
+
+#### Sampling: `--vm-prof`
+
+`--vm-stats` counts dispatches, not time, and a dispatch count can
+mislead: one op may cost ten times another. `loimi build --vm-prof`
+links a sampling profiler into the program instead (`src/prof_rt.c`; no
+source change, any dispatch mode, executables and libraries). A timer
+sends `SIGPROF` 1000 times a second. Each sample records the
+interrupted instruction, the vm's `pc` (every handler stores it on
+entry) and the return addresses on the stack (the build has unwind
+tables). At exit the samples are named in the process, with no
+external tools, and printed to stderr as three tables sorted by
+count. Here is Mini on `binary_trees`:
+
+```text
+== vm prof: 961 samples, 1000 Hz of wall-clock time, 0.961 s ==
+
+self (where the samples landed):
+   samples       %    cum%  location
+       163   17.0%   17.0%  CALL
+       106   11.0%   28.0%  GETINDEXI
+        98   10.2%   38.2%  value.new_table_sized
+        84    8.7%   46.9%  SETLIST
+       ...
+        30    3.1%   82.2%  std.gc.mark_ptr
+       132   13.7%          (21 more)
+
+by vm location, with what it calls (the innermost op or cold block on the stack):
+   samples       %    cum%  location
+       202   21.0%   21.0%  NEWTABLE
+       163   17.0%   38.0%  CALL
+       ...
+        31    3.2%   90.9%  GETINDEXI (cold block at examples/mini/vm.lm:748:13)
+
+by guest pc (the vm's pc when the op started):
+   samples       %    cum%  pc              location
+       111   11.6%   11.6%  0x7fce3443144c  NEWTABLE
+        79    8.2%   19.8%  0x7fce34431440  NEWTABLE
+       ...
+```
+
+- **Self**: where the samples landed. Op handlers are named by op, and
+  cold blocks as `--vm-stats` names them. The program's other functions
+  (the collector, `std`, the interpreter's helpers) are named by symbol.
+  Shared-library code is named with the program function that called
+  it (`libc.so.6:memmove <- value.table_resize`), and JIT code by stencil
+  (`ADD (jit)`, or `ADD* (jit)` for a variant).
+- **By vm location**: the innermost op or cold block on the stack, so
+  the collection that `NEWTABLE` triggers counts for `NEWTABLE`.
+  Samples with no vm frame (compiling, startup) are `(outside vm code)`.
+- **By guest pc**: the vm's `pc` when the op started (in JIT code, the
+  compiled instruction's word) with its location: which instructions of
+  the guest program are hot. Pcs are addresses; mapping them to guest
+  source lines is up to the interpreter (a hook for it is not built).
+
+How code is named:
+- **Tail-call mode.** Handlers and outlined cold blocks are functions,
+  and the compiler records their addresses.
+- **Inline cold blocks.** The compiler marks each one's first
+  instruction with an empty inline asm, which records the address in a
+  section and emits no instructions. It marks the block's ends the same
+  way, since LLVM lays an op's other blocks after its cold ones.
+- **Goto and switch modes.** All handlers are one function, and LLVM
+  merges and copies blocks across them, so an address alone cannot say
+  whose code it is. Each handler stores its op's number on entry
+  instead, and the op that runs owns the sample. Marks only tell that
+  op's cold blocks from the rest. Switch mode's central dispatch counts
+  for the op that dispatches, as goto and tail-call handlers dispatch
+  from their own code.
+- **JIT.** Under `--jit-stencils` the JIT reports each instruction it
+  compiles, the data `LOIMI_JIT_MAP` writes.
+
+On Mini and Python, the top entries agree with an `LD_PRELOAD` sampler
+on the same binaries to within 1–3 points ([design/speed-audit.md](design/speed-audit.md), item 6).
+
+Environment variables:
+- `LOIMI_PROF_OUT=file`: write the report there instead of stderr.
+- `LOIMI_PROF_HZ=n`: the rate (default 1000). Faster costs more: 10 kHz
+  cost Mini 3–9%.
+- `LOIMI_PROF_TOP=n`: rows per table (default 30; 0 prints all).
+- `LOIMI_PROF_CLOCK=cpu`: sample CPU time instead of wall-clock time.
+  A CPU-time timer fires at most once per kernel tick, often 250 Hz.
+  The wall-clock timer is a high-resolution timer, and a busy
+  interpreter's wall-clock time is its CPU time; time blocked in a
+  system call shows as the libc function that made it.
+- `LOIMI_PROF_DEPTH=n`: return addresses kept per sample (default 24;
+  0 skips the stack walk, and the second table then sees only the
+  interrupted function).
+- `LOIMI_PROF=0`: no sampling, which measures what the instrumentation
+  alone costs.
+
+Limits:
+- The cost: one store per op (two in goto and switch modes), unwind
+  tables, and the samples (about 100 bytes each). At 1000 Hz, Mini and
+  Python in tail-call mode run 3% slower, of which half is the store;
+  goto-mode Mini runs 8% slower.
+- One process-wide timer: with several threads, a sample goes to the
+  thread that is running.
+- The report runs at exit (a C destructor): a program that ends in
+  `_exit` or crashes prints none.
+- x86-64 and AArch64 Linux only.
 
 ### 7.4 Accumulators
 

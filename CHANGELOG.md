@@ -564,6 +564,18 @@ implementation; `git log` has the details.
   with `y: i32` ([language.md §1.2](docs/language.md#12-basics)).
 - **`--vm-stats`** counts entries into each `cold` block, per op, with
   its source location ([status.md](docs/status.md), Instrumentation row).
+- **`loimi build --vm-prof`**: a sampling profiler linked into the
+  program, replacing the `LD_PRELOAD` samplers each tuning round wrote.
+  At exit it prints time per op handler and cold block (the `--vm-stats`
+  names), per program function, and per library function with its
+  caller. It also prints time by the innermost op on the stack (a
+  collection counts for the op that allocated) and by guest `pc`. It
+  covers all three dispatch modes and the `--jit-stencils` JIT (by
+  stencil), on x86-64 and AArch64, and names samples in the process. At
+  the default 1000 Hz it costs about 3% in tail-call mode (8% in goto
+  mode); its top entries match the hand sampler's on Mini and Python
+  ([language.md §7.3](docs/language.md#sampling---vm-prof);
+  [design/speed-audit.md](docs/design/speed-audit.md), item 6).
 - **Doc-snippet test**: every `loimi` code block in the README and
   `docs/` compiles, runs or fails as its annotation says
   (`tests/docs.rs`); the tutorial is checked against

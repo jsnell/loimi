@@ -31,7 +31,7 @@ says so. Some modules are design only; their sections say so at the top.
 | [`std.rt`](#stdrt-runtime-support) | built in part (`protect`/`throw`, `catch_panic`/`panic`; no `ValueStack`, `FrameStack`, `Fiber`) | `std/rt.lm` |
 | [`std.collections`](#design-not-built-stdcollections) (beyond `HashMap`, `OrderedMap`, `Dict`) | **not built** | |
 | [`std.ast`](#stdast) | **not built** | |
-| [`std.prof`](#stdprof) | built (clock, `Bench`, `Counters`, `--vm-stats` counts; no sampling profiler) | `std/prof.lm` |
+| [`std.prof`](#stdprof) | built (clock, `Bench`, `Counters`, `--vm-stats` counts; sampling is `loimi build --vm-prof`) | `std/prof.lm` |
 | [`std.ffi`](#design-not-built-stdio-stdos-stdffi) | **not built** (`extern "C"` is in the language) | |
 | [`std.test`](#stdtest) | built (`#[test]`, `loimi test`, assertions, capture, golden files; no matrix or differential runner) | `std/test.lm` |
 
@@ -1357,10 +1357,10 @@ access is compiled in only when the program uses it.
 
 ### Design (not built)
 
-A sampling profiler that reads the synced `pc` from a timer signal
-(made accurate by an instrumentation variant that syncs on backward
-jumps and calls) and maps it through the line table to guest source
-lines, with folded stacks for flame graphs; `suggest-supers` as a
+Guest-level sampling: `loimi build --vm-prof` (language.md §7.3)
+samples handlers, functions and the vm's `pc`; not built is mapping
+those pcs through the interpreter's line table to guest source lines,
+with folded stacks for flame graphs; `suggest-supers` as a
 library over the pair counts; confidence intervals in `Bench`.
 
 ## `std.test`

@@ -1108,19 +1108,18 @@ fn prof_cold_exit(g: &mut FnGen) {
 
 /// `--vm-prof`: at the start of op `k`'s handler, store `pc` where the
 /// sampler reads it. In goto and switch modes (one function holds all
-/// handlers) also mark the code and store the op: LLVM merges and copies
-/// blocks between handlers there, so the op that runs, not the mark
-/// before the sample, says whose code it is; marks then tell its cold
-/// blocks from the rest. (Tail-call handlers are marked by their
-/// address.)
+/// handlers, marked by its address) also store the op: LLVM merges and
+/// copies blocks between handlers there, so the op that runs, not a
+/// mark before the sample, says whose code it is, and the marks of
+/// inline cold blocks tell its cold code from the rest. (An inline asm
+/// mark at each handler cost goto-mode Mini more than the store.)
+/// Tail-call handlers are functions, marked by their address.
 fn prof_op(g: &mut FnGen, k: u32, combined: bool) {
     if !g.cg.opts.vm_prof || g.stencil.is_some() {
         return;
     }
     let vm = g.f().vm.unwrap();
     if combined {
-        let key = prof_key(g.cg, vm, PROF_OP, k as usize);
-        prof_mark(g, key);
         g.emit(format!("store i32 {}, ptr @loimi.prof.op", ((vm as u64) << 20 | k as u64) + 1));
     }
     let p = g.p();
@@ -1335,11 +1334,11 @@ done:
 /// locations, between `PROF_BEGIN` and `PROF_END` lines (a JIT build
 /// moves it past the stencil module, which must not see it):
 /// - per vm, a `struct prof_vm` in section `loimi_prof_vms`: tag, name,
-///   op names, cold block labels (as `--vm-stats` prints them) and the
-///   getter of the thread's last `pc`;
+///   op names, cold block labels (as `--vm-stats` prints them) with the
+///   op each is in, and the getters of the thread's last `pc` and op;
 /// - the functions marked by address, as `struct prof_mark`s in section
 ///   `loimi_prof_marks`, where `prof_mark`'s inline asm records the rest.
-/// The thread-local `pc` itself goes with the other globals.
+/// The thread-locals themselves go with the other globals.
 pub fn emit_prof(cg: &mut crate::codegen::Codegen) -> String {
     let mut out = String::new();
     if !cg.opts.vm_prof {
@@ -1374,7 +1373,7 @@ pub fn emit_prof(cg: &mut crate::codegen::Codegen) -> String {
         );
         let _ = writeln!(
             out,
-            "@\"loimi.prof.vm.{vi}\" = internal global {{ i64, ptr, i64, i64, ptr, ptr, ptr, i64, ptr, ptr, i64 }} {{ i64 {tag}, ptr {name}, i64 {}, i64 {}, ptr @\"loimi.prof.ops.{vi}\", ptr @\"loimi.prof.colds.{vi}\", ptr @loimi.prof.pc_addr, i64 {nvms}, ptr @loimi.prof.op_addr, ptr @\"loimi.prof.owners.{vi}\", i64 {vi} }}, section \"loimi_prof_vms\", align 8",
+            "@\"loimi.prof.vm.{vi}\" = internal global {{ i64, ptr, i64, i64, ptr, ptr, ptr, i64, ptr, ptr, i64 }} {{ i64 {tag}, ptr {name}, i64 {}, i64 {}, ptr @\"loimi.prof.ops.{vi}\", ptr @\"loimi.prof.colds.{vi}\", ptr @loimi.prof.pc_get, i64 {nvms}, ptr @loimi.prof.op_get, ptr @\"loimi.prof.owners.{vi}\", i64 {vi} }}, section \"loimi_prof_vms\", align 8",
             ops.len(),
             colds.len(),
         );
@@ -1384,8 +1383,12 @@ pub fn emit_prof(cg: &mut crate::codegen::Codegen) -> String {
         let _ = writeln!(out, "@\"loimi.prof.fm.{}\" = internal global {{ ptr, i64 }} {{ ptr @\"{}\", i64 {} }}, section \"loimi_prof_marks\", align 8", i, sym, key);
         used.push(format!("ptr @\"loimi.prof.fm.{}\"", i));
     }
-    let _ = writeln!(out, "define internal ptr @loimi.prof.pc_addr() {{\n  ret ptr @loimi.prof.pc\n}}");
-    let _ = writeln!(out, "define internal ptr @loimi.prof.op_addr() {{\n  ret ptr @loimi.prof.op\n}}");
+    // The getters return the values, not the addresses: a thread-local
+    // whose address escapes may alias what the handlers load and store,
+    // and LLVM then keeps values in memory across the `pc` store (Mini's
+    // sort ran 12% slower).
+    let _ = writeln!(out, "define internal ptr @loimi.prof.pc_get() {{\n  %v = load volatile ptr, ptr @loimi.prof.pc\n  ret ptr %v\n}}");
+    let _ = writeln!(out, "define internal i32 @loimi.prof.op_get() {{\n  %v = load volatile i32, ptr @loimi.prof.op\n  ret i32 %v\n}}");
     if !used.is_empty() {
         let _ = writeln!(out, "@llvm.compiler.used = appending global [{} x ptr] [{}], section \"llvm.metadata\"", used.len(), used.join(", "));
     }
