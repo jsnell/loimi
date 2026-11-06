@@ -1221,6 +1221,8 @@ fn eval(rhs: &str, state: &HashMap<String, Val>, vals: &HashMap<String, Val>, tr
 /// Profile counts of a region build, by step pc and block label.
 struct Prof {
     blocks: HashMap<(usize, String), u64>,
+    /// The counts before the minimum fraction (for the report).
+    raw: HashMap<(usize, String), u64>,
     /// A block counts as on the trace if run at least this many times.
     min: u64,
 }
@@ -1289,6 +1291,8 @@ struct FnGen<'t, 'a> {
     flushed: bool,
     /// LOIMI_TRACE_DEBUG: annotate accesses with what the analysis found.
     debug: bool,
+    /// The guards, for the report.
+    guard_info: Vec<String>,
 }
 
 impl<'t, 'a> FnGen<'t, 'a> {
@@ -1534,6 +1538,8 @@ impl<'t, 'a> FnGen<'t, 'a> {
                     for &s in &st.succs[b] {
                         if !on[s] {
                             guard_edges.insert((b, s));
+                            let cnt = |l: &str| self.prof.as_ref().and_then(|p| p.raw.get(&(pc, l.to_string())).copied()).unwrap_or(0);
+                            self.guard_info.push(format!("{}: {} ({}) -> {} ({})", pc, st.blocks[b].0, cnt(&st.blocks[b].0), st.blocks[s].0, cnt(&st.blocks[s].0)));
                         }
                     }
                 }
@@ -1747,9 +1753,12 @@ impl<'t, 'a> FnGen<'t, 'a> {
                     let parts: Vec<&str> = rhs.split("label ").collect();
                     if parts.len() == 3 {
                         let mut labs = Vec::new();
+                        // metadata after the labels (`, !prof !3`) stays
+                        let last = parts[2].trim();
+                        let suffix = &last[last.find([',', ' ']).unwrap_or(last.len())..];
                         for part in &parts[1..] {
-                            let tok = part.trim_end_matches(',').trim().trim_end_matches(',');
-                            let tb = st.blocks.iter().position(|bb| format!("%{}{}", p, bb.0) == tok).ok_or("bad branch")?;
+                            let tok = part.trim().split([',', ' ']).next().unwrap_or("");
+                            let tb = st.blocks.iter().position(|bb| format!("%{}{}", p, bb.0) == tok).ok_or_else(|| format!("step {}: bad branch `{}`", pc, rhs))?;
                             if guard_edges.contains(&(b, tb)) {
                                 guard_ix += 1;
                                 let g = format!("guard.{}.{}", pc, guard_ix);
@@ -1763,13 +1772,13 @@ impl<'t, 'a> FnGen<'t, 'a> {
                                 labs.push(tok.to_string());
                             }
                         }
-                        self.e.line(format!("  {}label {}, label {}", parts[0], labs[0], labs[1]));
+                        self.e.line(format!("  {}label {}, label {}{}", parts[0], labs[0], labs[1], suffix));
                         continue;
                     }
                 }
                 if rhs.starts_with("br label ") {
-                    let tok = rhs["br label ".len()..].trim();
-                    let tb = st.blocks.iter().position(|bb| format!("%{}{}", p, bb.0) == tok).ok_or("bad branch")?;
+                    let tok = rhs["br label ".len()..].trim().split([',', ' ']).next().unwrap_or("");
+                    let tb = st.blocks.iter().position(|bb| format!("%{}{}", p, bb.0) == tok).ok_or_else(|| format!("step {}: bad branch `{}`", pc, rhs))?;
                     if window && real_in[tb] {
                         let w = self.wb_edge(tok);
                         self.e.line(format!("  br label {}", w));
@@ -1853,6 +1862,8 @@ pub struct Options {
     pub only: Vec<usize>,
     /// Instructions left out of regions, as exits (debugging).
     pub skip: Vec<usize>,
+    /// LOIMI_TRACE_REPORT=2: the report lists every guard.
+    pub verbose: bool,
 }
 
 impl Options {
@@ -1866,6 +1877,7 @@ impl Options {
             min_frac: var("LOIMI_TRACE_MINFRAC").and_then(|v| v.parse().ok()).unwrap_or(0.001),
             fail_limit: 1024,
             only: var("LOIMI_TRACE_ONLY").map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect()).unwrap_or_default(),
+            verbose: var("LOIMI_TRACE_REPORT").is_some_and(|v| v == "2"),
             skip: var("LOIMI_TRACE_SKIP").map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect()).unwrap_or_default(),
         }
     }
@@ -1926,6 +1938,7 @@ impl<'t, 'a> FnGen<'t, 'a> {
             side: Vec::new(),
             flushed: false,
             debug: std::env::var_os("LOIMI_TRACE_DEBUG").is_some(),
+            guard_info: Vec::new(),
         }
     }
 
@@ -2061,6 +2074,7 @@ struct GenFn {
     nr: usize,
     nguards: usize,
     neffect: usize,
+    guard_info: Vec<String>,
 }
 
 /// The function `kind` for loop h of `code`, over `order`.
@@ -2074,7 +2088,7 @@ fn generate_fn(m: &Module, vm: &VmInfo, code: &Code, h: usize, order: &[usize], 
     }
     let mut g = FnGen::new(&mut t, kind, name.to_string(), index, order.to_vec(), succ, prof, opts.check);
     let ir = g.emit()?;
-    let r = GenFn { ir, blockmap: std::mem::take(&mut g.blockmap), edges: std::mem::take(&mut g.edges), kchk: BTreeSet::new(), nr: g.nr, nguards: g.nguards, neffect: g.neffect };
+    let r = GenFn { ir, blockmap: std::mem::take(&mut g.blockmap), edges: std::mem::take(&mut g.edges), kchk: BTreeSet::new(), nr: g.nr, nguards: g.nguards, neffect: g.neffect, guard_info: std::mem::take(&mut g.guard_info) };
     drop(g);
     Ok(GenFn { kchk: std::mem::take(&mut t.kchk), ..r })
 }
@@ -2313,13 +2327,13 @@ pub fn traces(ir: &str, stencils: &str, vm: &VmInfo, profs: &[ProfRegion], opts:
             *blocks.entry((*pc, lab.clone())).or_default() += pr.counts[i];
         }
         let mut on_blocks = HashMap::new();
-        for ((pc, lab), n) in blocks {
-            if path.contains(&pc) {
-                let mn = ((first_count[&pc] as f64) * opts.min_frac).ceil() as u64;
-                on_blocks.insert((pc, lab), if n >= mn.max(1) { n } else { 0 });
+        for ((pc, lab), n) in &blocks {
+            if path.contains(pc) {
+                let mn = ((first_count[pc] as f64) * opts.min_frac).ceil() as u64;
+                on_blocks.insert((*pc, lab.clone()), if *n >= mn.max(1) { *n } else { 0 });
             }
         }
-        let prof = Prof { blocks: on_blocks, min: 1 };
+        let prof = Prof { blocks: on_blocks, raw: blocks, min: 1 };
         let succ: HashMap<usize, usize> = (0..path.len()).map(|i| (path[i], path[(i + 1) % path.len()])).collect();
         let name = format!("t{}", out.entries.len());
         let index = out.entries.len();
@@ -2341,6 +2355,11 @@ pub fn traces(ir: &str, stencils: &str, vm: &VmInfo, profs: &[ProfRegion], opts:
                     g.neffect,
                     ops.join(" ")
                 );
+                if opts.verbose {
+                    for gi in &g.guard_info {
+                        let _ = writeln!(report, "  guard {}", gi);
+                    }
+                }
             }
             Err(e) => {
                 let _ = writeln!(report, "no trace for code {:016x} loop {}: {}", code.hash, h, e);

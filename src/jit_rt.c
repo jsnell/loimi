@@ -164,6 +164,8 @@ static void report(void) {
     fprintf(stderr, "jit: %llu code objects registered, %zu kept\n", (unsigned long long)st.registered, nrecs);
 }
 
+static void trace_setup(void);
+
 __attribute__((constructor)) static void jit_init(void) {
     const char *e = getenv("LOIMI_JIT");
     enabled = e && *e && strcmp(e, "0") != 0;
@@ -200,6 +202,7 @@ __attribute__((constructor)) static void jit_init(void) {
      * attributing profiler samples to stencils. */
     const char *m = getenv("LOIMI_JIT_MAP");
     if (enabled && m && *m) mapf = fopen(m, "w");
+    if (enabled) trace_setup();
     inited = 1;
 }
 
@@ -1034,10 +1037,12 @@ static void trace_report(void) {
     }
 }
 
+static void record_all(void);
+
 static void trace_setup(void) {
     trace_inited = 1;
     const char *d = getenv("LOIMI_TRACE_RECORD");
-    if (d && *d) trace_recf = fopen(d, "w");
+    if (d && *d && (trace_recf = fopen(d, "w"))) atexit(record_all);
     const char *o = getenv("LOIMI_TRACE");
     trace_off = o && strcmp(o, "0") == 0;
     const char *fe = getenv("LOIMI_TRACE_FAILS");
@@ -1081,30 +1086,52 @@ static void trace_install(struct rec *r) {
     }
 }
 
+/* The recording of compiled code object r: its words (the real ones,
+ * not enter words), the op of each instruction, and the constants its
+ * stencils patch in. */
+static void record_code(struct rec *r) {
+    uint64_t h = words_hash(r, 0, r->n);
+    int64_t hot = last_hot && last_hot >= r->code && last_hot < r->code + r->n ? last_hot - r->code : -1;
+    fprintf(trace_recf, "code %p %llu %016llx hot %lld\n", (void *)r->code, (unsigned long long)r->n, (unsigned long long)h, (long long)hot);
+    for (uint64_t pc = 0; pc < r->n; pc++) {
+        if (!r->home[pc]) {
+            fprintf(trace_recf, "w %llu %08x -\n", (unsigned long long)pc, r->w[pc]);
+            continue;
+        }
+        fprintf(trace_recf, "w %llu %08x %s\n", (unsigned long long)pc, r->w[pc], loimi_jit_opnames[r->w[pc] & OPMASK]);
+        const struct jit_stencil *sp = &loimi_jit_stencils[stencil_in(r, r->w[pc])];
+        for (uint32_t k = 0; k < sp->nreloc && r->pool; k++) {
+            const struct jit_reloc *rl = &loimi_jit_relocs[sp->reloc + k];
+            if (rl->kind != K_CONST) continue;
+            unsigned o = rl->arg & 255;
+            uint64_t c = (uint64_t)r->pool[field(r->w[pc + o], rl->arg)];
+            fprintf(trace_recf, "k %llu %u.%u.%u %016llx\n", (unsigned long long)pc, o, (unsigned)(rl->arg >> 8) & 255,
+                    (unsigned)(rl->arg >> 16) & 255, (unsigned long long)c);
+        }
+    }
+    fprintf(trace_recf, "end\n");
+}
+
+/* At exit, every compiled code object again: rewrites after the last
+ * compile (quickening that retargeted instead of recompiling) are in
+ * the steady state the traces should be made for. */
+static void record_tree(struct rec *t) {
+    if (!t) return;
+    record_tree(t->left);
+    if (t->state == S_COMPILED && t->home && !t->rewriting) record_code(t);
+    record_tree(t->right);
+}
+static void record_all(void) {
+    record_tree(recs);
+    fclose(trace_recf);
+    trace_recf = NULL;
+}
+
 /* After a compile: the recording, then the traces. */
-static void trace_hook(struct rec *r, const uint32_t *sts) {
+static void trace_hook(struct rec *r) {
     if (!trace_inited) trace_setup();
     if (trace_recf) {
-        uint64_t h = words_hash(r, 0, r->n);
-        int64_t hot = last_hot && last_hot >= r->code && last_hot < r->code + r->n ? last_hot - r->code : -1;
-        fprintf(trace_recf, "code %p %llu %016llx hot %lld\n", (void *)r->code, (unsigned long long)r->n, (unsigned long long)h, (long long)hot);
-        for (uint64_t pc = 0; pc < r->n; pc++) {
-            if (!r->home[pc]) {
-                fprintf(trace_recf, "w %llu %08x -\n", (unsigned long long)pc, r->w[pc]);
-                continue;
-            }
-            fprintf(trace_recf, "w %llu %08x %s\n", (unsigned long long)pc, r->w[pc], loimi_jit_opnames[r->w[pc] & OPMASK]);
-            const struct jit_stencil *sp = &loimi_jit_stencils[sts[pc]];
-            for (uint32_t k = 0; k < sp->nreloc && r->pool; k++) {
-                const struct jit_reloc *rl = &loimi_jit_relocs[sp->reloc + k];
-                if (rl->kind != K_CONST) continue;
-                unsigned o = rl->arg & 255;
-                uint64_t c = (uint64_t)r->pool[field(r->w[pc + o], rl->arg)];
-                fprintf(trace_recf, "k %llu %u.%u.%u %016llx\n", (unsigned long long)pc, o, (unsigned)(rl->arg >> 8) & 255,
-                        (unsigned)(rl->arg >> 16) & 255, (unsigned long long)c);
-            }
-        }
-        fprintf(trace_recf, "end\n");
+        record_code(r);
         fflush(trace_recf);
     }
     trace_install(r);
@@ -1190,7 +1217,7 @@ static int compile(struct rec *r, const int32_t *oent) {
             if (map[pc] >= 0) map_line(r->body[pc], lens[pc], sts[pc]);
         fflush(mapf);
     }
-    trace_hook(r, sts);
+    trace_hook(r);
     if (debug) {
         fprintf(stderr, "jit: compiled %p (%llu words) at %p\n", (void *)code, (unsigned long long)n, (void *)dst);
         for (uint64_t pc = 0; pc < n; pc++) {
