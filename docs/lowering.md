@@ -206,6 +206,67 @@ the fast path, and Mini's mandelbrot and nbody ran 4–5% slower. With
 the `double` load, `addsd` reads memory and the slow path does the
 `movq` instead.
 
+### `nanbox(int_high)`
+
+The layout is chosen as above (classic, eight, packed or shared), and
+then every word is stored rotated: the word of the layout's word `c` is
+`rotl(c, 16) ^ k`, where `k` is the 16-bit tag of the integer variant's
+48-bit block (the first variant with an integer payload and a whole
+48-bit block; `0xFFF9` in the classic layout). It is a bijection, so
+everything the layout guarantees holds; what changes is which bits are
+where:
+
+| Variant | Word | Test | Payload |
+|---|---|---|---|
+| `Int(i48)` (the `k` block) | `x << 16` | `(w & 0xFFFF) == 0` | `ashr exact w, 16` |
+| a pointer with a whole block `T` | `p << 16 \| (T ^ k)` | `(w & 0xFFFF) == T ^ k` | `w >> 16` |
+| a shared block `T`, low tag `L` | `(p \| L) << 16 \| (T ^ k)` | `(w & 0x7FFFF) == ..` | `(w >> 16) - L`, the `- L` in the load's displacement |
+| narrower blocks (packed) | the payload at bit 16 | `(w & rotl(mask, 16)) == ..` | `w >> 16`, truncated |
+| `Num(f64) unboxed` | `rotl(d, 16) ^ k` | `rotr(w ^ k, 16) <u NUM` | `rotr(w ^ k, 16)`: `xor; ror` |
+
+`V.X.mask` and `V.X.tag` are the rotated mask and tag (the mask always
+covers the layout word's top 16 bits, which become the low 16, so `^ k`
+stays inside it). Tuple tests merge as before: `(Int, Int)` is
+`(a | b) & 0xFFFF == 0`, `mov; or %si, %bx; je` on x86-64.
+
+The `exact` on the integer's payload is what removes the shifts: the
+checked add on `i48` shifts its operands left by 16 (above), LLVM folds
+`shl(ashr exact(w, 16), 16)` back to `w`, and re-tagging `Int(r)` is
+`r << 16`, which folds into the `ashr exact` of the sum. Python's `ADD`
+is `match (a, b) { (Int(x), Int(y)) => if let Some(r) =
+x.add_checked(y) { dst = Int(r); next }, (Float(x), Float(y)) => .. }`;
+its int path, operand decoding and dispatch included, went from 28
+instructions to 18:
+
+```asm
+mov    %edx, %ebx
+or     %si, %bx           ; (a | b) & 0xFFFF == 0: both Int
+je     .Lint
+...                       ; the float arm: xor; rol each, umax test, addsd, rol; xor
+.Lint:
+add    %rsi, %rdx
+jo     .Lcold
+mov    %rdx, (%r14,%rcx,8)
+```
+
+`MUL` is `sar $16, %rsi; imul %rsi, %rdx; jo` (one operand shifted, as
+for odd widths), `LT` a word `cmp`, and `x as f64` is `sar; cvtsi2sd`
+(the plain i48 needs `shl; sar` first). Pointer payloads become `shr
+$16` instead of an `and` with a 48-bit mask that needs a `movabs`
+(Python's handlers are 5% smaller in all: GETATTR 64 to 56
+instructions, CALLEX 1091 to 1025). Floats pay: two instructions to
+decode each operand and two to encode the result, and the test decodes
+before the `umax`. In Python's `ADD` the float path still went only from
+31 instructions to 32, as the int test in front of it got shorter. Per benchmark see `design/speed-audit.md`, item 7.
+
+The GC marks through the same payload extraction; the JIT's stencil
+variants per constant tag (`--jit-stencils`) use the rotated mask and
+tag, and the float, whose test is no mask test of the stored word, gets
+no stencil variant (traces load float constants from the pool instead
+of baking them in). `#[scan_raw_words]` is refused: a raw pointer's low
+16 bits can be any variant's tag. The all-zero word is `Int(0)`, not
+`0.0`, which is what zero-filled trailing arrays hold.
+
 ### `lowtag`
 
 The word is `payload << s | tag`, where `tag` has `s` bits. With at most 8
@@ -283,7 +344,7 @@ to the shifted overflow add (shorter dependency chain: `add; and; or`) is
 2-5% slower (more instructions; these handlers are throughput-bound). The
 remaining cost against `Int(i32)` is the two `shl` per operation and the
 `shr` before re-tagging; avoiding them needs the tag in the low bits of
-the rotated word, which the checked operation does not know.
+a rotated word: `nanbox(int_high)` (above), where the add is `add; jo`.
 
 ### `boxed`
 

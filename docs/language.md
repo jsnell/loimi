@@ -1408,7 +1408,7 @@ Available representations:
 
 | `repr` | Layout | Typical user |
 |---|---|---|
-| `nanbox` | 64-bit word. Doubles stored directly; other variants in the NaN space with payloads of up to 48 bits | JS engines, LuaJIT |
+| `nanbox` | 64-bit word. Doubles stored directly; other variants in the NaN space with payloads of up to 48 bits. `nanbox(int_high)`: the same rotated, so that an integer is `payload << 16` and doubles cost a decode (below) | JS engines, LuaJIT |
 | `lowtag` | 64-bit word. Aligned pointers with tag bits in the low bits; integers of up to 61 bits shifted | Ruby, OCaml, many Schemes |
 | `boxed` | Two words `{tag, payload}`, passed and returned in two registers | PUC Lua (`TValue`) |
 | `pointer` | **Not built:** everything is a `Gc<_>` with a header type tag | CPython |
@@ -1545,9 +1545,9 @@ happening silently:
   `V.Int.mask` (the bits that identify the variant), `V.Int.tag` (their
   value: a word `w` holds `Int` exactly when `w & V.Int.mask ==
   V.Int.tag`), `V.Int.block` (the block width), and `V.Num.limit` for
-  the `unboxed` variant (its words are those below it). They are
-  constants, so tests built from them cost what hand-written ones do,
-  and they follow the layout.
+  the `unboxed` variant (its words are those below it; not under
+  `int_high`, below). They are constants, so tests built from them
+  cost what hand-written ones do, and they follow the layout.
 
 <!-- snippet: run "both ints" -->
 ```loimi
@@ -1577,13 +1577,75 @@ fn main() {
 Switching `repr` is a one-word change, which makes the representation
 something you can benchmark rather than something you commit to on day one.
 
+**`repr nanbox(int_high)`: integers in the high bits.** In a plain
+nanbox an `Int(i48)` sits under a 16-bit tag, so `x.add_checked(y)` has
+to shift both payloads to the top of the word to get an overflow flag at
+48 bits, and shift the sum back to re-tag it (`shl; shl; add; jo; shr;
+or`). The `int_high` option rotates every word of the layout left by 16
+bits and xors the integer variant's tag away, so that variant's word is
+`payload << 16` with zero low bits: a checked add or subtract of two of
+them is `add; jo` on the words (the result is already tagged), a
+multiply is `sar; imul; jo`, a compare is a word compare, and the test
+for two of them is `(a | b) & 0xFFFF == 0`. Every other variant has
+nonzero low 16 bits, and a pointer payload is `word >> 16`, which needs
+no 48-bit mask constant. The price is the unboxed `f64`: decoding it is
+`xor; ror` and encoding it `rol; xor`, and its test decodes first. The
+integer variant is the first one with an integer payload and a whole
+48-bit block; a declaration without one is an error. `--explain-values`
+prints the rotated masks and tags and these costs.
+
+<!-- snippet: run "int 140737488355327" "overflow" "num 0.75" -->
+```loimi
+import std.io;
+value V repr nanbox(int_high) {
+    Num(f64) unboxed,
+    Int(i48),             // the word is x << 16
+    Nil,
+}
+
+fn add(a: V, b: V) -> V {
+    match (a, b) {
+        // `add; jo` on the two words
+        (Int(x), Int(y)) => if let Some(r) = x.add_checked(y) { V.Int(r) } else { V.Nil },
+        (Num(x), Num(y)) => V.Num(x + y),   // xor; ror each, addsd, rol; xor
+        _ => V.Nil,
+    }
+}
+
+fn show(v: V) {
+    match v {
+        Int(x) => { io.print("int "); io.print_int(x as i64); }
+        Num(x) => { io.print("num "); io.print_f64(x); }
+        Nil => io.print("overflow"),
+    }
+    io.println("");
+}
+
+fn main() {
+    show(add(V.Int(140737488355326), V.Int(1)));
+    show(add(V.Int(140737488355327), V.Int(1)));
+    show(add(V.Num(0.5), V.Num(0.25)));
+}
+```
+
+Python uses it (`examples/python/value.lm`): its 11 benchmarks ran
+0.93–0.95 of the plain nanbox's time, the integer ones 0.87–0.97 and the
+float ones 0.91–1.05 (`design/speed-audit.md`, item 7). It is opt-in
+because it is an exchange: code whose values are mostly floats pays
+four instructions per float operation and gains little. Two things do
+not carry over from the plain nanbox: `V.Num.limit` does not exist (the
+float's words are not the words below a limit), and a float-first fast
+path that adds two slots as doubles before testing them
+(`f64.from_bits(a as u64)`, `lowering.md` §2) reads rotated words.
+
 **`#[scan_raw_words]`** on a value type asks the compiler to guarantee
 that every word below 2^48 (a user-space pointer on x86-64 and AArch64,
 or a small non-negative integer) reads as a variant without references,
 and is an error if the layout does not (only `repr nanbox` with an
-unboxed float variant does: such words are floats). A root scanner may
-then `gc_mark` memory that mixes raw pointers and counts with values of
-the type, word by word, as Prolog's environment stack does (frames of
+unboxed float variant does: such words are floats; not
+`nanbox(int_high)`, where the low 16 bits pick the variant). A root
+scanner may then `gc_mark` memory that mixes raw pointers and counts
+with values of the type, word by word, as Prolog's environment stack does (frames of
 `{ ce: *Frame, cp: *u32, n: u64 }` followed by terms); switching the
 type to `lowtag` then fails to compile instead of breaking the scanner.
 
