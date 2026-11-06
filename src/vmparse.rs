@@ -48,26 +48,27 @@ fn desugar_break(vm: &mut VmDecl) -> Res<()> {
     Ok(())
 }
 
-/// `refuse CODE;`: after every `become X` of a family that some super
-/// names (as a part, or a member of a part's family), call
-/// `Vm.refuse(CODE)`, which selects value accumulator variants again and
-/// fuses supers again over the whole code, as `Vm.optimize` does on
-/// quickened code. A `become` of a family that no super names and that
-/// has no accumulator variants to select cannot change what fuses, so it
-/// stays a single store.
+/// `refuse CODE;`: after every `become X` where X is a part of some super
+/// (or an accumulator variant of one), call `Vm.refuse(CODE)`, which
+/// selects value accumulator variants again and fuses supers again over
+/// the whole code, as `Vm.optimize` does on quickened code. Other
+/// `become`s stay a single store: a word that becomes an op no super
+/// names forms no super, and a super it was a later part of keeps
+/// running (its part's code checks the word's op family, as before);
+/// the head of a super is never rewritten from outside it.
 fn desugar_refuse(vm: &mut VmDecl) {
     let Some(code) = vm.refuse.clone() else { return };
-    let fams: Vec<(String, String)> = vm.ops.iter().map(|o| (o.name.name.clone(), o.family.clone().unwrap_or_else(|| o.name.name.clone()))).collect();
-    let fam = |n: &str| fams.iter().find(|(o, _)| o == n).map(|(_, f)| f.clone());
-    let mut fused: Vec<String> = vm.supers.iter().flat_map(|s| s.parts.iter()).filter_map(|p| fam(&p.name)).collect();
-    // `Vm.refuse` selects value accumulator variants too (`vmexpand`).
+    let base = |n: &str| n.split("__").next().unwrap_or(n).to_string();
+    let mut fused: Vec<String> = vm.supers.iter().flat_map(|s| s.parts.iter()).map(|p| base(&p.name)).collect();
+    // `Vm.refuse` selects value accumulator variants too (`vmexpand`):
+    // a `become` of an op with variants re-selects.
     if !vm.accs.is_empty() && vm.accs.iter().all(|a| a.wt) {
-        fused.extend(vm.ops.iter().filter(|o| o.accumulate).filter_map(|o| fam(&o.name.name)));
+        fused.extend(vm.ops.iter().filter(|o| o.accumulate).map(|o| base(&o.name.name)));
     }
     // With `supers from`, the supers are known only at expansion: every
     // `become` re-fuses.
     let all = !vm.supers_from.is_empty();
-    let wants = |n: &str| all || fam(n).is_some_and(|f| fused.contains(&f));
+    let wants = |n: &str| all || fused.contains(&base(n));
     let vname = vm.name.name.clone();
     let call = |sp: Span| Expr {
         kind: ExprKind::Call(
