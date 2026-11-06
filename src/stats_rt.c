@@ -14,6 +14,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 typedef struct {
     uint64_t key;  // ops, 16 bits each, the last in the low bits
@@ -132,6 +133,36 @@ static void print_super(const loimi_cand *c, const char **names, uint64_t total,
             (unsigned long long)c->saving);
 }
 
+// An accumulator variant (`language.md` 7.4): a name ending in `__`
+// and letters A and R, at least one A. Its length without them in *base.
+static int acc_variant(const char *name, size_t *base) {
+    size_t n = strlen(name), i = n, a = 0;
+    while (i > 0 && (name[i - 1] == 'A' || name[i - 1] == 'R')) a += name[--i] == 'A';
+    if (a == 0 || i == n || i < 3 || name[i - 1] != '_' || name[i - 2] != '_') return 0;
+    if (base) *base = i - 2;
+    return 1;
+}
+
+// For a suggestion over accumulator variants: the existing super over the
+// same ops without the variants (which the variants split up), if any.
+static int64_t split_super(const loimi_cand *c, const char **names, const loimi_cand *exist, uint64_t nexist) {
+    int any = 0;
+    for (int j = 0; j < c->len; j++) any |= acc_variant(names[c->ops[j]], 0);
+    if (!any) return -2;
+    for (uint64_t k = 0; k < nexist; k++) {
+        if (exist[k].len != c->len) continue;
+        int eq = 1;
+        for (int j = 0; j < c->len && eq; j++) {
+            const char *a = names[c->ops[j]], *b = names[exist[k].ops[j]];
+            size_t na = strlen(a);
+            acc_variant(a, &na);
+            eq = strlen(b) == na && strncmp(a, b, na) == 0;
+        }
+        if (eq) return (int64_t)k;
+    }
+    return -1;
+}
+
 // The suggestions that end the report, as one list that can be pasted
 // whole. Candidates are adjacent pairs of plain ops (no supers) that run
 // at least 1% of the time, and sequences of 3 or 4 that do and are
@@ -197,11 +228,21 @@ __attribute__((weak, visibility("hidden"))) void loimi_stats_suggest(loimi_seq *
     if (ntaken) {
         fprintf(stderr, "\nsuggested superinstructions (each at least 1%% of executed ops; none overlaps another or an\n"
                         "existing super, so they can all be added together):\n");
+        int over_acc = 0;
         for (uint64_t k = 0; k < n; k++) {
             if (cand[k].clash >= 0) continue;
             print_super(&cand[k], names, total, "    ");
+            int64_t sp = split_super(&cand[k], names, exist, nexist);
+            over_acc |= sp >= -1;
+            if (sp >= 0) {
+                fprintf(stderr, "; the variants split ");
+                print_name(&exist[sp], names);
+            }
             fprintf(stderr, "\n");
         }
+        if (over_acc)
+            fprintf(stderr, "(supers over accumulator variants: a variant breaks up the supers over its op, and gains\n"
+                            "little where it does; declare these `#[forward]`, docs/language.md section 7.4)\n");
     }
     if (ntaken < n) {
         fprintf(stderr, "\nalso frequent, but each overlaps one of the above or an existing super (an alternative to\n"

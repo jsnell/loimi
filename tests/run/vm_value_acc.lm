@@ -1,0 +1,162 @@
+// matrix: dispatch
+// Value accumulators (language.md §7.4): an `f64` accumulator for a
+// kind that holds a nanbox `value`. Every form of a writer writes it
+// through (the slot and the accumulator), so there are only reader
+// variants; selection needs no first_temp; `accumulate` may name family
+// members and runs again from a handler after quickening (`quicken`).
+// The hazards: the op that quickens leaves its result in the
+// accumulator (ADD's `next` after `become ADD_F`), and `redo` after a
+// `become` (ADD_IF) re-runs a word that may now be a reader. `verify`
+// rejects readers, and `deopt` turns them back into their ops.
+import std.io;
+
+value V repr nanbox { Num(f64) unboxed, Int(i32), Nil }
+
+struct Frame { nregs: u64 }
+
+var CODE: *u32 = 0 as *u32;
+var CODE_LEN: u64 = 0;
+var QUICKENED: u64 = 0;
+
+fn quicken() {
+    QUICKENED += 1;
+    M.accumulate(CODE.slice(CODE_LEN), 0);
+}
+
+vm M {
+    state { pc: *u32, regs: *V }
+    verify_context f: *Frame;
+    operand reg = regs[it] verify (it as u64) < f.nregs;
+    operand imm = it;
+    operand label = pc + it verify is_insn_boundary(pc + it);
+
+    accumulator vacc: f64 for reg;
+    accumulate ADD_F, MUL, JLT;
+
+    encoding fixed(u32) {
+        format ABC { op: 8, a: 8, b: 8, c: 8 }
+        format ABsC { op: 8, a: 8, b: 8, sc: s8 }
+    }
+
+    op LOADI(d: reg, v: imm) : ABC { d = Int(v as i32); next }
+    op LOADH(d: reg, v: imm) : ABC { d = Num(v as f64 / 2.0); next }
+    op ADDI(d: reg, a: reg, v: imm) : ABC {
+        if let Int(x) = a { d = Int(x + v as i32); next }
+        d = Nil;
+        next
+    }
+    family ADD(d: reg, a: reg, b: reg) : ABC {
+        generic {
+            if let (Int(x), Int(y)) = (a, b) { d = Int(x + y); next }
+            if let (Num(x), Num(y)) = (a, b) { d = Num(x + y); become ADD_F; quicken(); next }
+            if let (Int(_), Num(_)) = (a, b) { become ADD_IF; redo }
+            d = Nil;
+            next
+        }
+        ADD_F {
+            if let (Num(x), Num(y)) = (a, b) { d = Num(x + y); next }
+            if let (Int(x), Num(y)) = (a, b) { d = Num(x as f64 + y); next }
+            d = Nil;
+            next
+        }
+        ADD_IF {
+            if let (Int(x), Num(y)) = (a, b) and QUICKENED > 100 { d = Num(x as f64 + y); next }
+            become ADD_F; quicken(); redo
+        }
+    }
+    op MUL(d: reg, a: reg, b: reg) : ABC {
+        if let (Num(x), Num(y)) = (a, b) { d = Num(x * y); next }
+        if let (Int(x), Int(y)) = (a, b) { d = Int(x * y); next }
+        d = Nil;
+        next
+    }
+    op JLT(a: reg, b: reg, t: label) : ABsC {
+        let lt = match (a, b) {
+            (Int(x), Int(y)) => x < y,
+            (Num(x), Num(y)) => x < y,
+            _ => false,
+        };
+        if lt { jump t }
+        next
+    }
+    op RET(a: reg) : ABC {
+        if let Num(x) = a { exit x }
+        if let Int(x) = a { exit x as f64 }
+        exit -1.0
+    }
+
+    entry run(code: Verified<M>, r: *V) -> f64 {
+        regs = r;
+        jump code
+    }
+}
+
+fn show(code: []u32) {
+    var i: u64 = 0;
+    while i < code.len {
+        io.print(M.op_name(code[i]));
+        io.print(" ");
+        i += M.op_size(code[i]);
+    }
+    io.println("");
+}
+
+fn main() {
+    var code: [u32; 16] = [0; 16];
+    code[0] = M.LOADH(0, 1);        // r0 = 0.5
+    code[1] = M.LOADH(1, 1);        // r1 = 0.5
+    code[2] = M.LOADI(2, 0);        // r2 = 0 (counter)
+    code[3] = M.LOADI(3, 3);        // r3 = 3
+    code[4] = M.LOADI(6, 2);        // r6 = 2
+    // loop: r4 = r0 + r1; r5 = r4 * r4; r0 = r5 + r0; r0 = r0 * r1 (a
+    // chain once ADD quickens); r7 = r6 + r0 (Int + Num: ADD_IF, then
+    // ADD_F with redo, a reader of the MUL before it).
+    code[5] = M.ADD(4, 0, 1);
+    code[6] = M.MUL(5, 4, 4);
+    code[7] = M.ADD(0, 5, 0);
+    code[8] = M.MUL(0, 0, 1);
+    code[9] = M.ADD(7, 6, 0);
+    code[10] = M.ADDI(2, 2, 1);
+    code[11] = M.JLT(2, 3, -6);
+    code[12] = M.RET(7);
+    let n: u64 = 13;
+    let words = code[0..13];
+    CODE = words.ptr;
+    CODE_LEN = n;
+    var f = Frame { nregs: 8 };
+    var regs: [V; 8] = [V.Nil; 8];
+    let Ok(v) = M.verify(words, &f) else { io.println("verify failed"); return; };
+    // Before any site quickened: JLT reads the ADDI's Int result.
+    M.accumulate(words, 0);
+    show(words);
+    let r = M.run(v, &regs[0]);
+    io.print_int((r * 1000.0) as i64); io.println("");
+    io.print_int(QUICKENED as i64); io.println("");
+    show(words);
+    // Again: the same choice (idempotent).
+    M.accumulate(words, 0);
+    show(words);
+    // A second run on the quickened code: the same value.
+    var regs2: [V; 8] = [V.Nil; 8];
+    let r2 = M.run(v, &regs2[0]);
+    io.print_int((r2 * 1000.0) as i64); io.println("");
+    // Code with readers does not verify.
+    match M.verify(words, &f) { Ok(_) => io.println("verified"), Err(_) => io.println("rejected") }
+    // deopt: back to the ops the emitters made, which verify again.
+    let v2 = M.deopt(v);
+    show(words);
+    match M.verify(words, &f) { Ok(_) => io.println("verified"), Err(_) => io.println("rejected") }
+    var regs3: [V; 8] = [V.Nil; 8];
+    let r3 = M.run(v2, &regs3[0]);
+    io.print_int((r3 * 1000.0) as i64); io.println("");
+}
+// expect: LOADH LOADH LOADI LOADI LOADI ADD MUL ADD MUL ADD ADDI JLT RET 
+// expect: 3949
+// expect: 3
+// expect: LOADH LOADH LOADI LOADI LOADI ADD_F MUL__RRA ADD_F__RAR MUL__RAR ADD_F__RRA ADDI JLT RET 
+// expect: LOADH LOADH LOADI LOADI LOADI ADD_F MUL__RRA ADD_F__RAR MUL__RAR ADD_F__RRA ADDI JLT RET 
+// expect: 3949
+// expect: rejected
+// expect: LOADH LOADH LOADI LOADI LOADI ADD MUL ADD MUL ADD ADDI JLT RET 
+// expect: verified
+// expect: 3949

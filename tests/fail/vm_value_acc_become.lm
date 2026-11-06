@@ -1,0 +1,26 @@
+// error: `ADD_F` writes accumulator `vacc` and may only `become` an op that does too: name `ADD` in `accumulate`
+// A writer of a value accumulator that quickened into an op that is not
+// one would leave a reader after it with a stale accumulator.
+value V repr nanbox { Num(f64) unboxed, Int(i32), Nil }
+vm M {
+    state { pc: *u32, regs: *V }
+    operand reg = regs[it];
+    accumulator vacc: f64 for reg;
+    accumulate ADD_F;
+    encoding fixed(u32) { format ABC { op: 8, a: 8, b: 8, c: 8 } }
+    family ADD(d: reg, a: reg, b: reg) : ABC {
+        generic {
+            if let (Num(x), Num(y)) = (a, b) { d = Num(x + y); become ADD_F; next }
+            d = Nil;
+            next
+        }
+        ADD_F {
+            if let (Num(x), Num(y)) = (a, b) { d = Num(x + y); next }
+            become ADD; redo
+        }
+    }
+    op HALT() : ABC { exit 0 }
+    entry run(code: *u32, r: *V) -> i64 { regs = r; jump code }
+}
+
+fn main() {}

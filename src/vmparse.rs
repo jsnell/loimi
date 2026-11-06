@@ -485,7 +485,7 @@ impl Parser {
                         kinds.push(self.ident()?);
                     }
                     self.expect(";")?;
-                    vm.accs.push(AccDecl { name: n, ty, kinds });
+                    vm.accs.push(AccDecl { name: n, ty, kinds, wt: false });
                 }
                 "accumulate" => {
                     // `accumulate ADD, SUB;`: as `#[accumulate]` on each.

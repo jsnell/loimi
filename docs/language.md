@@ -3475,8 +3475,8 @@ kinds. Each kind must be a place whose type the declaration spells
 (`*(E as *T)`, or `s[it]` for a state variable `s: *T`) and a number of
 the accumulator's class: integers for an integer accumulator, floats for
 a float one (the value is converted with `as`, so an `i32` view of a
-`u64` accumulator reads its low 32 bits). Accumulators hold numbers
-only: no GC references, so a value in one needs no rooting.
+`u64` accumulator reads its low 32 bits), or a `value` type (a *value
+accumulator*, below).
 
 `#[accumulate]` on an op derives its **variants**: the operand of an
 accumulator's kind that the body only assigns (`d = ..`) is the result
@@ -3496,7 +3496,8 @@ can be parts of supers. An op whose result is also read (`d = d + a`)
 gets source variants only; an op without operands of an accumulator's
 kind gets none, so an `inline for` may mark a whole table. The vm item
 `accumulate ADD, CVT, FMUL;` marks the ops it names, for picking a few
-ops out of `inline for` tables (by *op selectors*, below): every variant is an opcode and a
+ops out of `inline for` tables (by *op selectors*, below), and may name
+family members (`ADD_F`), whose variants are members of the family. Every variant is an opcode and a
 handler, and in goto mode all handlers are one function (the wasm
 interpreter marked 90 ops at first, which gave 287 variants: 669 opcodes
 instead of 382 (121 ops now); its goto build took 17 s and 220 MB, `lowering.md` §5, where it
@@ -3504,7 +3505,9 @@ took 4 minutes and 1 GB before goto mode shared one dispatch block, and
 marking every op then no longer fit in 2.5 GB).
 
 `Vm.accumulate(code, first_temp)` selects them, on unverified words
-before `Vm.verify`: where an op writes a slot at or above `first_temp`
+before `Vm.verify` (value accumulators: on verified code, after it). It
+first turns every variant back into its op and splits supers, so it may
+run again on code it already ran on. Where an op writes a slot at or above `first_temp`
 that the next op reads as a source of the same accumulator and names in
 no other field, and that next op is not a jump target (a `pc + it`
 operand of some op in `code`), the first gets a variant that writes the
@@ -3523,6 +3526,96 @@ like any other.
 What it gains (wasm interpreter, `examples/wasm/FRICTION.md`): a variant
 reading or writing the accumulator is 7 to 11 instructions where the slot
 form is 13 or 14, and a chain's values never touch memory.
+
+**Value accumulators.** An accumulator whose kinds hold a `value` type,
+not numbers, holds the value's word: as an `f64` (`f64.from_bits`), so
+that it takes an SSE register and no general one, or as a `u64`. The
+type must be a one-word value (`nanbox` or `lowtag`) whose word 0 holds
+no reference. For a nanbox, a float result is already the word, so a
+float chain costs no conversion; only integer paths pay a `movq`.
+
+<!-- snippet: check
+value V repr nanbox { Num(f64) unboxed, Int(i32), Nil }
+vm M {
+    state { pc: *u32, regs: *V }
+    operand reg = regs[it];
+    encoding fixed(u32) { format ABC { op: 8, a: 8, b: 8, c: 8 } }
+{snippet}
+    op HALT() : ABC { exit 0 }
+    entry run(code: *u32, r: *V) -> i64 { regs = r; jump code }
+}
+-->
+```loimi
+accumulator vacc: f64 for reg;          // reg holds a V: its word, in xmm0
+accumulate ADD_F, MUL;                  // a family member and a plain op
+
+family ADD(d: reg, a: reg, b: reg) : ABC {
+    generic {
+        if let (Int(x), Int(y)) = (a, b) { d = Int(x + y); next }
+        if let (Num(x), Num(y)) = (a, b) { d = Num(x + y); become ADD_F; next }
+        d = Nil;
+        next
+    }
+    ADD_F {
+        if let (Num(x), Num(y)) = (a, b) { d = Num(x + y); next }
+        d = Nil;
+        next
+    }
+}
+op MUL(d: reg, a: reg, b: reg) : ABC {
+    if let (Num(x), Num(y)) = (a, b) { d = Num(x * y); next }
+    d = Nil;
+    next
+}
+```
+
+A value accumulator is *written through*: every form of an op whose
+result is of its kind (a *writer*: `ADD_F`, `MUL` and their variants)
+stores the result slot and also leaves the word in the accumulator, before
+each `next` (LLVM forwards the value just stored, so it is a register
+move). So the slot is always current, and the collector, `raise`, the
+debugger and the JIT need to know nothing: the collector does not move
+objects, so the slot keeps the accumulator's object alive. There are no
+variants that put the result only in the accumulator, just readers
+(`ADD_F__RAR`, `ADD_F__RRA`, `MUL__RAR`, `MUL__RRA`), and selection needs
+no promise: pass `first_temp` 0, and locals chain too.
+
+Quickening is what makes it subtle, and the compiler handles it:
+
+- **A word quickened in a handler.** A float member appears only once a
+  site has run, so `Vm.accumulate` runs again from the handler that
+  quickened (`become ADD_F` and then a call that selects again, as
+  Mini's `refuse`). The next word may now be a reader, of a result the
+  generic member did not put in the accumulator. So in an op that is not
+  a writer, every `next` that may follow a `become` of a writer also
+  leaves the result in the accumulator (from the slot: a load, on that
+  path only).
+- **`redo` after `become`.** The word re-run may now be a reader. Its
+  writer ran just before, and every form of a writer leaves the
+  accumulator current; nothing may store to it before a `redo` (the
+  error `redo_effect`, section 4). So the reader takes what the slot
+  holds.
+- **`become` keeps what selection made.** A writer may only `become` a
+  writer of the same accumulator (an error otherwise: a reader after it
+  would read a stale word). In a variant, `become X` is to X's variant
+  with the same letters, or to X itself if it has none (a reader may fall
+  back to the slot, which is current).
+- **Entries and computed jumps.** A reader is never a jump target, and
+  every entry zeroes the accumulator. A `jump` to a computed target (a
+  return address, an exception handler, not a label operand, `then.x` or
+  `pc`) zeroes it too: should one land on a reader, it reads the word 0,
+  which is no reference.
+- **Verification and `deopt`.** `Vm.verify` rejects readers (as an
+  invalid opcode): they are selected on verified code, where the
+  generated selection sees every jump target. `Vm.deopt` turns them back
+  into their ops, which verify again.
+
+A writer cannot leave through a vm function with `next` or `jump`, such
+as a call of a guest method whose return lands on the next word (an
+error). Measured on Mini (`bench/mini/RESULTS.md`): mandelbrot 0.90,
+with supers over the variants. A variant breaks up the supers over its
+op, so those matter: `--vm-stats` suggests supers over variants, and
+names the super they split.
 
 **Op selectors.** The ops of an `accumulate` list, and of a variant's
 `wraps [..]` (section 9), are given by selectors, each naming one or
