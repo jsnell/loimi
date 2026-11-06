@@ -8,6 +8,7 @@
 
 import std.gc;
 import std.mem;
+import std.math;
 import term.{Term, Var, Struct, Cons, deref};
 import term;
 import machine.{Machine, Frame, Choice, unify};
@@ -575,6 +576,19 @@ pub vm Wam {
             let b = deref(b0);
             if let (Int(x), Int(y)) = (a, b) and guard { d = Term.Int(result); next }
             cold { d = arith.arith2(ctx, kind, a, b)?; next }
+        }
+    }
+    // Division by a positive constant k < 2^31 (crypt's `X mod 10`,
+    // `X // 10`): a multiply and a shift instead of a 64-bit `idiv`. The
+    // compiler prepares k as a std.math.Divisor in the cache.
+    cache DivK = math.Divisor;
+    inline for (name, kind, method) in [
+        ("IDIVK", 3, div_trunc), ("MODK", 4, rem_floor), ("DIVK", 9, div_floor), ("REMK", 10, rem_trunc),
+    ] {
+        op #name(d: xr, a0: xr) : RR + DivK {
+            let a = deref(a0);
+            if let Int(x) = a { d = Term.Int((&cache).#method(x as i64) as i48); next }
+            cold { d = arith.arith2(ctx, kind, a, Term.Int((&cache).divisor() as i48))?; next }
         }
     }
     inline for (name, kind) in [("SHL", 6), ("DIV", 9), ("FDIV", 14)] {

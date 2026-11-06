@@ -6,6 +6,7 @@
 // level variable passed to the auxiliary predicate.
 
 import std.mem;
+import std.math;
 import std.text;
 import std.io;
 import std.hash;
@@ -907,6 +908,20 @@ fn C.expr(c: *C, t0: Term) -> (u32, bool) {
                 let r = c.temp();
                 let iop = if op == Wam.OP_ADD { Wam.OP_ADDI } else if op == Wam.OP_SUB { Wam.OP_SUBI } else { Wam.OP_MULI };
                 c.emit(Wam.encode.R3s(iop, r as u8, a as u8, k as i8));
+                return (r, true);
+            }
+            // A positive constant divisor: a std.math.Divisor in the op's
+            // cache (vm.lm, DivK), multiplying instead of dividing.
+            let kop = if op == Wam.OP_IDIV { Wam.OP_IDIVK } else if op == Wam.OP_MOD { Wam.OP_MODK }
+                else if op == Wam.OP_DIV { Wam.OP_DIVK } else if op == Wam.OP_REM { Wam.OP_REMK } else { 0 };
+            if let Int(k) = rhs and kop != 0 and (k as i64) < 2147483648 and let Some(dv) = math.Divisor.new(k as i64) {
+                let (a, oa) = c.expr(s.args[0]);
+                if oa { c.release(a); }
+                let r = c.temp();
+                c.emit(Wam.encode.RR(kop, r as u8, a as u8));
+                let at = c.code.len;
+                for _ in 0..Wam.CW_DivK { c.emit(0); }
+                dv.store(c.code.items()[at..at + Wam.CW_DivK]);
                 return (r, true);
             }
             let (a, oa) = c.expr(s.args[0]);

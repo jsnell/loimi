@@ -1,0 +1,143 @@
+// std.math.Divisor against plain division: every divisor 1..1100 with
+// every dividend in -1100..1100, edge dividends (0, ±1, ±2^31, ±2^47,
+// ±(2^63 - 1), near multiples) for every divisor up to 1100 and for
+// powers of two, their neighbours and random divisors up to 2^32 - 1,
+// and random dividends of every magnitude; then the cache layout in a vm.
+import std.io;
+import std.math;
+
+var bad: u64 = 0;
+var checked: u64 = 0;
+
+fn fdiv(x: i64, d: i64) -> i64 {
+    let q = x / d;
+    if (x % d != 0) and ((x < 0) != (d < 0)) { q - 1 } else { q }
+}
+fn fmod(x: i64, d: i64) -> i64 {
+    let r = x % d;
+    if r != 0 and ((r < 0) != (d < 0)) { r + d } else { r }
+}
+
+fn report(what: str, x: i64, d: i64, got: i64, want: i64) {
+    if bad < 10 {
+        io.print(what); io.print(" x="); io.print_int(x); io.print(" d="); io.print_int(d);
+        io.print(" got "); io.print_int(got); io.print(" want "); io.print_int(want); io.println("");
+    }
+    bad += 1;
+}
+
+fn check(dv: *math.Divisor, x: i64) {
+    let d = dv.divisor();
+    checked += 1;
+    if dv.div_trunc(x) != x / d { report("div_trunc", x, d, dv.div_trunc(x), x / d); }
+    if dv.rem_trunc(x) != x % d { report("rem_trunc", x, d, dv.rem_trunc(x), x % d); }
+    if dv.div_floor(x) != fdiv(x, d) { report("div_floor", x, d, dv.div_floor(x), fdiv(x, d)); }
+    if dv.rem_floor(x) != fmod(x, d) { report("rem_floor", x, d, dv.rem_floor(x), fmod(x, d)); }
+    if x >= 0 {
+        let n = x as u64;
+        let du = d as u64;
+        if dv.udiv(n) != n / du { report("udiv", x, d, dv.udiv(n) as i64, (n / du) as i64); }
+        if dv.urem(n) != n % du { report("urem", x, d, dv.urem(n) as i64, (n % du) as i64); }
+        if n < 2147483648 {
+            if dv.udiv31(n) != n / du { report("udiv31", x, d, dv.udiv31(n) as i64, (n / du) as i64); }
+            if dv.urem31(n) != n % du { report("urem31", x, d, dv.urem31(n) as i64, (n % du) as i64); }
+        }
+    }
+}
+
+var seed: u64 = 0x9E3779B97F4A7C15;
+fn rand() -> u64 {
+    seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+    seed
+}
+
+/// Edge dividends for d, and random ones of every magnitude.
+fn edges(dv: *math.Divisor, nrand: u64) {
+    let d = dv.divisor();
+    let max: i64 = 9223372036854775807;
+    let xs: [i64; 17] = [0, 1, -1, 2147483647, 2147483646, -2147483648, 2147483648, -2147483649,
+        140737488355327, -140737488355328, 4294967295, -4294967296,
+        max, 0 - max, max - 1, 0 - max + 1, 4611686018427387904];
+    for i in 0..17 { check(dv, xs[i]); }
+    // Near multiples of d, at several magnitudes.
+    var k: i64 = 1;
+    while k < max / (d * 4) and k > 0 {
+        let base = k * d;
+        for j in 0..3 {
+            let x = base + (j as i64) - 1;
+            check(dv, x); check(dv, 0 - x);
+        }
+        k = k * 3 + 1;
+    }
+    let qmax = max / d;
+    for j in 0..3 { let x = qmax * d - 2 + (j as i64); if x > 0 { check(dv, x); check(dv, 0 - x); } }
+    for _ in 0..nrand {
+        let bits = rand() % 63;
+        let x = (rand() >> (64 - bits - 1)) as i64;
+        if x != 0 - max - 1 { check(dv, if (rand() & 1) == 0 { x } else { 0 - x }); }
+    }
+}
+
+fn divisor(d: i64) -> math.Divisor {
+    let Some(dv) = math.Divisor.new(d) else { io.print("no divisor "); io.print_int(d); io.println(""); trap() };
+    dv
+}
+
+// Constant-divisor ops whose cache the emitter fills.
+vm V {
+    state { pc: *u32, regs: *i64 }
+    operand reg = regs[it];
+    encoding fixed(u32) { format AB { op: 8, a: 8, b: 8 } }
+    cache DivK = math.Divisor;
+    op MODK(dst: reg, a: reg) : AB + DivK { dst = (&cache).rem_floor(a); next }
+    op IDIVK(dst: reg, a: reg) : AB + DivK { dst = (&cache).div_trunc(a); next }
+    op RET(a: reg) : AB { exit a }
+    entry run(code: *u32, r: *i64) -> i64 { regs = r; jump code }
+}
+
+fn main() {
+    // Exhaustive small range.
+    for d in 1..1101 {
+        let dv = divisor(d as i64);
+        var x: i64 = -1100;
+        while x <= 1100 { check(&dv, x); x += 1; }
+        edges(&dv, 20);
+    }
+    // Powers of two and their neighbours up to 2^32 - 1.
+    for b in 1..33 {
+        let p = (1 as i64) << (b as i64);
+        for j in 0..3 {
+            let d = p + (j as i64) - 1;
+            if d <= 4294967295 { let dv = divisor(d); edges(&dv, 200); }
+        }
+    }
+    // Random divisors of every size.
+    for _ in 0..3000 {
+        let bits = rand() % 32 + 1;
+        let d = (rand() >> (64 - bits)) as i64;
+        if d >= 1 { let dv = divisor(d); edges(&dv, 100); }
+    }
+    io.print("bad "); io.print_int(bad as i64); io.println("");
+    io.print_bool(checked > 3000000); io.println("");
+    // Out of range.
+    io.print_bool(math.Divisor.new(0).is_none() and math.Divisor.new(-3).is_none()
+        and math.Divisor.new(4294967296).is_none() and math.Divisor.new(4294967295).is_some()); io.println("");
+
+    // The vm: R2 = R0 mod 10, R3 = R1 // 7, filled by the emitter.
+    var code: [u32; 32] = [0; 32];
+    var at = V.emit.MODK(code[..], 0, 2, 0);
+    let d10 = divisor(10);
+    d10.store(code[1..5]);
+    at = V.emit.IDIVK(code[..], at, 3, 1);
+    let d7 = divisor(7);
+    d7.store(code[6..10]);
+    at = V.emit.RET(code[..], at, 2);
+    var r: [i64; 4] = [-123, -100, 0, 0];
+    io.print_int(V.run(&code[0], &r[0])); io.print(" "); io.print_int(r[3]); io.println("");
+    io.print_int(V.op_size(V.MODK(0, 0) as u32) as i64); io.println("");
+}
+// expect: bad 0
+// expect: true
+// expect: true
+// expect: 7 -14
+// expect: 5

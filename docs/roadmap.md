@@ -459,3 +459,10 @@ quickening on/off.
       load with several uses) would trade ALU work for loads;
     - not built: direct threading (handler addresses in the code words) for `u64`
       words, which saves the table load and the opcode extraction.
+    - *tried and dropped* (2026-11-06; `design/speed-audit.md`, item 2,
+      "Prototype results"): pre-scaled byte-offset fields save no
+      instruction on x86-64, where the scale is free in the addressing
+      mode (1.003 on PolyBench), and offset-threaded dispatch
+      (`lea base(,%op,8)` instead of the table load, same instruction
+      count) measured 1.008 (PolyBench), slower: the predicted indirect
+      jump already hides the table load.

@@ -1,7 +1,9 @@
 # Design note: a speed audit (features for faster interpreters)
 
 Status: **proposal.** Written 2026-11-06 against master at 0813bc1.
-Item 1 is built (its "As built" note).
+Items 1 and 3 are built (their "As built" notes); item 2 was
+prototyped and dropped (its "Prototype results"); item 14 has an
+experiment and a staged plan (`trace-tier.md`).
 
 > Have we exhausted the possibilities for language improvements that
 > can be used to write faster interpreters or runtimes?
@@ -73,7 +75,7 @@ one, else an estimate.
 | # | Proposal | Evidence | Gain | Cost |
 |---|---|---|---|---|
 | 1 | **Accumulators for `value` types** (GC-safe, write-through or spilled at sync points), f32 accumulators, selection past non-interfering ops | Only wasm can use accumulators; it got 0.91, and 0.79 with supers. The five nanbox VMs (Mini, MiniJS, Lox, Python, Scheme) cannot (`vmacc.rs:267`). The latency probe puts an 8% bound on one cached register (`copy-and-patch.md` §13). Store-to-load chains appear in mandelbrot, nbody and spectral_norm | 2–5% on numeric benchmarks in 5 VMs (est.) | M |
-| 2 | **Cheaper operand decoding and dispatch**: pre-scaled byte-offset fields, then offset-threaded dispatch (a handler offset in the word, no table load) | `F64_MUL` is 14 instructions: 6 decode, 3 work, 5 dispatch. wasm3's is 5 (`roadmap.md` Q11). Every interpreter pays this on every op | 2–6% on handler-bound code (est.), all VMs | M, then L |
+| 2 | **Cheaper operand decoding and dispatch**: pre-scaled byte-offset fields, then offset-threaded dispatch (a handler offset in the word, no table load) | `F64_MUL` is 14 instructions: 6 decode, 3 work, 5 dispatch. wasm3's is 5 (`roadmap.md` Q11). Every interpreter pays this on every op. **Prototyped 2026-11-06: no gain on x86-64** (item 2, "Prototype results") | measured: 1.00 (step 1); 1.01, slower (step 2) | M, then L |
 | 3 | **Division by a verified constant**: `std.math.Divisor` (Granlund–Montgomery) and a verify-time hook that fills it | Prolog crypt: MOD/IDIV 27% of samples. MiniJS closures: MODK's `idiv` 8%. Mini built a magic-number IC by hand (`vm.lm:833`), and recomputing the magic on a miss cost 12%. Python slicing: `idiv` 14% (special-cased by hand) | 5–20% on 3–4 benchmarks; ~0.5% suite | S |
 | 4 | **Load facts**: `dereferenceable`/`nonnull`/invariant loads on pointers and `const` operand kinds | Listed in Mini's "remaining compiler issues" (`RESULTS.md:579`). Dependent-load chains: Python GETATTR 14–26%, MiniJS GETPROP_IN. GETINDEX_GETINDEX (20% of interp) keeps a frame | unknown; 0–3% (est.) | S |
 | 5 | **Smaller objects**: typed small-object chunks with no per-object header (BiBoP), or an 8-byte header for fixed-size types | Every object has a 16-byte header. A Scheme pair is 32 bytes against Guile's 16, and CAR alone is 12–15% of nboyer. Size sensitivity, measured: +8 bytes per object cost MiniJS binary_trees 6% and Python float 6% | 3–10% on allocation- and memory-bound benchmarks in 6 VMs (est.) | L |
@@ -630,6 +632,165 @@ Step 2 is L. Risks:
 **General:** every interpreter for step 1, and those with u64 words for
 step 2 (wasm, Stak; Mini and MiniJS would need wider words).
 
+#### Prototype results (2026-11-06): no gain, no-go
+
+Both steps were built by hand on `examples/wasm` and measured. **Neither
+helps on x86-64.** Pre-scaling changes nothing, and offset threading is
+1% slower. The stop rule (< 2% on PolyBench) applies to both, so step 3
+(an estimate for other interpreters) was not run.
+
+**Setup.**
+- **Machine.** i7-6700 (Skylake), LLVM 19, tail-call dispatch,
+  `--align-functions=64`.
+- **Timing.** user+sys CPU, the minimum of interleaved runs: 7 rounds of
+  the tuning set (the seven programs of `programs.sh`) and 11 of
+  PolyBench (30 kernels). The order of the binaries rotates each round.
+- **Control.** The A/A binary is a byte-identical copy of the baseline,
+  run in the same interleave.
+- **Load.** The load average was 2.4–4.3 on 8 cores, from two other
+  benchmark jobs.
+- **Correctness.** Each variant passed `polybench.sh --check` (30/30),
+  the full spec suite (52,800 commands, 0 failed) and the ten programs'
+  expected output.
+
+**Results** (geometric means, ratio to the baseline):
+
+| Build | Tuning set (7) | PolyBench (30) |
+|---|---:|---:|
+| A/A control | 0.997 | 1.000 |
+| Step 1: pre-scaled slot fields | 0.998 | 1.003 |
+| A/A control (second run) | 0.998 | 0.999 |
+| Step 2: offset-threaded dispatch | 1.004 | 1.008 |
+| A/A control, `--align-functions=128` | 1.001 | 1.000 |
+| Step 2, `--align-functions=128` | 1.010 | 1.010 |
+
+- **Noise.** Single benchmarks move ±1–2% in the A/A runs.
+- **Step 1.** The per-program swings (binarytrees 0.94, fannkuchredux
+  1.03) are placement effects, and they cancel in the means.
+- **Step 2.** It is slower on 22 of the 30 kernels at both alignments.
+
+**Step 1: pre-scaled slot fields.**
+
+What was built:
+- **Operand kinds.** The 16 slot kinds of `vm.lm` became byte offsets:
+  `*(((regs as *u8) + it) as *f64)`, verified by `(it & 7) == 0` and
+  `it < nslots * 8`.
+- **Encoder.** A pass after `W.accumulate` in `compile.lm` multiplies
+  every slot-kind field by 8. It finds the fields through
+  `W.operand_kind`/`operand_bits`.
+- **Limits.** `bulk` gets slot indices back with `>> 3`. The R4
+  tee-fusions' 12-bit fields drop to 512 slots.
+
+The asm is the evidence:
+
+- **Totals.** 19,022 instructions over 1,094 handlers become 19,054.
+  30 handlers lost one, 39 gained one, and `I8X16_SHUFFLE` gained 23.
+  Every hot handler is unchanged: `F64_MUL` 14, `F64_ADD` 14,
+  `F64_LOAD__AR` 15, `F64_LOAD` 18, `I32_ADDK` 13, `MOV` 11,
+  `F64_LOAD_F64_MUL` 28.
+- **Why: the scale is free on x86-64.** It is part of the addressing
+  mode, so `(%r14,%rax,8)` becomes `(%r14,%rax,1)` at the same cost.
+- **The decode does not shrink.** The "6 decode" instructions of
+  `F64_MUL` are the field extraction:
+  - field `a` (bits 16–31): `shr $16, %ecx`, a 32-bit shift that also
+    clears the bits above;
+  - field `b`: `mov; shr $32; movzwl`;
+  - field `c` (the top 16 bits): `mov; shr $48`.
+
+  A byte offset still has to be shifted out of the word and
+  zero-extended, so it needs the same instructions.
+
+wasm3 saves these instructions because its slot offset is a whole code
+word, not because the offset is scaled. AArch64 also scales for free
+(`ldr d0, [x, x, lsl #3]`). Some older cores charge a cycle for a
+scaled register offset, but that was not measured.
+
+**Step 2: offset-threaded dispatch.**
+
+What was built:
+- **The IR patch.** On the `--keep-ll` IR of the tail-call build, every
+  `getelementptr @"vm.W.table", op` followed by `load ptr` (1,218 sites)
+  became `getelementptr i64, @"vm.W.op.MOV", op`. The target is then
+  `base + 8 * op`, and `MOV` is the lowest handler.
+- **Rewriting the code.** `rt.lm` runs a pass after `W.optimize`, and
+  over the HALT and RESTORE stubs. It rewrites each instruction word's
+  16-bit opcode, and each super part's, to
+  `(table[op] - base) / 8`. The pass is `loimi_proto_xlate`, defined in
+  the patch, and it aborts if a handler is out of reach.
+- **Reach.** The handlers span 0x403000–0x45ad80 (360 KiB), and the
+  reach is 512 KiB.
+
+The asm (`F64_MUL`, and every other handler):
+
+```
+before:  mov 0x8(%r13),%rcx; add $0x8,%r13; movzwl %cx,%eax; mov 0x47cd50(,%rax,8),%rax; jmp *%rax
+after:   mov 0x8(%r13),%rcx; add $0x8,%r13; movzwl %cx,%eax; lea 0x403000(,%rax,8),%rax;  jmp *%rax
+```
+
+The instruction count is the same (19,022 in both builds, every handler
+the same). The only change is that a load µop (ports 2/3) became an ALU
+µop (ports 1/5 for `lea`).
+
+**Why it gives nothing.**
+- **The table load is off the critical path.** The indirect jump is
+  predicted, so the next handler starts before the load resolves, and
+  the load only confirms the prediction. Removing it does not shorten
+  the path.
+- **It costs an ALU slot.** These handlers are ALU-heavy (the shifts
+  and moves of the decode), and the 2 load ports are not saturated
+  (about 4 loads per 4–5 cycles). The extra ALU µop is a slight loss.
+- **The earlier trade went the same way.** Narrow field loads (more
+  loads, fewer ALU ops) measured 1.044, above. Both directions are worse
+  than the current mix.
+
+What a load-free and extraction-free dispatch would need is wasm3's
+layout: the handler address as a whole code word, with operands in
+their own words. That doubles the code words and moves a load from the
+table to the stream, and it is not a field-format change. Not tried.
+After this result it is not ranked either: the predicted indirect jump
+is what makes our dispatch cheap, and wasm3's per-op advantage was
+traced to its `fp0`/`r0` registers (now accumulators), not to its
+dispatch (wasm FRICTION, "Float benchmarks against wasm3").
+
+**What the JIT removes, then.** The JIT's 0.76–0.83 does not come from
+the table load. It comes from the indirect jump itself (straight-line
+stencils), the `pc` advance and the field extraction (operands are
+patched in as constants). None of these is reachable by a change to the
+interpreter's word format.
+
+**Design sketch, kept for the record.** It is not recommended on this
+evidence; revisit only on a core where the table load is measured to
+matter (for example AArch64 hardware), with the same prototype.
+- **Surface.** `#[dispatch(tailcall, threaded)]`, for `u64` encodings
+  with an op field of at least 16 bits.
+- **Encoding.** A final pass over verified, optimized code
+  (`Verified<Vm>` keeps it a proof) maps each word's opcode to
+  `(handler - base) >> k`, with `base` a symbol emitted first in
+  `.text.hot.<vm>`. `k = 3` reaches 512 KiB. `k = 6` reaches 4 MiB but
+  costs a `shl`, one instruction more than today.
+- **Readers of opcodes.** `Vm.opcode`, `op_size`, `op_name`, the
+  disassembler and `Vm.deopt` would decode through an inverse map
+  (offset to opcode, a sorted array or a 64 Ki table). The verifier
+  runs before the pass, so it is unchanged.
+- **`become`.** It would write the handler offset, through a generated
+  `Vm.OP_X` offset table.
+- **Serialization.** Code words would need a relocation pass back to
+  opcodes.
+- **`#[profile]` ordering.** Every handler, hot or cold, must stay
+  inside the window from `base`. A link-time check is needed.
+- **Instrumentation variants.** These need handler blocks at identical
+  offsets from a per-variant base, or table dispatch in variant builds.
+- **`--jit-stencils`.** Its enter words, and the rewrite back to real
+  words, would be offsets as well.
+- **Other modes.** goto and switch modes are out of scope. So are u32
+  vms: Mini, MiniJS, Lox, Python, Scheme, Prolog, regex and Stak all
+  have 8-bit op fields, which have no room for an offset.
+- **Cost.** L. **Measured gain on x86-64:** −1%.
+
+**Prototype code.** It is not committed. It is a hand patch plus an IR
+rewrite outside the compiler, so there is nothing clean to put behind a
+flag.
+
 ### 3. Division by a verified constant
 
 **Evidence.**
@@ -687,6 +848,61 @@ truncating and flooring forms.
 - None with the GC, `redo` or supers.
 
 **General:** four interpreters, a few hot benchmarks each.
+
+**Prototype results (2026-11-06).** Mini's magic-number method copied
+by hand into Prolog: `MODK`/`IDIVK`/`REMK` ops with the magic in a cache
+the clause compiler filled, for constants 1 <= k < 2^31. crypt took
+0.846 of its time (min of 11 interleaved runs, user+sys,
+`--align-functions=64`; A/A 1.000; 0.876 at `--align-functions=128`).
+The other Prolog programs have no constant divisor: they moved within
+placement noise (query 1.05 at 64-byte alignment, 1.004 at 128).
+Results matched SWI-Prolog on 98,016 lines of `//`, `mod`, `rem` and
+`div` over 65 constants, negative constants, zero, the i48 limits and
+bignums. That is above the 5% stop line, so the feature was built.
+
+**As built.** `std.math.Divisor` ([`stdlib/math.md`](../stdlib/math.md)):
+- **Range.** Divisors are 1 <= d < 2^32. The magic is 64 bits, and
+  floor(n / d) = hi(2n · m) >> l for every n < 2^63, so one form covers
+  i32 and i48 payloads.
+- **Methods.** `div_trunc`/`rem_trunc`, `div_floor`/`rem_floor`,
+  `udiv`/`urem`, and `udiv31`/`urem31` (one `imul`, for non-negative
+  i32 values).
+- **Layout.** Four `u32` fields, so `cache DivK = math.Divisor;` is a
+  cache layout and `&cache` is a `*Divisor`.
+- **The op.** A constant-divisor op is one line:
+  `d = Term.Int((&cache).rem_floor(x as i64) as i48)`.
+
+**Ports:**
+- **Prolog.** `IDIVK`, `MODK`, `DIVK` and `REMK` (`div` is new), with
+  the cache filled by the emitter.
+- **Mini.** `MODK` and `MOD` fill the cache on first run, in a `cold`
+  block (`mod_magic` is gone).
+- **MiniJS.** `MODK`'s cache is filled by the emitter.
+- **Python.** Not ported: its slice division is by a run-time step.
+
+**Timing.** Ratios are new/old over whole suites, at the minimum of 5
+interleaved runs. The load average was 2.9–3.0 (two other agents were
+running).
+- **Prolog:** crypt 0.855, geomean 0.9935 (A/A 0.9994).
+- **Mini:** geomean 1.0002 (A/A 1.0013), closures 0.995 and the
+  coroutine sieve 0.976. The old code was already a magic number, so
+  nothing was expected beyond parity. A first version used the 128-bit
+  product and filled the cache inline. That gave `MODK` a stack frame
+  and made closures 1.022; the `cold` fill and `urem31` brought it to
+  0.998 (min of 11).
+- **MiniJS:** closures 0.970, geomean 0.9944 (A/A 0.9979). The 8%
+  `idiv` share was a 32-bit `idiv` on non-negative Ints, so the gain is
+  smaller than the share.
+
+`loimi ir-diff` on Mini: 621 of 627 functions are unchanged. The
+changes are `MOD`, `MODK`, their cold blocks (plus one new cold block
+each, for the first-run fill) and the op-size tables (the caches grew
+from 2 and 3 words to 4).
+
+**Not built:** `const` cache fields and a verify-time fill. No
+interpreter deoptimizes these ops, so an emitter-filled ordinary cache
+was enough. Until `const` fields exist, `Vm.deopt` would zero the
+cache.
 
 ### 4. Load facts: dereferenceable, nonnull, invariant
 
@@ -1222,6 +1438,16 @@ another 2× on numeric loops. The shared-frame design (interpreter and
 compiled code share state) is what makes deoptimization cheap, and it
 should be the first constraint of any design.
 
+**Prototyped** (`trace-tier.md`). Traces stitched mechanically from
+the stencils, with the register file as an SSA window and guards from a
+profile, ran at:
+- mandelbrot 0.63 of the JIT's time (inside the bound);
+- nbody 0.73;
+- fannkuch 0.82;
+- sieve 0.87.
+
+Recommendation: go, staged.
+
 **Cost: L+.**
 
 ## 2. Reference techniques, against what Loimi offers
@@ -1263,8 +1489,8 @@ little. In order:
 
 | Experiment | Item | Effort | Stop if |
 |---|---|---|---|
-| Pre-scaled slot offsets in `examples/wasm` by hand (encoder `* 8`, operand kinds as byte offsets) | 2 | half a day | PolyBench and wasm geomean move < 2% |
-| Offset-threaded dispatch by IR patch on the wasm tail-call build | 2 | 1–2 days | < 3% on top of the above |
+| Pre-scaled slot offsets in `examples/wasm` by hand (encoder `* 8`, operand kinds as byte offsets) | 2 | half a day | PolyBench and wasm geomean move < 2% (**done:** 1.003 and 0.998; stopped) |
+| Offset-threaded dispatch by IR patch on the wasm tail-call build | 2 | 1–2 days | < 3% on top of the above (**done:** 1.008 and 1.004, slower; stopped) |
 | Mini float members with a raw `u64` accumulator, no collection (heap budget raised) | 1 | 1 day | mandelbrot, nbody and spectral_norm all > 0.95 |
 | Mini's `mod_magic` in Prolog's MOD/IDIV with constant divisors | 3 | 1 hour | crypt < 5% faster (unlikely) |
 | `dereferenceable` and `!invariant.load` added to Python's GETATTR IR | 4 | 1 day | deltablue, go and richards < 2% |
