@@ -371,6 +371,61 @@ truncating and flooring forms.
 
 **General:** four interpreters, a few hot benchmarks each.
 
+**Prototype results (2026-11-06).** Mini's magic-number method copied
+by hand into Prolog: `MODK`/`IDIVK`/`REMK` ops with the magic in a cache
+the clause compiler filled, for constants 1 <= k < 2^31. crypt took
+0.846 of its time (min of 11 interleaved runs, user+sys,
+`--align-functions=64`; A/A 1.000; 0.876 at `--align-functions=128`).
+The other Prolog programs have no constant divisor: they moved within
+placement noise (query 1.05 at 64-byte alignment, 1.004 at 128).
+Results matched SWI-Prolog on 98,016 lines of `//`, `mod`, `rem` and
+`div` over 65 constants, negative constants, zero, the i48 limits and
+bignums. That is above the 5% stop line, so the feature was built.
+
+**As built.** `std.math.Divisor` ([`stdlib/math.md`](../stdlib/math.md)):
+- **Range.** Divisors are 1 <= d < 2^32. The magic is 64 bits, and
+  floor(n / d) = hi(2n · m) >> l for every n < 2^63, so one form covers
+  i32 and i48 payloads.
+- **Methods.** `div_trunc`/`rem_trunc`, `div_floor`/`rem_floor`,
+  `udiv`/`urem`, and `udiv31`/`urem31` (one `imul`, for non-negative
+  i32 values).
+- **Layout.** Four `u32` fields, so `cache DivK = math.Divisor;` is a
+  cache layout and `&cache` is a `*Divisor`.
+- **The op.** A constant-divisor op is one line:
+  `d = Term.Int((&cache).rem_floor(x as i64) as i48)`.
+
+**Ports:**
+- **Prolog.** `IDIVK`, `MODK`, `DIVK` and `REMK` (`div` is new), with
+  the cache filled by the emitter.
+- **Mini.** `MODK` and `MOD` fill the cache on first run, in a `cold`
+  block (`mod_magic` is gone).
+- **MiniJS.** `MODK`'s cache is filled by the emitter.
+- **Python.** Not ported: its slice division is by a run-time step.
+
+**Timing.** Ratios are new/old over whole suites, at the minimum of 5
+interleaved runs. The load average was 2.9–3.0 (two other agents were
+running).
+- **Prolog:** crypt 0.855, geomean 0.9935 (A/A 0.9994).
+- **Mini:** geomean 1.0002 (A/A 1.0013), closures 0.995 and the
+  coroutine sieve 0.976. The old code was already a magic number, so
+  nothing was expected beyond parity. A first version used the 128-bit
+  product and filled the cache inline. That gave `MODK` a stack frame
+  and made closures 1.022; the `cold` fill and `urem31` brought it to
+  0.998 (min of 11).
+- **MiniJS:** closures 0.970, geomean 0.9944 (A/A 0.9979). The 8%
+  `idiv` share was a 32-bit `idiv` on non-negative Ints, so the gain is
+  smaller than the share.
+
+`loimi ir-diff` on Mini: 621 of 627 functions are unchanged. The
+changes are `MOD`, `MODK`, their cold blocks (plus one new cold block
+each, for the first-run fill) and the op-size tables (the caches grew
+from 2 and 3 words to 4).
+
+**Not built:** `const` cache fields and a verify-time fill. No
+interpreter deoptimizes these ops, so an emitter-filled ordinary cache
+was enough. Until `const` fields exist, `Vm.deopt` would zero the
+cache.
+
 ### 4. Load facts: dereferenceable, nonnull, invariant
 
 **Evidence.**
