@@ -995,6 +995,19 @@ fn compiler_main() -> ExitCode {
     } else {
         None
     };
+    // LOIMI_TRACE_IR=file (with --jit-stencils): append generated trace
+    // functions to the program's IR (an experiment, docs/design/trace-tier.md).
+    if jit_rt.is_some() {
+        if let Some(p) = std::env::var_os("LOIMI_TRACE_IR") {
+            match std::fs::read_to_string(&p) {
+                Ok(t) => ir.push_str(&t),
+                Err(e) => {
+                    eprintln!("error: LOIMI_TRACE_IR: {}", e);
+                    return ExitCode::from(1);
+                }
+            }
+        }
+    }
     let ll = tmpdir.join(format!("{}.ll", stem));
     if let Err(e) = std::fs::write(&ll, &ir) {
         eprintln!("error: cannot write {}: {}", ll.display(), e);

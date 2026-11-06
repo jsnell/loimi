@@ -1291,6 +1291,16 @@ another 2× on numeric loops. The shared-frame design (interpreter and
 compiled code share state) is what makes deoptimization cheap, and it
 should be the first constraint of any design.
 
+**Prototyped** (`trace-tier.md`). Traces stitched mechanically from
+the stencils, with the register file as an SSA window and guards from a
+profile, ran at:
+- mandelbrot 0.63 of the JIT's time (inside the bound);
+- nbody 0.73;
+- fannkuch 0.82;
+- sieve 0.87.
+
+Recommendation: go, staged.
+
 **Cost: L+.**
 
 ## 2. Reference techniques, against what Loimi offers

@@ -345,7 +345,10 @@ static struct rec *lookup(const uint32_t *pc) {
     return best;
 }
 
+static void trace_forget(struct rec *r);
+
 static void free_compiled(struct rec *r) {
+    trace_forget(r);
     free(r->home);
     free(r->body);
     free(r->w);
@@ -863,6 +866,119 @@ void loimi_jit_rewritten(uint32_t *code) {
     sync_entries(r);
 }
 
+/* Trace-tier experiment (docs/design/trace-tier.md): loop functions
+ * generated ahead of time from stencils by a script, linked in with
+ * LOIMI_TRACE_IR at build time. Each names its code object by length and
+ * word hash and its loop header; after a compile of a matching object,
+ * the header's home jumps to it. Absent unless linked in (weak). */
+struct loimi_trace { uint64_t nwords, lo, hi, hash, header; void *fn; uint64_t *counts; uint64_t ncounts; const char *name; };
+extern const struct loimi_trace loimi_traces[] __attribute__((weak));
+extern const int64_t loimi_ntraces __attribute__((weak));
+static const uint32_t *last_hot;
+static FILE *trace_dumpf;
+/* Installed traces (by index in loimi_traces): where, and what the home
+ * held before; `banned` after too many guard failures. */
+#define MAX_TRACES 64
+static struct { struct rec *r; uint8_t *home, *body; uint8_t saved[5]; int banned; } inst[MAX_TRACES];
+
+static void trace_forget(struct rec *r) {
+    for (int t = 0; t < MAX_TRACES; t++)
+        if (inst[t].r == r) inst[t].r = NULL;
+}
+
+/* Called by a trace's guard exits once they have failed too often (a
+ * trace without side traces would exit on every iteration): put the
+ * stencil code back, and do not install the trace again. */
+void loimi_trace_blacklist(const char *name) {
+    for (int64_t t = 0; &loimi_ntraces && t < loimi_ntraces && t < MAX_TRACES; t++) {
+        if (loimi_traces[t].name != name) continue;
+        inst[t].banned = 1;
+        struct rec *r = inst[t].r;
+        if (!r) continue;
+        uint64_t h = loimi_traces[t].header;
+        memcpy(WR(inst[t].home), inst[t].saved, 5);
+        r->body[h] = inst[t].body;
+        if (r->ent[h] >= 0) loimi_jit_entries[r->ent[h]] = inst[t].body;
+        inst[t].r = NULL;
+        if (debug) fprintf(stderr, "jit: %p+%llu: trace %s blacklisted\n", (void *)r->code, (unsigned long long)h, name);
+    }
+}
+
+/* FNV-1a of the instruction words in [lo, hi) (not cache words). */
+static uint64_t words_hash(const struct rec *r, const int64_t *map, uint64_t lo, uint64_t hi) {
+    uint64_t h = 1469598103934665603ull;
+    for (uint64_t i = lo; i < hi && i < r->n; i++) {
+        if (map[i] < 0) continue;
+        h ^= r->w[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+static void trace_report(void) {
+    const char *p = getenv("LOIMI_TRACE_PROFILE");
+    FILE *f = p && *p ? fopen(p, "w") : NULL;
+    if (!f) return;
+    for (int64_t t = 0; t < loimi_ntraces; t++) {
+        const struct loimi_trace *tr = &loimi_traces[t];
+        fprintf(f, "trace %s\n", tr->name);
+        for (uint64_t i = 0; i < tr->ncounts; i++) fprintf(f, "%llu %llu\n", (unsigned long long)i, (unsigned long long)tr->counts[i]);
+    }
+    fclose(f);
+}
+
+/* LOIMI_TRACE_DUMP=file: the compiled code object's words, stencils and
+ * patched constants (the recording the trace generator reads). */
+static void trace_hook(struct rec *r, const uint32_t *sts, const int64_t *map) {
+    static int init, off;
+    if (!init) {
+        init = 1;
+        const char *d = getenv("LOIMI_TRACE_DUMP");
+        if (d && *d) trace_dumpf = fopen(d, "w");
+        const char *o = getenv("LOIMI_TRACE");
+        off = o && strcmp(o, "0") == 0;
+        if (&loimi_ntraces && getenv("LOIMI_TRACE_PROFILE")) atexit(trace_report);
+    }
+    if (trace_dumpf) {
+        uint64_t h = words_hash(r, map, 0, r->n);
+        int64_t hot = last_hot && last_hot >= r->code && last_hot < r->code + r->n ? last_hot - r->code : -1;
+        fprintf(trace_dumpf, "code %p %llu %016llx hot %lld\n", (void *)r->code, (unsigned long long)r->n, (unsigned long long)h, (long long)hot);
+        for (uint64_t pc = 0; pc < r->n; pc++) {
+            if (map[pc] < 0) {
+                fprintf(trace_dumpf, "w %llu %08x -\n", (unsigned long long)pc, r->w[pc]);
+                continue;
+            }
+            fprintf(trace_dumpf, "w %llu %08x %s\n", (unsigned long long)pc, r->w[pc], loimi_jit_opnames[r->w[pc] & OPMASK]);
+            const struct jit_stencil *sp = &loimi_jit_stencils[sts[pc]];
+            for (uint32_t k = 0; k < sp->nreloc && r->pool; k++) {
+                const struct jit_reloc *rl = &loimi_jit_relocs[sp->reloc + k];
+                if (rl->kind != K_CONST) continue;
+                unsigned o = rl->arg & 255;
+                uint64_t c = (uint64_t)r->pool[field(r->w[pc + o], rl->arg)];
+                fprintf(trace_dumpf, "k %llu %u.%u.%u %016llx\n", (unsigned long long)pc, o, (unsigned)(rl->arg >> 8) & 255,
+                        (unsigned)(rl->arg >> 16) & 255, (unsigned long long)c);
+            }
+        }
+        fflush(trace_dumpf);
+    }
+    if (off || !&loimi_ntraces) return;
+    for (int64_t t = 0; t < loimi_ntraces; t++) {
+        const struct loimi_trace *tr = &loimi_traces[t];
+        if (tr->nwords != r->n || tr->hash != words_hash(r, map, tr->lo, tr->hi) || !r->home[tr->header]) continue;
+        if (t < MAX_TRACES) {
+            if (inst[t].banned) continue;
+            inst[t].r = r;
+            inst[t].home = r->home[tr->header];
+            inst[t].body = r->body[tr->header];
+            memcpy(inst[t].saved, r->home[tr->header], 5);
+        }
+        jmp5(r->home[tr->header], tr->fn);
+        r->body[tr->header] = (uint8_t *)tr->fn;
+        if (r->ent[tr->header] >= 0) loimi_jit_entries[r->ent[tr->header]] = tr->fn;
+        if (debug) fprintf(stderr, "jit: %p+%llu: trace %s\n", (void *)r->code, (unsigned long long)tr->header, tr->name);
+    }
+}
+
 /* Compile code object r from its words (none of them enter words). With
  * oent (a recompile), instructions keep their entry indices. */
 static int compile(struct rec *r, const int32_t *oent) {
@@ -943,6 +1059,7 @@ static int compile(struct rec *r, const int32_t *oent) {
             if (map[pc] >= 0) map_line(r->body[pc], lens[pc], sts[pc]);
         fflush(mapf);
     }
+    trace_hook(r, sts, map);
     if (debug) {
         fprintf(stderr, "jit: compiled %p (%llu words) at %p\n", (void *)code, (unsigned long long)n, (void *)dst);
         for (uint64_t pc = 0; pc < n; pc++) {
@@ -978,6 +1095,7 @@ out:
 }
 
 void loimi_jit_hot(uint32_t *pc) {
+    last_hot = pc;
     loimi_jit_hotcount[((uintptr_t)pc >> 2) & (HOT_SLOTS - 1)] = threshold;
     if (!enabled || !init_region()) return;
     struct rec *r = lookup(pc);
