@@ -1313,12 +1313,18 @@ workflow (§11.1); results in §13.6.
   rest (a jump-table dispatch loop whose arms are side traces, a side
   trace that resumes a superinstruction, arithmetic that changes type in
   a side trace, nested loops, a polymorphic call site) and asserts that
-  the scripts and benchmarks make at least 10 side traces. A build from
-  that script alone checks, with guards forced (`LOIMI_TRACE_MINFRAC=0.5`:
-  the side trace's branch taken in 3 of 7 of its runs is a guard), that a
-  side trace is blacklisted while its root runs on. Every script and
-  conformance test runs as before in every GC mode with these traces,
-  with failing guards and with blacklisting at every failure.
+  the scripts and benchmarks make at least 10 side traces. Every script
+  and conformance test runs as before in every GC mode with these
+  traces, with failing guards and with blacklisting at every failure.
+- `mini_traces_sides` traces that script alone and checks, with guards
+  forced (`LOIMI_TRACE_MINFRAC=0.5`: the side trace's branch taken in 3
+  of 7 of its runs is a guard), that a side trace is blacklisted while
+  its root runs on.
+- The tests' recording and profiling runs are retried when they leave no
+  file: under the tests' 2 GB address-space cap the JIT cannot always
+  map its code region (about 1 run in 40 of a JIT build compiled nothing,
+  silently), and a program whose profile is missing makes no traces. Two
+  failures of the new checks while other builds ran came from that.
 - `mini_traces_fuzz`: the generator makes jump tables and `elseif` chains
   whose arms run more or less often by the input (side traces whose
   guards fail with another input), and every program ends with a

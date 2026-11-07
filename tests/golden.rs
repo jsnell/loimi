@@ -441,13 +441,38 @@ fn mini_traces() {
     failures.extend(mini_conformance_on(&bt.forced, &env1, &|_| true));
     failures.extend(bt.check_benchmarks(&bt.forced, &root.join("bench/mini/programs"), &env1));
     bt.cleanup();
+    if !failures.is_empty() {
+        panic!("{} failure(s):\n\n{}", failures.len(), failures.join("\n\n"));
+    }
+}
+
+/// A side trace whose own guard fails is dropped alone, its root runs on
+/// (docs/design/trace-tier.md section 13.2): trace_sides.mini traced with
+/// guards forced.
+#[test]
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn mini_traces_sides() {
+    if cross() {
+        return;
+    }
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let env = [("LOIMI_JIT", "1"), ("LOIMI_JIT_HOT", "2")];
+    let mut failures = Vec::new();
     // a side trace whose own guard fails (the forced build makes a block
     // run in 3 of 7 of its runs a guard) is dropped alone: its root runs on
-    // (traces of this script alone: the bounded profiling build above may
-    // leave its loops out)
+    // (traces of this script alone: the bounded profiling build of
+    // mini_traces may leave its loops out)
     let sides = root.join("examples/mini/tests/trace_sides.mini");
     let bs = build_traces("sides", &root.join("examples/mini/main.lm"), std::slice::from_ref(&sides), &[("LOIMI_JIT_HOT", "2")]);
-    let out = program(&bs.forced).arg(&sides).envs(env.iter().copied()).env("LOIMI_JIT_STATS", "1").output().unwrap();
+    let mut out = program(&bs.forced).arg(&sides).envs(env.iter().copied()).env("LOIMI_JIT_STATS", "1").output().unwrap();
+    for _ in 0..3 {
+        // (the JIT's code region cannot always be mapped under the memory
+        // cap: run again when it compiled nothing)
+        if !String::from_utf8_lossy(&out.stderr).contains("jit: nothing compiled") {
+            break;
+        }
+        out = program(&bs.forced).arg(&sides).envs(env.iter().copied()).env("LOIMI_JIT_STATS", "1").output().unwrap();
+    }
     let err = String::from_utf8_lossy(&out.stderr);
     let dropped = err.lines().any(|l| l.starts_with("jit:   side trace ") && l.ends_with(", blacklisted"));
     let root_ran = err.lines().any(|l| l.starts_with("jit:   trace ") && !l.ends_with(", blacklisted") && !l.contains(": 0 iterations"));
@@ -460,9 +485,7 @@ fn mini_traces() {
         ));
     }
     bs.cleanup();
-    if !failures.is_empty() {
-        panic!("{} failure(s):\n\n{}", failures.len(), failures.join("\n\n"));
-    }
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
 }
 
 #[path = "fuzz/traceprog.rs"]
@@ -623,9 +646,19 @@ fn build_traces(tag: &str, src: &Path, inputs: &[PathBuf], env: &[(&str, &str)])
         let mut all = String::new();
         for (i, f) in inputs.iter().enumerate() {
             let file = dir.join(format!("{}.{}", i, ext));
-            let _ = program(exe).arg(f).env("LOIMI_JIT", "1").env(var, &file).envs(env.iter().copied()).output().unwrap();
-            all.push_str(&std::fs::read_to_string(&file).unwrap_or_default());
-            let _ = std::fs::remove_file(&file);
+            // (again when the JIT compiled nothing, which leaves no file:
+            // under the memory cap its code region cannot always be mapped,
+            // about 1 run in 40)
+            let mut text = None;
+            for _ in 0..3 {
+                let _ = program(exe).arg(f).env("LOIMI_JIT", "1").env(var, &file).envs(env.iter().copied()).output().unwrap();
+                text = std::fs::read_to_string(&file).ok();
+                let _ = std::fs::remove_file(&file);
+                if text.is_some() {
+                    break;
+                }
+            }
+            all.push_str(&text.unwrap_or_default());
         }
         let p = dir.join(format!("all.{}", ext));
         std::fs::write(&p, all).unwrap();
