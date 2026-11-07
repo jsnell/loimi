@@ -1,0 +1,51 @@
+// `rt.ValueStack`: `ensure` clears never-written slots (with `rt.SLACK`
+// more) and raises the high-water mark, `lower` clears the stale slots
+// above the live windows and lowers it, raising it again clears nothing
+// (a slot written above the mark keeps its value), and `ensure` past
+// the end fails.
+// expect: 0 true 260
+// expect: true 260
+// expect: 5 -1 10
+// expect: -1 -1
+// expect: true 260 7
+// expect: false 260
+// expect: true 1000
+import std.io;
+import std.rt;
+
+fn at(s: *rt.ValueStack<i64>, p: *i64) -> i64 { ((p as u64 - s.base as u64) / 8) as i64 }
+
+fn line(xs: *i64, n: u64) {
+    for i in 0..n { io.print_int(xs[i]); if i + 1 < n { io.print(" "); } }
+    io.println("");
+}
+
+fn ensured(s: *rt.ValueStack<i64>, top: *i64) {
+    io.print_bool(s.ensure(top)); io.print(" "); io.print_int(at(s, s.hw)); io.println("");
+}
+
+fn main() {
+    var s = rt.ValueStack.new(1000, -1 as i64);
+    defer s.free();
+    let b = s.base;
+    // A window of 4 slots: cleared, with SLACK (256) more.
+    io.print_int(at(&s, s.hw)); io.print(" ");
+    ensured(&s, b + 4);
+    // Below the mark: one compare, nothing changes.
+    ensured(&s, b + 200);
+    b[3] = 5; b[100] = 10;
+    var v: [i64; 3] = [b[3], b[4], b[100]];
+    line(&v[0], 3);
+    // A collection found the live windows end at slot 4: the stale slots
+    // above are cleared and the mark lowered.
+    s.lower(b + 4);
+    v = [b[4], b[100], 0];
+    line(&v[0], 2);
+    b[50] = 7;
+    io.print_bool(s.ensure(b + 60)); io.print(" "); io.print_int(at(&s, s.hw)); io.print(" ");
+    io.print_int(b[50]); io.println("");
+    ensured(&s, b + 1001);
+    // Near the end, the slack stops at the end.
+    s.lower(b);
+    ensured(&s, b + 990);
+}

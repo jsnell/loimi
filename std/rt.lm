@@ -22,6 +22,8 @@
 // library returns an error to its host (docs/language.md §10.1 says what
 // state is left behind).
 
+import std.mem;
+
 extern "C" fn loimi_protect(f: fn(*u8), data: *u8) -> i32;
 extern "C" fn loimi_throw();
 extern "C" fn loimi_catch_panic(f: fn(*u8), data: *u8) -> i32;
@@ -68,4 +70,95 @@ pub fn panic_message() -> str {
     if n == 0 { return ""; }
     if p[n - 1] == 10 { n -= 1; }
     p.slice(n)
+}
+
+// ── Value stacks ─────────────────────────────────────────────────────
+
+/// A vm's value stack (its register windows) with a high-water mark, so
+/// that calls need not clear their registers for the collector.
+///
+/// - Every slot below `hw` holds a value the root scanner may read: a
+///   live register, or a stale one from a finished call whose object no
+///   collection has freed.
+/// - Slots from `hw` up to `fresh` hold values that refer to no freed
+///   object: cleared ones, or ones written above the mark since the last
+///   collection.
+/// - Slots from `fresh` up have never been written.
+///
+/// A call whose window ends above the mark takes the slow path
+/// (`raise`): it clears the never-written slots its window needs (and
+/// `SLACK` more) and raises the mark to `fresh`. The root scanner, having
+/// marked every live window, clears the stale slots above them and
+/// lowers the mark (`lower`). So a call checks one compare, against the
+/// mark, in place of the compare against the end, and clears nothing;
+/// after a collection, the first deeper call moves the mark back up
+/// without clearing.
+///
+/// It needs the interpreter to write every register before it reads
+/// it, and the scanner to find every live window. It does not move (no
+/// `grow`): allocate what the guest may use; `mem.alloc` zeroes, so
+/// untouched pages cost nothing.
+pub struct ValueStack<T> {
+    base: *T,
+    end: *T,
+    hw: *T,
+    fresh: *T,
+    fill: T,
+}
+
+/// Never-written slots cleared past a window that raises the mark.
+pub const SLACK: u64 = 256;
+
+/// A stack of `n` slots; `fill` is what cleared slots hold (a value the
+/// collector ignores, such as nil).
+pub fn ValueStack<T>.new(n: u64, fill: T) -> ValueStack<T> {
+    let p = mem.alloc<T>(n);
+    ValueStack { base: p, end: p + n, hw: p, fresh: p, fill: fill }
+}
+
+pub fn ValueStack<T>.free(s: *ValueStack<T>) {
+    mem.release(s.base);
+}
+
+/// Whether the slots below `top` are readable already: one compare
+/// against the mark. A handler's hot path checks this and calls `raise`
+/// from a `cold` block that ends in `redo`, so that the handler needs no
+/// stack frame for the call:
+///
+///     if !ctx.stack.fits(top) { cold { if !ctx.stack.raise(top) { raise overflow } redo } }
+#[inline]
+pub fn ValueStack<T>.fits(s: *ValueStack<T>, top: *T) -> bool { top <= s.hw }
+
+/// Make the slots below `top` readable: `fits`, else `raise`. For slow
+/// paths (a call to `raise` makes the caller keep a stack frame).
+#[inline]
+pub fn ValueStack<T>.ensure(s: *ValueStack<T>, top: *T) -> bool {
+    if top <= s.hw { return true; }
+    s.raise(top)
+}
+
+/// The slow path of `ensure`: false if `top` is past the end; else clear
+/// the never-written slots below `top` (and up to `SLACK` more) and
+/// raise the mark to the last cleared slot.
+#[cold]
+pub fn ValueStack<T>.raise(s: *ValueStack<T>, top: *T) -> bool {
+    if top > s.end { return false; }
+    if top > s.fresh {
+        let room = (s.end as u64 - top as u64) / size_of<T>();
+        let to = top + (if room < SLACK { room } else { SLACK }) as i64;
+        var p = s.fresh;
+        while p < to { *p = s.fill; p = p + 1; }
+        s.fresh = to;
+    }
+    s.hw = s.fresh;
+    true
+}
+
+/// For the root scanner, after it marked every live window: `top` is
+/// the end of the live windows. Clear the slots from there to the mark
+/// (this collection may free what they hold) and lower the mark.
+pub fn ValueStack<T>.lower(s: *ValueStack<T>, top: *T) {
+    var p = top;
+    while p < s.hw { *p = s.fill; p = p + 1; }
+    if top < s.hw { s.hw = top; }
 }

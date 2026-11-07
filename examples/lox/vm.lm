@@ -9,6 +9,7 @@ import std.io;
 import std.gc;
 import std.mem;
 import std.obj;
+import std.rt;
 // clox defines `clock()` as processor time, as C's clock() measures it.
 extern "C" fn clock() -> i64;
 import std.text;
@@ -56,8 +57,9 @@ pub fn Globals.define(g: *Globals, key: u32, v: Value) {
 }
 
 pub struct Machine {
-    stack: *Value,
-    stack_end: *Value,
+    /// The registers, with a high-water mark (`rt.ValueStack`): calls do
+    /// not clear their registers.
+    stack: rt.ValueStack<Value>,
     frames: *Frame,
     frames_end: *Frame,
     /// The running frame, as of the last sync: the root scanner walks the
@@ -84,7 +86,7 @@ pub struct Machine {
 
 /// Release everything the machine owns, the heap included.
 pub fn Machine.free(m: *Machine) {
-    mem.release(m.stack);
+    m.stack.free();
     mem.release(m.frames);
     mem.release(m.globals.slots);
     m.strings.free();
@@ -100,12 +102,15 @@ pub fn Machine.free(m: *Machine) {
 /// function's constants, the globals.
 pub fn scan_roots(h: *gc.Heap, m: *Machine) {
     var f = m.frames;
+    var top = m.stack.base;
     while f <= m.fp {
         gc_mark(h, f.cl);
         let n = f.cl.proto.nregs as u64;
         for i in 0..n { gc_mark(h, f.base[i]); }
+        if f.base + n > top { top = f.base + n; }
         f = f + 1;
     }
+    m.stack.lower(top);
     for i in 0..m.protos.len {
         let p = m.protos.at(i);
         for j in 0..p.consts.len { gc_mark(h, p.consts[j]); }
@@ -446,16 +451,8 @@ pub vm Lox {
         let p = c.proto;
         if n != p.arity as u64 { raise arity_error(ctx, p.arity as u64, n) }
         let callee = regs + base;
-        if callee + p.nregs as u64 > ctx.stack_end or fp + 1 == ctx.frames_end {
-            raise "Stack overflow."
-        }
-        // Registers past the arguments may hold stale references that the
-        // root scanner would read.
-        var i = n + 1;
-        while i < p.nregs as u64 {
-            callee[i] = Nil;
-            i += 1;
-        }
+        let top = callee + p.nregs as u64;
+        if !ctx.stack.ensure(top) or fp + 1 == ctx.frames_end { raise "Stack overflow." }
         fp.ret = next_pc;
         fp = fp + 1;
         fp.cl = c;
@@ -750,9 +747,9 @@ pub vm Lox {
         ctx = m;
         fp = m.frames;
         fp.cl = main;
-        fp.base = m.stack;
-        regs = m.stack;
-        for i in 0..main.proto.nregs as u64 { regs[i] = Nil; }
+        fp.base = m.stack.base;
+        regs = m.stack.base;
+        if !m.stack.ensure(regs + main.proto.nregs as u64) { exit Err("Stack overflow.") }
         regs[0] = Fun(main);
         k = main.proto.consts.ptr;
         m.fp = fp;
