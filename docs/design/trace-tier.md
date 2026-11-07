@@ -1332,7 +1332,16 @@ workflow (§11.1); results in §13.6.
   made. Programs are profiled with one input and run with three, with
   traces, forced guards, blacklisting at every failure and a collection
   at every safepoint.
-- ASan (by hand, as in §11.6): RESULTS-ASAN
+- ASan (by hand, as in §11.6): Mini built with `--sanitize=address`
+  and the trace of `interp`'s profile (its dispatch loop with 14 side
+  traces) ran `interp` correct and without reports (29.7 million
+  iterations in the trace), and Mini's scripts without reports. Only that
+  profile: the build took 15 minutes; with the traces of five profiles
+  (interp, fannkuch, mandelbrot, nbody, sort) and with all 14, ASan
+  builds did not finish in 50 and 60 minutes (a build without traces took
+  18, on a loaded machine), although each of the six largest trace
+  functions compiles with ASan alone in seconds. Why the whole module is
+  that slow was not found.
 - Found on the way: the quadratic regions, superinstruction resumes as
   opaque exits (§13.3), missing branch weights (§13.3), a wrong filter
   of side-trace starts under `LOIMI_TRACE_MINFRAC` (a site's per-target
@@ -1342,7 +1351,11 @@ workflow (§11.1); results in §13.6.
 ### 13.5 Other vms
 
 MiniJS runs unchanged: nbody, fannkuch, spectral_norm, bitops and sort
-recorded, profiled and traced (22 traces, 14 side traces), every output equal to the JIT's. RESULTS-JS
+recorded, profiled and traced (22 traces, 14 side traces), every output equal to the JIT's. Against its JIT
+(5 interleaved runs, minimum, a loaded machine: JIT A/A 1.03): nbody
+0.58, spectral_norm 0.53, fannkuch 0.79 (§12.8: its traces did not
+install, 1.00), bitops 0.89, sort 0.95; 0.730 by geometric mean, no
+program slower.
 Scheme and Prolog were not run through the workflow.
 
 ### 13.6 Results
