@@ -85,8 +85,8 @@ one, else an estimate.
 | 6 | **A sampling profiler in std** (`std.prof`), mapped to handlers, cold blocks and guest pcs | Every tuning round wrote its own LD_PRELOAD SIGPROF sampler (wasm FRICTION 366, Python FRICTION 618, Mini RESULTS:9). The 64 KiB verifier memset (Prolog sieve 0.54) was found only by sampling | indirect; it finds the next items. **Built 2026-11-06** (`--vm-prof`, item 6): top entries match the hand sampler within 1 point; costs 3% (tail-call) at 1000 Hz | S–M |
 | 7 | **Shifted-int nanbox option** (Int payload in the high bits, so `add; jo` checks overflow) | Python's i48 overflow check is `shl; shl; add; jo; shr`, costing spectral_norm 5–8%. Mini measured i48 at +4–9% and kept i32 (`RESULTS.md:527`). **Built 2026-11-06** as `repr nanbox(int_high)` (item 7, "As built"); Python and Prolog use it; Scheme, MiniJS, Mini and Lox measured and not kept (item 7, "Ports") | measured: Python suite 0.932 (align 64), 0.942 (128); integer benchmarks 0.87–0.97 (spectral_norm 1.00 at 128), nbody 0.99–1.01 | M |
 | 8 | **Re-fusion on `become`**, and supers from a profile file | Mini and MiniJS call `refuse` (a whole-function `optimize`) by hand after quickening; doing so gave mandelbrot −6% and nbody −5%. Lox, Python and Scheme don't do it. **Built 2026-11-06** as `refuse CODE;` (item 8, "As built"): Lox zoo 0.88, suite 0.973; Python and Scheme no gain | measured: Lox 0.97; others 1.00 | S |
-| 9 | **A value-stack and frame runtime** (`std.rt.ValueStack`): high-water-mark clearing across coroutines, nested runs and the debugger | Built by hand in MiniJS, Scheme and Python; for Scheme it gave fib 0.81 and tak 0.85. Mini's three attempts failed: the unsafe upper bound was fib 0.92, the safe attempt 0.995–1.003. Python's frames do 8 stores | 1–2% for Mini and Lox; mostly ergonomic for the rest | M |
-| 10 | **Adaptive quickening**: warmup and backoff counters on families (CPython's PEP 659) | No interpreter counts; all specialize on first execution. There is no measured flip-flop yet, so measure first | 0–2% (est.) | S |
+| 9 | **A value-stack and frame runtime** (`std.rt.ValueStack`): high-water-mark clearing across coroutines, nested runs and the debugger | Built by hand in MiniJS, Scheme and Python; for Scheme it gave fib 0.81 and tak 0.85. Mini's three attempts failed: the unsafe upper bound was fib 0.92, the safe attempt 0.995–1.003. Python's frames do 8 stores. **Built 2026-11-07** (item 9, "As built"): Lox stops clearing at calls; Scheme and MiniJS use it in place of their own marks; Mini not retried, Python not ported; no `FrameStack` (every frame layout differs) | measured: Lox 0.970 (64), 0.966 (128), fib 0.86; Scheme and MiniJS 1.00 | M |
+| 10 | **Adaptive quickening**: warmup and backoff counters on families (CPython's PEP 659) | No interpreter counts; all specialize on first execution. **Measured 2026-11-07** (item 10): later `become`s are at most 0.055% of dispatches (MiniJS deltablue); float members that keep missing without a `become` (MiniJS strings, bitops) bound backoff at 1.8% even with free counters. No-go | measured: ≤ 0.982 on one benchmark (bound) | S |
 | 11 | **Coroutine and generator switching** as a vm primitive (`suspend`, state snapshot and restore) | Mini's resume/yield cold blocks are 31% of chameneos, the one Mini benchmark slower than LuaJIT `-joff` (1.06). Python generators copy every register on YIELD and resume. **Prototyped 2026-11-06** (item 11, "Prototype results"): quickened CALL members (no language change) kept in Mini; the primitive is a no-go | measured: chameneos 0.925, coroutine_ring 0.96, sieve 0.944 (Mini change); primitive's bound ≤ 2 loads per switch | M |
 | 12 | **Trailing immediate words in formats** (`roadmap.md` Q10) | wasm keeps CONST64 and table and segment indices in cache words, bounds-checked on every execution | ~1% for wasm; niche | M |
 | 13 | **JIT stencils: computed jumps that exit to the target** | Mini's SWITCH straight to its target was 4% faster on interp (interpreter) but crashes `--jit-stencils`. **Built 2026-11-06** (item 13, "As built"): the crash was a decode of an enter word; `Vm.real_word` is now an inline table load, and computed jumps enter the target's compiled code | measured: interp 0.977 (align 64), 0.947 (128); JIT 1.00 | S |
@@ -1846,6 +1846,79 @@ was a placement-sensitive oo_methods.
 **General:** the protocol is general, but its *speed* gain is mostly
 taken already. It ranks low for speed, higher for ergonomics.
 
+#### As built (2026-11-07): `std.rt.ValueStack`; Lox 0.97
+
+**Survey.**
+- **Frames.** All five interpreters keep frames in a separate frame
+  array and check its limit with a second compare, which no value-stack
+  type can fold in.
+- **Frame layouts all differ**: Lox 3 fields, Scheme 4, MiniJS and Mini
+  5, Python 9. A shared `FrameStack` would not save code.
+- **The mark** has three variants:
+  - MiniJS: slots above the mark are clean, raising it only moves a
+    pointer, and the scanner clears above the innermost window.
+  - Scheme: slots below the mark are valid, raising it clears 1024
+    slots ahead, and the scanner clears above the highest window.
+  - Python: never lowered, and every slot below it is marked.
+- **Size of the code.** The high-water code proper is small: MiniJS
+  about 25 lines, Scheme about 45, Python about 15. Only Mini relocates
+  its stacks, for coroutines, and with them it must fix open-upvalue
+  pointers, frame bases and per-coroutine fields.
+
+**The upper bound in Lox.** Lox still cleared the callee's registers
+in every call. Removing the clearing (unsafe) measured fib 0.87,
+binary_trees 0.94–0.95, trees 0.96–0.97 and the suite 0.968–0.969
+(A/A 1.004–1.006), well above the 1–2% the table estimated. A mark by
+hand in Lox measured suite 0.963–0.965 (fib 0.864–0.869, trees
+0.926–0.953), the same as the bound. Lox has no coroutines, nested runs
+or debugger.
+
+**Built.** `std.rt.ValueStack<T>` (`stdlib.md`, std.rt):
+- `fits(top)`: one compare against the mark;
+- `raise(top)`: `#[cold]`, clears only never-written slots (plus
+  `SLACK`) and raises the mark to them;
+- `ensure(top)`: `fits`, else `raise`;
+- `lower(top)`: for the scanner.
+
+A `fresh` pointer separates the slots the scanner has cleaned (between
+the mark and `fresh`) from the never-written ones. So raising the mark
+after a collection clears nothing, which is MiniJS's protocol, without
+filling the stack when it is allocated.
+
+Two lessons from the ports:
+- **Hot paths call `raise` from a `cold` block that ends in `redo`.**
+  A first Scheme port that called `ensure` on the hot path gave every
+  call handler a stack frame (`push`/`sub rsp`). The suite stayed
+  1.008 (A/A 1.007), but fib was 1.05, ntakl 1.08 and ack 1.03.
+- **`raise` must not clear slots between the mark and `fresh`.** A
+  first version cleared from the mark up and broke MiniJS under GC
+  stress, because MiniJS writes argument slots above the mark before a
+  call raises it.
+
+**Ports** (user+sys, minimum of 7–9 interleaved runs, A/A in the same
+run):
+
+| vm | change | align 64 | A/A | align 128 |
+|---|---|---|---|---|
+| Lox | clearing at calls → `ValueStack` | 0.970 (fib 0.863, binary_trees 0.939, trees 0.985) | 1.004 | 0.966 (fib 0.867, binary_trees 0.918, trees 0.961) |
+| Scheme | `hwm` + `rt.grow` → `ValueStack` | 1.000 (fib 1.017, tak 0.990) | 1.000 | 0.995 |
+| MiniJS | `hw` + `grow_stack` → `ValueStack` | 0.995 | 0.998 | 1.002 (A/A 1.004) |
+
+All three kept. Lox's and Scheme's tests pass, with and without GC
+stress, and Lox's with a poison value in every register it no longer
+clears. Code: Scheme's `grow` (16 lines) and its scanner's clearing
+loop are gone. MiniJS's raise sites became one call each. Lox gained
+about 10 lines.
+
+**Not ported.**
+- **Python** never lowers its mark and marks every slot below it. It
+  clears nothing at any point, so there is nothing to gain.
+- **Mini** needs a stack per coroutine (relocated by `grow`), and the
+  mark would have to be lowered for suspended coroutines, resumers and
+  `--cfg gil` threads. That is the third attempt in `RESULTS.md`, which
+  measured 0.995–1.003. `ValueStack` does not move, so it does not
+  remove that work. Not retried.
+
 ### 10. Adaptive quickening (warmup and backoff counters)
 
 **Evidence.**
@@ -1885,6 +1958,61 @@ that, do not build this.
 - **`Vm.deopt`:** zeroes the counter.
 
 **General:** six interpreters with families. Gain unknown.
+
+#### Measured (2026-11-07): no flip-flop worth a counter, no-go
+
+`--vm-stats` now counts every `become` per site and transition
+(`language.md` §7.3): a site's first `become` is its quickening, and
+each later one is a re-quickening or a deopt. Mini, MiniJS, Lox,
+Python and Scheme on their whole suites:
+
+| vm | later `become`s, worst benchmark | share of dispatches |
+|---|---|---|
+| Mini (17 programs) | none: every site quickens once | 0 |
+| Scheme (43) | none | 0 |
+| Lox (10) | trees: 96 (INVOKE_P ↔ INVOKE_MISS) | < 0.0001% |
+| Python (11) | go: 38 (GETGLOBAL ↔ GETGLOBAL_B) | < 0.0001% |
+| MiniJS (14) | deltablue: 153,444 at 67 sites, 142,799 at one (SETPROP ↔ SETPROP_ADD) | 0.055% |
+
+The worst is 0.055% of dispatches, against the 1% go threshold. The
+deltablue site adds a property to objects of two shapes; the profile
+gives `SETPROP_ADD` and generic `SETPROP` 0.9% of samples together,
+hits included.
+
+The other kind of waste a counter could avoid is a quickened member
+that keeps missing without a `become`. MiniJS's float members
+(`ADD_F`, ...) handle every type, so a site that quickened on one
+float never goes back. The cold-block counts find it:
+- **strings**: `ADD_F` runs 8.3M times and misses every time (3.6% of
+  dispatches; 76% of the misses are two Ints). The hash loop's
+  `((h << 5) + h + c) | 0` overflows into a double once, and the site
+  stays float.
+- **bitops**: 95% of `ADD_F` runs miss (2.7% of dispatches, half of
+  them two Ints).
+- **raytrace**: `SUB_F` and `MUL_F` miss 4% of dispatches, mostly on
+  Int/float mixes. Those sites are really polymorphic.
+- **Mini, Lox, Python and Scheme**: their hot cold blocks are generic
+  slow paths (calls, bignums, closures), not member misses.
+
+Backoff (deopt to the generic member, and wait longer before
+quickening again) is the right tool for strings and bitops. Its upper
+bound is a vm whose `ADD` never quickens to a float member, which
+removes those misses for free:
+
+| benchmark | A/A | ADD never quickens |
+|---|---|---|
+| bitops (align 64; 21 runs) | 0.991 | 0.986 |
+| strings | 1.011 | 0.994 |
+| bitops (align 128; 15 runs) | | 0.982 |
+| strings | | 0.996 |
+
+That is at most 1.8% on one benchmark, before paying for a counter.
+A hand prototype could not beat the 2% bar, so it was not built.
+Building the language feature would also need a cache word on ops
+that have none (MiniJS's arithmetic is `ABC` with no cache), and a
+deopt from a member that writes an accumulator needs the generic op to
+have accumulator variants too. **No-go.** The `become` counts stay in
+`--vm-stats` to recheck this with new interpreters.
 
 ### 11. Coroutine and generator switching
 

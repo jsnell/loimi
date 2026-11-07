@@ -555,6 +555,17 @@ implementation; `git log` has the details.
 
 ### Standard library
 
+- **`std.rt.ValueStack<T>`**: a vm's value stack with a high-water
+  mark, so that calls do not clear their registers for the collector.
+  `fits` is one compare against the mark, in place of the overflow
+  compare; the `#[cold]` `raise` clears only never-written slots; the
+  root scanner calls `lower` after marking the live windows. Lox stopped
+  clearing at calls: suite 0.970 (align 64; A/A 1.004) and 0.966 (128),
+  fib 0.86. Scheme's and MiniJS's hand-written marks became the std
+  type, at the same speed (Scheme 1.000 and 0.995; MiniJS 0.995 and
+  1.002) ([stdlib.md](docs/stdlib.md#value-stacks-rtvaluestackt),
+  [design/speed-audit.md](docs/design/speed-audit.md), item 9).
+
 - **`std.math.Divisor`**: division by a prepared constant (Granlund and
   Montgomery, with a 64-bit magic). It has truncating and flooring
   signed `div`/`rem`, unsigned and 31-bit forms, and four `u32` fields,
@@ -609,6 +620,14 @@ implementation; `git log` has the details.
   ([stdlib.md](docs/stdlib.md#run-time-operator-tables-parseops)).
 
 ### Tooling
+
+- **`--vm-stats` counts quickenings**: every `become` per site and per
+  transition. A site's later ones (re-quickenings and deopts) are
+  reported as a share of dispatches. Across Mini, MiniJS, Lox, Python
+  and Scheme they are at most 0.055% (MiniJS deltablue). Warmup and
+  backoff counters (speed-audit item 10) were measured not to pay: the
+  bound is 1.8% on one benchmark
+  ([language.md](docs/language.md) §7.3).
 
 - **`loimi ir-diff A B`** compares the optimized IR (and with `--asm`
   the assembly) of two builds function by function, ignoring panic

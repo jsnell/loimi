@@ -567,6 +567,27 @@ dependency chain. Per benchmark: `bench/prolog/README.md`,
 `bench/scheme/README.md`, `bench/minijs/RESULTS.md`,
 `bench/mini/RESULTS.md`.
 
+## Value stacks; quickening flip-flop (2026-11-07)
+
+Not a run of the suites: speed-audit items 9 and 10
+([design/speed-audit.md](design/speed-audit.md)). Tail-call builds
+against master's, user+sys CPU, minimum of 7 (Scheme, MiniJS) or 9
+(Lox) interleaved runs, with an A/A copy of the baseline in the same
+interleave (geometric means). The 128 column ran with an A/A copy only for MiniJS (1.004).
+
+| Change | Suite | 64 | A/A | 128 | Kept |
+|---|---|---:|---:|---:|---|
+| No register clearing at calls (`std.rt.ValueStack`) | Lox (9) | 0.970 | 1.004 | 0.966 | yes: fib 0.86, binary_trees 0.92–0.94 |
+| Hand-written mark → `std.rt.ValueStack` | Scheme (43) | 1.000 | 1.000 | 0.995 | yes |
+| Hand-written mark → `std.rt.ValueStack` | MiniJS (14) | 0.995 | 0.998 | 1.002 | yes |
+
+Item 10: `--vm-stats` now counts `become`s per site. The later ones
+(re-quickenings and deopts) are at most 0.055% of dispatches (MiniJS
+deltablue), and are 0 in Mini and Scheme. An oracle build in which
+MiniJS's ADD never quickens bounds warmup and backoff counters at
+0.982–0.986 on bitops and 0.994–0.996 on strings, so they were not
+built.
+
 ## Per suite
 
 ### mini
