@@ -616,6 +616,19 @@ pub fn vm_expr(g: &mut FnGen, e: &TExpr, v: &TVm) -> String {
             }
             let w = g.inst(format!("load {}, ptr {}", wt, pc));
             let mask = ((1u64 << vd.op_bits) - 1) << vd.op_shift;
+            if g.cg.opts.vm_stats && *back == 0 {
+                // `--vm-stats`: the site and its transition (`stats_rt.c`).
+                let sym = vd.symbol.clone();
+                let to = vd.op_index(*opc as usize).unwrap_or(0);
+                let (shift, bits) = (vd.op_shift, vd.op_bits);
+                let w64 = if vd.word.bits == 64 { w.clone() } else { g.inst(format!("zext {} {} to i64", wt, w)) };
+                let sh = g.inst(format!("lshr i64 {}, {}", w64, shift));
+                let old = g.inst(format!("and i64 {}, {}", sh, (1u64 << bits) - 1));
+                g.emit(format!(
+                    "call void @{}(ptr @\"{}.stats.names\", ptr @\"{}.stats.opidx\", ptr {}, i64 {}, i64 {})",
+                    stats_rt_sym("become"), sym, sym, pc, old, to
+                ));
+            }
             let cleared = g.inst(format!("and {} {}, {}", wt, w, !mask as i64 & word_mask(vd.word.bits)));
             let nw = g.inst(format!("or {} {}, {}", wt, cleared, (*opc as u64) << vd.op_shift));
             g.emit(format!("store {} {}, ptr {}", wt, nw, pc));
@@ -1195,6 +1208,13 @@ pub fn emit_stats(cg: &mut crate::codegen::Codegen) {
             names.push(format!("ptr {}", s));
         }
         let _ = writeln!(cg.globals, "@\"{}.stats.names\" = internal constant [{} x ptr] [{}]", sym, n, names.join(", "));
+        // Opcode to op index, for the quickening report.
+        let mut opidx = vec![-1i64; 1usize << vd.op_bits];
+        for (i, o) in vd.ops.iter().enumerate() {
+            opidx[o.opcode as usize] = i as i64;
+        }
+        let opidx: Vec<String> = opidx.iter().map(|i| format!("i32 {}", i)).collect();
+        let _ = writeln!(cg.globals, "@\"{}.stats.opidx\" = internal constant [{} x i32] [{}]", sym, opidx.len(), opidx.join(", "));
         // Cold block counters (`count_cold`) and their labels.
         let vi = p.vms.iter().position(|v| std::ptr::eq(v, vd)).unwrap();
         let colds = cg.cold_stats[vi].clone();
@@ -1292,6 +1312,7 @@ coldnext:
   br i1 %cdone, label %suggest, label %coldloop
 suggest:
   call void @{suggest}(ptr @"{sym}.stats.seq", ptr @"{sym}.stats.pairs", i64 {n}, ptr @"{sym}.stats.names", ptr @"{sym}.stats.plain", i64 %tot1, ptr @"{sym}.stats.supers", i64 {nsw})
+  call void @{become_report}(ptr @"{sym}.stats.names", i64 %tot1)
   br label %done
 done:
   ret void
@@ -1299,6 +1320,7 @@ done:
 "#,
             nsw = super_words.len(),
             suggest = stats_rt_sym("suggest"),
+            become_report = stats_rt_sym("become_report"),
             nocold = if nc == 0 { "true" } else { "false" },
         );
         // `prof.OpCounts.reset`: zero the counts, pairs and sequences.
@@ -1314,12 +1336,14 @@ done:
   %tab = load ptr, ptr %tabp
   call void @free(ptr %tab)
   call void @llvm.memset.p0.i64(ptr @"{sym}.stats.seq", i8 0, i64 48, i1 false)
+  call void @{become_reset}(ptr @"{sym}.stats.names")
   ret void
 }}
 "#,
             cb = n * 8,
             pb = (n + 1) * n * 8,
             ccb = nc.max(1) * 8,
+            become_reset = stats_rt_sym("become_reset"),
         );
         dtors.push(format!("{{ i32, ptr, ptr }} {{ i32 65535, ptr {}, ptr null }}", f));
     }
@@ -1331,6 +1355,9 @@ done:
         cg.decls.insert("declare void @free(ptr)");
         cg.decls.insert(format!("declare void @{}(ptr, i64, i64)", stats_rt_sym("seq")));
         cg.decls.insert(format!("declare void @{}(ptr, ptr, i64, ptr, ptr, i64, ptr, i64)", stats_rt_sym("suggest")));
+        cg.decls.insert(format!("declare void @{}(ptr, ptr, ptr, i64, i64)", stats_rt_sym("become")));
+        cg.decls.insert(format!("declare void @{}(ptr, i64)", stats_rt_sym("become_report")));
+        cg.decls.insert(format!("declare void @{}(ptr)", stats_rt_sym("become_reset")));
     }
 }
 
@@ -1462,9 +1489,12 @@ pub fn stats_rt_sym(name: &str) -> String {
 /// `stats_rt_sym`.
 pub fn stats_rt_source() -> String {
     format!(
-        "#define loimi_stats_seq {}\n#define loimi_stats_suggest {}\n{}",
+        "#define loimi_stats_seq {}\n#define loimi_stats_suggest {}\n#define loimi_stats_become {}\n#define loimi_stats_become_report {}\n#define loimi_stats_become_reset {}\n{}",
         stats_rt_sym("seq"),
         stats_rt_sym("suggest"),
+        stats_rt_sym("become"),
+        stats_rt_sym("become_report"),
+        stats_rt_sym("become_reset"),
         STATS_RT
     )
 }

@@ -1,0 +1,49 @@
+// args: --vm-stats
+// matrix: dispatch
+// `--vm-stats` counts every `become` per site (the instruction's word)
+// and per transition: a site's first is its quickening, a later one a
+// re-quickening or deopt (flip-flop). Here PAR's site flips on every
+// loop iteration (5 becomes, 4 of them later ones); ONCE's quickens once.
+// expect-stderr: quickening: 6 becomes at 2 sites; 4 later ones (re-quickening or deopt) at 1 sites,
+// expect-stderr: of 21 dispatches; the most at one site 5
+// expect-stderr:              1               2  PAR -> PAR_ODD
+// expect-stderr:              0               2  PAR_ODD -> PAR
+// expect-stderr:              1               0  ONCE -> ONCE_Q
+// expect: 15
+import std.io;
+
+struct C { n: i64 }
+
+vm V {
+    context ctx: *C;
+    state { pc: *u32, r: *i64 }
+    operand reg = r[it];
+    encoding fixed(u32) { format A { op: 8, a: 8, b: 8, c: 8 } }
+
+    family PAR(x: reg) : A {
+        generic { if x % 2 == 1 { become PAR_ODD; } next }
+        PAR_ODD { if x % 2 == 0 { become PAR; } next }
+    }
+    family ONCE(x: reg) : A {
+        generic { become ONCE_Q; next }
+        ONCE_Q { next }
+    }
+    op INC(x: reg) : A { x = x + 1; ctx.n += x; next }
+    op LOOP(x: reg) : A { if x < 5 { jump pc - 3 } next }
+    op RET(x: reg) : A { exit ctx.n }
+    entry run(c: *C, code: *u32, regs: *i64) -> i64 { ctx = c; pc = code; r = regs; jump pc }
+}
+
+fn main() {
+    var code: [u32; 8] = [0; 8];
+    var at: u64 = 0;
+    let s = code[..];
+    at = V.emit.INC(s, at, 0);
+    at = V.emit.PAR(s, at, 0);
+    at = V.emit.ONCE(s, at, 0);
+    at = V.emit.LOOP(s, at, 0);
+    at = V.emit.RET(s, at, 0);
+    var regs: [i64; 4] = [0; 4];
+    var c = C { n: 0 };
+    io.print_int(V.run(&c, &code[0], &regs[0])); io.println("");
+}

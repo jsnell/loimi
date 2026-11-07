@@ -3588,6 +3588,27 @@ That is usually the next question after the op counts: which slow
 paths run, and how often. The counters cost nothing without
 `--vm-stats`; with it, one increment per entry.
 
+Last come the quickenings: every `become` that rewrites an
+instruction's own word, counted per site (the word) and per transition.
+A site's first `become` is its quickening; each later one is a
+re-quickening or a deopt, a site flipping between members, so that line
+gives their share of the dispatches. The transitions follow, those with
+the most later ones first:
+
+```text
+quickening: 153735 becomes at 291 sites; 153444 later ones (re-quickening or deopt) at 67 sites,
+0.0554% of 276771674 dispatches; the most at one site 142799
+         first           later  transition
+            23           76294  SETPROP -> SETPROP_ADD
+             0           76294  SETPROP_ADD -> SETPROP
+```
+
+(MiniJS on deltablue: a site that adds a property sees objects of
+two shapes, so `SETPROP_ADD` misses, deopts, and the generic member
+caches the add again.) A site is the word's address, so code that is
+freed and reallocated at the same address counts as the same site.
+`prof.OpCounts.reset` clears these counts too.
+
 #### Sampling: `--vm-prof`
 
 `--vm-stats` counts dispatches, not time, and a dispatch count can
