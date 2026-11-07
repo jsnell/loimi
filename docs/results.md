@@ -299,7 +299,13 @@ first-parent history in a separate worktree (`git bisect --first-parent`,
   0.236 → 0.251 s); the interpreter is unchanged on both (1.00).
   First bad commit: 3e0de22 "errors and deoptimization are cold by
   default" (its parent f7688b7: puzzle 1.00; 3e0de22 against f7688b7:
-  puzzle 1.11, array1 1.07). Not investigated further.
+  puzzle 1.11, array1 1.07). Investigated afterwards: this is where the
+  JIT's code lands. The hot stencils are unchanged. A few copies that run
+  outside the loops (`PRIMCALL`, `CALLK`) got 5 bytes shorter and moved
+  the loops. Starting the JIT region 16 bytes later swaps the two
+  builds' times, and placements that avoid the JCC erratum or align loop
+  heads do not help over the suite
+  ([design/copy-and-patch.md §15](design/copy-and-patch.md#15-placement-of-compiled-code-the-scheme-puzzlearray1-regression-2026-11-07)).
 - **wasm tail-call binarytrees 1.06** (1.247 → 1.324 s). First bad
   commit: 5667a53 "examples: dispatch profiles for hot-handler ordering"
   (`#[profile]`; its parent 39c715f: 1.00). The suite is unchanged

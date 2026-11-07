@@ -15,7 +15,9 @@ gain). Section 13 measures keeping guest registers in machine registers
 (worth little over the suite; recommendation: stop the template-JIT
 line). Section 14 is Prolog (`examples/prolog`): clauses entered through
 resume points were never compiled, and the code-object registry was
-quadratic for programs that assert clauses.
+quadratic for programs that assert clauses. Section 15 shows that a
+Scheme JIT regression (puzzle 1.11) comes from where the copies land,
+and that two principled layouts gave nothing over the suite.
 
 > Handlers are separate functions with a fixed register interface, which
 > is close to what a copy-and-patch template compiler needs. Can `vm`
@@ -1070,3 +1072,53 @@ backtracking-heavy program, `backtrack` and TRY are the ops that grow
 (about 6% of the time) and the JIT build takes 1.16. Aligning compiled
 instructions to 16, 32 or 64 bytes (an experiment, not kept) changed
 nothing (0.996, 1.001, 1.008 of the time over 12 programs).
+
+## 15. Placement of compiled code: the Scheme puzzle/array1 regression (2026-11-07)
+
+The 2026-11-07 run (`results.md`) found Scheme with the JIT at puzzle
+1.11 and array1 1.07, bisected to 3e0de22 ("errors and deoptimization
+are cold by default"), with the interpreter unchanged. It is placement
+of the code the JIT copies, not slower code:
+
+- **The hot stencils did not change.** In both programs the time is in
+  small `VREF`/`VSET`/`ADDI_JMP`/compare-and-branch loops (`--vm-prof`:
+  VREF 45% of puzzle; VSET, VREF, ADDI_JMP and the tests 73% of array1).
+  Those stencils are byte-identical in the two builds. 3e0de22 passes
+  `poison` for the instruction word to `on raise`, so the stencils that
+  raise after a call lose a `mov $word, %esi`. Comparing the
+  `LOIMI_JIT_MAP`s of the bisect binaries, only those copies are shorter:
+  array1 has 2 of 20 copies 5 bytes shorter (`PRIMCALL`), and puzzle
+  has 248 of 2296 (`CALLK*`, `PRIMCALL`, `CALL`, plus one each of
+  `MKBOX`, `CLOSURE` and `CALLCC`). The JIT packs copies back to back,
+  so everything after them moves by a few bytes. Most of those copies run
+  once per loop entry, not in the loop.
+- **Moving the code alone gives the same difference.** If the JIT
+  region starts 16 bytes later (a test-only knob, not kept), the two
+  builds swap: 3e0de22 runs puzzle in 0.064 s (the parent's time) and the
+  build without the `poison` change takes 0.072 s (3e0de22's).
+  `--align-functions` cannot help, since the JIT does not place code by
+  function. In one build, start offsets from 0 to 63 bytes give array1
+  0.247–0.294 s, with a 32-byte period.
+- **No principled layout fixes it.** Two were tried, measured on the
+  whole suite against an A/A copy (best of 4–5, interleaved):
+  - *JCC-erratum-aware placement.* A length decoder found every
+    stencil's branches, macro-fused pairs counted as one; it agreed with
+    `objdump` on all 151 Scheme stencils. The JIT then padded each copy
+    with nops to the smallest offset that keeps every branch off 32-byte
+    boundaries, as `-x86-align-branch-boundary=32` does for the
+    interpreter (lowering.md §12). No layout depended on the start offset
+    any more, and array1's loops had no bad branch. Even so, array1 took
+    0.27 s at every offset, the slow level, and the suite came out at
+    1.017 (A/A 1.011): ack 1.07, mazefun 1.14, diviter 0.84.
+  - *Loop heads aligned to 32 or 64 bytes.* These are the targets of
+    backward jumps. This also removes the dependence on the start
+    offset, but it fixes array1 at its fast level and puzzle at its slow
+    one. Suite: 0.992 at 32 and 0.999 at 64 (A/A 0.995). Prolog's
+    experiment (section 14) gave the same.
+
+  So the cost follows the absolute placement of the loops, through a
+  front-end effect that is not the JCC erratum. Without performance
+  counters (unavailable here) it cannot be named. Nothing was changed.
+  3e0de22's shorter stencils stay, and a JIT A/B within ±10% on one
+  short loop-bound program should be rechecked with the JIT's code moved
+  before it is taken as a regression.
