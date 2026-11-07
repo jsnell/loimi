@@ -259,3 +259,105 @@ __attribute__((weak, visibility("hidden"))) void loimi_stats_suggest(loimi_seq *
     free(cand);
     free(exist);
 }
+
+// Quickening: every `become` that rewrites an instruction's own word
+// (`loimi_stats_become`), per site (the word's address) and per
+// transition (old op, new op). A site's first `become` is its
+// quickening; every later one is a re-quickening or a deopt, the
+// flip-flop that warmup and backoff counters would avoid. The report
+// (`loimi_stats_become_report`) follows the vm's cold blocks.
+typedef struct {
+    const void *pc;
+    const char **names;  // the vm (its op names)
+    uint64_t count;
+} loimi_become_site;
+
+typedef struct {
+    const char **names;
+    uint32_t from, to;  // op indices
+    uint64_t first;     // a site's first `become`
+    uint64_t again;     // a later one
+} loimi_become_trans;
+
+#define BECOME_SITES (1u << 20)
+#define BECOME_TRANS 4096u
+static loimi_become_site *become_sites;
+static loimi_become_trans become_trans[BECOME_TRANS];
+
+__attribute__((weak, visibility("hidden"))) void loimi_stats_become(const char **names, const int32_t *opidx,
+                                                                    const void *pc, uint64_t oldopc, uint64_t to) {
+    if (!become_sites && !(become_sites = calloc(BECOME_SITES, sizeof(*become_sites)))) return;
+    uint64_t h = ((uint64_t)(uintptr_t)pc * 0x9e3779b97f4a7c15ull) >> 44;
+    loimi_become_site *s = 0;
+    for (uint32_t i = 0; i < BECOME_SITES; i++) {
+        s = &become_sites[(h + i) & (BECOME_SITES - 1)];
+        if (!s->pc || (s->pc == pc && s->names == names)) break;
+    }
+    if (!s->pc) {
+        s->pc = pc;
+        s->names = names;
+    }
+    s->count++;
+    int32_t f = opidx[oldopc];
+    uint32_t from = f < 0 ? 0 : (uint32_t)f;
+    uint64_t t = ((((uint64_t)from * 4099 + to) ^ (uint64_t)(uintptr_t)names) * 0x9e3779b97f4a7c15ull) >> 52;
+    for (uint32_t i = 0; i < BECOME_TRANS; i++) {
+        loimi_become_trans *e = &become_trans[(t + i) & (BECOME_TRANS - 1)];
+        if (!e->names) {
+            e->names = names;
+            e->from = from;
+            e->to = (uint32_t)to;
+        }
+        if (e->names == names && e->from == from && e->to == to) {
+            if (s->count == 1) e->first++;
+            else e->again++;
+            return;
+        }
+    }
+}
+
+// `prof.OpCounts.reset`: forget the vm's sites and transitions.
+__attribute__((weak, visibility("hidden"))) void loimi_stats_become_reset(const char **names) {
+    for (uint32_t i = 0; become_sites && i < BECOME_SITES; i++)
+        if (become_sites[i].names == names) become_sites[i] = (loimi_become_site){ (const void *)1, 0, 0 };
+    for (uint32_t i = 0; i < BECOME_TRANS; i++)
+        if (become_trans[i].names == names) become_trans[i].first = become_trans[i].again = 0;
+}
+
+static int by_again(const void *a, const void *b) {
+    const loimi_become_trans *x = a, *y = b;
+    uint64_t kx = x->again * 4 + x->first, ky = y->again * 4 + y->first;
+    return kx < ky ? 1 : kx > ky ? -1 : 0;
+}
+
+__attribute__((weak, visibility("hidden"))) void loimi_stats_become_report(const char **names, uint64_t total) {
+    if (!become_sites) return;
+    uint64_t sites = 0, becomes = 0, flip_sites = 0, max = 0;
+    for (uint32_t i = 0; i < BECOME_SITES; i++) {
+        loimi_become_site *s = &become_sites[i];
+        if (!s->pc || s->names != names) continue;
+        sites++;
+        becomes += s->count;
+        flip_sites += s->count > 1;
+        if (s->count > max) max = s->count;
+    }
+    if (!sites) return;
+    uint64_t again = becomes - sites;
+    fprintf(stderr,
+            "\nquickening: %llu becomes at %llu sites; %llu later ones (re-quickening or deopt) at %llu sites,\n"
+            "%.4f%% of %llu dispatches; the most at one site %llu\n",
+            (unsigned long long)becomes, (unsigned long long)sites, (unsigned long long)again,
+            (unsigned long long)flip_sites, total ? 100.0 * (double)again / (double)total : 0.0,
+            (unsigned long long)total, (unsigned long long)max);
+    loimi_become_trans *v = calloc(BECOME_TRANS, sizeof(*v));
+    if (!v) return;
+    uint64_t n = 0;
+    for (uint32_t i = 0; i < BECOME_TRANS; i++)
+        if (become_trans[i].names == names) v[n++] = become_trans[i];
+    qsort(v, n, sizeof(*v), by_again);
+    fprintf(stderr, "%14s  %14s  transition\n", "first", "later");
+    for (uint64_t k = 0; k < n && k < 30; k++)
+        fprintf(stderr, "%14llu  %14llu  %s -> %s\n", (unsigned long long)v[k].first, (unsigned long long)v[k].again,
+                names[v[k].from], names[v[k].to]);
+    free(v);
+}

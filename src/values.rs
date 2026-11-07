@@ -868,13 +868,25 @@ pub fn variant_const(d: &ValueDef, idx: u32, name: &str) -> Result<(i128, bool),
         return Err(format!("`{}` is boxed (a tag word and a payload word): its variants have no encoding constants", short));
     }
     if var.unboxed {
-        return match name {
-            "limit" if d.int_high.is_some() => Err(format!(
-                "`{}` is `nanbox(int_high)`: its unboxed variant `{}` is not the words below a limit (its words are those that no tagged variant's `mask` and `tag` match)",
+        return match (name, d.int_high) {
+            ("limit", Some(_)) => Err(format!(
+                "`{}` is `nanbox(int_high)`: its unboxed variant `{}` is not the words below a limit (its words are those that no tagged variant's `mask` and `tag` match; it has `xor`)",
                 short, var.name
             )),
-            "limit" => Ok((d.num_limit as i128, true)),
-            _ => Err(format!(
+            ("limit", None) => Ok((d.num_limit as i128, true)),
+            // int_high: the word of an f64 with bits `b` is
+            // `rotl(b, 16) ^ xor`, so a word's f64 bits are
+            // `rotr(w ^ xor, 16)` (a tagged word decodes to a NaN).
+            ("xor", Some(k)) => Ok((k as i128, true)),
+            ("xor", None) => Err(format!(
+                "no constant `xor` for `{}.{}`: `{}` is not `nanbox(int_high)` (its words are the f64's bits; it has `limit`)",
+                short, var.name, short
+            )),
+            (_, Some(_)) => Err(format!(
+                "no constant `{}` for the unboxed variant `{}.{}`: it has `xor` (its word is `rotl(bits, 16) ^ xor`)",
+                name, short, var.name
+            )),
+            (_, None) => Err(format!(
                 "no constant `{}` for the unboxed variant `{}.{}`: it has `limit` (its words are those below it)",
                 name, short, var.name
             )),

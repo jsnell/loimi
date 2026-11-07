@@ -287,6 +287,37 @@ CALL/RET and the property loads elsewhere (`GETPROP_IN` is a dependent
 load of the shape id; the Obj.sid experiment above did not pay);
 `MODK` by non-power-of-two constants is an `idiv` (closures 8%).
 
+## `nanbox(int_high)` with i48 Ints: measured, not kept (2026-11-06)
+
+`value V repr nanbox(int_high)` (`docs/language.md` §2) with `Int(i32)
+block 32` widened to `Int(i48)`, the layout's integer variant (commit
+980c67c, reverted by the next): `number()` keeps integral values in
+the i48 range as Ints, bit operators take an Int's low 32 bits
+(ToInt32), and the float-first members (ADD_F, DIV_F and the like) read
+their registers as `rotr(w ^ V.Num.xor, 16)` and write `rotl(r, 16) ^
+V.Num.xor`. User+sys CPU, minimum of 9 interleaved runs per benchmark,
+against base (master), A/A (a copy of base) in brackets; the align 128
+round ran next to a test build and its A/A spread is wide:
+
+| | align 64 | align 128 |
+|---|---:|---:|
+| bitops | 0.757 (1.033) | 0.737 (0.969) |
+| sort | 0.772 (0.928) | 0.901 (1.339) |
+| strings | 0.858 (1.018) | 0.907 (1.445) |
+| fannkuch | 0.874 (0.990) | 0.889 (0.999) |
+| awfy_micro | 0.947 (0.999) | 0.882 (0.989) |
+| raytrace | 1.054 (1.002) | 1.073 (0.963) |
+| nbody | 1.254 (0.963) | 1.469 (0.970) |
+| suite (14) | 0.941 (0.993) | 0.958 (1.049) |
+
+Not kept: the suite gains about 5%, the integer and string benchmarks
+up to 26% (bitops also because sums past 2^31 stay Ints), but nbody is
+25-47% slower. Its time is in the float supers (`MUL_F; MUL_F__RAR;
+ADD_F__RRA; SETPROP_IN__RA`, `--vm-prof`: 0.44 s to 0.67 s), where each
+register operand was one `mulsd` from memory and is now a load, `xor`,
+`rol` and `movq`, and each result two more instructions before the
+store.
+
 ## A value accumulator, measured again: kept (2026-11-06)
 
 The port below (commit 6d40423) again, with more rounds, and with and

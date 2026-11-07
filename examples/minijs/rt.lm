@@ -7,6 +7,7 @@
 
 import std.gc;
 import std.mem;
+import std.rt.{ValueStack};
 import std.map;
 import std.hash;
 import std.text;
@@ -32,13 +33,10 @@ pub struct Native { f: fn(*Ctx, V, *V, u64) -> Result<V, V>, name: str }
 pub struct Ctx {
     heap: gc.Heap,
     m: obj.Model<Gc<Obj>, Gc<Vals>, V>,
-    stack: *V,
-    stack_end: *V,
-    /// High-water mark of the register stack since the last collection:
-    /// every slot from here up holds a value that refers to no freed
-    /// object (CALL does not clear registers; scan_roots clears the stack
-    /// above the innermost window up to here and lowers the mark).
-    hw: *V,
+    /// The registers, with a high-water mark (`std.rt.ValueStack`): CALL
+    /// does not clear registers; scan_roots clears the stack above the
+    /// innermost window up to the mark and lowers it.
+    vs: ValueStack<V>,
     frames: *Frame,
     frames_end: *Frame,
     /// The innermost frame (published by the vm's `sync` block).
@@ -95,7 +93,7 @@ pub fn Ctx.new() -> Ctx {
     var c = Ctx {
         heap: gc.Heap.new(),
         m: obj.Model.new(new_vals, V.Undef),
-        stack: mem.alloc(STACK_SLOTS),
+        vs: ValueStack.new(STACK_SLOTS, V.Undef),
         frames: mem.alloc(FRAME_SLOTS),
         gvals: mem.Vec.new(),
         gnames: mem.Vec.new(),
@@ -119,8 +117,6 @@ pub fn Ctx.new() -> Ctx {
         f_cca: V.Undef, f_charat: V.Undef, f_push: V.Undef, f_floor: V.Undef, f_sqrt: V.Undef,
         ..zero
     };
-    c.stack_end = c.stack + STACK_SLOTS;
-    c.hw = c.stack;
     c.frames_end = c.frames + FRAME_SLOTS;
     c.fp = c.frames;
     c
@@ -206,13 +202,7 @@ pub fn scan_roots(h: *gc.Heap, c: *Ctx) {
     // Registers above the innermost window are not scanned: clear them,
     // so that a window that later covers them (without writing them
     // first) holds nothing this collection frees.
-    var top = c.fp.base + c.fp.cl.proto.nregs as u64;
-    while top < c.hw {
-        *top = V.Undef;
-        top = top + 1;
-    }
-    let end = c.fp.base + c.fp.cl.proto.nregs as u64;
-    if end < c.hw { c.hw = end; }
+    c.vs.lower(c.fp.base + c.fp.cl.proto.nregs as u64);
 }
 
 pub fn Ctx.flush(c: *Ctx) {

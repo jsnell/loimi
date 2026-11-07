@@ -566,6 +566,49 @@ mask constant); float 1.00; nbody 0.99 at 64 and 1.01 / 1.06 at 128;
 spectral_norm 0.92 at 64 and 1.00 / 1.07 at 128 (its int ops got
 cheaper and its float accumulation dearer).
 
+## Shifted-int nanbox on the other vms (2026-11-06)
+
+Not a run of the suites: speed-audit item 7, "Ports"
+([design/speed-audit.md](design/speed-audit.md)). Each vm's value type
+on `repr nanbox(int_high)` against master's build, tail-call builds,
+user+sys CPU, minimum of 7 (Scheme, Prolog) or 9 interleaved runs, an
+A/A copy of the baseline in the same interleave (geometric means).
+
+| Change | Suite | 64 | A/A | 128 | A/A | Kept |
+|---|---|---:|---:|---:|---:|---|
+| `Term` on `int_high` | Prolog (30) | 0.917 | 1.003 | 0.920 | 1.008 | yes |
+| fixnums `i48` on `int_high` | Scheme (43) | 0.979 | 0.994 | 0.978 | 0.998 | no: sumfp 1.27, mbrot 1.15 |
+| `Int(i48)` on `int_high` | MiniJS (14) | 0.941 | 0.993 | 0.958 | 1.049 | no: nbody 1.25–1.47 |
+| `Int(i48)` on `int_high` | Mini (14) | 1.034 | 1.003 | 1.030 | 1.001 | no: mandelbrot 1.80, nbody 1.32 |
+| `Native` as the zero-tag variant | Lox (9) | 1.005 | 0.987 | 1.030 | 1.007 | no: all numbers are floats |
+
+Integer benchmarks gained 5–25% in every vm; float kernels lost 12–80%,
+as each float operand from a register costs a decode on the loop's
+dependency chain. Per benchmark: `bench/prolog/README.md`,
+`bench/scheme/README.md`, `bench/minijs/RESULTS.md`,
+`bench/mini/RESULTS.md`.
+
+## Value stacks; quickening flip-flop (2026-11-07)
+
+Not a run of the suites: speed-audit items 9 and 10
+([design/speed-audit.md](design/speed-audit.md)). Tail-call builds
+against master's, user+sys CPU, minimum of 7 (Scheme, MiniJS) or 9
+(Lox) interleaved runs, with an A/A copy of the baseline in the same
+interleave (geometric means). The 128 column ran with an A/A copy only for MiniJS (1.004).
+
+| Change | Suite | 64 | A/A | 128 | Kept |
+|---|---|---:|---:|---:|---|
+| No register clearing at calls (`std.rt.ValueStack`) | Lox (9) | 0.970 | 1.004 | 0.966 | yes: fib 0.86, binary_trees 0.92–0.94 |
+| Hand-written mark → `std.rt.ValueStack` | Scheme (43) | 1.000 | 1.000 | 0.995 | yes |
+| Hand-written mark → `std.rt.ValueStack` | MiniJS (14) | 0.995 | 0.998 | 1.002 | yes |
+
+Item 10: `--vm-stats` now counts `become`s per site. The later ones
+(re-quickenings and deopts) are at most 0.055% of dispatches (MiniJS
+deltablue), and are 0 in Mini and Scheme. An oracle build in which
+MiniJS's ADD never quickens bounds warmup and backoff counters at
+0.982–0.986 on bitops and 0.994–0.996 on strings, so they were not
+built.
+
 ## Per suite
 
 ### mini

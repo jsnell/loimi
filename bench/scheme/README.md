@@ -612,6 +612,36 @@ heaps (nboyer, sboyer, mperm: marking is 8-15%), products in std.bigint
 (base-case code generation), and glibc's heap growth and trimming for
 large strings (`brk` is 5% of string).
 
+## `nanbox(int_high)` with i48 fixnums: measured, not kept (2026-11-06)
+
+`value V repr nanbox(int_high)` (`docs/language.md` §2) with `Int(i32)
+block 48` widened to `Int(i48)`, the layout's integer variant (commit
+ed1ef3a, reverted by the next). Fixnum `+`/`-` become `or %si, %bx; je; add; jo` on the words
+and pointer payloads `shr $16`; every flonum operand pays `xor; rol`
+and every flonum result `rol; xor`. User+sys CPU, minimum of 7
+interleaved runs per benchmark (`compare.py`'s programs and inputs),
+against base (master), A/A (a copy of base) in brackets:
+
+| | align 64 | align 128 |
+|---|---:|---:|
+| tak | 0.821 | 0.945 |
+| fib | 0.955 | 0.958 |
+| chudnovsky | 0.876 | 0.876 |
+| simplex | 0.917 | 0.930 |
+| sumfp | 1.269 | 1.238 |
+| mbrot | 1.117 | 1.145 |
+| fibfp | 1.006 | 1.084 |
+| fft | 1.089 | 1.009 |
+| suite (43) | 0.979 (0.994) | 0.978 (0.998) |
+
+Not kept: the suite gains about 2%, but sumfp is 24-27% slower and mbrot
+12-15% (`--vm-prof` on sumfp: 0.188 s to 0.259 s, spread over its LT,
+SUB and ADD). They are loops whose flonums are carried from register to
+register, so the two decode and two encode instructions of each float
+op sit on the loop-carried dependency chain; Python's float benchmarks
+(chaos, raytrace) spend more of their time on pointers, whose payloads
+got cheaper. The integer-heavy rows gain 4-18%.
+
 ## A value accumulator, measured again: still not kept (2026-11-06)
 
 The port below (commit 161bfef) again, with the dispatch load folded

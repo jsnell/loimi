@@ -3729,7 +3729,8 @@ impl<'a> Checker<'a> {
             }
             return Err(Diag::new(name.span, format!("no variant or function `{}` in `{}`", name.name, self.ty_name(&t))));
         }
-        // `V.Int.mask`, `V.Int.tag`, `V.Int.block`, `V.Num.limit`: the
+        // `V.Int.mask`, `V.Int.tag`, `V.Int.block`, `V.Num.limit` (`V.Num.xor`
+        // under `int_high`): the
         // encoding of a value variant, as constants.
         if let ExprKind::Field(tb, vn) = &base.kind {
             if let Some(t @ Ty::Value(vi)) = self.type_path(cx, tb) {

@@ -4,6 +4,7 @@ import std.io;
 import std.gc;
 import std.mem;
 import std.obj;
+import std.rt;
 import std.text;
 import parser;
 import compile;
@@ -50,7 +51,7 @@ pub fn run_source(src: str, o: Options) -> i32 uses gc {
     defer names.free();
     var natives: [Native; 1] = [Native { name: "clock", arity: 0, f: vm.clock_native }];
     var m = Machine {
-        stack: mem.alloc(STACK), frames: mem.alloc(FRAMES),
+        stack: rt.ValueStack.new(STACK, Value.Nil), frames: mem.alloc(FRAMES),
         globals: Globals.new(), names: &names, heap: gc.Heap.new(),
         m: obj.Model.new(value.new_slots, Value.Nil), natives: &natives[0],
         out: text.StrBuf.new(), msg: text.StrBuf.new(), tmp: text.StrBuf.new(), keys: mem.Vec.new(),
@@ -58,7 +59,6 @@ pub fn run_source(src: str, o: Options) -> i32 uses gc {
         ..zero
     };
     defer m.free();
-    m.stack_end = m.stack + STACK;
     m.frames_end = m.frames + FRAMES;
     m.fp = m.frames;
     m.strings = gc.WeakInterner.new(&m.heap, value.new_lstr);

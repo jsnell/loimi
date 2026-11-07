@@ -643,7 +643,7 @@ pub vm Scheme {
             nf = fp + 1;
         }
         if tail { dst = regs; }
-        if dst + 3 >= ctx.hwm and !rt.grow(ctx, dst + 3) { raise rt.err_msg(ctx, "stack overflow") }
+        if !ctx.vs.ensure(dst + 3 + 1) { raise rt.err_msg(ctx, "stack overflow") }
         let kc = new(&ctx.heap, Closure { proto: cp }, 1);
         kc.free.ptr[0] = Int((((nf as u64) - (ctx.frames as u64)) / size_of<Frame>()) as i32);
         dst[0] = regs[base + 1];
@@ -680,7 +680,7 @@ pub vm Scheme {
             n -= 2;
             var cur = lst;
             while let P(p) = cur {
-                if regs + base + n + 2 >= ctx.hwm and !rt.grow(ctx, regs + base + n + 2) { raise rt.err_msg(ctx, "stack overflow") }
+                if !ctx.vs.ensure(regs + base + n + 3) { raise rt.err_msg(ctx, "stack overflow") }
                 regs[base + 1 + n] = p.car;
                 n += 1;
                 cur = p.cdr;
@@ -700,7 +700,7 @@ pub vm Scheme {
                 nf = fp + 1;
             }
             if tail { dst = regs; }
-            if dst + 3 >= ctx.hwm and !rt.grow(ctx, dst + 3) { raise rt.err_msg(ctx, "stack overflow") }
+            if !ctx.vs.ensure(dst + 3 + 1) { raise rt.err_msg(ctx, "stack overflow") }
             let kc = new(&ctx.heap, Closure { proto: cp }, 1);
             kc.free.ptr[0] = Int((((nf as u64) - (ctx.frames as u64)) / size_of<Frame>()) as i32);
             dst[0] = regs[base + 1];
@@ -756,7 +756,7 @@ pub vm Scheme {
                 raise rt.err_msg(ctx, "stack overflow (too many nested calls)")
             }
             let nr = p.nregs as u64;
-            if dst + nr >= ctx.hwm and !rt.grow(ctx, dst + nr) { raise rt.err_msg(ctx, "stack overflow") }
+            if !ctx.vs.ensure(dst + nr + 1) { raise rt.err_msg(ctx, "stack overflow") }
             if !tail {
                 fp.resume = pc + 1;
                 fp = fp + 1;
@@ -798,9 +798,9 @@ pub vm Scheme {
         let p = cl.proto;
         let callee = regs + base + 1;
         let n = p.nregs as u64;
-        if callee + n >= ctx.hwm or fp + 1 >= ctx.frames_end {
+        if !ctx.vs.fits(callee + n + 1) or fp + 1 >= ctx.frames_end {
             cold {
-                if fp + 1 >= ctx.frames_end or !rt.grow(ctx, callee + n) {
+                if fp + 1 >= ctx.frames_end or !ctx.vs.raise(callee + n + 1) {
                     raise rt.err_msg(ctx, "stack overflow (too many nested calls)")
                 }
                 redo
@@ -824,9 +824,9 @@ pub vm Scheme {
             let p = cl.proto;
             let callee = regs + base + 1;
             let n = p.nregs as u64;
-            if callee + n >= ctx.hwm or fp + 1 >= ctx.frames_end {
+            if !ctx.vs.fits(callee + n + 1) or fp + 1 >= ctx.frames_end {
                 cold {
-                    if fp + 1 >= ctx.frames_end or !rt.grow(ctx, callee + n) {
+                    if fp + 1 >= ctx.frames_end or !ctx.vs.raise(callee + n + 1) {
                         raise rt.err_msg(ctx, "stack overflow (too many nested calls)")
                     }
                     redo
@@ -848,9 +848,9 @@ pub vm Scheme {
         if let Clo(cl) = f {
             let p = cl.proto;
             let n = p.nregs as u64;
-            if regs + n >= ctx.hwm {
+            if !ctx.vs.fits(regs + n + 1) {
                 cold {
-                    if !rt.grow(ctx, regs + n) { raise rt.err_msg(ctx, "stack overflow") }
+                    if !ctx.vs.raise(regs + n + 1) { raise rt.err_msg(ctx, "stack overflow") }
                     redo
                 }
             }
@@ -872,9 +872,9 @@ pub vm Scheme {
             if likely(p.fixed == nargs as u32) {
                 let callee = regs + base + 1;
                 let n = p.nregs as u64;
-                if callee + n >= ctx.hwm or fp + 1 >= ctx.frames_end {
+                if !ctx.vs.fits(callee + n + 1) or fp + 1 >= ctx.frames_end {
                     cold {
-                        if fp + 1 >= ctx.frames_end or !rt.grow(ctx, callee + n) {
+                        if fp + 1 >= ctx.frames_end or !ctx.vs.raise(callee + n + 1) {
                             raise rt.err_msg(ctx, "stack overflow (too many nested calls)")
                         }
                         redo
@@ -901,9 +901,9 @@ pub vm Scheme {
             let p = cl.proto;
             if likely(p.fixed == nargs as u32) {
                 let n = p.nregs as u64;
-                if regs + n >= ctx.hwm {
+                if !ctx.vs.fits(regs + n + 1) {
                     cold {
-                        if !rt.grow(ctx, regs + n) { raise rt.err_msg(ctx, "stack overflow") }
+                        if !ctx.vs.raise(regs + n + 1) { raise rt.err_msg(ctx, "stack overflow") }
                         redo
                     }
                 }
@@ -988,10 +988,10 @@ pub vm Scheme {
     entry run(c: *Ctx, cl: Gc<Closure>) -> V uses gc {
         ctx = c;
         let p = cl.proto;
-        c.stack[0] = Imm(value.IMM_UNSPEC);
-        regs = c.stack + 1;
+        c.vs.base[0] = Imm(value.IMM_UNSPEC);
+        regs = c.vs.base + 1;
         for i in 0..p.nregs as u64 { regs[i] = Imm(value.IMM_UNSPEC); }
-        if regs + p.nregs as u64 >= c.hwm and !rt.grow(c, regs + p.nregs as u64) {
+        if !c.vs.ensure(regs + p.nregs as u64 + 1) {
             c.error = rt.err_msg(c, "stack overflow");
             exit Imm(value.IMM_UNSPEC)
         }

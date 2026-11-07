@@ -28,7 +28,7 @@ says so. Some modules are design only; their sections say so at the top.
 | [`std.gc`](#stdgc), [details](stdlib/gc.md) | built (mark-sweep, optional generational mode) | `std/gc.lm` |
 | [`std.gil`](stdlib/gc.md#threads-sharing-a-heap-stdgil) | built (a global interpreter lock per heap) | `std/gil.lm` |
 | [`std.obj`](#stdobj-objects-and-shapes), [details](stdlib/obj.md) | built (no comptime `Model`) | `std/obj.lm` |
-| [`std.rt`](#stdrt-runtime-support) | built in part (`protect`/`throw`, `catch_panic`/`panic`; no `ValueStack`, `FrameStack`, `Fiber`) | `std/rt.lm` |
+| [`std.rt`](#stdrt-runtime-support) | built in part (`protect`/`throw`, `catch_panic`/`panic`, `ValueStack`; no `FrameStack`, `Fiber`) | `std/rt.lm` |
 | [`std.collections`](#design-not-built-stdcollections) (beyond `HashMap`, `OrderedMap`, `Dict`) | **not built** | |
 | [`std.ast`](#stdast) | **not built** | |
 | [`std.prof`](#stdprof) | built (clock, `Bench`, `Counters`, `--vm-stats` counts; sampling is `loimi build --vm-prof`) | `std/prof.lm` |
@@ -1302,12 +1302,92 @@ the stack through a root scanner. The example interpreters
 (`examples/mini`, `examples/stack`, the tutorial's step 7 onwards) show
 the pattern.
 
+### Value stacks: `rt.ValueStack<T>`
+
+A register vm's root scanner marks every register of every frame's
+window, so a register the callee has not written yet must not hold a
+pointer to a freed object. Clearing the window on every call does that,
+at a cost (Lox's fib: 13% of its time). `rt.ValueStack<T>` keeps a
+*high-water mark* `s.hw` instead, with three regions:
+
+- below `s.hw`, every slot holds a value the scanner may read: a live
+  register, or a stale one whose object no collection has freed;
+- from `s.hw` up to `s.fresh`, slots hold values that refer to no freed
+  object (cleared ones);
+- from `s.fresh` up, slots were never written.
+
+The operations:
+
+- `s.fits(top) -> bool`: one compare, `top <= s.hw`. A call checks it in
+  place of the compare against the stack's end.
+- `s.raise(top) -> bool` (`#[cold]`): false past the end; else it clears
+  the never-written slots below `top` (and `rt.SLACK`, 256, more) and
+  raises the mark to `s.fresh`. After a collection lowered the mark,
+  raising it again clears nothing.
+- `s.ensure(top) -> bool`: `fits`, else `raise`, for slow paths. In a
+  handler's hot path, call `raise` from a `cold` block that ends in
+  `redo` instead: a call to it on the hot path would give the handler a
+  stack frame (Scheme's calls were 3–8% slower that way).
+- `s.lower(top)`: for the root scanner, after it marked the live
+  windows, with `top` the end of the live windows. It clears the stale
+  slots from there to the mark, because this collection may free what
+  they point to, and lowers the mark.
+
+So calls clear nothing. The interpreter must write every register
+before it reads it (a compiler that allocates registers to locals and
+temporaries does). The scanner's `top` must cover every live window. A
+callee's window can end below its caller's, so take the highest end
+over all frames (Lox, Scheme), or have the compiler put a call's window
+above all of the caller's live registers (MiniJS). A value written
+above the mark (arguments set up before the call raises it) keeps its
+value through `raise`, but the mark must cover it before the next
+collection.
+
+<!-- snippet: skip a fragment of examples/scheme/vm.lm and rt.lm -->
+```loimi
+pub struct Ctx { vs: ValueStack<V>, frames: *Frame, frames_end: *Frame, fp: *Frame, .. }
+
+op CALLSELF(base: callbase, nargs: imm) : ABC {           // in the vm
+    let callee = regs + base + 1;
+    let n = fp.cl.proto.nregs as u64;
+    if !ctx.vs.fits(callee + n + 1) or fp + 1 >= ctx.frames_end {
+        cold {
+            if fp + 1 >= ctx.frames_end or !ctx.vs.raise(callee + n + 1) { raise overflow(ctx) }
+            redo
+        }
+    }
+    ..                                                    // no clearing
+}
+
+pub fn scan_roots(h: *gc.Heap, c: *Ctx) {
+    var top = c.vs.base;
+    var f = c.frames;
+    while f <= c.fp {
+        let n = f.cl.proto.nregs as u64;
+        for i in 0..n { gc_mark(h, f.base[i]); }
+        if f.base + n > top { top = f.base + n; }
+        f = f + 1;
+    }
+    c.vs.lower(top);
+}
+```
+
+`rt.ValueStack.new(n, fill)` allocates `n` slots (`mem.alloc` zeroes
+them, so untouched pages cost nothing). `fill` is what cleared slots
+hold, a value the collector ignores (nil). The stack does not move.
+
+Lox, Scheme and MiniJS use it; Python keeps its own variant, which
+never lowers the mark and marks every slot below it. A vm with
+coroutines needs one stack per coroutine, and the scanner must lower
+the mark of each one; nested runs must `ensure` their windows. Mini's
+hand-written attempt at all that measured no gain
+([design/speed-audit.md](design/speed-audit.md), item 9).
+
 ### Design (not built)
 
-- `ValueStack<T>`: the VM stack. It would reserve virtual address space up
-  front and commit pages on demand, so it never moves, and `StackTop`
-  pointers stay valid. Overflow is a single compare against the limit,
-  done once per call.
+- `ValueStack<T>` (built, above) could reserve virtual address space up
+  front and commit pages on demand, and per-coroutine stacks could be
+  registered with the collector.
 - `FrameStack<F>`: guest call frames, with entry markers for reentrant calls.
 - `Upvalues`: open-upvalue list and closing (Lua-style), for closure capture by
   reference with stack-allocated locals.

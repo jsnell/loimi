@@ -292,12 +292,12 @@ natives and the compiler allocate freely.
 
 Registers are not cleared on entry to a frame, so the scanner sees stale
 values of dead frames in registers not yet written. That is safe because
-every stack slot below a high-water mark (`ctx.hwm`) holds a value that
-is safe to mark: a stale value inside a live window is marked (so its
-object stays allocated), and the scanner clears the slots above the top
-window and lowers the mark to it; a call whose window passes the mark
-clears the new slots first (`rt.grow`, on the cold path that also checks
-for stack overflow).
+every stack slot below a high-water mark (`ctx.vs`, a
+`std.rt.ValueStack`) holds a value that is safe to mark: a stale value
+inside a live window is marked (so its object stays allocated), and the
+scanner clears the slots above the top window and lowers the mark to it
+(`vs.lower`); a call whose window passes the mark raises it (`vs.raise`,
+on the cold path that also checks for stack overflow).
 
 ### Ops
 
