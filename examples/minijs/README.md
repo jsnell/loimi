@@ -185,10 +185,11 @@ argument count: missing arguments are set to undefined in a cold block,
 and nothing else is cleared. The compiler writes every register before
 reading it (`var` bindings get undefined when their scope starts), so
 the callee's other registers may hold stale values. They are still valid
-values for the collector: `Ctx.hw` is the stack's high-water mark since
-the last collection, `scan_roots` clears the stack from the innermost
-window up to it (and lowers it), and a call whose window reaches the
-mark raises it, a compare that replaces the stack-overflow check. A
+values for the collector: the stack is a `std.rt.ValueStack` with a
+high-water mark since the last collection, `scan_roots` clears the
+stack from the innermost window up to it (and lowers it), and a call
+whose window reaches the mark raises it, a compare that replaces the
+stack-overflow check. A
 stale register therefore never refers to an object a collection freed;
 at worst it keeps a dead object until the next collection. `new` frames and the bottom frame are flagged, so
 `RET` tests one word before returning. A call's result is used where it

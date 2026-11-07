@@ -1185,7 +1185,7 @@ pub vm JS {
         }
         let callee = regs + base + 1;
         let n = p.nregs as u64;
-        if callee + n >= ctx.stack_end or fp + 1 >= ctx.frames_end {
+        if !ctx.vs.ensure(callee + n + 1) or fp + 1 >= ctx.frames_end {
             raise ctx.new_error(ctx.err_proto(), "Maximum call stack size exceeded")
         }
         let np = p.nparams as u64 + 1;
@@ -1195,7 +1195,6 @@ pub vm JS {
             callee[i] = Undef;
             i += 1;
         }
-        if callee + n + 1 > ctx.hw { ctx.hw = callee + n + 1; }
         fp.resume = pc + 1;
         fp = fp + 1;
         fp.cl = cl;
@@ -1213,8 +1212,7 @@ pub vm JS {
     /// that collection lowers the mark every time.)
     fn grow_stack(end: *V) -> never {
         cold {
-            if end >= ctx.stack_end { raise ctx.new_error(ctx.err_proto(), "Maximum call stack size exceeded") }
-            ctx.hw = end + 1;
+            if !ctx.vs.raise(end + 1) { raise ctx.new_error(ctx.err_proto(), "Maximum call stack size exceeded") }
             redo
         }
     }
@@ -1243,9 +1241,9 @@ pub vm JS {
                     // they held (the compiler writes every register before
                     // reading it). They are valid values: the collector
                     // clears the stack above the innermost window up to
-                    // the high-water mark ctx.hw (rt.scan_roots), so a
+                    // the high-water mark ctx.vs.hw (rt.scan_roots), so a
                     // stale register never refers to a freed object.
-                    if callee + n + 1 >= ctx.hw { grow_stack(callee + n + 1) }
+                    if !ctx.vs.fits(callee + n + 2) { grow_stack(callee + n + 1) }
                     if fp + 1 >= ctx.frames_end {
                         raise ctx.new_error(ctx.err_proto(), "Maximum call stack size exceeded")
                     }
@@ -1362,10 +1360,7 @@ pub vm JS {
         let callee = regs + base + 1;
         let n = p.nregs as u64;
         // As in CALL.
-        if callee + n + 1 >= ctx.hw {
-            if callee + n + 1 >= ctx.stack_end { raise ctx.new_error(ctx.err_proto(), "Maximum call stack size exceeded") }
-            ctx.hw = callee + n + 2;
-        }
+        if !ctx.vs.ensure(callee + n + 2) { raise ctx.new_error(ctx.err_proto(), "Maximum call stack size exceeded") }
         if fp + 1 >= ctx.frames_end {
             raise ctx.new_error(ctx.err_proto(), "Maximum call stack size exceeded")
         }
@@ -1583,10 +1578,10 @@ pub vm JS {
     entry run(c: *Ctx, cl: Gc<Fn>) -> V uses gc {
         ctx = c;
         let p = cl.proto;
-        c.stack[0] = Undef;
-        regs = c.stack + 1;
+        c.vs.base[0] = Undef;
+        regs = c.vs.base + 1;
         for i in 0..p.nregs as u64 { regs[i] = Undef; }
-        if regs + p.nregs as u64 + 1 > c.hw { c.hw = regs + p.nregs as u64 + 1; }
+        if !c.vs.ensure(regs + p.nregs as u64 + 1) { exit Undef }
         fp = c.frames;
         fp.cl = cl;
         fp.base = regs;
