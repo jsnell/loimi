@@ -1330,7 +1330,14 @@ most once per kernel tick, which is 250 Hz here. Each sample records
 the interrupted instruction from the `ucontext` (x86-64 and AArch64),
 the vm's `pc` and running op, and up to 24 return addresses
 (`backtrace`). The build adds `uwtable` to every function, so the stack
-walk goes from a runtime function back to the handler that called it.
+walk goes from a runtime function back to the handler that called it,
+and links with `-z now`: glibc's AArch64 lazy-binding trampoline
+(`_dl_runtime_resolve`) has wrong unwind info (its CFA leaves out the
+16 bytes the PLT pushed), and a sample that landed in the first call
+of `write` unwound into garbage and crashed libgcc's unwinder (one
+run in three of `tests/run/vm_prof.lm` under qemu at 4 kHz; a C
+reproducer with an IFUNC resolver crashes every time, and x86-64's
+trampoline is right). Bound at load time, nothing runs it.
 
 **Naming, in the process at exit.**
 - **Functions** are named from the ELF symbol tables of the loaded
