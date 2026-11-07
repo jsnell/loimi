@@ -3678,6 +3678,12 @@ Environment variables:
 - `LOIMI_PROF=0`: no sampling, which measures what the instrumentation
   alone costs.
 
+A `--vm-prof` executable or shared library is linked with `-z now`: the
+stack walk cannot unwind through glibc's AArch64 lazy-binding
+trampoline, whose unwind info is wrong, so nothing is bound lazily. A
+host linking a `--vm-prof` static library on AArch64 should link with
+`-z now` too.
+
 Limits:
 - The cost: one store per op (two in goto and switch modes), unwind
   tables, and the samples (about 100 bytes each). At 1000 Hz, Mini and

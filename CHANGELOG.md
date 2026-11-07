@@ -610,6 +610,13 @@ implementation; `git log` has the details.
 
 ### Tooling
 
+- **`--vm-prof` no longer crashes on AArch64**: a sample during a lazy
+  PLT binding walked the stack through glibc's `_dl_runtime_resolve`,
+  whose unwind info is 16 bytes off, and segfaulted in libgcc's
+  unwinder (`aarch64_qemu`, one run in three). `--vm-prof` builds link
+  with `-z now`; `vm_prof_stress` runs the profiler at 10 kHz in every
+  mode, on AArch64 too
+  ([language.md §7.3](docs/language.md), "Sampling: `--vm-prof`").
 - **`loimi ir-diff A B`** compares the optimized IR (and with `--asm`
   the assembly) of two builds function by function, ignoring panic
   locations, constant and local names, metadata numbering and function

@@ -1221,6 +1221,17 @@ fn compiler_main() -> ExitCode {
     if opts.kind != OutKind::Static {
         cmd.arg("-lm");
     }
+    // `--vm-prof`: bind every symbol at load time, not lazily at its first
+    // call. The sampler walks the stack from a signal, and glibc's lazy
+    // binding trampoline on AArch64 (`_dl_runtime_resolve`, ld.so) has
+    // wrong unwind info: its CFA leaves out the 16 bytes the PLT pushed,
+    // so the unwinder reads its caller's frame 16 bytes off and follows a
+    // garbage return address (a SIGSEGV in libgcc's unwinder when a
+    // sample lands during the first call of `write`; docs/language.md
+    // §7.3).
+    if opts.vm_prof && opts.kind != OutKind::Static {
+        cmd.arg("-Wl,-z,now");
+    }
     let status = cmd.status();
     match status {
         Ok(s) if s.success() => {}

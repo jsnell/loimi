@@ -392,6 +392,82 @@ fn vm_prof_ranks() {
     assert!(rows.first().is_some_and(|(_, n)| n.ends_with("(jit)")) && 2 * jit > all, "mini --jit-stencils: JIT code not named:\n{}", report);
 }
 
+/// Whether the ELF executable `exe` binds every symbol at load time
+/// (`DF_BIND_NOW` in `DT_FLAGS` or `DF_1_NOW` in `DT_FLAGS_1`, `-z now`).
+fn bind_now(exe: &Path) -> bool {
+    let b = std::fs::read(exe).unwrap();
+    let u16_at = |o: usize| u16::from_le_bytes(b[o..o + 2].try_into().unwrap()) as usize;
+    let u64_at = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+    let (phoff, phentsize, phnum) = (u64_at(0x20) as usize, u16_at(0x36), u16_at(0x38));
+    for i in 0..phnum {
+        let ph = phoff + i * phentsize;
+        if u32::from_le_bytes(b[ph..ph + 4].try_into().unwrap()) != 2 {
+            continue; // not PT_DYNAMIC
+        }
+        let (off, size) = (u64_at(ph + 8) as usize, u64_at(ph + 32) as usize);
+        for d in (off..off + size).step_by(16) {
+            match (u64_at(d), u64_at(d + 8)) {
+                (30, f) if f & 8 != 0 => return true,         // DT_FLAGS, DF_BIND_NOW
+                (0x6fff_fffb, f) if f & 1 != 0 => return true, // DT_FLAGS_1, DF_1_NOW
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
+/// `--vm-prof` under stress: tests/run/vm_prof.lm at 10 kHz, several runs
+/// in each dispatch mode, and under qemu on AArch64 when the cross
+/// toolchain is installed. The sampler walks the stack from a signal;
+/// before `--vm-prof` linked with `-z now`, a sample during the lazy
+/// binding of `write` (its first call, at the end) unwound through
+/// glibc's AArch64 `_dl_runtime_resolve`, whose unwind info is wrong, and
+/// crashed about one run in three under qemu. The executables must be
+/// bound at load time, which catches that every time.
+#[test]
+fn vm_prof_stress() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let dir = std::env::temp_dir().join(format!("loimi-vmprof-stress-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let qemu = root.join("bench/cross/install/bin/qemu-aarch64");
+    let sysroot = root.join("bench/cross/sysroot-aarch64");
+    let a64 = !cross() && qemu.exists() && sysroot.join("usr/lib/aarch64-linux-gnu/libc.so.6").exists();
+    let runner = format!("{} -L {}", qemu.display(), sysroot.display());
+    let sysroot = sysroot.display().to_string();
+    let a64_env = [("LOIMI_TARGET", "aarch64-linux-gnu"), ("LOIMI_SYSROOT", sysroot.as_str())];
+    // (target environment, runner, runs per mode): the host's (or the
+    // suite's cross target's), then AArch64 under qemu.
+    let mut targets: Vec<(&[(&str, &str)], String, usize)> = vec![(&[], std::env::var("LOIMI_RUNNER").unwrap_or_default(), 5)];
+    if a64 {
+        targets.push((&a64_env, runner.clone(), 3));
+    }
+    std::thread::scope(|s| {
+        for (env, runner, runs) in &targets {
+            for mode in ["--dispatch=tailcall", "--dispatch=goto", "--dispatch=switch"] {
+                let dir = &dir;
+                s.spawn(move || {
+                    let exe = dir.join(format!("vm_prof{}{}", mode.replace(['-', '='], ""), target_tag(env)));
+                    let out = loimi().envs(env.iter().copied()).args(["build", "--vm-prof", mode]).arg(root.join("tests/run/vm_prof.lm")).arg("-o").arg(&exe).output().unwrap();
+                    assert!(out.status.success(), "building vm_prof.lm {mode}{} failed:\n{}", target_tag(env), String::from_utf8_lossy(&out.stderr));
+                    assert!(bind_now(&exe), "vm_prof.lm {mode}{}: a --vm-prof executable must be linked with -z now", target_tag(env));
+                    for i in 0..*runs {
+                        let out = program_under(runner, &exe).env("LOIMI_PROF_HZ", "10000").output().unwrap();
+                        let report = String::from_utf8_lossy(&out.stderr);
+                        assert!(
+                            out.status.success() && out.stdout == b"done\n" && report.contains("== vm prof:"),
+                            "vm_prof.lm {mode}{} at 10 kHz, run {i}: {}\n--- stdout\n{}\n--- stderr\n{report}",
+                            target_tag(env),
+                            out.status,
+                            String::from_utf8_lossy(&out.stdout)
+                        );
+                    }
+                });
+            }
+        }
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Ahead-of-time traces (`--trace-regions`, `--traces`, src/tracegen.rs,
 /// docs/design/trace-tier.md): Mini's benchmarks and scripts are
 /// recorded with a JIT build, profiled with a (bounded) region
