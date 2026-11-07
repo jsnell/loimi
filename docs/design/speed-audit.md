@@ -83,7 +83,7 @@ one, else an estimate.
 | 4 | **Load facts**: `dereferenceable`/`nonnull`/invariant loads on pointers and `const` operand kinds | Listed in Mini's "remaining compiler issues" (`RESULTS.md:579`). Dependent-load chains: Python GETATTR 14–26%, MiniJS GETPROP_IN. GETINDEX_GETINDEX (20% of interp) keeps a frame. **Prototyped 2026-11-06: no handler of Mini or MiniJS changes; no gain** (item 4, "Prototype results") | measured: 1.00 | S |
 | 5 | **Smaller objects**: typed small-object chunks with no per-object header (BiBoP), or an 8-byte header for fixed-size types | Every object has a 16-byte header. A Scheme pair is 32 bytes against Guile's 16, and CAR alone is 12–15% of nboyer. Size sensitivity, measured: +8 bytes per object cost MiniJS binary_trees 6% and Python float 6% | est. 3–10%; **upper bound measured 2026-11-06: 1–3%** on nboyer, sboyer, mperm, earley (16-byte pairs, no collection, faults excluded), 24-byte pairs and Prolog ≈0; RSS halved. No-go (item 5) | L |
 | 6 | **A sampling profiler in std** (`std.prof`), mapped to handlers, cold blocks and guest pcs | Every tuning round wrote its own LD_PRELOAD SIGPROF sampler (wasm FRICTION 366, Python FRICTION 618, Mini RESULTS:9). The 64 KiB verifier memset (Prolog sieve 0.54) was found only by sampling | indirect; it finds the next items. **Built 2026-11-06** (`--vm-prof`, item 6): top entries match the hand sampler within 1 point; costs 3% (tail-call) at 1000 Hz | S–M |
-| 7 | **Shifted-int nanbox option** (Int payload in the high bits, so `add; jo` checks overflow) | Python's i48 overflow check is `shl; shl; add; jo; shr`, costing spectral_norm 5–8%. Mini measured i48 at +4–9% and kept i32 (`RESULTS.md:527`). **Built 2026-11-06** as `repr nanbox(int_high)` (item 7, "As built"); Python uses it. Mini not tried (its float-first paths read raw words) | measured: Python suite 0.932 (align 64), 0.942 (128); integer benchmarks 0.87–0.97 (spectral_norm 1.00 at 128), nbody 0.99–1.01 | M |
+| 7 | **Shifted-int nanbox option** (Int payload in the high bits, so `add; jo` checks overflow) | Python's i48 overflow check is `shl; shl; add; jo; shr`, costing spectral_norm 5–8%. Mini measured i48 at +4–9% and kept i32 (`RESULTS.md:527`). **Built 2026-11-06** as `repr nanbox(int_high)` (item 7, "As built"); Python and Prolog use it; Scheme, MiniJS, Mini and Lox measured and not kept (item 7, "Ports") | measured: Python suite 0.932 (align 64), 0.942 (128); integer benchmarks 0.87–0.97 (spectral_norm 1.00 at 128), nbody 0.99–1.01 | M |
 | 8 | **Re-fusion on `become`**, and supers from a profile file | Mini and MiniJS call `refuse` (a whole-function `optimize`) by hand after quickening; doing so gave mandelbrot −6% and nbody −5%. Lox, Python and Scheme don't do it. **Built 2026-11-06** as `refuse CODE;` (item 8, "As built"): Lox zoo 0.88, suite 0.973; Python and Scheme no gain | measured: Lox 0.97; others 1.00 | S |
 | 9 | **A value-stack and frame runtime** (`std.rt.ValueStack`): high-water-mark clearing across coroutines, nested runs and the debugger | Built by hand in MiniJS, Scheme and Python; for Scheme it gave fib 0.81 and tak 0.85. Mini's three attempts failed: the unsafe upper bound was fib 0.92, the safe attempt 0.995–1.003. Python's frames do 8 stores | 1–2% for Mini and Lox; mostly ergonomic for the rest | M |
 | 10 | **Adaptive quickening**: warmup and backoff counters on families (CPython's PEP 659) | No interpreter counts; all specialize on first execution. There is no measured flip-flop yet, so measure first | 0–2% (est.) | S |
@@ -1536,7 +1536,7 @@ ops cheaper (ADD 279 → 189 samples, FORITER2 302 → 201) and the float ones d
 - **Python** uses it (`examples/python/value.lm`); `id()` reads the
   payload above the low tag. The measurement above is the port.
 
-**Mini: not tried.** It is not cheap there: Mini's fast paths add two
+**Mini: not tried when built** (it was later: "Ports", below). It is not cheap there: Mini's fast paths add two
 slots as doubles before testing them (`f64.from_bits(a as u64)`, the
 float-first form that gave mandelbrot and nbody 4–5%), and under
 `int_high` those words are rotated, so every such path (and its
@@ -1546,6 +1546,57 @@ off the instruction counts: Mini's i32 add is `addl; jo; movl; or`, and
 an `int_high` i48 add is `add; jo` with no re-tag, so i48 would no
 longer cost Mini's integer benchmarks the measured 4–9%; its float
 benchmarks would pay the decode, as nbody does here.
+
+#### Ports (2026-11-06)
+
+The other nanbox vms on `int_high`, each against master's build: user+sys
+CPU, minimum of 7 (Scheme, Prolog) or 9 interleaved runs per benchmark,
+an A/A copy of the baseline in the same interleave, align 64 and 128
+(suite geomeans, A/A in brackets):
+
+| vm | change | align 64 | align 128 | worst | kept |
+|---|---|---:|---:|---|---|
+| Prolog (30) | `Term` was already `Int(i48)` | 0.917 (1.003) | 0.920 (1.008) | sieve 0.99–1.03, log10 0.97–1.06 | yes |
+| Scheme (43) | fixnums `i32` → `i48` | 0.979 (0.994) | 0.978 (0.998) | sumfp 1.24–1.27, mbrot 1.12–1.15 | no |
+| MiniJS (14) | `Int(i32)` → `i48` | 0.941 (0.993) | 0.958 (1.049) | nbody 1.25–1.47, raytrace 1.05–1.07 | no |
+| Mini (14) | `Int(i32)` → `i48` | 1.034 (1.003) | 1.030 (1.001) | mandelbrot 1.80, nbody 1.32, spectral_norm 1.18–1.20 | no |
+| Lox (9) | no integers: `Native(u32) block 48` as the zero-tag variant | 1.005 (0.987) | 1.030 (1.007) | equality 1.06–1.13, fib 1.04–1.09 | no |
+
+The integer side behaved as in Python everywhere: Prolog's queens_8
+0.78–0.80, Scheme's tak 0.82–0.95, MiniJS's bitops 0.74–0.76 and sort
+0.77–0.90, Mini's fannkuch 0.84–0.89 and queens 0.88–0.92; Mini's i48
+no longer costs it the 4–9% of `bench/mini/RESULTS.md`. The float side
+did not: in a tight float loop every operand read from a register is a
+load, `xor`, `rol` and `movq` where it was one `addsd`/`mulsd` from
+memory, and every result two more instructions before its store, all on
+the loop's dependency chain (sumfp: 0.188 s to 0.259 s under
+`--vm-prof`, Mini's mandelbrot 0.69 s to 1.12 s, spread over its float
+supers). Python's float benchmarks pay the same per operation but spend
+more of their time elsewhere. So the layout pays for a vm whose values
+are rarely floats (Python, Prolog) and not for one with float kernels
+among its benchmarks.
+
+- **Compiler: `V.Num.xor`.** A float-first fast path (add two registers
+  as doubles, test the result for NaN) needs the rotation's constant:
+  under `int_high` an f64 with bits `b` is `rotl(b, 16) ^ V.Num.xor`
+  (`language.md` §2; `tests/run/values_int_high_xor.lm`,
+  `tests/fail/value_xor_not_int_high.lm`). MiniJS's and Mini's ports
+  used it.
+- **Prolog** (kept, `bench/prolog/README.md`): `#[scan_raw_words]` is
+  refused under the layout, so its environment frames store their
+  three header words as `Int` words and the scanner still reads the
+  stack word by word; first-argument index keys of Ints set bit 15, as
+  `Int(0)`'s word is the no-key 0.
+- **Scheme, MiniJS, Mini** (`bench/scheme/README.md`,
+  `bench/minijs/RESULTS.md`, `bench/mini/RESULTS.md`): each port is a
+  commit followed by its revert. Mini's needed `int_index`, the integer
+  compare-and-branch, FORLOOP and the intern table's slot words
+  rewritten for rotated words; its value accumulator and traces were
+  untouched.
+- **Lox** has no integer variant; pinning `Native(u32) block 48` makes
+  it the zero-tag one, so only the pointer payloads (cheaper) and the
+  floats (dearer) change. Its numbers are all floats: not kept, no
+  commit.
 
 ### 8. Re-fusion on `become`; supers from a profile file
 

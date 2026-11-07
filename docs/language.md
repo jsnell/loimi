@@ -1546,7 +1546,7 @@ happening silently:
   value: a word `w` holds `Int` exactly when `w & V.Int.mask ==
   V.Int.tag`), `V.Int.block` (the block width), and `V.Num.limit` for
   the `unboxed` variant (its words are those below it; not under
-  `int_high`, below). They are constants, so tests built from them
+  `int_high`, below, where it has `V.Num.xor` instead). They are constants, so tests built from them
   cost what hand-written ones do, and they follow the layout.
 
 <!-- snippet: run "both ints" -->
@@ -1636,7 +1636,17 @@ four instructions per float operation and gains little. Two things do
 not carry over from the plain nanbox: `V.Num.limit` does not exist (the
 float's words are not the words below a limit), and a float-first fast
 path that adds two slots as doubles before testing them
-(`f64.from_bits(a as u64)`, `lowering.md` §2) reads rotated words.
+(`f64.from_bits(a as u64)`, `lowering.md` §2) reads rotated words. It
+can be written with `V.Num.xor`, the constant of the rotation: the
+word of an f64 with bits `b` is `rotl(b, 16) ^ V.Num.xor`, so a word's
+f64 is `f64.from_bits(rotr(w ^ V.Num.xor, 16))` (spelled `(x >> 16) |
+(x << 48)`; LLVM makes it one `ror`), and every other variant's word
+reads as a NaN, which is the test the float-first path already makes
+on its result (`tests/run/values_int_high_xor.lm`). The ports of
+MiniJS's and Mini's `ADD_F` did this, and were not kept: a float operand
+read from a register is then a load, `xor`, `rol` and `movq` instead of
+an `addsd` from memory, and Mini's mandelbrot ran 1.8 times as long
+(`design/speed-audit.md`, item 7, "Ports").
 
 **`#[scan_raw_words]`** on a value type asks the compiler to guarantee
 that every word below 2^48 (a user-space pointer on x86-64 and AArch64,
@@ -1645,9 +1655,11 @@ and is an error if the layout does not (only `repr nanbox` with an
 unboxed float variant does: such words are floats; not
 `nanbox(int_high)`, where the low 16 bits pick the variant). A root
 scanner may then `gc_mark` memory that mixes raw pointers and counts
-with values of the type, word by word, as Prolog's environment stack does (frames of
-`{ ce: *Frame, cp: *u32, n: u64 }` followed by terms); switching the
-type to `lowtag` then fails to compile instead of breaking the scanner.
+with values of the type, word by word (as Prolog's environment stack
+did, frames of `{ ce: *Frame, cp: *u32, n: u64 }` followed by terms,
+before its `Term` moved to `int_high` and its frame headers to `Int`
+words); switching the type to `lowtag` then fails to compile instead
+of breaking the scanner.
 
 ---
 

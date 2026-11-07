@@ -616,8 +616,7 @@ large strings (`brk` is 5% of string).
 
 `value V repr nanbox(int_high)` (`docs/language.md` §2) with `Int(i32)
 block 48` widened to `Int(i48)`, the layout's integer variant (commit
-"Scheme: fixnums as Int(i48) on nanbox(int_high)", reverted by the
-next). Fixnum `+`/`-` become `or %si, %bx; je; add; jo` on the words
+ed1ef3a, reverted by the next). Fixnum `+`/`-` become `or %si, %bx; je; add; jo` on the words
 and pointer payloads `shr $16`; every flonum operand pays `xor; rol`
 and every flonum result `rol; xor`. User+sys CPU, minimum of 7
 interleaved runs per benchmark (`compare.py`'s programs and inputs),

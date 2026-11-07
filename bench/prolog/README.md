@@ -186,6 +186,38 @@ startup included: ~0.02 s for swipl, ~0.03 s for tpl). All programs print
 
 ## Results: the Loimi Prolog (examples/prolog)
 
+### `nanbox(int_high)` (2026-11-06)
+
+`Term` on `repr nanbox(int_high)` (`docs/language.md` §2; commit
+7a80f29): `Int(i48)` is the integer variant, so `is`'s `+`/`-` on two
+Ints are `add; jo` on the words, compares are word compares and every
+pointer payload (`Ref`, `Str`, `Lst`, dereferencing) is `shr $16`
+where it was an `and` with a 48-bit mask. `#[scan_raw_words]` is
+refused under the layout, so environment frame headers are stored as
+`Int` words and the root scanner still marks the stack word by word;
+first-argument keys of Ints set bit 15, as `Int(0)`'s word is 0, the
+no-key marker (`tests/index_keys.pl`). User+sys CPU, minimum of 7
+interleaved runs per benchmark (`run.py`'s programs), against base
+(master), A/A (a copy of base) in brackets:
+
+| | align 64 | align 64, again | align 128 |
+|---|---:|---:|---:|
+| queens_8 | 0.785 (0.999) | 0.795 (0.995) | 0.777 (1.000) |
+| query | 0.844 (0.999) | 0.846 (1.000) | 0.812 (1.000) |
+| sendmore | 0.839 (0.992) | 0.845 (0.996) | 0.982 (1.000) |
+| nreverse | 0.896 (1.013) | 0.864 (1.001) | 0.866 (1.002) |
+| crypt | 0.914 (1.019) | 0.883 (1.013) | 0.884 (1.001) |
+| eval | 0.840 (0.958) | 0.851 (1.006) | 0.872 (1.023) |
+| log10 | 1.394 (1.301) | 1.059 (1.004) | 0.971 (0.977) |
+| sieve | 0.959 (1.040) | 0.991 (1.028) | 1.026 (1.095) |
+| suite (30) | 0.919 (1.013) | 0.917 (1.003) | 0.920 (1.008) |
+
+Kept. The first align 64 round ran next to test builds (its A/A
+spread is wide; log10's 1.39 is noise, 1.06 and 0.97 in the quieter
+rounds). The Prolog benchmarks hardly use floats, so the decode cost
+that sank Scheme, MiniJS and Mini (`docs/design/speed-audit.md`, item
+7, "Ports") does not show.
+
 ### Third round (2026-11-04)
 
 `run.py -n 3 --exe before=OLD --exe loimi=NEW`, release builds

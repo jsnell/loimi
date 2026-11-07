@@ -276,6 +276,17 @@ implementation; `git log` has the details.
   ([language.md §2](docs/language.md#2-value-types-declared-representations),
   [lowering.md §2](docs/lowering.md#2-values-nanbox-lowtag-boxed);
   [design/speed-audit.md](docs/design/speed-audit.md), item 7).
+  Prolog uses it too (suite 0.917 at align 64, 0.920 at 128; its
+  environment frames now store their headers as `Int` words, as
+  `#[scan_raw_words]` is refused under the layout). Scheme, MiniJS, Mini
+  and Lox were measured on it and not kept: their integer benchmarks
+  gained 5–25%, their float kernels lost 12–80% (Mini's mandelbrot 1.80)
+  ([design/speed-audit.md](docs/design/speed-audit.md), item 7, "Ports").
+- **`V.Num.xor`**: the rotation constant of `nanbox(int_high)`'s
+  unboxed float (its word is `rotl(bits, 16) ^ V.Num.xor`), so a
+  float-first fast path can read and write registers as doubles under
+  the layout
+  ([language.md §2](docs/language.md#2-value-types-declared-representations)).
 - **`#[scan_raw_words]`** on a value type: a checked guarantee that words
   below 2^48 (raw pointers, small integers) read as reference-free
   variants, for scanners of mixed frames
