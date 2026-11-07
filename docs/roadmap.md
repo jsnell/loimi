@@ -26,11 +26,11 @@ Progress (2026-11-02):
   `examples/scheme` (an R7RS-small subset) and `examples/minijs` (a
   JavaScript subset).
 - **Speed criterion 1 is met.** Mini beats PUC-Lua 5.4 on all 14
-  clean-room benchmarks, taking 0.26–0.71× of Lua's time (0.47× by
-  geometric mean). Current numbers for every interpreter:
+  clean-room benchmarks, taking 0.31–0.71× of Lua's time (0.49× by
+  geometric mean, 2026-11-07). Current numbers for every interpreter:
   [`results.md`](results.md).
 - **The stretch goal is met.** Mini takes less time than LuaJIT's
-  interpreter (`-joff`) on all 14 (hash_strings, the closest, 0.96×;
+  interpreter (`-joff`) on all 14 (queens, the closest, 0.93×;
   0.75× by geometric mean).
 - MiniJS beats `node --jitless` (0.48× by geometric mean) and QuickJS
   (0.37×) on all 14 of its clean-room benchmarks.
@@ -284,7 +284,9 @@ quickening on/off.
      MiniJS 0.85, Scheme 0.79 (Scheme with the JIT is 0.80 of Guile 3's
      time with its JIT). Remeasured 2026-11-05
      ([`results.md`](results.md)): 0.76, 0.83, 0.79 (Scheme with the
-     JIT 0.63 of Guile's); Prolog, added later, 1.00 (1.35 on `sieve`). A JIT build with
+     JIT 0.63 of Guile's); Prolog, added later, 1.00 (1.35 on `sieve`).
+     Again 2026-11-07: 0.76, 0.83, 0.78 (0.63 of Guile's); Prolog 0.94
+     (0.93 without `sieve`). A JIT build with
      the JIT off now runs the default build's handlers (counting copies are swapped in only with
      `LOIMI_JIT=1`) and is within noise of a default build (was +5%).
      Stencil builds take a third less time.
