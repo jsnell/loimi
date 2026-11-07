@@ -1,12 +1,12 @@
 # Design note: a speed audit (features for faster interpreters)
 
 Status: **proposal.** Written 2026-11-06 against master at 0813bc1.
-Items 1, 3, 6, 7 and 8 are built (their "As built" notes); items 2 and 4
-were prototyped and dropped (their "Prototype results"); item 5's upper
-bound was measured and it is not worth building for speed; item 13 is
-built; item 11's vm primitive is a no-go, and Mini switches coroutines
-through quickened CALL members instead; item 14 has
-an experiment and a staged plan (`trace-tier.md`).
+Items 1, 3, 6, 7, 8, 9 and 13 are built (their "As built" notes);
+items 2, 4 and 10 were prototyped or measured and dropped; item 5's
+upper bound was measured and it is not worth building for speed; item
+11's vm primitive is a no-go, and Mini switches coroutines through
+quickened CALL members instead; item 12 is open; item 14 is the trace
+tier (`trace-tier.md`).
 
 > Have we exhausted the possibilities for language improvements that
 > can be used to write faster interpreters or runtimes?
