@@ -8,6 +8,20 @@ implementation; `git log` has the details.
 
 ### `vm` declarations and dispatch
 
+- **Side traces, and loops inside loops** (trace tier M2): a trace is
+  now a graph in one function: its root path goes through the loops
+  inside its loop, and the hot paths from its exits are side traces
+  that rejoin it, under a size budget (`LOIMI_TRACE_SIDES`,
+  `LOIMI_TRACE_SIDE_MIN`, `LOIMI_TRACE_SIDE_FRAC`,
+  `LOIMI_TRACE_SIDE_LINES`; `LOIMI_TRACE_NEST=0`). A side trace counts its
+  own guard failures and is dropped alone. Jump tables (Mini's SWITCH)
+  and superinstruction resumes are path edges, step branches carry the
+  profile's weights, and profiling regions no longer grow with the square
+  of their size (`interp`'s dispatch loop: 542,000 → 50,000 lines). Mini:
+  0.759 of the JIT by geometric mean (0.773 at `--align-functions=128`;
+  M4 0.858): `interp` 0.72, fannkuch 0.35, mandelbrot 0.53, nbody 0.68,
+  sort 0.67; side traces alone are 0.812 → 0.763
+  ([design/trace-tier.md §13](docs/design/trace-tier.md#13-side-traces-and-loops-inside-loops-m2)).
 - **JIT: handlers may read other instructions' words; computed jumps
   enter compiled code.** `Vm.real_word` maps a JIT enter word through
   an inline load from the runtime's table (`loimi_jit_words`) instead

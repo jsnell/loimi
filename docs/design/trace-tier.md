@@ -4,7 +4,8 @@
 --trace-regions=REC` and `--traces=PROF` make ahead-of-time traces from a
 profile, with the generator in the compiler (`src/tracegen.rs`). **Then
 cheaper exits and traces through calls** (§12, M4 in part): Mini at 0.858
-of the JIT by geometric mean (M1: 0.932), no program slower. §1–§10
+of the JIT by geometric mean (M1: 0.932), no program slower. **Then side
+traces and loops inside loops** (§13, M2): 0.759 (`interp` 0.72). §1–§10
 describe the experiment as it was run; its hooks were replaced
 (`LOIMI_TRACE_DUMP` is `LOIMI_TRACE_RECORD`, `LOIMI_TRACE_IR` is
 `--traces`, `loimi_trace_blacklist` is `loimi_trace_failing`).
@@ -1095,7 +1096,8 @@ are generic problems:
   pay: the loop is an `if` chain over 13 opcodes and the hottest arm
   (PUSH) is 24% of its iterations, so a one-path trace fails its first
   guard three times in four and is blacklisted. It needs side traces
-  (M3), not a smaller region.
+  (M3), not a smaller region. (Done in §13: the region was quadratic, and side
+  traces cover the arms.)
 
 ### 12.6 Results
 
@@ -1202,3 +1204,202 @@ regions, `LOIMI_TRACE_MONO=x` (0.9: lower inlines polymorphic sites;
 traces. `LOIMI_TRACE_REPORT=1` gives per trace its iterations per entry,
 inlined calls and steps that call writers; `=2` also the path of loops
 that got none. `LOIMI_JIT_STATS=1` counts callees bound.
+
+## 13. Side traces and loops inside loops (M2)
+
+§12 left four programs with no trace at all and `interp`'s dispatch loop
+unprofiled. This section makes a trace a graph: a root path around its
+loop, through the loops inside it, plus *side traces*, the hot paths
+from its exits, each until it rejoins the trace. Everything is still one
+LLVM function per loop, built ahead of time from the same three-step
+workflow (§11.1); results in §13.6.
+
+### 13.1 Shape
+
+- **The root** is the hottest path from the header, as before, except
+  that it no longer ends at an inner loop. Exits are now edges of the
+  path search too: a region records each static exit with its block's
+  count (no new counters, so profiles keep their format), and a dynamic
+  jump whose site went to the same code object (Mini's SWITCH, §13.3)
+  is an edge with the site's count. When the path comes back to a step
+  it already took (a loop inside the loop), the loop is closed there
+  and the path leaves it by the hottest edge out of it. Such steps are
+  *heads*: iterations are counted at every head, so a trace's guard
+  failures compare with all the iterations it runs.
+- **Side traces.** Then, while the budget allows, the hottest edge from
+  a step of the trace that leaves it (an exit that ran at least
+  `LOIMI_TRACE_SIDE_MIN` times, by default `LOIMI_TRACE_MIN`, and in at least
+  `LOIMI_TRACE_SIDE_FRAC` of the root's iterations, 1%) starts a walk
+  that follows the hottest path from there until it reaches a step of
+  the trace: the side trace rejoins it there, the header or any other
+  step, rather than duplicating the tail to the header (its exits are
+  candidates for more side traces). An edge into a step that is already
+  in the trace just becomes internal. A walk that leaves the loop, or
+  passes 1,000 steps, is dropped. Calls on side traces need not be
+  monomorphic: each callee of a site that ran often enough is a frame of
+  its own with its own binding slot. Side traces go into calls as roots
+  do (oo_methods: `apply`'s two branches call `withdraw` and `deposit`,
+  each inlined on a side trace).
+- **Merging, not tail duplication.** A rejoin makes the step's state
+  registers phis of both paths, as a region's are. The window, the
+  dirty-slot flow and the per-step snapshots of §12.1 are already
+  analyses over the function's whole CFG, so what is dirty at a guard of
+  a side trace is exactly what is dirty on the paths that reach it: the
+  "transfer" of window state to a side trace is SSA, not a copy.
+- **Budget.** Side traces are added hottest first while the trace's
+  steps (estimated as lines of stencil IR, cold blocks included) stay
+  under `LOIMI_TRACE_SIDE_LINES` (60,000), at most `LOIMI_TRACE_SIDES`
+  (32) per trace; if the generated function is still over
+  `LOIMI_TRACE_MAXLINES`, the trace is generated again with half the
+  side traces.
+- `LOIMI_TRACE_SIDES=0` and `LOIMI_TRACE_NEST=0` turn the two parts off.
+
+### 13.2 Accounting, blacklisting, invalidation
+
+- A side trace is an entry of `loimi_traces` of its own (`tN.sK`, with
+  `parent` the root's index; the runtime never installs it). Its guards
+  count failures in its own state; `loimi_trace_failing` compares them
+  with the root's iterations (one in 8, as for roots: a side trace that
+  is entered rarely costs little even when it fails) and drops it
+  alone: it sets `state[4]`, which the root loads where it would enter
+  the side trace, and that edge is an exit again, as without side
+  traces. The root runs on. Root guards count against the root.
+- A root's word range covers the steps of its side traces (frame 0), so
+  a word change anywhere in it uninstalls the whole tree; a dropped side
+  trace stays dropped when the root is installed again. Inlined frames
+  on side traces bind and unbind as in §12.3. Nothing changes for the
+  collector: the frames are the vm's, and every step is a stencil.
+- `LOIMI_JIT_STATS=1` prints `N linked, S side traces`, and a line per
+  side trace whose guards failed.
+
+### 13.3 What it took besides side traces
+
+- **Regions were quadratic.** A dispatch through the table in a region
+  (a cold block's `next`, a computed jump) switched over every
+  instruction of the region: `interp`'s dispatch loop was 542,000 lines
+  of IR, 23,000 of its 25,000 blocks that switch. A region now records
+  the target (`loimi_trace_site`, now 16 targets per site: a jump table
+  has a target per case) and leaves through the table, which enters the
+  region again at the target's trampoline. The loop is 50,000 lines (all 14 programs: 159 regions, 1 over the budget, against 147 and 13);
+  the profiling build of the 14 programs is faster.
+- **Mini's SWITCH** jumps to a computed pc (the arm's JMP when it is
+  compiled; commit 318fa82). Its site's targets in the same code are
+  path edges, and the trace compares the computed pc with each
+  successor's address, hottest first.
+- **Superinstruction resumes.** A cold block's `next` in a part of a
+  super before the last calls the super's resume function (the super
+  from the next part on, `lowering.md` §3). The generator took it for an
+  opaque exit, so Mini's ADDI_ADDI with a float operand left every trace
+  that ran it. It is now an edge to the next part's instruction, which
+  runs the same parts.
+- **Branch weights.** Step branches get `llvm.expect` where the
+  profile's block counts differ by 32 times or more, and guards always
+  (toward the trace). Without it LLVM takes each guard for a coin toss,
+  so a loop that passes ten guards seems to iterate once, and the
+  register allocator gave the registers to the code around it: the
+  trace of mandelbrot's whole nest spilled every value of its inner
+  loop, 1.85 of the M4 trace; with the weights it is 0.87 of it.
+- **Writeback at loop entries.** On edges into a loop inside the trace
+  from outside it (the head does not dominate the source), the window is
+  written back, so that the inner loop's guards and exits restore only
+  what the inner loop changed. Alone it did not cure mandelbrot's spills
+  (1.85 with it; the branch weights did); it is kept (not measured on
+  its own since) because it bounds what an inner loop keeps live for
+  its guards.
+
+### 13.4 Tests
+
+- `mini_traces` traces `examples/mini/tests/trace_sides.mini` with the
+  rest (a jump-table dispatch loop whose arms are side traces, a side
+  trace that resumes a superinstruction, arithmetic that changes type in
+  a side trace, nested loops, a polymorphic call site) and asserts that
+  the scripts and benchmarks make at least 10 side traces. A build from
+  that script alone checks, with guards forced (`LOIMI_TRACE_MINFRAC=0.5`:
+  the side trace's branch taken in 3 of 7 of its runs is a guard), that a
+  side trace is blacklisted while its root runs on. Every script and
+  conformance test runs as before in every GC mode with these traces,
+  with failing guards and with blacklisting at every failure.
+- `mini_traces_fuzz`: the generator makes jump tables and `elseif` chains
+  whose arms run more or less often by the input (side traces whose
+  guards fail with another input), and every program ends with a
+  dispatch loop on `i % (M + 1)`; the test asserts that side traces were
+  made. Programs are profiled with one input and run with three, with
+  traces, forced guards, blacklisting at every failure and a collection
+  at every safepoint.
+- ASan (by hand, as in §11.6): RESULTS-ASAN
+- Found on the way: the quadratic regions, superinstruction resumes as
+  opaque exits (§13.3), missing branch weights (§13.3), a wrong filter
+  of side-trace starts under `LOIMI_TRACE_MINFRAC` (a site's per-target
+  count is not its block's), and `LOIMI_TRACE_SIDE_MIN` ignoring
+  `LOIMI_TRACE_MIN` (the fuzz programs' loops run 1,000 times).
+
+### 13.5 Other vms
+
+MiniJS runs unchanged: nbody, fannkuch, spectral_norm, bitops and sort
+recorded, profiled and traced (22 traces, 14 side traces), every output equal to the JIT's. RESULTS-JS
+Scheme and Prolog were not run through the workflow.
+
+### 13.6 Results
+
+Machine and method as in §11.5 (the shared 8-core box; another agent
+building and testing): user+sys CPU seconds, minimum of 7 interleaved
+runs, every output checked, a JIT A/A pair and the trace binary with
+`LOIMI_TRACE=0` as controls. All 14 programs recorded, region-profiled
+and traced again by the final compiler (159 regions, 1 over the budget,
+against 147 and 13 before; the whole workflow 4 minutes; 35 traces with
+45 side traces). The columns *no sides* and *no nesting* are builds from
+the same profiles with `LOIMI_TRACE_SIDES=0`, and with
+`LOIMI_TRACE_SIDES=0 LOIMI_TRACE_NEST=0` (5 runs, a separate round);
+*M4* is §12.6.
+
+| program | JIT | trace | trace off | trace/JIT | (medians) | at 128 | no sides | no nesting | M4 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| binary_trees | 0.650 | 0.648 | 0.642 | 1.00 | 1.01 | 1.04 | 1.01 | 1.04 | 1.00 |
+| closures | 0.423 | 0.410 | 0.393 | 0.97 | 1.04 | 1.00 | 0.97 | 0.99 | 1.00 |
+| fannkuch | 0.895 | 0.311 | 0.892 | **0.35** | 0.34 | 0.35 | 0.52 | 0.65 | 0.67 |
+| fib | 0.672 | 0.661 | 0.666 | 0.98 | 1.04 | 1.01 | 1.00 | 1.00 | 0.99 |
+| hash_strings | 0.910 | 0.780 | 0.901 | **0.86** | 0.87 | 0.88 | 0.86 | 0.87 | 0.89 |
+| interp | 0.701 | 0.503 | 0.704 | **0.72** | 0.71 | 0.72 | 0.85 | 0.85 | 1.01 |
+| mandelbrot | 0.430 | 0.228 | 0.433 | **0.53** | 0.54 | 0.53 | 0.60 | 0.61 | 0.64 |
+| nbody | 0.365 | 0.248 | 0.365 | **0.68** | 0.67 | 0.64 | 0.66 | 0.76 | 0.76 |
+| oo_methods | 0.531 | 0.513 | 0.515 | 0.97 | 0.95 | 0.97 | 0.99 | 0.99 | 0.99 |
+| queens | 0.746 | 0.641 | 0.744 | **0.86** | 0.95 | 0.89 | 0.90 | 0.91 | 0.93 |
+| sieve | 0.626 | 0.515 | 0.628 | **0.82** | 0.82 | 0.88 | 0.80 | 0.81 | 0.85 |
+| sort | 0.756 | 0.510 | 0.751 | **0.67** | 0.69 | 0.71 | 0.79 | 0.81 | 0.81 |
+| spectral_norm | 0.741 | 0.484 | 0.741 | **0.65** | 0.63 | 0.66 | 0.65 | 0.61 | 0.64 |
+| string_build | 0.648 | 0.618 | 0.656 | 0.95 | 0.97 | 1.00 | 0.99 | 0.98 | 1.00 |
+
+**Geometric mean: 0.759 of the JIT at 64, 0.773 at 128** (M4 0.858,
+0.862). Controls: JIT A/A 0.989, trace-off/JIT 0.991 (1.004 and 1.007 at
+128); single programs vary by up to 6% in the A/A pair (closures, nbody
+at 64). In the separate round: 0.763 with everything, 0.812 without side
+traces, 0.835 without side traces or nesting. So:
+
+- **Side traces** took the suite from 0.812 to 0.763: `interp` 0.85 →
+  0.71 (14 side traces, one per hot arm of its jump table: §13.6),
+  fannkuch 0.52 → 0.35 (the exits from one loop of its nest into the
+  next are side traces, so a trace runs the whole nest), sort 0.79 → 0.68,
+  mandelbrot 0.60 → 0.54 (the escape exit of the inner loop rejoins the
+  outer loops).
+- **Loops inside loops** took it from 0.835 to 0.812: nbody 0.76 → 0.66
+  (its inner loop runs 1.5 times per entry; the outer loop's trace runs
+  it in place), fannkuch 0.65 → 0.52.
+- **The rest** (branch weights, resumes, SWITCH edges, smaller regions)
+  took it from 0.858 to 0.835: `interp` 1.01 → 0.85 with a root trace
+  alone (its loop is now profiled), mandelbrot 0.64 → 0.61.
+
+**Stop rule (M2 as asked here: stop if `interp` stays over 0.90 and the
+geometric mean over 0.83): met on both.** `interp` is 0.72 (0.72 at 128),
+the geometric mean 0.759 (0.773). Still at 1.00: binary_trees and fib
+(recursion outside loops), closures, oo_methods and string_build (heap
+work, which a trace does as the stencils do; oo_methods' methods are
+inlined on side traces, 0.97).
+
+**What `interp` looks like.** The root runs the hottest arm (PUSH, 24%); the
+SWITCH's dispatch compares the computed pc with each arm's JMP, hottest
+first; 12 side traces run the other arms, each rejoining the back edge,
+and 2 more the rarer way of a branch inside an arm. A side trace's entry
+loads its `state[4]`; there are no counters on the way in. The trace has
+73 steps (68 of them on side traces) and 158 guards; the run stays in it
+from its first entry (29.7 million iterations, no guard failures).
+

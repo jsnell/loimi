@@ -463,6 +463,27 @@ Scheme stays out: over five runs, folded or not, it averages 0.3%
 slower, with tak and fib slower in every run (a `movq` to the
 accumulator on ADD/SUB/MUL's integer paths).
 
+## Side traces (2026-11-07)
+
+Not a run of the suites: the trace tier's Mini benchmarks with side
+traces and loops inside loops
+([design/trace-tier.md §13](design/trace-tier.md#13-side-traces-and-loops-inside-loops-m2)),
+`--jit-stencils` with ahead-of-time traces from a profile of the 14
+programs against the same binary's JIT, user+sys CPU seconds, minimum
+of 7 interleaved runs.
+
+| | M4 | now, `--align-functions=64` | 128 |
+|---|---:|---:|---:|
+| trace / JIT, geometric mean | 0.858 | **0.759** | 0.773 |
+| JIT A/A | 0.996 | 0.989 | 1.004 |
+| trace off / JIT | 1.003 | 0.991 | 1.007 |
+
+Side traces took the suite from 0.812 to 0.763 in a separate round
+(`interp` 0.85 → 0.71, fannkuch 0.52 → 0.35, sort 0.79 → 0.68), loops
+inside loops from 0.835 to 0.812 (nbody 0.76 → 0.66), and branch weights
+and the rest from 0.858 to 0.835. binary_trees, fib, closures,
+oo_methods and string_build stay at 0.95–1.00.
+
 ## Traces through calls (2026-11-06)
 
 Not a run of the suites: the trace tier's Mini benchmarks

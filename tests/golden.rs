@@ -452,7 +452,12 @@ fn mini_traces() {
     let dropped = err.lines().any(|l| l.starts_with("jit:   side trace ") && l.ends_with(", blacklisted"));
     let root_ran = err.lines().any(|l| l.starts_with("jit:   trace ") && !l.ends_with(", blacklisted") && !l.contains(": 0 iterations"));
     if !dropped || !root_ran || !out.status.success() {
-        failures.push(format!("trace_sides.mini (forced guards): no side trace was blacklisted alone while its root ran on\n{}", err));
+        failures.push(format!(
+            "trace_sides.mini (forced guards): no side trace was blacklisted alone while its root ran on ({:?})\n{}{}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            err
+        ));
     }
     bs.cleanup();
     if !failures.is_empty() {
