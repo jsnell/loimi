@@ -3,8 +3,9 @@
 //! type with the input (ints, floats), table reads and writes, string
 //! building, closures over loop variables, calls (which traces inline:
 //! callees that branch, allocate and call each other, call sites whose
-//! callee changes now and then, recursion), `break`s and nested
-//! loops. The input is a string constant (`tonumber("..")`): constant
+//! callee changes now and then, recursion), `break`s, nested loops,
+//! jump tables and `elseif` chains whose arms run more or less often by
+//! the input (side traces, and their guards failing). The input is a string constant (`tonumber("..")`): constant
 //! strings are loaded from the constant pool, not baked into traces, so
 //! one program's code with two inputs is the same code object, and a
 //! trace made from one input runs on the other.
@@ -86,12 +87,14 @@ impl Gen {
     fn stmt(&mut self, lv: &str, budget: &mut u32) {
         *budget = budget.saturating_sub(1);
         let v = self.r.pick(&VARS);
-        let c = match self.r.below(24) {
+        let c = match self.r.below(27) {
             10..=15 => 0,
             16..=18 => 10,
             19 => 11,
             20 => 12,
             21 => 13,
+            24 | 25 => 14,
+            26 => 15,
             k => k - 12,
         };
         match c {
@@ -150,6 +153,35 @@ impl Gen {
                 self.line(&format!("{} = {} + h({}, {})", v, v, lv, w));
                 self.clamp(v);
             }
+            14 => {
+                // a jump table (an `if` chain on 0..n): several hot arms,
+                // the root takes one, side traces the others
+                let m = self.r.pick(&["4", "5", "M + 2", "N % 5 + 3"]);
+                let w = self.r.pick(&VARS);
+                self.line(&format!("local k = {} % ({})", lv, m));
+                for j in 0..4 {
+                    let body = match self.r.below(4) {
+                        0 => format!("{} = {} + {}", w, w, j + 1),
+                        1 => format!("{} = {} + F", w, w),
+                        2 => format!("t[({} % 50) + 1] = {}", lv, w),
+                        _ => format!("if {} % 3 == 0 then {} = {} + 0.5 else {} = {} - 1 end", lv, w, w, w, w),
+                    };
+                    self.line(&format!("{} k == {} then {}", if j == 0 { "if" } else { "elseif" }, j, body));
+                }
+                self.line("end");
+                self.clamp(w);
+            }
+            15 => {
+                // an `elseif` chain whose arms run more or less often by the
+                // input: side traces whose guards fail with another input
+                let w = self.r.pick(&VARS);
+                let e = self.expr(lv, 2);
+                self.line(&format!("if {} % (M + 1) == 0 then {} = {} + 1", lv, w, w));
+                self.line(&format!("elseif {} % 3 == 1 then {} = {}", lv, w, e));
+                self.line(&format!("elseif {} > N / 2 then {} = {} * 0.5", lv, w, w));
+                self.line(&format!("else {} = {} - 2 end", w, w));
+                self.clamp(w);
+            }
             13 => {
                 // recursion: the recursive call leaves the trace
                 let w = self.r.pick(&VARS);
@@ -195,6 +227,29 @@ impl Gen {
         self.line("return r");
         self.depth -= 1;
         self.line("end");
+    }
+
+    /// A dispatch loop (a jump table on `i % (M + 1)`, ints only): its
+    /// arms are side traces, which run more or less often by the input.
+    fn dispatch_loop(&mut self) {
+        let n = self.r.below(3) + 4;
+        self.line("local q = 1");
+        self.line("for i = 1, N * 25 do");
+        self.depth += 1;
+        self.line("local k = i % (M + 1)");
+        for j in 0..n {
+            let body = match self.r.below(4) {
+                0 => format!("q = q + {}", j + 1),
+                1 => format!("q = (q * {}) % 1009", j + 2),
+                2 => "q = q - i % 7".to_string(),
+                _ => format!("if i % {} == 0 then q = q + 3 else q = q - 1 end", j + 2),
+            };
+            self.line(&format!("{} k == {} then {}", if j == 0 { "if" } else { "elseif" }, j, body));
+        }
+        self.line("else q = q + k end");
+        self.depth -= 1;
+        self.line("end");
+        self.line("sum = (sum + q) % 1000003");
     }
 
     fn loop_(&mut self, budget: &mut u32) {
@@ -264,6 +319,7 @@ pub fn generate(seed: u64, input: (&str, &str, &str)) -> String {
     for _ in 0..nl {
         g.loop_(&mut budget);
     }
+    g.dispatch_loop();
     g.line("print(string.format(\"%.6g %.6g %.6g %.6g %.6g\", a, b, c, d, sum))");
     g.line("print(#s, string.sub(s, 1, 60))");
     g.out

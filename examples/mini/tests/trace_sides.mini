@@ -22,20 +22,34 @@ for r = 1, 300 do
 end
 print(acc, n)
 
--- a side trace with a branch inside it, taken a third of the time: in
--- the forced builds (blocks run in under half of their step's runs are
--- guards) that is a guard of the side trace that fails, often enough to
--- drop the side trace; the root goes on
+-- a side trace with a branch inside it, taken in 3 of 7 of its runs: in
+-- the forced builds of mini_traces (blocks run in under half of their
+-- step's runs are guards) that is a guard of the side trace (an arm of the
+-- jump table) that fails, in more than one root iteration in 8: the side
+-- trace is dropped, its root goes on
 local s, t = 0, 0
-for i = 1, 30000 do
-  if i % 2 == 0 then
-    s = s + i
-  else
-    if i % 3 == 0 then t = t + 2.5 else t = t + 1 end
-    s = s - 1
-  end
+for i = 1, 40000 do
+  local k = i % 2
+  if k == 0 then s = s + i
+  elseif k == 1 then
+    if i % 7 < 3 then t = t + 2.5 else t = t + 1 end
+  elseif k == 2 then s = s - 1
+  elseif k == 3 then s = 0 end
 end
 print(s, t)
+
+-- a side trace that runs a superinstruction's second half on its own
+-- (the float path of ADDI_ADDI resumes at its second part)
+local u, q = 0, 0.5
+for i = 1, 30000 do
+  if i % 2 == 0 then
+    u = u + i
+  else
+    if i % 3 == 0 then q = q + 2.5 else q = q + 1 end
+    u = u - 1
+  end
+end
+print(u, q)
 
 -- arithmetic that changes type in a side trace: ints, then floats
 local x = 0
@@ -87,7 +101,8 @@ end
 print(w)
 
 -- expect: 96336	3600
--- expect: 225000000	22500.0
+-- expect: 400020000	32858.0
+-- expect: 225000000	22500.5
 -- expect: 19375.0
 -- expect: 683212
 -- expect: 9819	30273.0	53	19994	40

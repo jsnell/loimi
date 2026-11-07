@@ -426,6 +426,10 @@ fn mini_traces() {
     // traces of every loop of the tests, and the benchmarks' outputs
     let n = bt.ntraces(&bt.normal);
     assert!(n >= 10, "only {} traces from the Mini tests and benchmarks", n);
+    // side traces (docs/design/trace-tier.md section 13): interp's jump
+    // table, trace_sides.mini
+    let ns = bt.nsides(&bt.normal);
+    assert!(ns >= 10, "only {} side traces from the Mini tests and benchmarks", ns);
     failures.extend(mini_scripts_on(&bt.normal, "traces", &env, &|_| true));
     failures.extend(mini_conformance_on(&bt.normal, &env, &|_| true));
     failures.extend(bt.check_benchmarks(&bt.normal, &root.join("bench/mini/programs"), &env));
@@ -437,6 +441,20 @@ fn mini_traces() {
     failures.extend(mini_conformance_on(&bt.forced, &env1, &|_| true));
     failures.extend(bt.check_benchmarks(&bt.forced, &root.join("bench/mini/programs"), &env1));
     bt.cleanup();
+    // a side trace whose own guard fails (the forced build makes a block
+    // run in 3 of 7 of its runs a guard) is dropped alone: its root runs on
+    // (traces of this script alone: the bounded profiling build above may
+    // leave its loops out)
+    let sides = root.join("examples/mini/tests/trace_sides.mini");
+    let bs = build_traces("sides", &root.join("examples/mini/main.lm"), std::slice::from_ref(&sides), &[("LOIMI_JIT_HOT", "2")]);
+    let out = program(&bs.forced).arg(&sides).envs(env.iter().copied()).env("LOIMI_JIT_STATS", "1").output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    let dropped = err.lines().any(|l| l.starts_with("jit:   side trace ") && l.ends_with(", blacklisted"));
+    let root_ran = err.lines().any(|l| l.starts_with("jit:   trace ") && !l.ends_with(", blacklisted") && !l.contains(": 0 iterations"));
+    if !dropped || !root_ran || !out.status.success() {
+        failures.push(format!("trace_sides.mini (forced guards): no side trace was blacklisted alone while its root ran on\n{}", err));
+    }
+    bs.cleanup();
     if !failures.is_empty() {
         panic!("{} failure(s):\n\n{}", failures.len(), failures.join("\n\n"));
     }
@@ -523,6 +541,7 @@ fn mini_traces_fuzz() {
         }
     }
     let nt = bt.ntraces(&bt.normal);
+    let ns = bt.nsides(&bt.normal);
     if failures.is_empty() {
         let _ = std::fs::remove_dir_all(&dir);
         bt.cleanup();
@@ -530,6 +549,7 @@ fn mini_traces_fuzz() {
     assert!(failures.is_empty(), "{} of {} runs failed (programs kept in {}):\n\n{}", failures.len(), ran, dir.display(), failures.join("\n\n"));
     assert!(nt >= n as usize / 3, "only {} traces from {} programs", nt, n);
     assert!(bound > 0, "no trace inlined a call");
+    assert!(ns > 0, "no side traces from {} programs", n);
     // (programs that fail in the interpreter test less)
     assert!(ok * 4 >= progs.len() * inputs.len() * 3, "only {} of {} programs ran without error", ok, progs.len() * inputs.len());
 }
@@ -550,6 +570,15 @@ impl TraceBuilds {
         let out = program(exe).arg("/dev/null").env("LOIMI_JIT", "1").env("LOIMI_JIT_STATS", "1").output().unwrap();
         let err = String::from_utf8_lossy(&out.stderr);
         err.lines().find_map(|l| l.strip_prefix("jit: traces: ").and_then(|r| r.split(' ').next()).and_then(|n| n.parse().ok())).unwrap_or(0)
+    }
+
+    /// How many side traces a build linked (`LOIMI_JIT_STATS`).
+    fn nsides(&self, exe: &Path) -> usize {
+        let out = program(exe).arg("/dev/null").env("LOIMI_JIT", "1").env("LOIMI_JIT_STATS", "1").output().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        err.lines()
+            .find_map(|l| l.strip_prefix("jit: traces: ").and_then(|r| r.split(", ").find_map(|x| x.strip_suffix(" side traces"))).and_then(|n| n.parse().ok()))
+            .unwrap_or(0)
     }
 
     /// Each NAME.lua in `dir` must print NAME.expected; returns failures.

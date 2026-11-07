@@ -885,6 +885,18 @@ fn cont_target(code: &Code, pc: usize, callee: &str) -> Option<Option<usize>> {
     Some(if t >= 0 && (t as usize) < code.n { Some(t as usize) } else { None })
 }
 
+/// A call of a superinstruction's resume function (`VM.op.S.resumeK`, the
+/// super from part K on, with `pc` at that part's word): the part's word,
+/// the K-th instruction after pc (the parts' words are instructions).
+fn resume_target(code: &Code, pc: usize, callee: &str) -> Option<usize> {
+    let (head, k) = callee.rsplit_once(".resume")?;
+    let k: usize = k.parse().ok()?;
+    if k == 0 || !head.contains(".op.") {
+        return None;
+    }
+    (pc + 1..code.n).filter(|&i| code.op[i].is_some()).nth(k - 1)
+}
+
 /// The stencil of the instruction at pc.
 fn stencil_name(code: &Code, pc: usize) -> Option<String> {
     code.op[pc].as_ref().map(|o| format!("__jit.op.{}", o))
@@ -2292,6 +2304,18 @@ impl<'t, 'a> FnGen<'t, 'a> {
                             }
                             continue;
                         }
+                        if let Some(t) = resume_target(self.t.frames[node.f].code, pc, c.callee) {
+                            // a superinstruction's resume function (its
+                            // parts from K on, as a cold block's `next`
+                            // calls it): the instruction at part K's word
+                            if self.kind == Kind::Region {
+                                self.exits.push((pc, idx, t));
+                            } else if on[b] && self.internal(node, t) {
+                                self.edges.push((pc, idx, t));
+                                self.goto_head(Node::new(node.f, t), &state, window, rewrites, None);
+                                continue;
+                            }
+                        }
                         self.exit_call(&format!("@\"{}\"", c.callee), &args, window);
                         continue;
                     }
@@ -2700,7 +2724,7 @@ pub struct Options {
     /// Side traces per trace, at most (LOIMI_TRACE_SIDES; 0: none).
     pub max_sides: usize,
     /// An exit is the start of a side trace if it ran this many times
-    /// (LOIMI_TRACE_SIDE_MIN) and this fraction of the root's iterations
+    /// (LOIMI_TRACE_SIDE_MIN, default LOIMI_TRACE_MIN) and this fraction of the root's iterations
     /// (LOIMI_TRACE_SIDE_FRAC).
     pub side_min: u64,
     pub side_frac: f64,
@@ -2736,7 +2760,7 @@ impl Options {
             mono: var("LOIMI_TRACE_MONO").and_then(|v| v.parse().ok()).unwrap_or(0.9),
             inline_writers: var("LOIMI_TRACE_INLINE_WRITERS").is_some_and(|v| v != "0"),
             max_sides: var("LOIMI_TRACE_SIDES").and_then(|v| v.parse().ok()).unwrap_or(32),
-            side_min: var("LOIMI_TRACE_SIDE_MIN").and_then(|v| v.parse().ok()).unwrap_or(1000),
+            side_min: var("LOIMI_TRACE_SIDE_MIN").or_else(|| var("LOIMI_TRACE_MIN")).and_then(|v| v.parse().ok()).unwrap_or(1000),
             side_frac: var("LOIMI_TRACE_SIDE_FRAC").and_then(|v| v.parse().ok()).unwrap_or(0.01),
             side_lines: var("LOIMI_TRACE_SIDE_LINES").and_then(|v| v.parse().ok()).unwrap_or(60_000),
             nest: var("LOIMI_TRACE_NEST").is_none_or(|v| v != "0"),
@@ -3638,6 +3662,9 @@ impl<'p> Former<'p> {
                     add(t.count, Next::Call(ei));
                 }
             }
+        }
+        if std::env::var_os("LOIMI_TRACE_DEBUG_CANDS").is_some() {
+            eprintln!("cands f{} pc {}: {:?}", node.f, node.pc, out);
         }
         out
     }
