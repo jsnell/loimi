@@ -6,7 +6,8 @@ items 2, 4 and 10 were prototyped or measured and dropped; item 5's
 upper bound was measured and it is not worth building for speed; item
 11's vm primitive is a no-go, and Mini switches coroutines through
 quickened CALL members instead; item 12 is open; item 14 is the trace
-tier (`trace-tier.md`).
+tier (`trace-tier.md`). §5 surveys LLVM, clang and linker features
+(2026-11-07): none pays enough to build.
 
 > Have we exhausted the possibilities for language improvements that
 > can be used to write faster interpreters or runtimes?
@@ -2401,6 +2402,92 @@ because placement alone moves single benchmarks by 3–9%
   - **To revisit:** with item 6's profiler, if RET shows up as
     mispredict-bound.
 - **`--cpu=x86-64-v3` / `native`.** Noise for interpreters (wasm
-  FRICTION 344, `lowering.md` §12).
+  FRICTION 344, `lowering.md` §12; remeasured on Mini, Lox, Prolog,
+  MiniJS and the Mini JIT in §5).
 - **A balanced compare tree for if-chains.** Hot arms come first
   (Mini, after item 42).
+
+## 5. LLVM, clang and linker features (2026-11-07)
+
+A survey of what LLVM 19, clang 19 and the linkers offer that the
+build does not use yet. Already in use: `preserve_none` and `musttail`
+handlers, outlined `cold` blocks and `llvm.expect`, the goto-mode
+tail-duplication options, `-enable-tail-merge=false` for switch mode,
+JCC-erratum branch alignment, `--align-functions`, `nsw`, `-O3`,
+`--cpu`, vectorize-width metadata, and hot-handler ordering
+(`.text.hot.vm.X` sections in profile order). Item 4 already rejected
+load facts, and `copy-and-patch.md` §10 the stencil hot/cold split.
+
+**Method.** Each candidate was first a disassembly diff against the
+baseline, function by function, with addresses stripped. A candidate
+that changes no handler stops there. The rest were timed:
+- user+sys CPU, interleaved, with the order reversed every round;
+- `--release --align-functions=64`, tail-call dispatch;
+- an A/A column in every run (a copy of the baseline binary);
+- min / median of the per-program ratios, as geometric means.
+
+Mini has 14 programs, Lox 9 (`zoo_batch` and `string_equality` left
+out), Prolog 30 and MiniJS 14. The first screen ran at load average
+4–6 from other agents: A/A was up to 1.04 / 1.05 on Lox, so it only
+rules out large effects. Later runs (marked *quiet*) had A/A within
+0.999–1.002. The flags went through the clang command by a
+`LOIMI_CLANG` wrapper, and hand-edited IR replaced the `.ll` there.
+
+| Feature | What was tried | Result (A/A in brackets) | Decision |
+|---|---|---|---|
+| `--cpu=x86-64-v3` | Mini, Lox, Prolog (5 runs, noisy); MiniJS and the Mini JIT (`LOIMI_JIT=1`; 7 runs, quiet) | Mini 0.996 / 1.010 [0.995 / 1.007], Lox 1.075 / 0.998 [1.039 / 1.054], Prolog 1.016 / 1.015 [1.011 / 1.010]; quiet: MiniJS 1.008 [1.001], Mini JIT 1.000 [1.001] (mandelbrot 0.94) | no gain; the default stays the portable baseline |
+| `--cpu=x86-64-v2` | same three suites (noisy) | 1.004, 1.000, 1.007; it changes little but `floor` calls into `roundsd` (14 Mini functions, 3 Lox) | no |
+| `-mtune=skylake` | disassembly | 0 functions differ (Mini, Prolog) | stopped |
+| `-mllvm -enable-ipra` | disassembly, timing (noisy) | 0 Lox handlers differ, 4–22 other functions per vm; 0.999, 1.030, 1.022, inside A/A | no: `preserve_none` tail calls leave it nothing |
+| `-falign-loops=32` | timing (noisy) | 0.995, 0.972, 1.011 | no: handlers have no loops |
+| `-mllvm -enable-ext-tsp-block-placement` | timing (7 runs, quiet) | Mini 1.001 [1.000], Lox 1.008 [0.999], Prolog 1.001 [1.001] | no |
+| `-static` (no PLT; stands for `-fno-plt`) | timing (noisy) | 1.002, 1.016, 1.017; binaries 2.4–4× larger | no |
+| `-fuse-ld=lld` | timing (noisy) | 0.991, 0.985, 1.012 | no |
+| `noalias` on every handler pointer parameter (an upper bound for TBAA or scoped `noalias` there) | hand-edited `.ll` | 25 of 260 Lox, 75 of 635 Mini, 21 of 235 Prolog vm functions differ, mostly slow paths; Mini 0.977 [0.983], Lox 1.027 [1.002], Prolog 1.002 [1.000] (7 runs, noisy) | no, for item 4's reason: a straight-line handler has nothing to reorder |
+| IR PGO, trained on the timed programs (upper bound) | below | quiet: Lox 0.972 [1.000], MiniJS 0.970 [1.001], Prolog 0.978 and 0.971 [1.001]; Mini 1.007 [0.999], of which mandelbrot 1.45 and the rest 0.92–1.02 | not built |
+| IR PGO, held out | trained on half of the suite, timed on the other half | Prolog 0.993 and 0.985, MiniJS 0.980 and 0.988 [1.001 each] | under 2% |
+| `!prof` weights from `--vm-prof` | not built | the profiler samples per handler; it cannot give the branch probabilities inside a handler that PGO used | bounded by PGO above |
+| Runtime C linked into the program's IR | inspection | the collector and allocation are already generated IR in the program's module; `jit_rt.c`, `prof_rt.c` and `stats_rt.c` are JIT compilation and profiling, not fast paths | does not apply |
+| Symbol ordering file, `-z keep-text-section-prefix` | inspection | hot handlers are already placed by section and profile order (`hotorder`); GNU ld's default script already groups `.text.hot` and `.text.unlikely` | covered |
+| BOLT | — | `llvm-bolt` is not installed | not tried |
+| Huge-page text | inspection | `.text` is 240–640 KB, under one 2 MB page, and file-backed text gets no transparent huge pages here | no |
+| `!unpredictable` on dispatch | inspection | tail-call and goto dispatch are indirect jumps, not switches; on a switch it only steers select/branch formation | no |
+| Machine outliner, `-fno-semantic-interposition` | inspection | the outliner is off on x86-64; executables are `-fno-pic -no-pie`, so nothing is interposable | no |
+
+**PGO without a profile runtime.** `libclang_rt.profile` is not
+installed, so `-fprofile-generate` cannot link. The measurement went
+around it:
+1. `opt -passes=pgo-instr-gen -disable-vp` instruments the saved
+   `.ll`.
+2. A script lowers each `llvm.instrprof.increment(.step)` to a plain
+   update of one global counter array, and a C destructor writes the
+   array at exit.
+3. The counts become an `llvm-profdata` text profile.
+4. `opt -passes=pgo-instr-use` annotates the original `.ll`, which
+   the usual `clang -O3` command then compiles.
+
+The instrumented Lox ran 1.0–1.25× the baseline's time.
+
+**What PGO changes.** Mostly code that never ran: blocks with zero
+counts are optimized for size (Mini's `.text` 0x710af → 0x65497
+bytes, cold blocks of the float supers 185 → 26 instructions). Hot
+handlers change by a few instructions of block order.
+
+**The mandelbrot outlier.** Mini's mandelbrot is 1.45 / 1.49 times
+slower with the profile, in both the noisy and the quiet run. Its six
+hottest handlers (90% of the samples: `JGTKN__A`, `MUL_F_ADD_F__RRA`,
+`ADD_F__RAR_SUB_F`, `MULK_F_MUL_F__RAR`, `ADD_F__RAR_MUL_F__RRA__f1`,
+`FORLOOP`) differ only by a moved dispatch tail and changed padding
+prefixes (41 → 47 instructions at most). That points at placement,
+like the ±9% single-benchmark effects of `results.md`, not at the
+profile's decisions. The profile cannot be trusted per program without
+an alignment sweep.
+
+**Decision: nothing built.** The held-out PGO gain is 1–2% on the two
+suites tried. To get it, a build would need a training run and either
+the compiler-rt profile runtime (not installed by default; `--sanitize`
+already falls back to GCC's runtimes for this reason) or the lowering
+above shipped in Loimi. A one-program regression of 1.45× rules it out
+as a default. Every flag-only candidate is inside the A/A range. The
+remaining cost in handlers is the instructions they execute
+(sections 1–2), not how LLVM lays them out.
