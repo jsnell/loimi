@@ -441,8 +441,12 @@ fn main() {}
   (often right, as for an allocation the op exists to make: `#[allow(hot_gc)]`).
   The opt-in `handler_frame` (`-W handler_frame`) reports tail-call op
   handlers whose fast path sets up a stack frame (section 4), naming the
-  calls in the handler that can cause it (with the message of each panic
-  site: `.unwrap()`, bounds checks); it compiles the IR to assembly a
+  calls in the handler that can cause it. A panic is named by what it
+  checks and where ("the overflow check of `/` at vm.lm:512", "the
+  bounds check of an index at value.lm:224", "an `.unwrap()` of `None`
+  at ops.lm:156"), from a table codegen keeps of its panic sites; when
+  LLVM merged several panic calls into one, the warning lists the
+  handler's panic sites as candidates. It compiles the IR to assembly a
   second time, so it roughly doubles the build's clang time.
   `redo_effect` (section 4, "`redo`, polls"), an effect on a path before
   a `redo`, is an error unless an `#[allow(redo_effect)]` covers the

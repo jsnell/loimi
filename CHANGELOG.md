@@ -657,6 +657,11 @@ implementation; `git log` has the details.
 
 ### Tooling
 
+- **`-W handler_frame` names the panic behind a frame**: "the overflow
+  check of `/` at vm.lm:512", "the bounds check of an index at
+  value.lm:224", from a panic-site table codegen keeps (no change to the
+  generated code); merged panic calls list their candidates
+  ([language.md §1.2](docs/language.md#warnings-attributes-and-tests)).
 - **`--vm-stats` counts quickenings**: every `become` per site and per
   transition. A site's later ones (re-quickenings and deopts) are
   reported as a share of dispatches. Across Mini, MiniJS, Lox, Python

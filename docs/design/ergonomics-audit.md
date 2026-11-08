@@ -414,17 +414,16 @@ LOOP, CALL]`. Code and op set the same in all nine (see item 3).
   variable is typed from its range, not from later uses: `for j in
   0..3` used as a `u32` is an error whose note suggests `for j: u32 in
   ..`.
-- **`-W handler_frame` says *that* a frame appeared, not *why* it
-  appeared.** Prolog FRICTION 453 (open): adding a `deref` stopped LLVM
-  proving an `i48` division's overflow panic dead, and only the warning
-  hinted at it.
-  - The lint finds the calls in the assembly (`framelint.rs`). Mapping
-    a panic call back to its source panic, such as "the overflow check
-    of `/` at vm.lm:512", would answer this directly.
-  - `hot_gc` does not see calls inside plain vm functions (Lox FRICTION
-    219, partly fixed). The same mapping would cover them.
-  - Not done: it needs a panic-site table from codegen to the
-    assembly lint, outside the checker.
+- **`-W handler_frame` names the panic behind a frame.** Prolog
+  FRICTION 453: adding a `deref` stopped LLVM proving an `i48`
+  division's overflow panic dead, and the warning only said "a panic".
+  Built: codegen keeps a panic-site table (message text → "the overflow
+  check of `/` at vm.lm:512", "the zero check of `%`", "the bounds check
+  of an index", "an `.unwrap()` of `None`", ...), returned with the IR,
+  and `framelint.rs` names each panic call from it; panic calls LLVM
+  merged into one list the function's panic sites as candidates. The
+  generated code does not change. `hot_gc` still does not see calls
+  inside plain vm functions (Lox FRICTION 219).
 - **Operands map to format fields by position**, so `op DELGLOBAL(z:
   imm, name: kst) : ABx` needed a dummy operand (Python FRICTION 579).
   Built: `name: kst @ bx` names the field (`language.md` §3, formats;
