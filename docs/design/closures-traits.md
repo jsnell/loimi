@@ -347,10 +347,17 @@ cut down. Language-level description in `language.md` §1.2 ("Traits",
   parameters real checking.
 - **Static trait functions**: `T.zero()` on a type parameter resolves
   through the bound (type paths now see the type parameters in scope).
-- Not done: `dyn`, associated types and constants, supertraits, an
-  orphan rule or an overlap check between impls (the first matching
-  impl wins), and checking default bodies at the trait itself (they are
-  checked when an instance uses them).
+- **Overlap check** (`register_impls`): two impls of one trait whose
+  (type, trait arguments) unify are an error, a plain impl against a
+  generic one or two generic impls against each other (two-sided
+  unification over both impls' parameters). Bounds are ignored, as in
+  Rust. No orphan rule: the whole program is checked at once, and impls
+  carry no code (the methods are the type's), so there is nothing a rule
+  about where an impl sits would protect. Tests:
+  `tests/fail/trait_impl_overlap{,_generic}.lm`.
+- Default bodies are checked when an instance uses them, not at the
+  trait. There is no `dyn`, no associated types or constants and no
+  supertraits.
 
 ### Closures
 

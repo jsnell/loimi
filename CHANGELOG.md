@@ -319,6 +319,12 @@ implementation; `git log` has the details.
 
 ### Core language
 
+- **Overlapping impls are an error.** `impl Show for Vec<i64>;` next to
+  `impl<T: Show> Show for Vec<T>;`, or two generic impls whose types
+  unify, no longer let the first matching impl win silently: "overlapping
+  impls of `Show`: both apply to `Vec<i64>`", with a note at the other
+  impl. No orphan rule (the whole program is checked at once)
+  ([language.md §1.2](docs/language.md#generics-and-traits)).
 - **`e is P` and `e as! V`**: a pattern test that binds nothing (`t is
   Ref`, `v is Int | Float`, `!(o is Nil)`; a misspelled variant is an
   error, not a binding), and a checked unwrap of a variant (`let s =

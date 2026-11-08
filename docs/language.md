@@ -555,6 +555,16 @@ fn main() { Sym { id: 5 }.show_line(); }
     instance is needed (`Vec<f64>` is not `Show` if `f64` is not). The
     methods are the generic type's (`fn Vec<T>.show`). Each parameter of
     the impl must appear in the type.
+  - **Impls do not overlap.** Two impls of one trait (with the same
+    trait arguments) may not apply to the same type: `impl Show for
+    Vec<i64>;` next to `impl<T: Show> Show for Vec<T>;` is an error
+    ("overlapping impls of `Show`: both apply to `Vec<i64>`"), and so are
+    two generic impls whose types unify (`Pair<T, i64>` and
+    `Pair<str, T>`). Bounds are not consulted, so a new impl of a bound's
+    trait cannot make two existing impls start to overlap. There is no
+    orphan rule: a program is compiled as a whole, so the overlap check
+    sees every impl, and an impl may sit in any module that can name the
+    trait and the type.
   - **Static functions** of a trait (no `Self` parameter needed) are
     called on the type: `T.zero()` for a bounded `T`.
 
