@@ -369,7 +369,7 @@ implementation; `git log` has the details.
   the front end on every example (`docs/design/lifetimes.md` sections
   7-9).
 - **Pointer stability, phase 2** (`docs/design/lifetimes.md` section
-  10, questions 1, 2 and 6): a pointer into *growable* memory (a struct
+  5.4, errors 2 and 5): a pointer into *growable* memory (a struct
   field whose block some function moves: `Vec.ptr`, `HashMap.slots`,
   inferred) may not be stored where it outlives the function (a
   parameter's memory, a global, a GC object, an escaping closure; fresh
@@ -384,7 +384,7 @@ implementation; `git log` has the details.
   change.
 - **Pointer stability is checked by default** in every module, std's
   unsafe core (`mem`, `gc`, `obj`, `bigint`, `gil`, ..) included
-  (`docs/design/lifetimes.md` section 10, question 5).
+  (`docs/design/lifetimes.md` section 5.5).
   `#![lifetimes(off)]` opts a module out (not a `#![safe]` one);
   `#[may_alias]`, `#[shrinks]` and `unsafe { }` stay the finer escapes;
   a bare `#![lifetimes]` is accepted and does nothing, and the examples'

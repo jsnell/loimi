@@ -17,7 +17,7 @@ This report is kept as written. Since then:
 | 2 | Fixed: `verify` blocks see the base view (supers split, members generic). |
 | 3 | Fixed: `reject(at, msg)` in a `verify` block. |
 | 4 | Fixed: `--vm-stats` suggests 3- and 4-op sequences; `optimize` picks fusions by dynamic programming. |
-| 5, 9 | Fixed: stdlib docs lead with what exists; unbuilt features are marked "Not built"; §3.3 lists the generated API. |
+| 5, 9 | Fixed: stdlib docs describe only what exists (the design-only sections are gone); §3.3 lists the generated API. |
 | 6 | Fixed: `text.Fmt`, `StrBuf.add`, `b.fmt("{} {}", a, b)`. |
 | 7 | Fixed: string patterns in `match`. |
 | 8 | Fixed: `..zero` for fields where zero is valid, raw pointers (null) included, and `[]` as the empty slice; `Gc<T>` and function fields must be given (`?Gc<T>`, `?fn` start as None). `main.lm` and `fuzz.lm` no longer spell out `0 as *T`. |
