@@ -78,7 +78,7 @@ struct Opts {
     /// `--tls=`: the TLS model for runtime thread-locals (default:
     /// initial-exec, local-dynamic for `--shared`).
     tls: Option<Tls>,
-    /// `--jit-stencils`: build the copy-and-patch JIT prototype in
+    /// `--jit-stencils`: build the copy-and-patch JIT in
     /// (docs/design/copy-and-patch.md); `LOIMI_JIT=1` turns it on at run time.
     jit: bool,
     /// `--trace-regions=REC[,REC..]` (with `--jit-stencils`): a profiling
@@ -644,7 +644,6 @@ fn build_stencils(ir: &mut String, jit: &JitParts, clang: &str, cpu_flag: &[Stri
     std::fs::write(&sll, jitgen::stencil_module(ir, &jit.stencils)).map_err(|e| e.to_string())?;
     let st = Command::new(clang)
         .args(["-O3", "-Wno-override-module", "-fno-pic", "-ffunction-sections", "-fdata-sections", "-fno-asynchronous-unwind-tables", "-c", "-x", "ir"])
-        .args(if jitgen::split_stencils() { &["-fsplit-machine-functions"][..] } else { &[] })
         .args(cpu_flag)
         .arg(&sll)
         .arg("-o")

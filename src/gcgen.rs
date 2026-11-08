@@ -597,8 +597,8 @@ pub fn push_frame(g: &mut FnGen, f: &TExpr) -> Option<String> {
 /// through them. A call of a vm function of the same vm roots no state:
 /// the function roots it itself at its own calls that may collect, so a
 /// `gc_point()` that collects only on a cold path costs its callers
-/// nothing. (Not built: a moving collector, which would also copy the
-/// slots back after the call.)
+/// nothing. (The collector does not move objects, so nothing is copied
+/// back after the call.)
 fn state_roots(g: &mut FnGen, callee: &TExpr, roots: &mut Vec<(String, Ty)>) {
     let p = g.p();
     let fd = g.f();
