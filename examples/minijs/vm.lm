@@ -534,10 +534,12 @@ pub vm JS {
                 if let O(o) = obj {
                     let (v, st) = read_miss(ctx, o, key, &cache, obj.IcState.Generic);
                     regs[dst.raw] = v;
-                    if st == obj.IcState.OwnIn { become #own_in; }
-                    if st == obj.IcState.OwnOut { become #own_out; }
-                    if st == obj.IcState.Proto { become #protom; }
-                    if st == obj.IcState.Poly { become #polym; }
+                    become match st {
+                        OwnIn => #own_in,
+                        OwnOut => #own_out,
+                        Proto => #protom,
+                        Poly => #polym,
+                    }
                     next
                 }
                 let (v, p) = prim_get(ctx, obj, key, &cache)?;
@@ -579,11 +581,13 @@ pub vm JS {
                         pre
                         let (v, st) = read_miss(ctx, o, key, &cache, obj.IcState.OwnIn);
                         regs[dst.raw] = v;
-                        if st == obj.IcState.OwnIn { become #own_in; }
-                        if st == obj.IcState.OwnOut { become #own_out; }
-                        if st == obj.IcState.Proto { become #protom; }
-                        if st == obj.IcState.Poly { become #polym; }
-                        if st == obj.IcState.Generic { become #fam; }
+                        become match st {
+                            OwnIn => #own_in,
+                            OwnOut => #own_out,
+                            Proto => #protom,
+                            Poly => #polym,
+                            Generic => #fam,
+                        }
                         next
                     }
                     become #fam;
@@ -669,10 +673,12 @@ pub vm JS {
         generic {
             if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
             let st = write_miss(ctx, tgt, key, val, &cache, obj.IcState.Generic)?;
-            if st == obj.IcState.OwnIn { become SETPROP_IN; }
-            if st == obj.IcState.OwnOut { become SETPROP_OUT; }
-            if st == obj.IcState.Add { become SETPROP_ADD; }
-            if st == obj.IcState.Poly { become SETPROP_POLY; }
+            become match st {
+                OwnIn => SETPROP_IN,
+                OwnOut => SETPROP_OUT,
+                Add => SETPROP_ADD,
+                Poly => SETPROP_POLY,
+            }
             next
         }
         SETPROP_IN {
@@ -683,10 +689,12 @@ pub vm JS {
             cold {
                 if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
                 let st = write_miss(ctx, tgt, key, val, &cache, obj.IcState.OwnIn)?;
-                if st == obj.IcState.OwnOut { become SETPROP_OUT; }
-                if st == obj.IcState.Add { become SETPROP_ADD; }
-                if st == obj.IcState.Poly { become SETPROP_POLY; }
-                if st == obj.IcState.Generic { become SETPROP; }
+                become match st {
+                    OwnOut => SETPROP_OUT,
+                    Add => SETPROP_ADD,
+                    Poly => SETPROP_POLY,
+                    Generic => SETPROP,
+                }
                 next
             }
         }
@@ -699,10 +707,12 @@ pub vm JS {
             cold {
                 if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
                 let st = write_miss(ctx, tgt, key, val, &cache, obj.IcState.OwnOut)?;
-                if st == obj.IcState.OwnIn { become SETPROP_IN; }
-                if st == obj.IcState.Add { become SETPROP_ADD; }
-                if st == obj.IcState.Poly { become SETPROP_POLY; }
-                if st == obj.IcState.Generic { become SETPROP; }
+                become match st {
+                    OwnIn => SETPROP_IN,
+                    Add => SETPROP_ADD,
+                    Poly => SETPROP_POLY,
+                    Generic => SETPROP,
+                }
                 next
             }
         }
