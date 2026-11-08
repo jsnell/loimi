@@ -525,7 +525,7 @@ fn Gen.load_var(g: *Gen, v: *Var, dst: u32) {
         if !is_null(c) { g.to(c, dst); return; }
         if v.undeclared {
             let k = g.str_const(v.name);
-            g.emit(JS.THROWREF(0, k as u16));
+            g.emit(JS.THROWREF(k as u16));
             return;
         }
         g.emit(JS.GETGLOBAL(dst as u8, v.slot as u16));
@@ -545,7 +545,7 @@ fn Gen.store_var(g: *Gen, v: *Var, src: u32) {
     if v.kind == VK.Global {
         if v.undeclared {
             let k = g.str_const(v.name);
-            g.emit(JS.THROWREF(0, k as u16));
+            g.emit(JS.THROWREF(k as u16));
             return;
         }
         g.emit(JS.SETGLOBAL(src as u8, v.slot as u16));

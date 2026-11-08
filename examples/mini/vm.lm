@@ -994,7 +994,7 @@ pub vm Mini {
         rel negate(#("J" ++ cmp)) = #("J" ++ cmp ++ "N");
         rel negate(#("J" ++ cmp ++ "N")) = #("J" ++ cmp);
         inline for (opname, want) in [(#("J" ++ cmp), true), (#("J" ++ cmp ++ "N"), false)] {
-            op #opname(unused: imm, a: reg, b: bkind) : ABC then JMP {
+            op #opname(a: reg @ b, b: bkind @ c) : ABC then JMP {
                 let (x, y) = ((a as u64) ^ value.int_bias(), (b as u64) ^ value.int_bias());
                 if ((x | y) & V.Int.mask) == 0 { branch((isub) == want, then.target) }
                 if let (Num(x), Num(y)) = (a, b) { branch((fsub) == want, then.target) }
@@ -1007,7 +1007,7 @@ pub vm Mini {
         rel negate(#("J" ++ cmp)) = #("J" ++ cmp ++ "N");
         rel negate(#("J" ++ cmp ++ "N")) = #("J" ++ cmp);
         inline for (opname, want) in [(#("J" ++ cmp), true), (#("J" ++ cmp ++ "N"), false)] {
-            op #opname(unused: imm, a: reg, b: bkind) : ABC then JMP {
+            op #opname(a: reg @ b, b: bkind @ c) : ABC then JMP {
                 if let (Int(x), Int(y)) = (a, b) { branch((x == y) == want, then.target) }
                 // Same bits means equal, except for NaN; strings are interned.
                 if a == b {

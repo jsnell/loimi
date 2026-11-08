@@ -611,7 +611,7 @@ fn C.stmt(c: *C, st: *Stmt) {
                 match t.e {
                     Name(n) => match c.kind(n) {
                         Local(r) => c.emit(Py.LOADK(r as u8, c.k(Value.Undef) as u16)),
-                        Global => c.emit(Py.DELGLOBAL(0, c.kstr(n) as u16)),
+                        Global => c.emit(Py.DELGLOBAL(c.kstr(n) as u16)),
                         _ => c.fail("del of this name is not supported"),
                     },
                     Index(o, k) => {

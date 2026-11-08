@@ -530,7 +530,7 @@ pub vm Py {
             next
         }
     }
-    op DELGLOBAL(z: imm, name: kst) : ABx {
+    op DELGLOBAL(name: kst @ bx) : ABx {
         let f = fp.func as! Func;
         if !value.dict_del(f.globals, name, value.hash_of(name).unwrap()) {
             raise ops.name_error(ctx, name)

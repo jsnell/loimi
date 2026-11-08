@@ -426,10 +426,16 @@ LOOP, CALL]`. Code and op set the same in all nine (see item 3).
   - Not done: it needs a panic-site table from codegen to the
     assembly lint, outside the checker.
 - **Operands map to format fields by position**, so `op DELGLOBAL(z:
-  imm, name: kst) : ABx` needs a dummy operand (Python FRICTION 579; 6
-  sites in 4 vms, e.g. Mini's `unused: imm` at `vm.lm:997`). The message was fixed. A named binding (`name: kst @ bx`)
-  removes the dummy, and is S. Not done: it changes the vm parser and
-  the operand layout in `vmexpand.rs`.
+  imm, name: kst) : ABx` needed a dummy operand (Python FRICTION 579).
+  Built: `name: kst @ bx` names the field (`language.md` §3, formats;
+  `vmexpand::param_fields`), and the encoder-mismatch note mentions it.
+  Ported: Mini's 4 compare-and-jump ops (`a: reg @ b, b: bkind @ c`),
+  Scheme's CHKGLOBAL, Python's DELGLOBAL, MiniJS's THROWREF, and Wasm's
+  trailing `z: imm` on the lane stores (just dropped). Python's
+  SUPERMETHOD `z` is a real flag and stays. `loimi ir-diff --release`:
+  the handlers have the same code; what changes is the disassembler,
+  `operand_name` and verify-error text, which no longer know the dummy
+  operands (and in Mini the name of an accumulator spill slot).
 
 ## 2a. Smaller items
 

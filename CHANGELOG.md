@@ -8,6 +8,11 @@ implementation; `git log` has the details.
 
 ### `vm` declarations and dispatch
 
+- **Named operand fields**: `op DELGLOBAL(name: kst @ bx) : ABx` puts an
+  operand in a named format field (the others take the fields not named,
+  in order), so ops no longer need dummy `unused: imm` operands. Mini,
+  Scheme, Python, MiniJS and Wasm ported; handlers compile to the same
+  code ([language.md §3](docs/language.md#3-the-vm-declaration)).
 - **`v.index_of(at)` on `Verified<Vm>`**: the word index of a pointer
   into verified code, with the vm's word size, for line tables and
   exception ranges. It replaces 17 copies of `((pc as u64) - (start as

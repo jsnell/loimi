@@ -1004,7 +1004,7 @@ pub vm W {
         ("V128_STORE8_LANE", vub, u8, 1), ("V128_STORE16_LANE", vuh, u16, 2),
         ("V128_STORE32_LANE", vui, u32, 4), ("V128_STORE64_LANE", vul, u64, 8),
     ] {
-        op #name(a: ru, v: vk, z: imm) : RRR + Imm64 {
+        op #name(a: ru, v: vk) : RRR + Imm64 {
             let ea = (a as u64) + (cache.v & 0xFFFFFFFF);
             if ea + size > msize { raise Trap.MemOOB }
             ((mem + ea) as *ty).write_unaligned(v.lane_at(cache.v >> 32));

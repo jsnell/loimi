@@ -1827,7 +1827,28 @@ An op lists its operands and names its format. Operands map to the
 format's non-`op` fields by position, whatever their names; an op may
 have fewer operands than the format has fields, and the rest encode as 0
 and are ignored (`op HALT() : ABC`, `op DUP() : N` with `N` holding a
-24-bit `x`). The compiler type-checks the mapping.
+24-bit `x`). The compiler type-checks the mapping. An operand can name
+its field instead, `name: kind @ field`; the other operands take the
+fields not named, in order:
+
+<!-- snippet: check
+vm V {
+    state { pc: *u32, regs: *i64, k: *i64 }
+    operand reg = regs[it];
+    operand kst = k[it];
+    encoding fixed(u32) { format ABx { op: 8, a: 8, bx: 16 } format ABC { op: 8, a: 8, b: 8, c: 8 } }
+{snippet}
+    op RET(a: reg) : ABC { exit a }
+    entry run(code: *u32, r: *i64, ks: *i64) -> i64 { regs = r; k = ks; jump code }
+}
+-->
+```loimi
+op DELGLOBAL(name: kst @ bx) : ABx { next }   // `a` unused, encodes as 0
+op JLT(a: reg @ b, b: reg @ c) : ABC { next }            // `a` left for the compare it was
+```
+
+The encoder and emitter take the operands in the order written
+(`V.DELGLOBAL(k)`), and the disassembler shows only them.
 
 **Generated API.** Each item is `Vm.NAME` (`Vm__NAME` in the vm's module;
 private to the module unless the vm is `pub vm`). `W` is the code word

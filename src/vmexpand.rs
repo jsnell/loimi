@@ -115,7 +115,9 @@ pub fn layout(v: &VmDecl) -> Res<VmLayout> {
         if op.params.len() > non_op.len() {
             return Err(Diag::new(op.name.span, format!("format `{}` has only {} operand field(s)", op.format.name, non_op.len())));
         }
-        let fields = op.params.iter().zip(non_op.iter()).map(|(p, f)| (p.name.name.clone(), f.1, f.2, f.3)).collect();
+        let names: Vec<&str> = non_op.iter().map(|f| f.0.as_str()).collect();
+        let at = param_fields(&op.params, &names, &op.format.name)?;
+        let fields = op.params.iter().zip(at).map(|(p, i)| (p.name.name.clone(), non_op[i].1, non_op[i].2, non_op[i].3)).collect();
         let cache = match &op.cache {
             Some(c) => Some(
                 v.caches
@@ -2899,4 +2901,42 @@ fn generate_stack(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool) -> Res<St
     let _ = writeln!(s, "      __k += 1;\n    }}\n  }}");
     let _ = writeln!(s, "  Ok((__hi - __entry) as u32)\n}}");
     Ok(s)
+}
+
+/// The format field (index among the non-`op` fields `names`) of each
+/// operand: `name: kind @ field` names it; the others take the fields
+/// not named, in order.
+pub fn param_fields(params: &[OpParam], names: &[&str], format: &str) -> Res<Vec<usize>> {
+    let mut taken = vec![false; names.len()];
+    for p in params {
+        let Some(f) = &p.field else { continue };
+        let Some(i) = names.iter().position(|n| *n == f.name) else {
+            let what = if f.name == "op" { "the opcode field".to_string() } else { format!("format `{}` has no operand field `{}`", format, f.name) };
+            return Err(Diag::new(f.span, format!("`{} @ {}`: {}", p.name.name, f.name, what)));
+        };
+        if taken[i] {
+            return Err(Diag::new(f.span, format!("field `{}` is taken by two operands", f.name)));
+        }
+        taken[i] = true;
+    }
+    let mut out = Vec::new();
+    let mut next = 0;
+    for p in params {
+        let i = match &p.field {
+            Some(f) => names.iter().position(|n| *n == f.name).unwrap(),
+            None => {
+                while next < taken.len() && taken[next] {
+                    next += 1;
+                }
+                if next == taken.len() {
+                    return Err(Diag::new(p.name.span, format!("format `{}` has no field left for operand `{}`", format, p.name.name)));
+                }
+                taken[next] = true;
+                next += 1;
+                next - 1
+            }
+        };
+        out.push(i);
+    }
+    Ok(out)
 }

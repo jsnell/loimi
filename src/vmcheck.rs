@@ -622,18 +622,20 @@ pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
             // (`V.OP(..)`, `V.emit.OP(..)`): which field each operand is.
             if let Some(fd) = d.formats.iter().find(|f| f.name.name == od.format.name) {
                 let fields: Vec<&crate::vmast::FormatField> = fd.fields.iter().filter(|f| f.name.name != "op").collect();
+                let names: Vec<&str> = fields.iter().map(|f| f.name.name.as_str()).collect();
+                let at = crate::vmexpand::param_fields(&od.params, &names, &fd.name.name).unwrap_or_default();
                 let notes: Vec<String> = od
                     .params
                     .iter()
-                    .zip(&fields)
+                    .zip(at.iter().map(|&i| fields[i]))
                     .map(|(p, f)| {
                         let mut n = format!(
-                            "operand `{}` of `{}` is field `{}` of format `{}` ({} bits): operands take the format's fields in order",
+                            "operand `{}` of `{}` is field `{}` of format `{}` ({} bits): operands take the format's fields in order unless named (`name: kind @ field`)",
                             p.name.name, od.name.name, f.name.name, fd.name.name, f.bits
                         );
                         if od.params.len() < fields.len() {
                             n.push_str(&format!(
-                                " (`{}` has {} operand(s) for {} fields; a placeholder operand such as `z: imm` moves the next ones along)",
+                                " (`{}` has {} operand(s) for {} fields; `name: kind @ field` puts an operand in a later field)",
                                 od.name.name,
                                 od.params.len(),
                                 fields.len()
