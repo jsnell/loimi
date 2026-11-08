@@ -186,7 +186,7 @@ pub fn scan_roots(h: *gc.Heap, c: *Ctx) {
 }
 
 pub fn line_of(p: *Proto, pc: *u32) -> u32 {
-    let off = ((pc as u64) - (p.code.start() as u64)) / 4;
+    let off = p.code.index_of(pc);
     if off < p.lines.len { p.lines[off] } else { 0 }
 }
 
@@ -1410,7 +1410,7 @@ pub vm Py {
         let saved = g.extra.ptr;
         for i in 0..p.nregs as u64 { saved[i] = regs[i]; }
         gc.write_barrier(&ctx.heap, g as *u8);
-        g.n = (((next_pc as u64) - (p.code.start() as u64)) / 4) as i64;
+        g.n = p.code.index_of(next_pc) as i64;
         g.s = dst.raw as i64;
         g.m = GEN_SUSPENDED;
         if (fp.flags & F_BASE) != 0 { exit Ok(v) }
@@ -1477,7 +1477,7 @@ pub vm Py {
             let p = fp.proto;
             if ctx.err_line == 0 { ctx.err_line = line_of(p, pc); }
             let start = p.code.start();
-            let off = (((pc as u64) - (start as u64)) / 4) as u32;
+            let off = p.code.index_of(pc) as u32;
             for i in 0..p.handlers.len {
                 let h = p.handlers[i];
                 if off >= h.start and off < h.end {

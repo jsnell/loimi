@@ -521,7 +521,7 @@ pub vm Stak {
 
     on raise(msg: str) {
         let w = fp.word;
-        let i = ((pc as u64) - (w.code.start() as u64)) / 4;
+        let i = w.code.index_of(pc);
         ctx.error_line = w.lines[i];
         ctx.error_word = w.name;
         fail msg

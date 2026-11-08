@@ -217,7 +217,7 @@ fn traceback(m: *Machine, msg: str, top: *Frame, pc: *u32) {
     var at = pc;
     loop {
         let p = f.cl.proto;
-        let i = ((at as u64) - (p.code.start() as u64)) / 4;
+        let i = p.code.index_of(at);
         b.push_str("[line ");
         b.push_int(p.lines[i] as i64);
         b.push_str("] in ");

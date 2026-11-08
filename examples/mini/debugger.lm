@@ -430,7 +430,7 @@ fn where_at(c: *Ctx, pc: *u32, fp: *Frame) -> (u32, u64) {
 }
 
 fn line_of(p: Gc<Proto>, pc: *u32) -> u32 {
-    let i = ((pc as u64) - (p.code.start() as u64)) / 4;
+    let i = p.code.index_of(pc);
     if i < p.lines.data.len { p.lines.data[i] } else { 0 }
 }
 
@@ -504,7 +504,7 @@ fn Dbg.is_main(d: *Dbg, p: Gc<Proto>) -> bool {
 /// the compiler's hidden ones; then the upvalues of its closure.
 fn each_local(f: *Frame, at: *u32, visit: block fn(str, V)) {
     let p = f.cl.proto;
-    let i = ((at as u64) - (p.code.start() as u64)) / 4;
+    let i = p.code.index_of(at);
     let vars = locvars(p);
     for j in 0..vars.len {
         let v = vars[j];
@@ -905,7 +905,7 @@ fn cli_stop(d: *Dbg, data: *u8) -> Resume uses reenter {
             }
             Op => {
                 let words = p.code.words();
-                Mini.disasm_insn(words, ((pc as u64) - (words.ptr as u64)) / 4, &cl.out);
+                Mini.disasm_insn(words, p.code.index_of(pc), &cl.out);
             }
             Quit => { cl.flush(); lib.flush(); exit(0) }
             Help => {

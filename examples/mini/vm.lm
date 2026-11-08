@@ -168,7 +168,7 @@ fn error(c: *Ctx, msg: str, v: V) -> V {
 /// `e` prefixed with the line of the instruction at `at` in `p`'s code:
 /// "line N: e".
 fn at_line(c: *Ctx, p: Gc<Proto>, at: *u32, e: V) -> V {
-    let i = ((at as u64) - (p.code.start() as u64)) / 4;
+    let i = p.code.index_of(at);
     var line: u32 = 0;
     if i < p.lines.data.len { line = p.lines.data[i]; }
     c.out.clear();

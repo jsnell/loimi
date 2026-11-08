@@ -1198,6 +1198,7 @@ fn uses_resume(sm: &SourceMap) -> bool {
 fn generate_verifier_types(sm: &SourceMap, v: &VmDecl, l: &VmLayout) -> String {
     let n = &v.name.name;
     let w = format!("u{}", l.word_bits);
+    let bytes = l.word_bits / 8;
     let vis = if v.is_pub { "pub " } else { "" };
     let mut s = String::new();
     let stack = has_stack(v);
@@ -1224,6 +1225,7 @@ fn generate_verifier_types(sm: &SourceMap, v: &VmDecl, l: &VmLayout) -> String {
         "{vis}fn {n}__Verified.start(v: {n}__Verified) -> *{w} {{ v.__code.ptr }}\n\
          {vis}fn {n}__Verified.len(v: {n}__Verified) -> u64 {{ v.__code.len }}\n\
          {vis}fn {n}__Verified.words(v: {n}__Verified) -> []{w} {{ v.__code }}\n\
+         {vis}fn {n}__Verified.index_of(v: {n}__Verified, at: *{w}) -> u64 {{ ((at as u64) - (v.__code.ptr as u64)) / {bytes} }}\n\
          {vis}fn {n}__optimize(v: {n}__Verified) -> {n}__Verified {{ {n}__optimize_words(v.__code); v }}\n\
          {vis}fn {n}__deopt(v: {n}__Verified) -> {n}__Verified {{ {n}__deopt_words(v.__code); v }}"
     );

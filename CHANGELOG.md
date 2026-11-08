@@ -8,6 +8,11 @@ implementation; `git log` has the details.
 
 ### `vm` declarations and dispatch
 
+- **`v.index_of(at)` on `Verified<Vm>`**: the word index of a pointer
+  into verified code, with the vm's word size, for line tables and
+  exception ranges. It replaces 17 copies of `((pc as u64) - (start as
+  u64)) / 4` in the examples (same code by `loimi ir-diff`)
+  ([language.md §6](docs/language.md#6-verification-unchecked-by-proof)).
 - **`become match st { OwnIn => GETPROP_IN, OwnOut | Proto => .. }`**
   picks a family member from an enum value, replacing ladders of `if st
   == obj.IcState.X { become Y; }` (Lox and MiniJS ported, same code by

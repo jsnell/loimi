@@ -433,12 +433,12 @@ LOOP, CALL]`. Code and op set the same in all nine (see item 3).
 
 ## 2a. Smaller items
 
-- **`v.index_of(pc)` on `Verified<Vm>`.** It would replace 13 copies of
-  `((pc as u64) - (start as u64)) / 4`, with the word size hard-coded
-  each time (`mini/vm.lm:171`, `mini/debugger.lm:434`, `:508`, `:909`,
-  `scheme/vm.lm:61`, `minijs/vm.lm:364`, `lox/vm.lm:216`,
-  `python/vm.lm:202`, `:1433`, `:1505`, `stack/vm.lm:525`,
-  `python/debugger.lm:373`, `:502`). It is the same arithmetic. S.
+- **`v.index_of(pc)` on `Verified<Vm>`.** Built (`language.md` §6,
+  generated with the other `Verified` methods in `vmexpand.rs`): the
+  word index of a pointer into the code, with the vm's word size. It
+  replaced 17 copies of `((pc as u64) - (start as u64)) / 4` in Mini,
+  Mini's debugger, Scheme, MiniJS, Lox, Python, Python's debugger, Stack
+  and tutorial steps 6–9; `loimi ir-diff --release`: same code.
 - **`become match st { OwnIn => GETPROP_IN, .. }`.** Built
   (`language.md` §7.2): sugar in the parser for the ladder `if st is
   OwnIn { become GETPROP_IN; } ..`, and `x is A | B` on a local of a

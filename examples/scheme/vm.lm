@@ -59,7 +59,7 @@ fn record_fail(c: *Ctx, f: V, x: V) -> V {
 
 /// Source line of the instruction at `at` in `p` (0: unknown, e.g. prelude code).
 fn line_at(p: Gc<Proto>, at: *u32) -> u32 {
-    let i = ((at as u64) - (p.code.start() as u64)) / 4;
+    let i = p.code.index_of(at);
     if i < p.lines.data.len { p.lines.data[i] } else { 0 }
 }
 

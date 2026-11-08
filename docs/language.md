@@ -2828,8 +2828,10 @@ time. Only the vm's generated functions can build one: its field is
 private to the vm's expansion (fields whose names start with `__` are
 private to the file declaring their struct), so a struct literal or a
 field write outside it is an error. It offers `v.start() -> *W`,
-`v.len()`, and `v.words() -> []W` for reading (disassembly, line
-tables; writing through it voids the proof). In vm code, `jump v` starts
+`v.len()`, `v.words() -> []W` for reading (disassembly, line
+tables; writing through it voids the proof), and `v.index_of(at: *W) ->
+u64`, the index of the word `at` points at (`(at - start) / (W's size
+in bytes)`, for line tables and exception ranges). In vm code, `jump v` starts
 running the verified code. The escape hatches:
 
 - `unsafe { Mini.assume_verified(code) }`, for code the host built
