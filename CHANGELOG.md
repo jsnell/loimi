@@ -8,6 +8,20 @@ implementation; `git log` has the details.
 
 ### `vm` declarations and dispatch
 
+- **`const` inline cache fields**: `cache KIx { const k: u32 verify it <
+  proto.nk, hits: u32 }`, or `cache DivK = const math.Divisor verify
+  it.is_valid();` for every field of a struct layout. The emitter sets
+  them, handlers only read them (assigning one or taking its address is
+  an error), `Vm.deopt` keeps them, the base view of `verify` blocks
+  has them, and their `verify` clauses run once in `Vm.verify` (new
+  `VerifyReason.Cache`). Reads cost what they did. std.math's `Divisor`
+  caches in Prolog and MiniJS are `const` (`Divisor.is_valid` checks
+  them), and so are wasm's wide immediates; wasm's `CALL_INDIRECT_X`
+  table index is verified once instead of checked per call
+  ([language.md §7.1](docs/language.md#71-inline-caches); roadmap
+  question 10). The `weak` cache field qualifier, which was parsed and
+  rejected, is gone.
+
 - **Side traces, and loops inside loops** (trace tier M2): a trace is
   now a graph in one function: its root path goes through the loops
   inside its loop, and the hot paths from its exits are side traces

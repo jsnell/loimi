@@ -2663,6 +2663,7 @@ impl<'a> Checker<'a> {
                 Ok(mk(Ty::Never, TK::Continue(lp.id), span))
             }
             ExprKind::Assign(lhs, rhs) => {
+                crate::vmcheck::const_cache_write(self, cx, lhs, false)?;
                 let l = self.expr(cx, lhs, None)?;
                 self.check_assignable(cx, &l, lhs.span)?;
                 self.check_raw_place(cx, &l, lhs.span)?;
@@ -5108,6 +5109,7 @@ impl<'a> Checker<'a> {
                         return Ok(e);
                     }
                 }
+                crate::vmcheck::const_cache_write(self, cx, inner, true)?;
                 let inner_exp = match exp {
                     Some(Ty::Ptr(t)) => Some((**t).clone()),
                     _ => None,

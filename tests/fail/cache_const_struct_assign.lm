@@ -1,0 +1,10 @@
+struct S { a: u32, b: u32 }
+vm V {
+    state { pc: *u32 }
+    encoding fixed(u32) { format A { op: 8 } }
+    cache IC = const S;
+    op NOP() : A + IC { cache.b = cache.a; next }
+    entry run(c: *u32) -> i64 { pc = c; jump pc }
+}
+fn main() {}
+// error: cannot assign `cache.b`: it is a `const` field of cache `IC`

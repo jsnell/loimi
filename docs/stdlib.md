@@ -1240,9 +1240,7 @@ Full design: [`stdlib/gc.md`](stdlib/gc.md). Not built:
   scanner; traced `state` variables are rooted automatically),
   `Root<T>`, `GcVec<T>`;
 - finalizers that run guest code (free hooks for host memory are
-  built), heap snapshots, poisoning outside `--gc-check-roots` builds;
-- inline caches in bytecode as weak roots (caches cannot hold GC
-  references; language.md §7.1).
+  built), heap snapshots, poisoning outside `--gc-check-roots` builds.
 
 ## `std.obj`: objects and shapes
 

@@ -465,10 +465,9 @@ root ──x──▶ {x} ──y──▶ {x,y} ──z──▶ {x,y,z}
   common case and a small hash map once a shape has more than one child.
 - Transition edges are **weak**: unused shapes are collected. Shapes are kept
   alive by objects that use them and by their children (through `parent`).
-- `ShapeId`s come from a **shape table** (`Vec<Weak<Shape>>` plus a free list).
-  An id is reused only after its shape has died *and* a collection has reset
-  every weak inline-cache entry that referred to it (gc.md §8). That makes a
-  false cache hit impossible.
+- `ShapeId`s come from a **shape table** (`Vec<Weak<Shape>>`).
+  An id is never reused, so a cache that holds one cannot give a false hit
+  (gc.md §8).
 
 #### Lookup
 
@@ -573,14 +572,14 @@ state machine:
 <!-- snippet: skip design, not built: the real cache words are `obj.Site` -->
 ```loimi
 // Monomorphic: 2 words.
-cache PropIC { shape: weak ShapeId, slot: SlotRef }
+cache PropIC { shape: ShapeId, slot: SlotRef }
 
 // Polymorphic: 1 word in the code; entries live in a side table on the Proto.
 cache PolyRef { index: u32 }
-object PolyEntries { n: u8, shapes: [weak ShapeId; 4], slots: [SlotRef; 4] }
+object PolyEntries { n: u8, shapes: [ShapeId; 4], slots: [SlotRef; 4] }
 
 // Prototype-chain hit: the receiver shape plus a validity cell (section 6).
-cache ProtoIC { shape: weak ShapeId, entry: u32 }     // entry → ProtoEntry side table
+cache ProtoIC { shape: ShapeId, entry: u32 }     // entry → ProtoEntry side table
 object ProtoEntry { cell: Gc<ValidityCell>, holder: Gc<Object>, slot: SlotRef }
 ```
 

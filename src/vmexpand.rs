@@ -684,7 +684,11 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool) -> Res
     for (_, b) in &v.checks {
         check_call_arity(sm, b.span, &[("is_insn_boundary", 1), ("reject", 2)])?;
     }
+    for (_, e) in v.caches.iter().flat_map(|c| &c.verify) {
+        check_call_arity(sm, e.span, &[("is_insn_boundary", 1)])?;
+    }
     let boundary = format!("{n}__boundary(__code, __bits, ");
+    let esc = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ").replace('\\', "\\\\").replace('"', "\\\"");
     let clause = |kind: &str| -> Option<String> {
         let e = v.operands.iter().find(|o| o.name.name == kind)?.verify.as_ref()?;
         let ctx = format!("the generated verifier, checking operand kind `{kind}`");
@@ -831,6 +835,44 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool) -> Res
                 }
             }
         }
+        // `verify` clauses of `const` cache fields, with `it` the field's
+        // value (for `cache X = const S verify ..`, `&cache`, a `*S`).
+        let b = l.base(k);
+        if let Some(ci) = l.ops[b].cache {
+            let c = &v.caches[ci];
+            for (fname, e) in &c.verify {
+                let what = match fname {
+                    Some(f) => format!("cache field `{}`", f.name),
+                    None => format!("cache `{}`", c.name.name),
+                };
+                let ctx = format!("the generated verifier, checking {what}");
+                let text = splice_calls(sm, e.span, &ctx, &[("is_insn_boundary", &boundary)]);
+                let msg = format!("{what} fails `{}`", esc(sm.text(e.span)));
+                let it = match fname {
+                    Some(f) => {
+                        let mut off = "__i + 1".to_string();
+                        let mut ty = String::new();
+                        for (g, t, _) in &c.fields {
+                            if g.name == f.name {
+                                ty = type_src(t);
+                                break;
+                            }
+                            off = format!("{off} + (size_of<{}>() + {})/{}", type_src(t), l.word_bits / 8 - 1, l.word_bits / 8);
+                        }
+                        format!("let it: {ty} = ((__code.ptr + {off}) as *{ty}).read_unaligned();")
+                    }
+                    None => {
+                        let st = c.from.as_ref().map(type_src).unwrap_or_default();
+                        format!("let it: *{st} = (__code.ptr + __i + 1) as *{st};")
+                    }
+                };
+                let _ = write!(
+                    checks,
+                    "{{ let pc: *{w} = __code.ptr + __i; {it} if !({text}) {{ return Err({n}__VerifyError {{ at: __i, reason: {n}__VerifyReason.Cache, op: {}, operand: 0, kind: {nk}, msg: \"{msg}\" }}); }} }} ",
+                    l.ops[b].opcode
+                );
+            }
+        }
         if !checks.is_empty() {
             let _ = writeln!(s, "      {} => {{ {} }}", o.opcode, checks);
         }
@@ -892,10 +934,21 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool) -> Res
              \x20   let __w = {};\n\
              \x20   let __f = {n}__family(__w);\n\
              \x20   __dst[__i] = if __f != {} {{ {n}__with_opcode(__w, __f as {w}) }} else {{ __w }};\n\
+             {}\
              \x20   __i += {n}__base_size(__w);\n\
              \x20 }}\n}}",
             real_src(n, jw, "__src[__i]"),
-            u64::MAX
+            u64::MAX,
+            // `const` cache fields are part of the base view.
+            if has_const_caches(v) {
+                format!(
+                    "    let __m = {n}__const_words(__w);\n\
+                     \x20   var __k: u64 = 1;\n\
+                     \x20   while (__m >> __k) != 0 {{ if ((__m >> __k) & 1) != 0 {{ __dst[__i + __k] = __src[__i + __k]; }} __k += 1; }}\n"
+                )
+            } else {
+                String::new()
+            }
         );
         // `reject(at, msg)` in a check: fail at word `at`, with a message.
         let _ = writeln!(
@@ -1020,6 +1073,44 @@ fn is_resume_field(v: &VmDecl, t: &TypeExpr) -> bool {
 /// Whether some inline cache layout of `v` has a `Vm.Resume` field.
 pub fn has_resume_caches(v: &VmDecl) -> bool {
     v.caches.iter().any(|c| c.fields.iter().any(|(_, t, _)| is_resume_field(v, t)))
+}
+
+/// Whether some inline cache layout of `v` has a `const` field.
+pub fn has_const_caches(v: &VmDecl) -> bool {
+    v.caches.iter().any(|c| c.fields.iter().any(|f| f.2))
+}
+
+/// The words of cache layout `c` whose fields `pick` selects, as source
+/// for a `u64` mask (bit k: word k of the instruction; the cache starts
+/// at word 1, and each field starts a word), or "0".
+fn cache_mask_src(c: &crate::vmast::CacheDecl, wb: u32, pick: impl Fn(&TypeExpr, bool) -> bool) -> String {
+    let mut off = "1".to_string();
+    let mut parts = vec![];
+    for (_, t, k) in &c.fields {
+        let words = format!("(size_of<{}>() + {})/{}", type_src(t), wb - 1, wb);
+        if pick(t, *k) {
+            parts.push(format!("((((1 as u64) << ({words})) - 1) << ({off}))"));
+        }
+        off = format!("{off} + {words}");
+    }
+    if parts.is_empty() { "0".to_string() } else { parts.join(" | ") }
+}
+
+/// `Vm__const_words(w)`: the mask of the words of `const` cache fields
+/// (see `cache_mask_src`) of the op `w` stands for alone (a super's head:
+/// its first part). `deopt` and the base view of `verify` blocks keep
+/// those words.
+fn generate_const_words(v: &VmDecl, l: &VmLayout) -> String {
+    let n = &v.name.name;
+    let w = format!("u{}", l.word_bits);
+    let masks: Vec<String> = v.caches.iter().map(|c| cache_mask_src(c, l.word_bits / 8, |_, k| k)).collect();
+    let arms = l.ops.iter().enumerate().filter_map(|(i, o)| {
+        let c = l.ops[l.base(i)].cache?;
+        (masks[c] != "0").then(|| (o.opcode, masks[c].clone()))
+    });
+    let mut s = String::new();
+    match_fn(&mut s, &format!("fn {n}__const_words(w: {w}) -> u64"), &format!("match {n}__opcode(w)"), arms, "_ => 0");
+    s
 }
 
 /// Cache fields of type `Vm.Resume` (verified code addresses in the
@@ -1201,6 +1292,7 @@ fn generate_verifier_types(sm: &SourceMap, v: &VmDecl, l: &VmLayout) -> String {
     let vis = if v.is_pub { "pub " } else { "" };
     let mut s = String::new();
     let stack = has_stack(v);
+    let cache_verify = v.caches.iter().any(|c| !c.verify.is_empty());
     let proof = |code: &str, max: &str| proof_src(v, code, max);
     // The proof type and what can be done with it.
     if stack {
@@ -1252,7 +1344,7 @@ fn generate_verifier_types(sm: &SourceMap, v: &VmDecl, l: &VmLayout) -> String {
     // Errors.
     let _ = writeln!(
         s,
-        "{vis}enum {n}__VerifyReason {{ Empty, TooLong, BadOpcode, Truncated, SuperPart, Forward, Then, RunsOffEnd, Operand, Check{} }}\n\
+        "{vis}enum {n}__VerifyReason {{ Empty, TooLong, BadOpcode, Truncated, SuperPart, Forward, Then, RunsOffEnd, Operand, Check{}{} }}\n\
          {vis}struct {n}__VerifyError {{ at: u64, reason: {n}__VerifyReason, op: u64, operand: u64, kind: u64, msg: str }}\n\
          fn {n}__verr(at: u64, reason: {n}__VerifyReason, op: u64, operand: u64, kind: u64) -> Result<{n}__Verified, {n}__VerifyError> {{\n\
          \x20 Err({n}__VerifyError {{ at: at, reason: reason, op: op, operand: operand, kind: kind, msg: \"\" }})\n}}\n\
@@ -1267,9 +1359,10 @@ fn generate_verifier_types(sm: &SourceMap, v: &VmDecl, l: &VmLayout) -> String {
          \x20   Then => \"the instruction is not followed by the op its `then` requires\",\n\
          \x20   RunsOffEnd => \"execution can run off the end of the code after this instruction\",\n\
          \x20   Operand => \"an operand fails its kind's verify clause\",\n\
-         \x20   Check => \"a `verify` check of the vm fails\",{}\n\
+         \x20   Check => \"a `verify` check of the vm fails\",{}{}\n\
          \x20 }}\n}}",
         if stack { ", StackUnderflow, StackMismatch, StackExit, StackTooDeep, StackCount, BadTarget" } else { "" },
+        if cache_verify { ", Cache" } else { "" },
         if stack {
             "\n    StackUnderflow => \"stack underflow\",\n\
              \x20   StackMismatch => \"paths reach this instruction with different stack depths\",\n\
@@ -1279,7 +1372,8 @@ fn generate_verifier_types(sm: &SourceMap, v: &VmDecl, l: &VmLayout) -> String {
              \x20   BadTarget => \"a jump target lies outside the code\","
         } else {
             ""
-        }
+        },
+        if cache_verify { "\n    Cache => \"a `const` cache field fails its verify clause\"," } else { "" }
     );
     let esc = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ").replace('\\', "\\\\").replace('"', "\\\"");
     let _ = writeln!(s, "{vis}fn {n}__verify_clause(k: u64) -> str {{ match k {{");
@@ -1340,7 +1434,7 @@ fn generate_verifier_types(sm: &SourceMap, v: &VmDecl, l: &VmLayout) -> String {
          \x20     out.push_str(\"` fails: \");\n\
          \x20     out.push_str(e.msg);\n\
          \x20   }}\n\
-         {}\
+         {}{}\
          \x20   _ => out.push_str(e.message()),\n\
          \x20 }}\n}}",
         if stack {
@@ -1349,7 +1443,9 @@ fn generate_verifier_types(sm: &SourceMap, v: &VmDecl, l: &VmLayout) -> String {
              \x20   StackExit => {{ out.push_str(\"the instruction ends the code and takes exactly \"); out.push_int(e.kind as i64); out.push_str(\" value(s), but the stack has \"); out.push_int(e.operand as i64); }}\n"
         } else {
             ""
-        }
+        },
+        // "word 4 (CALL_X): cache field `t` fails `it < inst.tables.len`"
+        if cache_verify { "    Cache => out.push_str(e.msg),\n" } else { "" }
     );
     s
 }
@@ -1651,11 +1747,18 @@ pub fn generate(v: &VmDecl, l: &VmLayout, jit: bool, cached: bool) -> String {
     let _ = writeln!(s, "    let __size = {n}__base_size(__code[__i]);");
     // A breakpoint's cache words are the patched instruction's: they stay.
     let _ = writeln!(s, "    var __k: u64 = {};", if v.on_break.is_some() { format!("if {n}__is_break(__code[__i]) {{ __size }} else {{ 1 }}") } else { "1".into() });
-    if has_resume_caches(v) {
-        // Resume points stay: they are where the code goes, not what it learned.
+    if has_resume_caches(v) || has_const_caches(v) {
+        // Resume points stay: they are where the code goes, not what it
+        // learned. So do `const` fields: the emitter set them.
+        let keep: Vec<String> = [(has_resume_caches(v), "resume"), (has_const_caches(v), "const")]
+            .iter()
+            .filter(|x| x.0)
+            .map(|x| format!("{n}__{}_words(__code[__i])", x.1))
+            .collect();
         let _ = writeln!(
             s,
-            "    let __keep = {n}__resume_words(__code[__i]);\n    while __k < __size and __i + __k < __code.len {{ if ((__keep >> __k) & 1) == 0 {{ __code[__i + __k] = 0; }} __k += 1; }}"
+            "    let __keep = {};\n    while __k < __size and __i + __k < __code.len {{ if ((__keep >> __k) & 1) == 0 {{ __code[__i + __k] = 0; }} __k += 1; }}",
+            keep.join(" | ")
         );
     } else {
         let _ = writeln!(s, "    while __k < __size and __i + __k < __code.len {{ __code[__i + __k] = 0; __k += 1; }}");
@@ -1665,6 +1768,9 @@ pub fn generate(v: &VmDecl, l: &VmLayout, jit: bool, cached: bool) -> String {
         let _ = writeln!(s, "  __extern_loimi_jit_rewritten(__code.ptr as *u8);");
     }
     let _ = writeln!(s, "}}");
+    if has_const_caches(v) {
+        s.push_str(&generate_const_words(v, l));
+    }
     s
 }
 
@@ -2465,7 +2571,8 @@ fn cache_structs(modules: &mut [Module]) -> Res<()> {
         for (ii, ci, t) in todo {
             let fields = cache_struct_fields(modules, mi, &t)?;
             if let Item::Vm(v) = &mut modules[mi].items[ii] {
-                v.caches[ci].fields = fields;
+                let k = v.caches[ci].konst;
+                v.caches[ci].fields = fields.into_iter().map(|(f, t, _)| (f, t, k)).collect();
             }
         }
     }

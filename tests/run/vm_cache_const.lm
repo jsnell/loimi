@@ -1,0 +1,101 @@
+// matrix: dispatch
+// `const` cache fields (language.md §7.1): set by the emitter, read by
+// handlers, kept by `deopt` (which zeroes the other cache words), seen by
+// the base view of `verify` blocks, and checked by their `verify`
+// clauses. A whole cache from a struct is `cache X = const S`.
+import std.io;
+import std.math;
+import std.text;
+
+struct Proto { nregs: u32, nk: u32 }
+
+vm V {
+    state { pc: *u32, regs: *i64 }
+    verify_context proto: *Proto;
+
+    operand reg = regs[it] verify (it as u32) < proto.nregs;
+
+    encoding fixed(u32) {
+        format AB { op: 8, a: 8, b: 8 }
+    }
+    /// A constant index, checked once by the verifier, and a hit count.
+    cache KIx { const k: u32 verify it < proto.nk, hits: u32 }
+    cache DivK = const math.Divisor verify it.is_valid();
+
+    // ADDK learns: the first run counts and quickens to ADDK_Q.
+    family ADDK(a: reg) : AB + KIx {
+        generic { a = a + cache.k as i64; cache.hits += 1; become ADDK_Q; next }
+        ADDK_Q { a = a + cache.k as i64 + 1000; cache.hits += 1; next }
+    }
+    op MODK(a: reg) : AB + DivK { a = (&cache).rem_floor(a); next }
+    op RET(a: reg) : AB { exit a }
+
+    // The base view: the const field is there, the hit count is not.
+    verify base {
+        var ok = true;
+        var i: u64 = 0;
+        while i < code.len {
+            let op = V.base_op(code[i]);
+            if op == V.OP_ADDK { ok = ok and code[i + 1] < 100 and code[i + 2] == 0; }
+            i += V.op_size(code[i]);
+        }
+        ok
+    }
+
+    entry run(code: *u32, r: *i64) -> i64 { regs = r; jump code }
+}
+
+fn show(e: V.VerifyError) {
+    var b = text.StrBuf.new();
+    e.write(&b);
+    io.println(b.as_str());
+}
+
+fn main() {
+    var p = Proto { nregs: 2, nk: 50 };
+    var regs: [i64; 2] = [0; 2];
+    var code: [u32; 16] = [0; 16];
+    var at: u64 = 0;
+    at = V.emit.ADDK_cached(code[..], at, 0, 7, 0);
+    let m = at;
+    at = V.emit.MODK(code[..], at, 0);
+    let Some(dv) = math.Divisor.new(7) else { trap() };
+    dv.store(code[m + 1..m + 5]);
+    at = V.emit.RET(code[..], at, 0);
+    let c = code[0..at];
+    let Ok(_) = V.verify(c, &p) else { io.println("not verified"); return; };
+    regs[0] = 10;
+    io.print_int(V.run(&code[0], &regs[0])); io.println("");     // (10 + 7) mod 7
+    regs[0] = 10;
+    io.print_int(V.run(&code[0], &regs[0])); io.println("");     // (10 + 1007) mod 7
+    io.print("hits "); io.print_int(code[2] as i64); io.println("");
+    // Quickened code still verifies: its base view is the emitted code.
+    match V.verify(c, &p) { Ok(_) => io.println("quickened verifies"), Err(e) => show(e) }
+    V.deopt_words(c);
+    io.print("after deopt: k "); io.print_int(code[1] as i64);
+    io.print(", hits "); io.print_int(code[2] as i64);
+    io.print(", d "); io.print_int(code[m + 3] as i64); io.println("");
+    regs[0] = 10;
+    io.print_int(V.run(&code[0], &regs[0])); io.println("");     // quickened again
+    // The verify clauses.
+    code[1] = 60;
+    match V.verify(c, &p) { Ok(_) => io.println("k 60 verified?"), Err(e) => show(e) }
+    code[1] = 7;
+    code[m + 1] = code[m + 1] + 1;
+    match V.verify(c, &p) { Ok(_) => io.println("bad divisor verified?"), Err(e) => show(e) }
+    code[m + 1] = code[m + 1] - 1;
+    // The `verify` block sees the const field.
+    p.nk = 200;
+    code[1] = 150;
+    match V.verify(c, &p) { Ok(_) => io.println("k 150 verified?"), Err(e) => show(e) }
+}
+
+// expect: 3
+// expect: 2
+// expect: hits 2
+// expect: quickened verifies
+// expect: after deopt: k 7, hits 0, d 7
+// expect: 3
+// expect: word 0 (ADDK_Q): cache field `k` fails `it < proto.nk`
+// expect: word 3 (MODK): cache `DivK` fails `it.is_valid()`
+// expect: check `base` fails

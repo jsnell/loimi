@@ -582,8 +582,7 @@ marking, card marking (a large array stored into is retraced whole by each minor
 collection), aging of small objects (measured, see above), finalizers that run guest
 code (free hooks for host memory are built, above), `Root<T>`/`GcVec<T>`, heap snapshots, poisoning (except in
 `--gc-check-roots` builds, above),
-and the `weak` field qualifier (also for inline caches, language.md
-§7.1).
+and the `weak` field qualifier.
 
 `LOIMI_GC_STATS=1` prints a line per collection to stderr: kind, live
 (old) bytes, the remembered set's size, the mark and sweep times (the
@@ -596,8 +595,7 @@ sweep is now only that of large objects), and the time spent in
 
 The original design draft. **Not built** unless "As implemented" above
 says so: in particular the policy parameter, `Incremental`, `HeapConfig`,
-`Root<T>`, finalizers (only free hooks are built), weak inline caches
-and heap snapshots.
+`Root<T>`, finalizers (only free hooks are built) and heap snapshots.
 
 ### Goals
 
@@ -752,7 +750,7 @@ collect():
   2. mark roots (section 6) → push onto mark stack
   3. drain the mark stack, tracing through TypeInfo
   4. process ephemerons until no new marks             (section 7)
-  5. clear weak references to unmarked objects; reset weak inline-cache entries
+  5. clear weak references to unmarked objects
   6. unmarked objects with finalizers → mark (resurrect), queue for finalization
   7. drain again (finalizer-reachable objects survive this cycle)
   8. pages: mark as "unswept" (actual sweeping is lazy, in refill)
@@ -913,27 +911,14 @@ fn Heap.run_finalizers(h: *Heap, ctx: *mut u8, f: fn(*mut u8, Gc<Any>) -> Result
 
 ---
 
-### 8. Code as a root: weak inline caches
+### 8. Code as a root: inline caches
 
-Inline caches live inside bytecode (language.md §7.1). A `ShapeId` cached in
-code would dangle if the shape died and its id were reused. Cache
-declarations can therefore mark fields weak:
-
-<!-- snippet: skip design, not built: no `weak` cache fields -->
-```loimi
-cache PropIC { shape: weak ShapeId, slot: SlotRef }
-```
-
-When a `Proto` is traced, its generated tracer walks the code with the vm's
-generated decoder. That is cheap, because the decoder knows exactly where cache
-words are. Weak cache fields don't keep anything alive. In step 5, any entry
-whose target died is **reset to its zero (empty) state**. Because family
-members reset to an empty cache look like a miss, the `cold` miss path
-re-specializes (`become generic`) the next time the instruction runs. This
-avoids both leaking shapes through stale caches and false cache hits.
-
-A weak field has a type that is a `Gc<T>` or an id type that declares a
-liveness check (`ShapeId` implements `WeakId` through the shape table).
+Decided: bytecode is not a root. Inline caches (language.md §7.1) hold
+no GC references and have no weak fields, so the collector never walks
+code. A cache holds what the interpreter keeps alive or never reuses (a
+`ShapeId` of `std.obj`, a version number) and checks it on use; weak
+caching of GC objects is a side table that a sweeper clears, or
+`std.gc.Weak`.
 
 ---
 

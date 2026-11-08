@@ -307,8 +307,12 @@ pub vm W {
         format R4  { op: 16, a: 12, b: 12, c: 12, d: 12 }
     }
 
-    cache Imm64 { v: u64 }
-    cache Imm128 { lo: u64, hi: u64 }
+    // Immediates wider than the word's fields, in `const` cache words:
+    // the translator writes them, handlers only read them, and a table
+    // index is checked once by the verifier.
+    cache Imm64 { const v: u64 }
+    cache Imm128 { const lo: u64, const hi: u64 }
+    cache TableIx { const ti: u64 verify it < inst.tables.len }
 
     // ── constants and moves ───────────────────────────────────────────
     op CONST32(d: ru, v: imm) : RU { d = v as u32; next }
@@ -709,12 +713,11 @@ pub vm W {
         if f.sig != ctx.sigs[t.raw] { raise Trap.SigMismatch }
         do_call(f, b.raw, false)
     }
-    // call_indirect through a table other than 0 (index in the cache word,
-    // checked here: the verifier does not see cache words).
-    op CALL_INDIRECT_X(b: base, t: tidx, i: ru) : RRR + Imm64 {
-        let ti = cache.v;
-        if ti >= ctx.inst.tables.len { raise Trap.TableOOB }
-        let tab = ctx.inst.tables.at(ti);
+    // call_indirect through a table other than 0: the table index in the
+    // cache word, checked by the verifier (`ctx.inst` is the instance the
+    // code was verified against).
+    op CALL_INDIRECT_X(b: base, t: tidx, i: ru) : RRR + TableIx {
+        let tab = ctx.inst.tables.ptr[cache.ti];
         if (i as u64) >= tab.size { raise Trap.UndefElem }
         let fv = tab.elems[i as u64];
         if fv == 0 { raise Trap.UninitElem }

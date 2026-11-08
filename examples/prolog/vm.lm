@@ -578,8 +578,9 @@ pub vm Wam {
     }
     // Division by a positive constant k < 2^31 (crypt's `X mod 10`,
     // `X // 10`): a multiply and a shift instead of a 64-bit `idiv`. The
-    // compiler prepares k as a std.math.Divisor in the cache.
-    cache DivK = math.Divisor;
+    // compiler prepares k as a std.math.Divisor in the cache (`const`:
+    // `deopt` keeps it, and the verifier checks it).
+    cache DivK = const math.Divisor verify it.is_valid();
     inline for (name, kind, method) in [
         ("IDIVK", 3, div_trunc), ("MODK", 4, rem_floor), ("DIVK", 9, div_floor), ("REMK", 10, rem_trunc),
     ] {

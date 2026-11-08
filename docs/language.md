@@ -1885,7 +1885,7 @@ type.
 | `Vm.verify(code, ctx..)`, `Verified<Vm>`, `Vm.VerifyError`, `Vm.VerifyReason`, `Vm.assume_verified`, `Vm.placeholder()`, `Vm.build_verified`, `Vm.build_assume_verified` | the verifier and its proof (section 6) |
 | `Vm.stack_effect(w) -> ?(u32, u32)`, `Vm.stack_effect_text(w) -> str`, `v.max_stack() -> u32` | stack VMs: an op's declared (pops, pushes) when they depend only on its operands, its effect as text, and the verified maximum depth (section 3.4a) |
 | `Vm.optimize(v)`, `Vm.optimize_words(code)` | superinstruction peephole (section 7.3) |
-| `Vm.deopt(v)`, `Vm.deopt_words(code)` | back to generic ops, supers split, caches zeroed (section 7.2) |
+| `Vm.deopt(v)`, `Vm.deopt_words(code)` | back to generic ops, supers split, caches zeroed but for resume and `const` fields (section 7.2) |
 | `Vm.accumulate(code, first_temp)`, `Vm.acc_variant(op, d, s) -> W` | accumulator variant selection, before verification (vms with an `accumulator`, section 7.4) |
 | `Vm.real_word(w) -> W` | the real word behind a JIT enter word (below) |
 | `Vm.depth: u32` | thread-local count of active nested runs, if the vm has a nested entry (section 10) |
@@ -2791,7 +2791,8 @@ or the first bad word and why it is bad. It checks:
 
 - every word decodes to a valid opcode and format;
 - every operand satisfies its kind's `verify` clause (register and constant
-  indices in range, upvalue indices valid, ...);
+  indices in range, upvalue indices valid, ...), and every `const` inline
+  cache field its own (§7.1);
 - every `label` lands on an instruction boundary (never inside an instruction
   or an inline cache);
 - in a superinstruction, each later part's word holds an op of that part's
@@ -2814,15 +2815,18 @@ or the first bad word and why it is bad. It checks:
   that may continue (`jump pc + 2` past its JMP) needs an instruction after
   that JMP.
 
-`verify` clauses see `it`, `pc` (the address of the operand's word) and the
-verify context, nothing else; a verify context cannot be named `it` or `pc`.
+`verify` clauses see `it`, `pc` (the address of the operand's word; for
+a cache field's clause, of the instruction's) and the verify context,
+nothing else; a verify context cannot be named `it` or `pc`.
 
 **Errors.** `Mini.VerifyError` has `at` (the word index), `reason` (an
 enum `Mini.VerifyReason`: `Empty`, `TooLong`, `BadOpcode`, `Truncated`,
 `SuperPart`, `Forward`, `Then`, `RunsOffEnd`, `Operand`, `Check` for a failing
 `verify` block, below; stack VMs add `StackUnderflow`, `StackMismatch`,
-`StackExit`, `StackTooDeep`, `StackCount` and `BadTarget`), for `Operand` the
-operand's index and kind, and `msg`, a `verify` block's message. `e.message()` describes the reason, and
+`StackExit`, `StackTooDeep`, `StackCount` and `BadTarget`, and vms whose
+`const` cache fields have `verify` clauses add `Cache`), for `Operand` the
+operand's index and kind, and `msg`, a `verify` block's message (or for
+`Cache`, the field and the clause). `e.message()` describes the reason, and
 `e.write(&out)` writes the whole diagnosis to any buffer with
 `push_str`/`push_int`:
 
@@ -3035,9 +3039,9 @@ with its code.
 
 `code` in a check is the **base view** of the code: every word as the op
 it stands for alone, its family's generic op (a superinstruction's head
-as its first part's), with inline caches zeroed, as `Vm.deopt` would
-leave it. So a check written against the plain ops still holds for code
-that went through `optimize` or quickening (verified again after loading
+as its first part's), with inline caches zeroed except their `const`
+fields, as `Vm.deopt` would leave it. So a check written against the
+plain ops still holds for code that went through `optimize` or quickening (verified again after loading
 from a cache, say). If the vm has supers or families, `code` is a copy;
 `is_insn_boundary` takes pointers into it. (`Vm.base_op(w)` maps one
 word the same way, for host code.)
@@ -3126,6 +3130,70 @@ emits an op with its cache's integer, `bool` and pointer fields set (in
 declaration order; other fields zero). It is generated for ops whose
 cache has such fields, in programs that name one.
 
+**`const` fields: what the emitter knows.** A field declared `const`
+is part of the instruction, not something it learns: the emitter sets
+it (`Vm.emit.OP_cached`, or by writing the words after `Vm.emit.OP`),
+vm code only reads it, `Vm.deopt` keeps it, and the verifier can check
+it. A `verify` clause after the field's type, as for an operand kind
+(section 6), sees the field's value as `it`, `pc` (the instruction's
+address) and the verify context, and is checked once per instruction
+by `Vm.verify`. `cache X = const S;` makes every field of a struct
+layout `const`, and its clause (`cache X = const S verify e;`) sees
+`&cache`, a `*S`, as `it`:
+
+<!-- snippet: run "7 hits 1, deopt: k 7 hits 0, k 9 refused"
+import std.io;
+import std.math;
+struct Proto { nk: u32 }
+vm V {
+    state { pc: *u32, regs: *i64 }
+    verify_context proto: *Proto;
+    operand reg = regs[it];
+    encoding fixed(u32) { format AB { op: 8, a: 8, b: 8 } }
+{snippet}
+    op RET(a: reg) : AB { exit a }
+    entry run(code: *u32, r: *i64) -> i64 { regs = r; jump code }
+}
+fn main() {
+    var p = Proto { nk: 8 };
+    var code: [u32; 16] = [0; 16];
+    var at = V.emit.ADDK_cached(code[..], 0, 0, 7, 0);
+    let m = at;
+    at = V.emit.MODK(code[..], at, 0);
+    let Some(dv) = math.Divisor.new(1000) else { trap() };
+    dv.store(code[m + 1..m + 5]);
+    at = V.emit.RET(code[..], at, 0);
+    let Ok(_) = V.verify(code[0..at], &p) else { trap() };
+    var r: [i64; 1] = [2000];
+    io.print_int(V.run(&code[0], &r[0]));                // (2000 + 7) mod 1000
+    io.print(" hits "); io.print_int(code[2] as i64);
+    V.deopt_words(code[0..at]);
+    io.print(", deopt: k "); io.print_int(code[1] as i64);
+    io.print(" hits "); io.print_int(code[2] as i64);
+    code[1] = 9;
+    match V.verify(code[0..at], &p) { Ok(_) => io.println(", k 9 verified"), Err(_) => io.println(", k 9 refused") }
+}
+-->
+```loimi
+cache KIx { const k: u32 verify it < proto.nk, hits: u32 }
+cache DivK = const math.Divisor verify it.is_valid();
+op ADDK(a: reg) : AB + KIx { a = a + cache.k as i64; cache.hits += 1; next }
+op MODK(a: reg) : AB + DivK { a = (&cache).rem_floor(a); next }
+```
+
+Assigning a `const` field (`cache.k = ..`, `c.k` through a handle) or
+taking its address is an error; `&cache` of a `const` struct layout is
+still a `*S`, for methods that read it (writing through that pointer is
+not checked). Reading a `const` field costs what reading any other
+field does: it is a load from the code stream, and only `deopt`, the
+verifier and the base view of `verify` blocks (section 6) treat it
+differently. A `const` field cannot be a `Vm.Resume` (below), and
+`verify` clauses are only for `const` fields: what a handler writes is
+not known at verification time. std.math's `Divisor` (a divisor
+prepared by the emitter) and wasm's immediates wider than a word
+(`examples/wasm`, whose `call_indirect` table index is checked once by
+the verifier) are `const` caches.
+
 **Layouts from structs: `cache X = S;`.** A cache may take its fields
 from a struct, `cache PropIC = obj.Site;`: the fields are `S`'s, in
 order, with the rules above (each starts a word; no GC references), and
@@ -3199,7 +3267,8 @@ field is set only by vm code (`cache.to = next_resume`, or any other
   array, `p.code`), writes `vals[0]`, `vals[1]`, .. into the resume
   fields of its instructions in code order, and is false if their
   number differs from `vals.len` (it fills what it can);
-- `deopt` keeps resume fields (it zeroes the rest of each cache).
+- `deopt` keeps resume fields (and `const` fields; it zeroes the rest
+  of each cache).
 
 <!-- snippet: skip excerpt: Prolog's try chains (examples/prolog), declarations elided -->
 ```loimi
@@ -3217,9 +3286,7 @@ code is still alive: the vm keeps it reachable.
 **No GC references.** A cache field cannot hold `Gc<T>`, a `value` type
 or anything else the collector traces: the collector does not scan
 bytecode, so the reference would neither keep its target alive nor be
-updated if it moved. (**Not built:** `weak` fields, which the GC would clear when their
-target dies: the collector does not scan bytecode, so it could not clear
-them.) Cache something whose
+updated if it moved. Cache something whose
 lifetime the interpreter controls instead: a shape id that is never
 reused, a pointer to a structure that is never freed or moved (shapes
 kept alive by a table), or a version number, and validate it on use.
@@ -3293,8 +3360,9 @@ The `generic` member, named after the family (`become GETPROP`), is what the com
 reached through `become`. `Vm.deopt(v)` maps every member back to
 `generic`, for debuggers and for code serialization: it rewrites each
 instruction word to its family's generic op, splits superinstructions
-(the head becomes its first part's generic op) and zeroes inline caches,
-which gives the code the emitters produced.
+(the head becomes its first part's generic op) and zeroes inline caches
+except their resume and `const` fields, which gives the code the
+emitters produced.
 
 Rewrites are single-word stores. With multiple guest threads they need an
 atomic store, which the compiler would emit when the vm is declared

@@ -951,10 +951,11 @@ changes are `MOD`, `MODK`, their cold blocks (plus one new cold block
 each, for the first-run fill) and the op-size tables (the caches grew
 from 2 and 3 words to 4).
 
-**Not built:** `const` cache fields and a verify-time fill. No
-interpreter deoptimizes these ops, so an emitter-filled ordinary cache
-was enough. Until `const` fields exist, `Vm.deopt` would zero the
-cache.
+**Built since (2026-11-08):** `const` cache fields (language.md §7.1).
+Prolog's and MiniJS's divisor caches are `const`: `Vm.deopt` keeps
+them and `verify` checks them with `Divisor.is_valid`; their handlers
+compile to the same code. A verify-time fill is not needed: the
+emitter fills the cache.
 
 ### 4. Load facts: dereferenceable, nonnull, invariant
 
@@ -2297,7 +2298,7 @@ Status: **N** native, **H** by hand only, **X** not expressible.
 | NaN tagging, dual int/double | LuaJIT | N: `nanbox`, merged tuple tests (`language.md` §2) | int-high layout, item 7 |
 | Top of stack in a register | wasm3 `_r0`/`_fp0` (`m3_exec.h:119-146`) | N for numbers (accumulators); X for tagged values; adjacent pairs only | item 1 |
 | Stack caching with several states (Ertl) | Forth systems | H: Stak's `tos` state variable by hand (10–15%, Stak FRICTION 358) | derived variants from `stack(..)` effects; niche (one stack VM), not ranked |
-| Inline caches in the code stream | CPython `_Py*Cache` | N: `cache`, `cache X = S` (`language.md` §7.1) | weak cache fields not built |
+| Inline caches in the code stream | CPython `_Py*Cache` | N: `cache`, `cache X = S`, `const` fields (`language.md` §7.1) | |
 | Quickening, families, deopt | CPython PEP 659 | N: `family`, `become`, `Vm.deopt` (§7.2) | counters, item 10; re-fusion, item 8 |
 | Warmup and backoff counters | CPython `pycore_backoff.h` | H: a cache field, which nobody writes | item 10 |
 | Static superinstructions | CPython (LOAD_FAST_LOAD_FAST), QuickJS | N, beyond the references: `supers`, DP `optimize`, `#[forward]`, suggestions (§7.3) | selection by profile, item 8(b) |

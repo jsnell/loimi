@@ -1,0 +1,9 @@
+vm V {
+    state { pc: *u32 }
+    encoding fixed(u32) { format A { op: 8 } }
+    cache IC { const k: u32, n: u32 }
+    op NOP() : A + IC { cache.n += 1; cache.k += 1; next }
+    entry run(c: *u32) -> i64 { pc = c; jump pc }
+}
+fn main() {}
+// error: cannot assign `cache.k`: it is a `const` field of cache `IC`
