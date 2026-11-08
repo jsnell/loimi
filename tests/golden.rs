@@ -121,10 +121,12 @@ fn loimi() -> Command {
 // ---------------------------------------------------------------------------
 // Tiers, shared builds, parallel runs.
 //
-// Three tiers (docs/testing.md):
+// Three tiers (README.md, "Testing and benchmarking"):
 //   fast     `LOIMI_TEST_FAST=1 cargo test --release`: the compiler's own
-//            tests and one build of each smaller example; tests outside
-//            it return at once (`fast_skip`).
+//            tests (tests/run, tests/fail, tests/test, the IR and C
+//            library tests), Lox, Mini's scripts and conformance tests
+//            in one build; the tests that build the other interpreters
+//            or Mini again return at once (`fast_skip`).
 //   default  `cargo test --release`.
 //   heavy    `cargo test --release -- --include-ignored`: the tests marked
 //            `#[ignore = "heavy ..."]` too.
@@ -233,8 +235,9 @@ fn build_dir() -> &'static Path {
 /// process: tests that build the same thing share it (a test asking for
 /// a build another is running waits for it). The tests' builds of the
 /// interpreters drop the x86-64 branch padding (`LOIMI_BRANCH_ALIGN=0`),
-/// which costs most of their clang time, unless `env` sets it;
-/// `mini_scripts`, `run_programs` and the heavy tier build with it.
+/// which costs most of their clang time, unless `env` sets it or
+/// `LOIMI_TEST_BRANCH_ALIGN=1`; `mini_scripts` and `mini_conformance`
+/// share a Mini built with it, and `run_programs` builds the default way.
 /// Panics (in every test that asks) if the build fails.
 fn build(src: &Path, flags: &[&str], env: &[(&str, &str)]) -> PathBuf {
     build_lib(src, flags, env, "lib.h")
@@ -593,29 +596,45 @@ fn bind_now(exe: &Path) -> bool {
 
 /// `--vm-prof` under stress: tests/run/vm_prof.lm at 10 kHz, several runs
 /// in each dispatch mode, and under qemu on AArch64 when the cross
-/// toolchain is installed. The sampler walks the stack from a signal;
+/// toolchain is installed (heavy tier). The sampler walks the stack from a signal;
 /// before `--vm-prof` linked with `-z now`, a sample during the lazy
 /// binding of `write` (its first call, at the end) unwound through
 /// glibc's AArch64 `_dl_runtime_resolve`, whose unwind info is wrong, and
 /// crashed about one run in three under qemu. The executables must be
-/// bound at load time, which catches that every time.
+/// bound at load time, which catches that every time. (The qemu part:
+/// `vm_prof_stress_aarch64`, heavy tier; the host's builds are checked
+/// for `-z now` here.)
 #[test]
 fn vm_prof_stress() {
+    vm_prof_stress_on(false);
+}
+
+/// `vm_prof_stress` on AArch64 under qemu (heavy tier).
+#[test]
+#[ignore = "heavy tier (qemu): cargo test --release -- --include-ignored"]
+fn vm_prof_stress_aarch64() {
+    vm_prof_stress_on(true);
+}
+
+/// `vm_prof_stress` on the host (or the suite's cross target), or, with
+/// `a64`, on AArch64 under qemu (skipped without the toolchain).
+fn vm_prof_stress_on(a64: bool) {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let dir = std::env::temp_dir().join(format!("loimi-vmprof-stress-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("loimi-vmprof-stress-{}-{}", a64, std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let qemu = root.join("bench/cross/install/bin/qemu-aarch64");
     let sysroot = root.join("bench/cross/sysroot-aarch64");
-    let a64 = !cross() && qemu.exists() && sysroot.join("usr/lib/aarch64-linux-gnu/libc.so.6").exists();
+    if a64 && (cross() || !qemu.exists() || !sysroot.join("usr/lib/aarch64-linux-gnu/libc.so.6").exists()) {
+        eprintln!("vm_prof_stress_aarch64: skipped: no AArch64 cross toolchain (run bench/cross/install.sh)");
+        return;
+    }
     let runner = format!("{} -L {}", qemu.display(), sysroot.display());
     let sysroot = sysroot.display().to_string();
     let a64_env = [("LOIMI_TARGET", "aarch64-linux-gnu"), ("LOIMI_SYSROOT", sysroot.as_str())];
     // (target environment, runner, runs per mode): the host's (or the
     // suite's cross target's), then AArch64 under qemu.
-    let mut targets: Vec<(&[(&str, &str)], String, usize)> = vec![(&[], std::env::var("LOIMI_RUNNER").unwrap_or_default(), 5)];
-    if a64 {
-        targets.push((&a64_env, runner.clone(), 3));
-    }
+    let targets: Vec<(&[(&str, &str)], String, usize)> =
+        if a64 { vec![(&a64_env, runner.clone(), 3)] } else { vec![(&[], std::env::var("LOIMI_RUNNER").unwrap_or_default(), 5)] };
     std::thread::scope(|s| {
         for (env, runner, runs) in &targets {
             for mode in ["--dispatch=tailcall", "--dispatch=goto", "--dispatch=switch"] {
@@ -654,6 +673,9 @@ fn vm_prof_stress() {
 #[test]
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 fn mini_traces() {
+    if fast_skip("mini_traces") {
+        return;
+    }
     if cross() {
         return;
     }
@@ -703,6 +725,9 @@ fn mini_traces() {
 #[test]
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 fn mini_traces_sides() {
+    if fast_skip("mini_traces_sides") {
+        return;
+    }
     if cross() {
         return;
     }
@@ -747,9 +772,17 @@ mod traceprog;
 /// with another (and the first), with traces and with guards forced to
 /// fail; the output must be the interpreter's (the same binary, JIT off).
 /// TRACEFUZZ_SEEDS=n sets the number of programs (default 10).
+/// Heavy tier: the trace features its programs mix are each in
+/// `mini_traces` (trace_calls.mini, trace_sides.mini, the benchmarks, in
+/// every GC mode, with guards failing and blacklisting) and
+/// `scheme_traces`; this adds random combinations of them.
 #[test]
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[ignore = "heavy tier: cargo test --release -- --include-ignored"]
 fn mini_traces_fuzz() {
+    if fast_skip("mini_traces_fuzz") {
+        return;
+    }
     if cross() {
         return;
     }
@@ -1146,11 +1179,6 @@ fn with_modes<'a>(programs: &[PathBuf], modes: &[&'a str]) -> Vec<(PathBuf, &'a 
 /// The Mini scripts that `select` picks, run by the Mini `exe` (named
 /// `what` in failures) in `env` in every GC mode: the failures.
 fn mini_scripts_on(exe: &Path, what: &str, env: &[(&str, &str)], select: &(dyn Fn(&str) -> bool + Sync)) -> Vec<String> {
-    mini_scripts_in_modes(exe, what, env, select, &GC_MODES)
-}
-
-/// `mini_scripts_on` in the GC modes `modes` (of `GC_MODES`).
-fn mini_scripts_in_modes(exe: &Path, what: &str, env: &[(&str, &str)], select: &(dyn Fn(&str) -> bool + Sync), modes: &[&str]) -> Vec<String> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut scripts: Vec<PathBuf> = std::fs::read_dir(root.join("examples/mini/tests"))
         .unwrap()
@@ -1160,7 +1188,7 @@ fn mini_scripts_in_modes(exe: &Path, what: &str, env: &[(&str, &str)], select: &
     scripts.sort();
     assert!(!scripts.is_empty());
     let runner = runner_in(env);
-    par_map(&with_modes(&scripts, modes), |(f, mode)| {
+    par_map(&with_modes(&scripts, &GC_MODES), |(f, mode)| {
         let mut failures = Vec::new();
         let text = std::fs::read_to_string(f).unwrap();
         let lua_directives = |key: &str| -> Vec<String> {
@@ -1213,11 +1241,6 @@ fn mini_conformance() {
 /// The conformance scripts `select` picks, run by the Mini `exe` in
 /// `env` in every GC mode: the failures.
 fn mini_conformance_on(exe: &Path, env: &[(&str, &str)], select: &(dyn Fn(&str) -> bool + Sync)) -> Vec<String> {
-    mini_conformance_in_modes(exe, env, select, &GC_MODES)
-}
-
-/// `mini_conformance_on` in the GC modes `modes`.
-fn mini_conformance_in_modes(exe: &Path, env: &[(&str, &str)], select: &(dyn Fn(&str) -> bool + Sync), modes: &[&str]) -> Vec<String> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let dir = root.join("examples/mini/tests/conformance");
     let mut scripts: Vec<PathBuf> = std::fs::read_dir(&dir)
@@ -1227,7 +1250,7 @@ fn mini_conformance_in_modes(exe: &Path, env: &[(&str, &str)], select: &(dyn Fn(
         .collect();
     scripts.sort();
     assert!(!scripts.is_empty());
-    par_map(&with_modes(&scripts, modes), |(f, mode)| {
+    par_map(&with_modes(&scripts, &GC_MODES), |(f, mode)| {
         let stem = f.file_stem().unwrap().to_string_lossy().to_string();
         let expected = std::fs::read_to_string(f.with_extension("expected")).unwrap();
         let should_fail = stem.starts_with("err_");
@@ -1304,12 +1327,7 @@ fn scheme_tests() -> Vec<PathBuf> {
 /// Every Scheme test program run by `exe` (with `env`) in every GC mode;
 /// returns the failures.
 fn scheme_programs_on(exe: &Path, label: &str, env: &[(&str, &str)]) -> Vec<String> {
-    scheme_programs_in_modes(exe, label, env, &GC_MODES)
-}
-
-/// `scheme_programs_on` in the GC modes `modes`.
-fn scheme_programs_in_modes(exe: &Path, label: &str, env: &[(&str, &str)], modes: &[&str]) -> Vec<String> {
-    par_map(&with_modes(&scheme_tests(), modes), |(f, mode)| {
+    par_map(&with_modes(&scheme_tests(), &GC_MODES), |(f, mode)| {
         let mut failures = Vec::new();
         let text = std::fs::read_to_string(f).unwrap();
         let scm_directives = |key: &str| -> Vec<String> {
@@ -1523,6 +1541,9 @@ fn lox_unit_tests() {
 /// without GC stress, built with `-W error` (examples/stack/check.sh).
 #[test]
 fn stack_programs() {
+    if fast_skip("stack_programs") {
+        return;
+    }
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let out = Command::new("bash")
         .arg(root.join("examples/stack/check.sh"))
@@ -1545,6 +1566,9 @@ fn stack_programs() {
 /// Needs no reference Prolog.
 #[test]
 fn prolog_programs() {
+    if fast_skip("prolog_programs") {
+        return;
+    }
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let out = Command::new("bash")
         .arg(root.join("examples/prolog/check.sh"))
@@ -1568,6 +1592,9 @@ fn prolog_programs() {
 #[test]
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 fn prolog_jit_stencils() {
+    if fast_skip("prolog_jit_stencils") {
+        return;
+    }
     if cross() {
         return;
     }
@@ -1594,6 +1621,9 @@ fn prolog_jit_stencils() {
 /// interpreter.
 #[test]
 fn python_programs() {
+    if fast_skip("python_programs") {
+        return;
+    }
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let out = Command::new("bash")
         .arg(root.join("examples/python/check.sh"))
@@ -1702,6 +1732,9 @@ fn bigint_vs_python() {
 /// (when bench/wasm/install.sh and spec.sh have run; skipped otherwise).
 #[test]
 fn wasm_interpreter() {
+    if fast_skip("wasm_interpreter") {
+        return;
+    }
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let out = Command::new("bash")
         .arg(root.join("examples/wasm/check.sh"))
@@ -1725,6 +1758,9 @@ fn wasm_interpreter() {
 /// cases and 100 random ones (fixed seed).
 #[test]
 fn regex_library() {
+    if fast_skip("regex_library") {
+        return;
+    }
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let out_dir = std::env::temp_dir().join(format!("loimi-regex-{}", std::process::id()));
     let out = Command::new("sh")
@@ -1753,6 +1789,9 @@ fn regex_library() {
 /// of one file, ignoring indentation.
 #[test]
 fn tutorial_steps() {
+    if fast_skip("tutorial_steps") {
+        return;
+    }
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let out = Command::new("bash")
         .arg(root.join("examples/tutorial/check.sh"))
@@ -2253,6 +2292,9 @@ fn c_library_asan() {
 /// shadow stack).
 #[test]
 fn mini_embedded() {
+    if fast_skip("mini_embedded") {
+        return;
+    }
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let e = root.join("examples/embed");
     c_host_run("mini-embed", &root.join("examples/mini/embed.lm"), &e.join("host.c"), &e.join("host.expected"), None);
@@ -2265,6 +2307,9 @@ fn mini_embedded() {
 /// Static and shared builds (initial-exec and local-dynamic TLS).
 #[test]
 fn mini_threads() {
+    if fast_skip("mini_threads") {
+        return;
+    }
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let e = root.join("examples/embed");
     c_host_run("mini-threads", &root.join("examples/mini/embed.lm"), &e.join("threads.c"), &e.join("threads.expected"), None);
@@ -2276,6 +2321,9 @@ fn mini_threads() {
 /// releasing the lock in a native and between calls.
 #[test]
 fn mini_shared() {
+    if fast_skip("mini_shared") {
+        return;
+    }
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let e = root.join("examples/embed");
     c_host_run_with(
@@ -2296,6 +2344,9 @@ fn mini_shared() {
 /// stress.
 #[test]
 fn mini_debug_api() {
+    if fast_skip("mini_debug_api") {
+        return;
+    }
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let e = root.join("examples/embed");
     c_host_run_with(

@@ -317,7 +317,7 @@ programs, and loses on one:
   every failure (`LOIMI_TRACE_FAILS=1`). The conformance tests' code is
   not profiled: they test that code without a profile runs without
   traces.
-- `mini_traces_fuzz` (tests/golden.rs, generator tests/fuzz/traceprog.rs):
+- `mini_traces_fuzz` (tests/golden.rs, heavy test tier; generator tests/fuzz/traceprog.rs):
   10 random Mini programs (loops of arithmetic that changes type with the
   input, table reads and writes, string building, closures over loop
   variables, calls, `break`s, nested loops), profiled with one input and

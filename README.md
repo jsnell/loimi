@@ -235,6 +235,32 @@ bench/lua/install.sh && bench/mini/compare.py          # Mini vs PUC-Lua / LuaJI
 bench/run_all.py --quick                               # every example vs its references
 ```
 
+The tests come in three tiers (`RUST_TEST_THREADS=2` on an 8-core machine):
+
+- **Fast** (`LOIMI_TEST_FAST=1`, about 2 minutes): the compiler's own
+  tests (`tests/run`, `tests/fail`, `tests/test`, IR and C-library
+  tests), Lox, Mini's scripts and conformance tests, the fuzz smoke runs
+  and the doc snippets. Tests that build the other interpreters skip,
+  saying so on stderr. Use it while iterating.
+- **Default** (about 10 minutes): every example in its dispatch modes,
+  GC modes, JIT and debugger builds, the trace tier, the C hosts.
+  Run it before every merge.
+- **Heavy** (`-- --include-ignored`): the `#[ignore = "heavy ..."]` tests
+  as well: AArch64 under qemu (`aarch64_qemu`, `vm_prof_stress_aarch64`),
+  the trace fuzzer (`mini_traces_fuzz`), the DAP session in the goto and
+  switch builds, two minutes of GC rooting fuzzing. Run it before merging
+  changes to code generation, dispatch, the JIT or traces, the GC or the
+  C ABI, or anything target-specific. (ASan and TSan tests run only
+  without `ulimit -v`.)
+
+The test builds of interpreters drop the x86-64 branch padding
+(`LOIMI_BRANCH_ALIGN=0`, which is `--no-branch-align`): it takes most of
+clang's time on a large vm and only moves code. Mini's scripts and
+conformance tests and `tests/run` keep it; `LOIMI_TEST_BRANCH_ALIGN=1`
+keeps it everywhere. Builds are shared between tests within a run, and
+`LOIMI_TEST_JOBS` (default 3) bounds the builds and programs a test
+runs at once.
+
 Cross-compiling for AArch64 Linux (links with `ld.lld`; tested under qemu
 user-mode, built from source with an extracted Debian sysroot, no root):
 
@@ -247,7 +273,7 @@ LOIMI_RUNNER="$PWD/bench/cross/install/bin/qemu-aarch64 -L $S" \
   ./target/release/loimi run tests/run/hello.lm --target=aarch64-linux-gnu --sysroot=$S
 ```
 
-`cargo test` runs a subset under qemu when the toolchain is installed
+The heavy tier (`cargo test --release -- --include-ignored`) runs a subset under qemu when the toolchain is installed
 (`aarch64_qemu`); `LOIMI_TARGET`, `LOIMI_SYSROOT` and `LOIMI_RUNNER` run the
 whole suite cross-compiled (see `cross()` in `tests/golden.rs`).
 

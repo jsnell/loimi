@@ -19,9 +19,21 @@ fn build(src: &Path, exe: &Path) {
     build_with(src, exe, &[]);
 }
 
+/// `LOIMI_BRANCH_ALIGN` for the fuzzers' builds: no x86-64 branch
+/// padding (it takes most of clang's time on a large vm and only moves
+/// code) unless `LOIMI_TEST_BRANCH_ALIGN=1`.
+fn branch_align() -> &'static str {
+    if std::env::var("LOIMI_TEST_BRANCH_ALIGN").is_ok_and(|v| v == "1") {
+        "1"
+    } else {
+        "0"
+    }
+}
+
 fn build_with(src: &Path, exe: &Path, flags: &[&str]) {
     let out = limited(env!("CARGO_BIN_EXE_loimi"))
         .env("LOIMI_STD", env!("CARGO_MANIFEST_DIR"))
+        .env("LOIMI_BRANCH_ALIGN", branch_align())
         .arg("build")
         .arg(src)
         .args(flags)
@@ -91,12 +103,14 @@ fn fuzz_mini() {
     std::os::unix::fs::symlink(root.join("tests/fuzz/mini_holes.lm"), dir.join("mini_holes.lm")).unwrap();
     // The verify holes the fuzzer found stay rejected.
     let holes = tmp("mini-holes");
-    build(&dir.join("mini_holes.lm"), &holes);
+    let exe = tmp("minifuzz");
+    std::thread::scope(|s| {
+        s.spawn(|| build(&dir.join("mini_holes.lm"), &holes));
+        build(&dir.join("minifuzz.lm"), &exe);
+    });
     let out = limited(&holes).output().unwrap();
     assert!(out.status.success(), "mini_holes: {}", String::from_utf8_lossy(&out.stdout));
     let _ = std::fs::remove_file(&holes);
-    let exe = tmp("minifuzz");
-    build(&dir.join("minifuzz.lm"), &exe);
     run(&exe, 0, 3000);
     let _ = std::fs::remove_file(&exe);
     let _ = std::fs::remove_dir_all(&dir);
@@ -118,10 +132,25 @@ fn fuzz_vm_combinations() {
     if jit {
         builds.push(("jit", vec!["--jit-stencils"], vec![("LOIMI_JIT", "1"), ("LOIMI_JIT_HOT", "1")]));
     }
-    let mut hashes: Vec<(String, String)> = Vec::new();
-    for (name, flags, env) in &builds {
+    // (each build and its runs on its own thread)
+    let per_build: Vec<Vec<(String, String)>> = std::thread::scope(|s| {
+        let handles: Vec<_> = builds.iter().map(|b| s.spawn(|| combo_runs(&src, b))).collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let hashes: Vec<(String, String)> = per_build.concat();
+    for (name, h) in &hashes {
+        let base = &hashes[if name.contains("stress") { 1 } else { 0 }];
+        assert_eq!(h, &base.1, "fuzzcombo: {} computes other results than {}", name, base.0);
+    }
+}
+
+/// One build of fuzzcombo.lm (name, flags, run environment), run
+/// normally and under GC stress: (run, outcome hash).
+fn combo_runs(src: &Path, (name, flags, env): &(&str, Vec<&str>, Vec<(&str, &str)>)) -> Vec<(String, String)> {
+    let mut hashes = Vec::new();
+    {
         let exe = tmp(&format!("fuzzcombo-{}", name));
-        build_with(&src, &exe, flags);
+        build_with(src, &exe, flags);
         for (count, extra) in [("3000", None), ("1000", Some("stress"))] {
             let mut c = limited(&exe);
             c.arg("0").arg(count).envs(env.iter().copied());
@@ -147,10 +176,7 @@ fn fuzz_vm_combinations() {
         }
         let _ = std::fs::remove_file(&exe);
     }
-    for (name, h) in &hashes {
-        let base = &hashes[if name.contains("stress") { 1 } else { 0 }];
-        assert_eq!(h, &base.1, "fuzzcombo: {} computes other results than {}", name, base.0);
-    }
+    hashes
 }
 
 // ── GC rooting fuzzer ───────────────────────────────────────────────────
@@ -223,13 +249,13 @@ fn gc_roots_seed(seed: u64, modes: &[&str]) -> Result<(), String> {
 #[test]
 fn fuzz_gc_roots() {
     let modes = ["tailcall", "goto", "switch"];
-    let mut failures = Vec::new();
-    for seed in 0..18u64 {
-        let m = seed as usize % 3;
-        if let Err(e) = gc_roots_seed(seed, &modes[m..m + 1]) {
-            failures.push(e);
-        }
-    }
+    // (three threads, one per dispatch mode)
+    let failures: Vec<String> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..3usize)
+            .map(|m| s.spawn(move || (0..18u64).filter(|seed| *seed as usize % 3 == m).filter_map(|seed| gc_roots_seed(seed, &modes[m..m + 1]).err()).collect::<Vec<_>>()))
+            .collect();
+        handles.into_iter().flat_map(|h| h.join().unwrap()).collect()
+    });
     assert!(failures.is_empty(), "{}\nprograms in target/rootfuzz/roots-SEED.lm", failures.join("\n\n"));
 }
 

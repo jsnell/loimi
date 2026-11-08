@@ -709,6 +709,13 @@ implementation; `git log` has the details.
 
 ### Tooling
 
+- **Test tiers**: `LOIMI_TEST_FAST=1 cargo test --release` (about 2
+  minutes), `cargo test --release` (about 10, before every merge) and
+  `-- --include-ignored` (qemu, the trace fuzzer and more, before risky
+  merges). Tests share interpreter builds and run their programs side by
+  side; test builds drop the x86-64 branch padding (`LOIMI_BRANCH_ALIGN=0`,
+  new, the same as `--no-branch-align`), which took most of clang's time
+  ([README](README.md#getting-started)).
 - **`-W handler_frame` names the panic behind a frame**: "the overflow
   check of `/` at vm.lm:512", "the bounds check of an index at
   value.lm:224", from a panic-site table codegen keeps (no change to the
