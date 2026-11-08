@@ -1,41 +1,39 @@
 # Design note: debugging guest programs
 
-Status: **prototype**. Built: `on break` (generated breakpoint ops,
-`Vm.set_break`/`clear_break`/`rearm`), `#[unfused]` variants,
+Status: **prototype**. The pieces: `on break` (generated breakpoint
+ops, `Vm.set_break`/`clear_break`/`rearm`), `#[unfused]` variants,
 `#[cfg(..)]` on vm items, `std.debug` (breakpoint sites with the
-step-over, line stepping, line starts, a command reader), and
-debuggers for Mini (`loimi build --cfg debug examples/mini/main.lm`,
+step-over, line stepping, line starts, conditions, a command reader),
+and debuggers for Mini (`loimi build --cfg debug examples/mini/main.lm`,
 then `mini --debug script.mini`) and for the Python subset
-(`python-loimi --debug prog.py`, pdb-like; section 8, which reports
-what did not fit the first design). For editors (section 9): Mini's
-stop-callback C API (`mini_debug_*`, `--cfg debug`), conditional and
-hit-counted breakpoints, break on error, a pause from another thread,
-expression evaluation, and a Debug Adapter Protocol server
-(`examples/mini/dap/mini_dap.c`). Written 2026-11-03.
+(`python-loimi --debug prog.py`, pdb-like; section 8). For editors
+(section 9): Mini's stop-callback C API (`mini_debug_*`, `--cfg
+debug`), conditional and hit-counted breakpoints, break on error, a
+pause from another thread, expression evaluation, and a Debug Adapter
+Protocol server (`examples/mini/dap/mini_dap.c`).
 
 > Breakpoints, single-stepping and inspecting frames and locals in an
-> interpreter built with Loimi: how much can be generated from the `vm`
-> declaration, at no cost when not debugging? Today an interpreter
-> author writes a line hook by hand (a `variant` wrapper) and keeps
-> their own breakpoint table.
+> interpreter built with Loimi: how much is generated from the `vm`
+> declaration, at no cost when not debugging?
 
 **Answer.** The instruction-level part is generic, and that part has
 the subtle invariants: patching verified code, quickening and
 superinstructions under a breakpoint, inline caches, instruction sizes.
-The compiler now generates it. The guest-level part (what a line,
+The compiler generates it. The guest-level part (what a line,
 a frame or a local is) stays the interpreter's, with `std.debug`
 supplying the bookkeeping (breakpoint sites, the step-over, the
-step/next/finish logic, command parsing). For Mini, the debugger is
-about 410 lines (`examples/mini/debugger.lm`) plus 14 `#[cfg(debug)]` items in
-the vm, compiler and `main`. Without `--cfg debug`, Mini's IR is
-byte-identical to before. With it but not debugging, the benchmarks
-are within noise. A program being debugged runs at full speed between
+step/next/finish logic, command parsing). Mini's debugger
+(`examples/mini/debugger.lm`, the command line and the core the C API
+shares) is about 780 lines of code, plus `#[cfg(debug)]` items in the
+vm, compiler, `main` and `embed`. Without `--cfg debug`, Mini's IR is
+byte-identical to a build without the debugger. With it but not
+debugging, the benchmarks are within noise. A program being debugged runs at full speed between
 breakpoints, and at 3.3x the time (1.5x to 4.9x) while a stepping command runs
 (section 6). A second debugger, for the Python subset, needed no change
 to the instruction-level part and four small additions to `std.debug`
 (section 8).
 
-## 1. What there was
+## 1. What it builds on
 
 - **Instrumentation variants** (language.md §9): `variant NAME wraps
   all { before { .. } }` makes a second dispatch table of wrappers, and
@@ -51,10 +49,10 @@ to the instruction-level part and four small additions to `std.debug`
 - **The generated disassembler** (`Vm.disasm_insn`, `Vm.op_name`,
   operand metadata).
 
-A hand-written debugger is a variant whose wrapper looks up `pc` in a
-breakpoint table on every instruction, plus a REPL. That works.
-Debugging then runs every instruction through the hook, and a
-breakpoint inside a superinstruction is never seen.
+With only these, a debugger is a variant whose wrapper looks up `pc`
+in a breakpoint table on every instruction, plus a REPL: every
+instruction runs through the hook, and a breakpoint inside a
+superinstruction is never seen.
 
 ## 2. Breakpoints
 
@@ -88,11 +86,9 @@ a line's first instruction) stays on boundaries with breakpoints set,
 without a side table. That costs `1 + #caches` opcodes (3 for Mini),
 only in builds that declare `on break`.
 
-A side table would be the alternative: one BREAK op, with the
-original opcode kept per code object, as CPython does. Then every
-generated walker (verifier, `optimize`, `deopt`, resume walks, the
-disassembler) would have to consult the table. With size-preserving
-ops, none of them changed.
+Rejected: one BREAK op with the original opcode in a side table, as
+CPython does; every generated walker (verifier, `optimize`, `deopt`,
+resume walks, the disassembler) would have to consult the table.
 
 ### 2.2 Patching verified code
 
@@ -170,18 +166,8 @@ Two ways:
   the cache it filled.
 - **Verification.** See 2.2. `resume_at` and `is_insn_boundary` work
   with breakpoints set; `verify` does not.
-- **The copy-and-patch JIT** compiles code words to machine code and
-  writes enter words over compiled instructions (copy-and-patch.md).
-  Not built: `on break` with `--jit-stencils` is a compile-time error.
-  The design: `set_break` calls the runtime's
-  `loimi_jit_invalidate(code)` (as `optimize` does), the JIT treats
-  breakpoint ops as uncompilable (they exit to the interpreter), and
-  `rearm`/`clear_break` report the rewrite (`loimi_jit_rewritten`).
-  Code with breakpoints then runs interpreted up to and through the
-  breakpoint. Stepping runs in the variant, which the JIT does not
-  compile, so that part needs nothing.
-- **Threads** sharing code (`#[threads(shared_code)]`, not built) need
-  the patch to be an atomic store, as for `become`.
+- **The copy-and-patch JIT**: `on break` with `--jit-stencils` is a
+  compile-time error; a debug build is its own `--cfg`.
 
 ## 3. Stepping
 
@@ -200,11 +186,14 @@ does the last part from the first two:
 Lines are compared within a frame, so a loop that jumps back to its own
 line does not stop (gdb's behavior; Lua's line hook stops there). The
 interpreter supplies line and depth: Mini's are `Proto.lines[pc -
-code]` and the frame index. Neither can be generated: the vm
+code]` and the frame index, plus the frames of the threads that resumed
+the running coroutine (each counted up to the frame that called
+`resume`), so that `next` over a `coroutine.resume` steps over the
+coroutine and a yield or return steps out to the resumer
+(`examples/mini/tests/debug/coro_next`). Neither can be generated: the vm
 declaration does not know where the current function's line table or
-the frame stack are. A vm-level declaration for them (say
-`debug_info { line: .., depth: .. }`) would save the interpreter two
-small functions and is not worth a construct.
+the frame stack are. (A vm-level `debug_info { line, depth }` construct
+was rejected: it saves two small functions.)
 
 ### 3.2 The hook
 
@@ -217,7 +206,7 @@ make that complete:
   `next` dispatches the next part through the variant table. So every
   instruction is seen, including a line that starts at a super's later
   part. The default table still runs the supers fused. (A `become` in
-  the first part, run alone, splits the super; `optimize` would fuse it
+  the first part, run alone, splits the super; `optimize` fuses it
   again.)
 - **`use_variant` where runs start and continue**: a run's table is in
   a state register, so a nested run (a `table.sort` comparator) starts
@@ -241,9 +230,7 @@ Exceptions: Mini's `on raise` ends the run or unwinds coroutines;
 - **Op level, generated**: the current instruction, disassembled with
   its operands (`op` in Mini's debugger: `Mini.disasm_insn` on the
   code, after the step-over has put the instruction back), its name and
-  operand kinds (`Vm.op_name`, `Vm.operand_kind`). A register-level dump
-  could be generated from the operand kinds that index a register file,
-  but it would mean little to a guest programmer; it is not built.
+  operand kinds (`Vm.op_name`, `Vm.operand_kind`).
 - **Guest level, the interpreter's**: frames and locals. Mini's backtrace
   walks its frame stack (each caller's line is that of its CALL,
   `fp.resume - 1`; for a frame calling a native, `--cfg debug` saves
@@ -256,30 +243,10 @@ Exceptions: Mini's `on raise` ends the run or unwinds coroutines;
   and functions are printed without their addresses (so that
   transcripts are deterministic).
 
-## 5. Embedding: a C API (built: section 9)
+## 5. Embedding: a C API
 
-A host drives the debugger the way the command loop does. The first
-sketch of what a DAP adapter needs, as `export "C"` functions over the
-same pieces (section 9.1 has the API as built):
-
-```c
-int  mini_debug_break(mini_State *s, const char *file, int line);  /* -> id, or 0 */
-void mini_debug_delete(mini_State *s, int id);
-/* Called at each stop; returns what to do next. */
-typedef enum { MINI_CONTINUE, MINI_STEP, MINI_NEXT, MINI_FINISH } mini_Resume;
-typedef mini_Resume (*mini_StopFn)(mini_State *s, void *ud, int bp_id);
-void mini_debug_on_stop(mini_State *s, mini_StopFn f, void *ud);
-/* Valid inside a stop callback: */
-int  mini_debug_depth(mini_State *s);
-int  mini_debug_frame(mini_State *s, int level, const char **func, int *line);
-int  mini_debug_local(mini_State *s, int level, int n, const char **name);  /* pushes the value */
-```
-
-The stop callback runs on the interpreter's thread inside the
-breakpoint's handler, as Mini's command loop does now. An adapter that
-must answer the client asynchronously blocks in the callback on a
-queue, as debugpy does. `stop()` in `debugger.lm` would become the
-default callback.
+A host drives the debugger the way the command loop does: Mini's
+stop-callback C API and the DAP adapter on it are in section 9.
 
 ## 6. Cost
 
@@ -291,9 +258,8 @@ a small but real cost in the hot loop. The option is what makes the
 default build's IR byte-identical: every Mini example, in all three
 dispatch modes, compiles to the same `--release --emit-llvm` as before
 (with std paths in panic strings normalized), and so does every other
-example. Mini's `#[cfg(debug)]` additions sit on existing lines, or at
-the end of the vm, so that a build without the debugger keeps its
-source positions in panic messages. (`#[cfg(gil)]` already did this.)
+example. `loimi ir-diff` ignores source positions, so `#[cfg(debug)]`
+additions go on lines of their own.
 
 **Compiled in.** The 14 Mini benchmarks (`bench/mini/programs`), best of
 5, interleaved, tail-call dispatch, x86-64, on a machine shared with
@@ -332,34 +298,22 @@ cost for the whole session, and what design 1 costs only while a
 stepping command runs. A breakpoint that is set but not reached costs
 nothing (*attached*).
 
-## 7. Limitations and next steps
+## 7. Limitations
 
-- **Code made after a breakpoint is set** (Mini compiles a whole file
-  at once; an interpreter with `load` or `eval`) needs the breakpoint
-  kept by file and line and applied to new code objects as they are
-  verified (gdb's pending breakpoints). The table knows file and line,
-  so this is a hook where the interpreter finishes a code object.
 - **Serialization, `optimize`, `verify` with breakpoints set**: clear
   them first (`Breakpoints.clear_all`). `optimize` and `deopt` are safe
   with breakpoints set, but a code cache must not save breakpoint ops.
-- **Coroutines**: Mini's depth is the frame index in the running
-  coroutine's stack, so `next` across a `coroutine.resume` treats the
-  coroutine's frames as shallower or deeper by accident. A per-thread
-  depth (the stack of resumers) would fix it.
-- **Watchpoints, setting variables**: a store hook in a variant
-  wrapping the SET ops; a store into the frame's register (not built).
-  Conditional breakpoints and break on error: section 9.
-- **JIT and threads**: section 2.4.
-- **Stack vms**: `on break` is rejected there for now (the breakpoint ops
+- **JIT**: section 2.4.
+- **Stack vms**: `on break` is rejected there (the breakpoint ops
   would need the stack effect of the instruction they stand for).
 
 **Does the generic part pay off?** The compiler part is small (about
 150 lines of Rust, most of it the generated `set_break`/`rearm`). It
 removes the parts a hand-written version gets wrong: the size of a
 patched instruction, supers, caches, verification. A hand-written
-BREAK op could not be made sound without the compiler, because it
-would have to forge proofs. `std.debug` is ordinary library code that
-an interpreter could also write; it is worth sharing because the
+BREAK op cannot be made sound without the compiler, because it
+has to forge proofs. `std.debug` is ordinary library code that
+an interpreter can also write; it is worth sharing because the
 step-over protocol has two corner cases (the instruction's own wrapper
 runs first; a pending breakpoint across nested runs), and those are
 where a hand-written version breaks. The interpreter keeps what only
@@ -382,9 +336,9 @@ nested runs from natives (`sorted` keys, `next(g)`, `g.send`,
 `__repr__`). The debugger behaves like pdb where that is natural
 (locations, `(Pdb)`, `where`), with gdb's `finish`.
 
-**Size.** `examples/python/debugger.lm` is 554 lines of code (Mini's: 333),
-plus 25 `#[cfg(debug)]` items in the vm, compiler and `main`, on
-existing lines but for two helpers at the end of `compile.lm` (Mini: 15). The difference is display and locals, not stepping:
+**Size.** `examples/python/debugger.lm` is 554 lines of code (Mini's,
+before the editor API of section 9: 333),
+plus 25 `#[cfg(debug)]` items in the vm, compiler and `main` (Mini: 15). The difference is display and locals, not stepping:
 showing values without running Python code (Python's `repr` may call
 `__repr__`, so the debugger has its own, 107 lines; Mini reuses
 `write_value`), and tracking where locals are bound (102 lines; Mini's
@@ -411,8 +365,8 @@ breakpoint and stepping parts (`on break`, the variant, `stop`,
   at a `for` over a generator stops at the line the generator resumes
   at, `next` over a `yield` stops in the resumer (pdb's behavior), and a
   breakpoint in a generator body is an ordinary site. (Mini's coroutines
-  have stacks of their own, which is why its depth is wrong across a
-  `resume`, section 7.)
+  have stacks of their own, so its depth adds the resumers' frames,
+  section 3.1.)
 - **Exceptions.** `on raise` finds the handler and `jump`s to it through
   the current table, so the variant sees the handler's first
   instruction: `next` over a call that raises, or `finish` from the
@@ -435,8 +389,8 @@ breakpoint and stepping parts (`on break`, the variant, `stop`,
    `Stepper.left(depth)`, called where a nested run ends (Python's
    `invoke_at` and `gen_next`, Mini's `call_value`): `step` then stops at
    whatever runs next, and `next`/`finish` wait for the caller (Mini's
-   new transcript `sort_next`). pdb gets this from frame identity; a frame serial number
-   would cost a store per call.
+   new transcript `sort_next`). pdb gets this from frame identity; a
+   frame serial number was rejected (a store per call).
 2. **Line starts.** Mini's rule (a site at the first word of each run of
    a line) gave one stop per `for` loop instead of one per iteration:
    Python's `GETITER` and `FORITER` share the `for` line, and the jump
@@ -458,8 +412,8 @@ breakpoint and stepping parts (`on break`, the variant, `stop`,
 4. **Instructions of no line.** Python's compiler gives a loop's jump
    back the line of the body's last statement, so `next` after a
    `finally` stopped on `out.append(-1)` in an `except` that did not
-   run: the jump back follows it in the code. Mini's compiler happens not
-   to do this. *Generic:* line 0 means "no line" and `Stepper.should_stop`
+   run: the jump back follows it in the code. Mini's compiler does not
+   do this. *Generic:* line 0 means "no line" and `Stepper.should_stop`
    never stops there (CPython 3.10 has the same notion for artificial
    instructions, PEP 626); Python's compiler gives the jumps back line 0
    under `--cfg debug` (a JMP never raises, so error lines do not change).
@@ -481,8 +435,8 @@ breakpoint and stepping parts (`on break`, the variant, `stop`,
    cleared on entry (reading a local before assignment is not detected),
    so a register may hold another call's value. Initializing them in
    debug builds would cost every call; instead the compiler reports where
-   each name is first stored in code order (`store` on the existing lines
-   that bind names), and `locals` shows a local from there on (a local
+   each name is first stored in code order (`store` next to the code
+   that binds names), and `locals` shows a local from there on (a local
    assigned later in a loop than it is read is hidden on the first part
    of the second iteration). Comprehension targets have live ranges, as
    Mini's block locals. Cells and free variables are read through their
@@ -490,22 +444,20 @@ breakpoint and stepping parts (`on break`, the variant, `stop`,
 8. **Showing values.** Python's `repr` may run `__repr__`, a nested run
    from inside the `on break` handler that would hit breakpoints and
    steps of its own (pdb turns tracing off while it evaluates). The
-   debugger prints values without running Python code. Evaluating
-   expressions at a stop needs that "nested run with the debugger
-   suspended": not built.
-9. **Source positions.** The vm is not at the end of `vm.lm` (host
-   functions follow it), so `on break` and the variant had to go on the
-   existing line that closes `on raise`, to keep the default build's
-   panic messages, and IR, unchanged. A layout constraint, not a
-   missing feature.
+   debugger prints values without running Python code, and has no
+   expression evaluation (Mini's, section 9.2, runs guest code with the
+   debugger suspended).
+9. **Source positions.** `on break` and the variant sit after `on
+   raise`, each on its own lines: `loimi ir-diff` ignores source
+   positions, so the default build's code is checked unchanged even
+   though its panic messages' line numbers move.
 
 The debugger state is a module variable rather than a `Ctx` field (the
 Python `Ctx` is built with a full literal in `main`), and the bottom of
 the program's prototypes is recorded before compiling the file, to tell
 the program's code from the prelude's.
 
-Mini's debugger gained the `left` hook (one `#[cfg(debug)]` on an
-existing line); its other transcripts are the same, and its default
+Mini's debugger gained the `left` hook (one `#[cfg(debug)]` line); its other transcripts are the same, and its default
 build's IR too.
 
 ### 8.3 Cost
@@ -554,7 +506,7 @@ show a value without running guest code.
 
 ## 9. Editors: a stop-callback API and a DAP adapter
 
-Section 5 sketched a C API; this is it as built, for Mini, with what an
+Mini's C API adds what an
 editor needs on top of the command line: conditional and hit-counted
 breakpoints, break on error, a pause button, expressions, and a Debug
 Adapter Protocol server (`examples/mini/dap/mini_dap.c`) that VS Code
@@ -599,7 +551,7 @@ Handles (`std.debug.Refs`) are ids for a frame's locals, the globals
 (without the library's, recorded when the debugger attaches) or a
 table, valid until the program continues; the tables they name are GC
 roots meanwhile. Locals include the closure's upvalues, whose names the
-compiler now reports too (`compile.debug_upvals`, under `--cfg debug`).
+compiler reports too (`compile.debug_upvals`, under `--cfg debug`).
 Chunks loaded for debugging stay alive (their code holds breakpoints),
 and their source is copied (local names point into it).
 
@@ -652,10 +604,8 @@ raise`), so evaluating means a nested run from there. Three questions:
    interpreter's hooks (`on_step`, `stepping`, `left`, `on_error`)
    return at once; `unsuspend` sets the sites again over what the code
    holds then. That is one store per site, and an evaluation compiles
-   and runs a chunk anyway. A flag that made the breakpoint handler skip
-   the stop instead would have needed the step-over of each nested hit
-   without touching the pending one: two step-overs at once, which
-   `Breakpoints` does not represent.
+   and runs a chunk anyway. (Rejected: a flag to skip the stop, which
+   needs two step-overs at once.)
 
 A condition that fails to evaluate stops, with the error as the stop's
 message (VS Code's behavior); a false one continues at once (`on_break`
@@ -670,25 +620,17 @@ returns without a stop; the handler runs the step-over either way).
 ### 9.3 Pause
 
 `mini_debug_pause` comes from another thread (the adapter's reader)
-while the interpreter runs. What may it touch?
+while the interpreter runs. That thread only stores a word
+(`std.debug.request_pause`, a relaxed atomic store into `Ctx.pause`),
+as CPython's eval breaker; the interpreter, at a poll, switches to the
+step variant (`use_variant step`), whose wrapper sees the flag at the
+next instruction (`take_pause`) and stops with reason Pause.
+Rejected: patching breakpoints in from the other thread (races with
+`become` and the step-over; needs atomic code writes and a lock per
+hit), and a signal whose handler patches (it may interrupt `hit`,
+`tick` or `malloc`).
 
-- **Patch breakpoints into the code from that thread** (a breakpoint at
-  every line start): free when not pausing, but the patching races with
-  the running code's own writes (`become` quickens the word being
-  patched; the step-over clears and rearms sites) and with its use of
-  the `Breakpoints` tables; making that safe needs atomic code writes
-  and a lock the interpreter takes at each hit.
-- **A signal** to the interpreter's thread, whose handler patches: no
-  data race on the code, but the handler may interrupt the debugger
-  itself (inside `hit` or `tick`) or `malloc`.
-- **A flag the running code polls**, as CPython's eval breaker: the
-  other thread only stores a word (`std.debug.request_pause`, a relaxed
-  atomic store into `Ctx.pause`); the interpreter, at a poll, switches
-  to the step variant (`use_variant step`), whose wrapper sees the flag
-  at the next instruction (`take_pause`) and stops with reason Pause.
-  Everything else happens on the interpreter's thread.
-
-**Chosen: the poll**, in debug builds only, where every long
+The polls are in debug builds only, where every long
 computation passes: the `JMP` (a `while` loop's back-edge), `FORLOOP`,
 `NEXT`, `INEXT` (the other loops), and `CALL` (recursion without
 loops); the places of `--cfg gil`'s hand-over poll, less the
@@ -704,8 +646,8 @@ the program is stopped is dropped when it continues.
 ### 9.4 Break on error
 
 Mini's `on raise` gets every error at the instruction that raised it,
-with the frames intact. The hook (`debugger.on_error`, `#[cfg(debug)]`
-on the existing line) runs there for an error raised in this run (not
+with the frames intact. The hook (`debugger.on_error`, under
+`#[cfg(debug)]`) runs there for an error raised in this run (not
 one passed on from a nested run, whose own run had it first), and
 stops if nothing will catch it. Mini has no `pcall`: an error is caught
 only by `coroutine.resume` (which returns `false, msg`). So it is
@@ -748,9 +690,9 @@ responses), `continue`, `next`, `stepIn`, `stepOut`, `pause`,
 `disconnect`, `terminate`; events `initialized`, `stopped` (entry,
 breakpoint with `hitBreakpointIds`, step, pause, exception with its
 message), `output` (stdout, and the final error on stderr), `exited`,
-`terminated`. Not built: `attach`, `setVariable`, `restart`,
-`loadedSources`, `breakpointLocations`, coroutines as DAP threads,
-columns (Mini records lines only).
+`terminated`. The adapter does not implement `attach`, `setVariable`,
+`restart`, `loadedSources` or `breakpointLocations`, shows coroutines
+as one thread, and has no columns (Mini records lines only).
 
 ### 9.6 Tests
 
@@ -804,7 +746,7 @@ interleaved, the debug build before and after (not debugging):
 | string_build | 1.138 | 1.04 | 0.99 |
 | **geometric mean** | | 1.005 | 1.005 |
 
-*after*: this build against the one before; *polls only*: an earlier
+*after*: with the polls and the `repeat` change against without; *polls only*: an earlier
 run of the polls without the `repeat` change. The machine was shared
 with other benchmark runs (a third run, at load 5.7, scattered from
 0.78 to 1.09 per program both ways, so it is not shown). fannkuch,
@@ -816,7 +758,7 @@ debuggers that evaluate source text.
 
 ### 9.8 What is generic
 
-`std.debug` gained what another interpreter's API would use unchanged:
+`std.debug` gained what another interpreter's API uses unchanged:
 `Reason`, conditions and hit conditions on `Bp` (`set_condition`,
 `counts`, `parse_hit_condition`), `Breakpoints.suspend`/`unsuspend`/
 `suspended` (no stops, and the step-over left alone, while the debugger

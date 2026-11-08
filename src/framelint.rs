@@ -12,7 +12,10 @@
 //! from entry to its first jump, looking for frame setup (`push`, `sub
 //! rsp`, spills; `stp`/`sub sp` on AArch64). It names the calls the
 //! handler makes (with the message of each panic site) as the likely
-//! causes.
+//! causes. A panic is named by what it checks and where, from codegen's
+//! panic-site table ("the overflow check of `/` at vm.lm:512"); when
+//! LLVM has merged several panic calls into one, the candidates are the
+//! panic messages the function refers to.
 
 use crate::codegen::Arch;
 use crate::diag::{Diag, Span};
@@ -23,6 +26,13 @@ pub struct Site {
     pub symbol: String,
     pub op: String,
     pub span: Span,
+}
+
+/// What the lint needs from a build: the handlers, and codegen's panic
+/// sites (message text, location included → what checks it and where).
+pub struct Lint {
+    pub sites: Vec<Site>,
+    pub panics: HashMap<String, String>,
 }
 
 /// The string constants of an assembly file: label → text.
@@ -120,7 +130,11 @@ fn fast_frame(lines: &[&str], arch: Arch) -> Option<String> {
 
 /// The calls a function makes, in order, each once; panics with their
 /// messages.
-fn calls(lines: &[&str], arch: Arch, strs: &HashMap<&str, String>) -> Vec<String> {
+fn calls(lines: &[&str], arch: Arch, strs: &HashMap<&str, String>, panics: &HashMap<String, String>) -> Vec<String> {
+    let name = |m: &str| match panics.get(m.trim()) {
+        Some(d) => d.clone(),
+        None => format!("a panic (`{}`)", m.trim()),
+    };
     let mut out: Vec<String> = Vec::new();
     let mut recent: Vec<&str> = Vec::new();
     for line in lines {
@@ -143,8 +157,28 @@ fn calls(lines: &[&str], arch: Arch, strs: &HashMap<&str, String>) -> Vec<String
                         .find_map(|tok| strs.get(tok))
                 });
                 match msg {
-                    Some(m) => format!("a panic (`{}`)", m.trim()),
-                    None => format!("`{}`", target),
+                    Some(m) => name(m),
+                    None => {
+                        // Panic calls merged into one (the message is a
+                        // phi): the panic messages the function loads.
+                        let mut cands: Vec<String> = Vec::new();
+                        for l in lines {
+                            let (i, _) = split(l, arch);
+                            for tok in i.split(|c: char| c == ' ' || c == ',' || c == '$' || c == '(' || c == ':') {
+                                if let Some(m) = strs.get(tok).filter(|m| panics.contains_key(m.trim())) {
+                                    let d = name(m);
+                                    if !cands.contains(&d) {
+                                        cands.push(d);
+                                    }
+                                }
+                            }
+                        }
+                        match cands.len() {
+                            0 => format!("`{}`", target),
+                            1 => cands.pop().unwrap(),
+                            _ => format!("a panic (one of: {})", cands.join("; ")),
+                        }
+                    }
                 }
             } else if target.starts_with('%') || target.starts_with('x') && arch == Arch::AArch64 && target.len() <= 3 {
                 "an indirect call".to_string()
@@ -164,14 +198,14 @@ fn calls(lines: &[&str], arch: Arch, strs: &HashMap<&str, String>) -> Vec<String
 }
 
 /// The warnings for `sites` in assembly `asm`.
-pub fn check(asm: &str, arch: Arch, sites: &[Site]) -> Vec<Diag> {
+pub fn check(asm: &str, arch: Arch, sites: &[Site], panics: &HashMap<String, String>) -> Vec<Diag> {
     let strs = strings(asm);
     let fns = functions(asm);
     let mut out = Vec::new();
     for s in sites {
         let Some(lines) = fns.get(&s.symbol) else { continue };
         let Some(ins) = fast_frame(lines, arch) else { continue };
-        let cs = calls(lines, arch, &strs);
+        let cs = calls(lines, arch, &strs, panics);
         let cause = if cs.is_empty() {
             "it makes no calls: the frame holds spills (too many values live at once)".to_string()
         } else {

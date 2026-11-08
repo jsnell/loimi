@@ -1,0 +1,42 @@
+// `name: kind @ field` puts an operand in a named format field; the
+// other operands take the fields not named, in order.
+import std.io;
+import std.text;
+
+vm V {
+    state { pc: *u32, regs: *i64, k: *i64 }
+    operand reg = regs[it] display "r{}";
+    operand kst = k[it] display "k{}";
+    encoding fixed(u32) { format ABx { op: 8, a: 8, bx: 16 } format ABC { op: 8, a: 8, b: 8, c: 8 } }
+    // No dummy operand for the unused `a` field.
+    op LOADG(name: kst @ bx) : ABx { regs[0] = name; next }
+    // Named and positional operands mixed: `src` takes `a`, `dst` takes `c`.
+    op MOVE(dst: reg @ c, src: reg) : ABC { dst = src; next }
+    op RET(a: reg) : ABx { exit a }
+    entry run(code: *u32, r: *i64, ks: *i64) -> i64 { regs = r; k = ks; jump code }
+}
+
+fn main() {
+    var code: [u32; 4] = [0; 4];
+    var at: u64 = 0;
+    at = V.emit.LOADG(code[..], at, 300);
+    at = V.emit.MOVE(code[..], at, 2, 0);
+    at = V.emit.RET(code[..], at, 2);
+    // LOADG's operand is in bits 16..32; MOVE's dst in bits 24..32.
+    io.print_int((code[0] >> 16) as i64); io.println("");
+    io.print_int((code[1] >> 24) as i64); io.println("");
+    let Ok(v) = V.verify(code[..at]) else { return; };
+    var regs: [i64; 3] = [0; 3];
+    var ks: [i64; 301] = [0; 301];
+    ks[300] = 42;
+    io.print_int(V.run(v.start(), &regs[0], &ks[0])); io.println("");
+    var b = text.StrBuf.new();
+    V.disasm(v.words(), &b);
+    io.print(b.as_str());
+}
+// expect: 300
+// expect: 2
+// expect: 42
+// expect:     0  LOADG name=k300
+// expect:     1  MOVE dst=r2 src=r0
+// expect:     2  RET a=r2

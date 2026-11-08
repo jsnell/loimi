@@ -4,15 +4,12 @@ The language handles the inner loop. The standard library handles the rest of
 an interpreter: getting from source text to verified bytecode, and providing
 the runtime structures every dynamic language needs.
 
-Each module section below starts with **what exists** (the API in
-`std/*.lm`, which you can import today), followed by a **Design (not
-built)** part describing what the module was planned to grow into. Do not
-plan around the design parts: nothing in them exists unless the built part
-says so. Some modules are design only; their sections say so at the top.
+Each section below documents a module's API in `std/*.lm`; import it
+with `import std.NAME;`.
 
 | Module | Status | Source |
 |---|---|---|
-| [`std.core`](#stdcore-built-in-types-and-operations) (built-ins) | built in part (no `assert`, `rotl`, ...; formatting is in `std.text`) | the compiler |
+| [`std.core`](#stdcore-built-in-types-and-operations) (built-ins) | built in (formatting is in `std.text`, assertions in `std.test`) | the compiler |
 | [`std.mem`](#stdmem) | built | `std/mem.lm` |
 | [`std.hash`, `std.map`](#stdhash-and-stdmap), [`std.dict`](#ordered-maps-maporderedmap-and-dictdict) | built (`HashMap`, insertion-ordered `OrderedMap`; `Dict`, the same in the GC heap; `KeyDict`, without stored hashes, for keys that cache theirs) | `std/hash.lm`, `std/map.lm`, `std/dict.lm` |
 | [`std.text`](#stdtext) | built (`StrBuf` with `{}` formatting, `Interner`, small helpers) | `std/text.lm` |
@@ -20,20 +17,17 @@ says so. Some modules are design only; their sections say so at the top.
 | [`std.math`](stdlib/math.md) | built (`Divisor`: division by a prepared constant, as an inline cache) | `std/math.lm` |
 | [`std.bigint`](#stdbigint) | built (Karatsuba, Toom-3, divide-and-conquer division, square root and radix conversion; no FFT) | `std/bigint.lm` |
 | [`std.io`, `std.os`](#stdio-and-stdos) | built (minimal) | `std/io.lm`, `std/os.lm` |
-| [`std.lex`](#stdlex) | built (a cursor toolkit, no generator) | `std/lex.lm` |
-| [`std.parse`](#stdparse) | built (`Pratt`, `Parser`, `Ops`; no `TokenStream`) | `std/parse.lm` |
+| [`std.lex`](#stdlex) | built (a cursor toolkit) | `std/lex.lm` |
+| [`std.parse`](#stdparse) | built (`Pratt`, `Parser`, `Ops`) | `std/parse.lm` |
 | [`std.diag`](#stddiag) | built | `std/diag.lm` |
 | [`std.debug`](#stddebug-guest-debuggers) | built (breakpoints with conditions and hit counts, stepping, pause requests, handles for lazy expansion, commands; frames and locals are the interpreter's) | `std/debug.lm` |
-| [`std.bc`](#stdbc-bytecode-construction) | built (a library, no generated `Builder`) | `std/bc.lm` |
+| [`std.bc`](#stdbc-bytecode-construction) | built | `std/bc.lm` |
 | [`std.gc`](#stdgc), [details](stdlib/gc.md) | built (mark-sweep, optional generational mode) | `std/gc.lm` |
 | [`std.gil`](stdlib/gc.md#threads-sharing-a-heap-stdgil) | built (a global interpreter lock per heap) | `std/gil.lm` |
-| [`std.obj`](#stdobj-objects-and-shapes), [details](stdlib/obj.md) | built (no comptime `Model`) | `std/obj.lm` |
-| [`std.rt`](#stdrt-runtime-support) | built in part (`protect`/`throw`, `catch_panic`/`panic`, `ValueStack`; no `FrameStack`, `Fiber`) | `std/rt.lm` |
-| [`std.collections`](#design-not-built-stdcollections) (beyond `HashMap`, `OrderedMap`, `Dict`) | **not built** | |
-| [`std.ast`](#stdast) | **not built** | |
+| [`std.obj`](#stdobj-objects-and-shapes), [details](stdlib/obj.md) | built | `std/obj.lm` |
+| [`std.rt`](#stdrt-runtime-support) | built (`protect`/`throw`, `catch_panic`/`panic`, `ValueStack`) | `std/rt.lm` |
 | [`std.prof`](#stdprof) | built (clock, `Bench`, `Counters`, `--vm-stats` counts; sampling is `loimi build --vm-prof`) | `std/prof.lm` |
-| [`std.ffi`](#design-not-built-stdio-stdos-stdffi) | **not built** (`extern "C"` is in the language) | |
-| [`std.test`](#stdtest) | built (`#[test]`, `loimi test`, assertions, capture, golden files; no matrix or differential runner) | `std/test.lm` |
+| [`std.test`](#stdtest) | built (`#[test]`, `loimi test`, assertions, capture, golden files) | `std/test.lm` |
 
 Design rules for the library:
 
@@ -165,16 +159,6 @@ import.
 - **String equality** is `a.eq(b)`, defined in `std.hash` (`import
   std.hash;`); `==` does not compare slices.
 
-### Design (not built)
-
-Not built: `fmt` as compile-time checked format strings (`text.StrBuf`
-has `fmt`/`add` with run-time `{}` placeholders, see `std.text`), `assert` / `debug_assert` (write `if !c { trap(); }`),
-`rotl`, `bswap`, `bitcast` (use `to_bits`/`from_bits` and `as`), the
-float functions `fma` and `nextafter`, `a.add_overflow(b)` as a method, `f64.to_i32_js()`, and
-saturating conversions. The guest-arithmetic helpers that were planned
-here (`floor_div`, `floor_mod`, `trunc_div`, `trunc_rem`,
-`to_i64_exact`) are built, in `std.num`.
-
 ## `std.mem`
 
 `std/mem.lm`:
@@ -234,12 +218,6 @@ here (`floor_div`, `floor_mod`, `trunc_div`, `trunc_rem`,
   freed yet. For escaping closures freed one at a time (`new(&m, |..|
   ..)`, `c.free(&m)`) and cells (`new(&m, v)`, `m.free_bytes(p as
   *u8)`).
-
-### Design (not built)
-
-`Arena.reset`, scoped sub-arenas and typed arena allocation
-(`arena.new(T)`, `arena.slice(T, n)`); `Pool<T>` (fixed-size free-list
-allocator); `Id<T>` / `IndexVec<Id<T>, T>` typed indices; `SmallVec<T, N>`.
 
 ## `std.hash` and `std.map`
 
@@ -403,19 +381,6 @@ instance with 7 attributes in a loop 0.84-0.90 of the time; `P(i, 2, 3)`
 in a loop unchanged (smaller allocations, but `eq` now loads colliding
 keys on the probe path where the stored hash used to reject them).
 
-### Design (not built): `std.collections`
-
-Everything here except `HashMap`, `OrderedMap` and `Dict` is design only:
-
-- `HashSet<T>`, SwissTable-style probing.
-- `BitSet`, `Deque`, `BinaryHeap`.
-- `std.collections.Table`: a **Lua-style hybrid table**. A dense array part
-  plus a hash part, with array-part migration. Keys are `Value`s through a
-  user-supplied hash/eq interface, so it works with any `value` type.
-  (Mini, Scheme and MiniJS each write their own.)
-- A per-process random hash seed (to resist hash flooding) and a
-  streaming hash API.
-
 ## `std.text`
 
 `std/text.lm`:
@@ -446,14 +411,6 @@ Everything here except `HashMap`, `OrderedMap` and `Dict` is design only:
   (decimal), `parse_f64(s) -> ?f64` (C syntax, via strtod). `std.num` has
   the exact parsers with error kinds.
 
-### Design (not built)
-
-`String` (host-owned), `Gc<Str>` (a GC string object with cached hash,
-byte length and code-point length; interpreters declare their own string
-`object`), `Symbol` as a type and compile-time pre-seeded symbols
-(`intern!("__init__")`), rope concatenation, UTF-8 and UTF-16 iteration
-and validation, and case mapping.
-
 ## `std.num`
 
 `std/num.lm`. Parsing returns `Result<_, NumError>` with `Invalid` and
@@ -476,12 +433,6 @@ and validation, and case mapping.
   (`?i64`: None on a zero divisor; `MIN / -1` wraps), `floor_div_f64`,
   `floor_mod_f64`, `add_overflow` / `sub_overflow` / `mul_overflow`
   returning `(i64, bool)`, and `to_i64_exact(f64) -> ?i64`.
-
-### Design (not built)
-
-Ryu formatting and Eisel-Lemire parsing (snprintf and strtod are used
-instead); binary literals, digit separators and per-language literal
-configuration.
 
 ## `std.bigint`
 
@@ -738,20 +689,10 @@ one-limb operands: the GC layer's per-call work); against Guile 3's VM
 (GMP), pi 1.31x -> 1.10x wall and chudnovsky 0.84x -> 0.74x (best of 9,
 interleaved, on a shared machine).
 
-### Design (not built)
-
-FFT (Schönhage-Strassen or number-theoretic) multiplication, Toom-4
-and the unbalanced Toom variants (Toom-3 works on owned temporaries:
-fine at hundreds of limbs, wasteful lower), division by a Newton
-reciprocal (Barrett) for very large numbers, short products and
-precomputed inverses for formatting (GMP-style; formatting is now
-division-bound: a 2n by n division costs about two n by n products),
-a subquadratic (Lehmer or half-gcd) `gcd`, correctly rounded `a / b`
-to `f64`, and in-place operations on an owned `BigInt` (each operation
-returns a new one). The base cases are carry chains in plain Loimi,
-1.2-1.8x behind GMP's assembly on sums, products and squares (table
-above); quotients of a few limbs are 1.6-3.5x behind (the quotient-limb
-estimates and per-call work).
+The base cases are carry chains in plain Loimi, 1.2-1.8x behind GMP's
+assembly on sums, products and squares (table above); quotients of a
+few limbs are 1.6-3.5x behind (the quotient-limb estimates and per-call
+work). Each operation returns a new `BigInt`.
 
 ## `std.io` and `std.os`
 
@@ -775,16 +716,9 @@ per 64 KiB instead of one per call.
 `std/os.lm`: `arg_count() -> u64`, `arg(i) -> ?str` (0 is the program),
 `quit(code) -> never`.
 
-### Design (not built): `std.io`, `std.os`, `std.ffi`
-
-`std.ffi` does not exist (`extern "C" fn` and `export "C"` are in the
-language, language.md §1.5). Not built: formatted output (beyond `std.text`),
-stdin, environment variables, clocks, `mmap`, dynamic loading.
-
 ## `std.lex`
 
-`std/lex.lm`. There is no comptime, so there is no lexer generator: the
-module is a `Cursor` toolkit, and a lexer is a short function that tries
+`std/lex.lm`. The module is a `Cursor` toolkit, and a lexer is a short function that tries
 the scanners in order:
 
 <!-- snippet: check
@@ -845,26 +779,6 @@ fn Lexer.next(lx: *Lexer) -> Result<Token, lex.Error> {
 
 A complete lexer for Mini's token set is about 50 lines
 (`tests/run/lex_toy.lm`).
-
-### Design (not built)
-
-A comptime lexer generator: a token specification turned into a DFA at
-compile time, with longest match, priority by declaration order, and
-keyword tables via perfect hashing:
-
-<!-- snippet: skip design, not built (no comptime) -->
-```loimi
-const Tok = std.lex.define(.{
-    .skip     = .{ "[ \t\r\n]+", "--[^\n]*" },
-    .tokens   = .{ .Num = "[0-9]+(\\.[0-9]+)?([eE][+-]?[0-9]+)?",
-                   .Name = "[A-Za-z_][A-Za-z0-9_]*",
-                   .Str  = std.lex.quoted('"', escapes = .c) },
-    .keywords = .{ .from = .Name, "if", "then", "else", "end" },
-    .punct    = .{ "+", "-", "*", "/", "==", "~=", "<", "<=", "=", "(", ")" },
-});
-```
-
-Also not built: UTF-8 aware character classes.
 
 ## `std.parse`
 
@@ -955,12 +869,6 @@ The Prolog reader (`examples/prolog/reader.lm`) parses with it;
 
 `Span` and `SourceMap` live in `std.diag`.
 
-### Design (not built)
-
-`TokenStream` (lookahead, `expect`, and error recovery to synchronization
-tokens, `recover_to(.{ .Semi, .End })`); an operator table built at
-compile time.
-
 ## `std.diag`
 
 `std/diag.lm`:
@@ -985,10 +893,6 @@ compile time.
   `error_count`, `warning_count`, `has_errors`, `summary(&buf)`
   (`1 warning and 2 errors generated.`), `render(&sm, &buf)`,
   `eprint(&sm)`, `clear`, `free`.
-
-### Design (not built)
-
-Fix-it hints, ANSI color, multi-line spans, guest tracebacks.
 
 ## `std.debug`: guest debuggers
 
@@ -1122,19 +1026,6 @@ with all of it.
 Nothing in `std.bc` collects, so GC references in a `Pool` are not
 roots: compile between collections, as Mini and Scheme do.
 
-### Design (not built)
-
-The design had a generated `Builder` per vm that this library would plug
-into. Not built:
-
-- emitters as `b.ADD(r1, r2, r3)` methods (the generated `Vm.ADD(..)`
-  encoders plus `code.op` cover it);
-- an exception table (ranges to handler pc) for `on raise`;
-- `Proto` assembly that calls the verifier and returns `Verified<V>` (each
-  interpreter's `Proto` and verify context differ; the compiler calls
-  `Vm.verify` and `Vm.optimize` itself);
-- serialization of protos (bytecode cache files).
-
 ## `std.gc`
 
 `std/gc.lm`; details and measurements in
@@ -1195,7 +1086,7 @@ into. Not built:
   marks and poisons unassigned slots and freed objects
   ([details](stdlib/gc.md#checking-roots---gc-check-roots)).
 - Threads: heaps have no shared state, so independent heaps run on
-  different threads without locks ([`stdlib/gc.md`](stdlib/gc.md#9-heaps-and-threads)).
+  different threads without locks ([`stdlib/gc.md`](stdlib/gc.md#threads-sharing-a-heap-stdgil)).
   Threads sharing a heap, one at a time: `std.gil` (`gil.Gil.new(&heap,
   data)`, `attach`, `detach`, `unlock`/`lock`, the poll `waiting()` and
   `yield_now()`, hooks that move per-thread interpreter state); see
@@ -1228,19 +1119,11 @@ at the live data plus `bytes` rather than at a multiple of it once the
 live data is large. Scheme uses 400%, a 2 MiB minimum and a 256 MiB cap
 (see `bench/scheme/README.md`).
 
-### Design (not built)
-
-Full design: [`stdlib/gc.md`](stdlib/gc.md). Not built:
-
-- heap policies as a compile-time parameter (`#![heap = ...]`) and the
-  `Incremental` policy (tri-color, snapshot-at-the-beginning barrier);
-- card marking, aging of small
-  objects before promotion, a moving collector;
-- roots generated from vm stacks and frame structs (write a root
-  scanner; traced `state` variables are rooted automatically),
-  `Root<T>`, `GcVec<T>`;
-- finalizers that run guest code (free hooks for host memory are
-  built), heap snapshots, poisoning outside `--gc-check-roots` builds.
+Limitations (details in [`stdlib/gc.md`](stdlib/gc.md#limitations)): the
+heap never moves objects; there is no card marking (a large array stored
+into is retraced whole by each minor collection) and no incremental
+marking; small objects are promoted at their first survival; finalizers
+cannot run guest code (free hooks release host memory).
 
 ## `std.obj`: objects and shapes
 
@@ -1262,13 +1145,9 @@ either way, instantiate `obj.Model<O, S, V>` with a function that
 allocates slot arrays. An inline-cache hit is two loads, a compare and
 the slot load (`bench/obj`).
 
-### Design (not built)
-
-Full design: [`stdlib/obj.md`](stdlib/obj.md). Not built: a compile-time
-`Model` configuration (attributes, prototypes, ordering, element storage
-and thresholds chosen per guest language), elements (integer-indexed
-storage), property cells for globals, `SetError`, and lookup tables shared
-along a transition chain.
+Limitations (details in [`stdlib/obj.md`](stdlib/obj.md#limitations)):
+no integer-indexed element storage and no global property cells (both
+are the interpreter's).
 
 ## `std.rt`: runtime support
 
@@ -1381,26 +1260,6 @@ the mark of each one; nested runs must `ensure` their windows. Mini's
 hand-written attempt at all that measured no gain
 ([design/speed-audit.md](design/speed-audit.md), item 9).
 
-### Design (not built)
-
-- `ValueStack<T>` (built, above) could reserve virtual address space up
-  front and commit pages on demand, and per-coroutine stacks could be
-  registered with the collector.
-- `FrameStack<F>`: guest call frames, with entry markers for reentrant calls.
-- `Upvalues`: open-upvalue list and closing (Lua-style), for closure capture by
-  reference with stack-allocated locals.
-- `Fiber`: stackful coroutines (separate host stack), for guest coroutines
-  that must suspend across host frames.
-- A C-stack depth guard for `reenter` (the compiler's `Vm.depth` counter
-  is built; checking it is the interpreter's job).
-
-## `std.ast`
-
-**Not built.** Design: arena-allocated trees with `Id<T>` links, a
-generic visitor via comptime reflection, and scope and resolver helpers:
-`Scopes<Symbol, Binding>` with local, upvalue, and global classification,
-which is the core of Lua-, JS-, and Python-style closure compilation.
-
 ## `std.prof`
 
 `std/prof.lm`, for timing and counting inside an interpreter or its
@@ -1432,14 +1291,6 @@ access is compiled in only when the program uses it.
   at exit covers what ran since) and `c.report()` (the exit report, now).
   The exit report (language.md §7.3) also counts entries into each
   `cold` block, per op, with its source location.
-
-### Design (not built)
-
-Guest-level sampling: `loimi build --vm-prof` (language.md §7.3)
-samples handlers, functions and the vm's `pc`; not built is mapping
-those pcs through the interpreter's line table to guest source lines,
-with folded stacks for flame graphs; `suggest-supers` as a
-library over the pair counts; confidence intervals in `Bench`.
 
 ## `std.test`
 
@@ -1512,14 +1363,3 @@ test result: FAILED. 1 passed; 1 failed; 0 filtered out
 Conformance tests that run a built interpreter on script files remain
 shell scripts (`examples/*/check.sh`); bytecode fuzzers are ordinary
 Loimi programs (tutorial chapter 9, `tests/fuzz/`).
-
-### Design (not built)
-
-- A golden-file runner over `tests/**/*.<ext>` scripts with `-- expect:`
-  comments, `--update` and parallel runs (`check.sh` does this per
-  example today).
-- A mode matrix: each test under every dispatch strategy, value repr and
-  GC policy asked for (`--matrix dispatch=*,gc=MarkSweep,stress`).
-- Differential testing against a reference interpreter binary.
-- Tests collected from imported modules, and tests in parallel or in
-  separate processes (so that a crash fails one test, not the run).

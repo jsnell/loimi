@@ -1,0 +1,42 @@
+// Lint `state_registers`: a tail-call vm whose state, context and
+// instruction word need more `preserve_none` argument registers than the
+// target has (x86-64: 12 general-purpose, 8 floating-point; AArch64: 24
+// and 8) passes the rest on the stack in every handler.
+// expect-stderr: warning[state_registers]: vm `Wide` passes 25 integer or pointer values (state and context, plus the instruction word) for
+// expect-stderr: and 9 floating-point state variables for 8 floating-point argument registers under `preserve_none` on
+// expect-no-stderr: vm `Narrow`
+// expect: 3
+import std.io;
+
+struct C { n: i64 }
+
+vm Wide {
+    context ctx: *C;
+    state {
+        pc: *u32, a: *i64, b: *i64, c: *i64, d: *i64, e: *i64, f: *i64, g: *i64, h: *i64, i: *i64, j: *i64,
+        k: *i64, l: *i64, w: *i64, n: *i64, o: *i64, y: *i64, q: *i64, r: *i64, s: *i64, t: *i64, u: *i64, v: *i64,
+        f0: f64, f1: f64, f2: f64, f3: f64, f4: f64, f5: f64, f6: f64, f7: f64, f8: f64,
+    }
+    encoding fixed(u32) { format A { op: 8, x: 24 } }
+    op END() : A { exit ctx.n + 1 }
+    entry run(mm: *C, code: *u32) -> i64 { ctx = mm; pc = code; jump pc }
+}
+
+// Exactly at the limit: 11 state registers and the word.
+vm Narrow {
+    context ctx: *C;
+    state {
+        pc: *u32, a: *i64, b: *i64, c: *i64, d: *i64, e: *i64, f: *i64, g: *i64, h: *i64, i: *i64,
+        f0: f64, f1: f64, f2: f64, f3: f64, f4: f64, f5: f64, f6: f64, f7: f64,
+    }
+    encoding fixed(u32) { format A { op: 8, x: 24 } }
+    op END() : A { exit ctx.n + 2 }
+    entry run(mm: *C, code: *u32) -> i64 { ctx = mm; pc = code; jump pc }
+}
+
+fn main() {
+    var m = C { n: 0 };
+    var code: [u32; 1] = [Wide.END()];
+    var code2: [u32; 1] = [Narrow.END()];
+    io.print_int(Wide.run(&m, &code[0]) + Narrow.run(&m, &code2[0])); io.println("");
+}

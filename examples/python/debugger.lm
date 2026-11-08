@@ -370,7 +370,7 @@ fn stop(d: *Dbg, c: *Ctx, pc: *u32, fp: *Frame, id: u32) {
             Print(name) => d.locals(fp, pc, name),
             Op => {
                 let words = fp.proto.code.words();
-                Py.disasm_insn(words, ((pc as u64) - (words.ptr as u64)) / 4, &d.out);
+                Py.disasm_insn(words, fp.proto.code.index_of(pc), &d.out);
             }
             Quit => { d.flush(); exit(0) }
             Help => d.out.push_str(debug.HELP),
@@ -499,7 +499,7 @@ fn Dbg.backtrace(d: *Dbg, c: *Ctx, pc: *u32, fp: *Frame) {
 /// the globals.
 fn Dbg.locals(d: *Dbg, fp: *Frame, pc: *u32, name: str) {
     let p = fp.proto;
-    let i = ((pc as u64) - (p.code.start() as u64)) / 4;
+    let i = p.code.index_of(pc);
     let vars = locvars(p);
     var found = false;
     for j in 0..vars.len {

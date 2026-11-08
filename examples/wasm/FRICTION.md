@@ -22,9 +22,9 @@ This report is kept as written. Since then:
 | 5 | Fixed: `Vm.set_FMT_field(w, v) -> ?W` (None if `v` does not fit the field) and `Vm.encode.FMT(op, a, b, ..)` (language.md §3.3). They are compiled only into programs that call them, so other vms' IR is unchanged. The masks, the `SELECT4` special case (now `match W.set_R4_a(w, x)`) and the `with_opcode` templates are gone. |
 | 6 | Fixed: tail-call handlers (and their cold blocks and super resume functions) carry `no-builtin-memset`/`memcpy`/`memmove`, so LLVM keeps loops as loops (language.md §3.7). CALL zeroes the callee's locals with a plain loop again, without a frame (63 instructions with the loop, against 46 for the four-stores workaround; geomean 0.99x of the workaround's time). Mini, MiniJS and Scheme compile to byte-identical `.text`; Stak's HALT/RET store their zeroed result differently. |
 | 7 | Fixed: `p.read_unaligned()` and `p.write_unaligned(v)` (`align 1`; language.md §1.3); every guest memory access in the handlers and the WASI host functions uses them, and `I32_LOAD` is unchanged (19 instructions in this build, the access one `mov`). |
-| 8 | Partly: `for x in e` iterates over an array or slice (language.md §1.2), so the K-form and fusion tables are walked without repeating their lengths; the return types still spell them (`[T; _]` is not built). |
+| 8 | Partly: `for x in e` iterates over an array or slice (language.md §1.2), so the K-form and fusion tables are walked without repeating their lengths; resolved where it mattered: `let t: [T; _] = [..]` takes the length from the literal (language.md §1.2); a return type still spells it. |
 | 9 | Fixed: "`Vec` is a generic type, not a value; .. write `var v: Vec<T> = Vec.new();`". |
-| 10 | Range patterns are documented (language.md §1.2, "Integer patterns"). `bool as` integer, a profiler and an op-table dump are unchanged. |
+| 10 | Range patterns are documented (language.md §1.2, "Integer patterns"). Resolved since: `bool as i32` works, `--vm-prof` profiles handlers, and `Vm.Op`, `Vm.op_of` and `Vm.disasm` give host code an op enum and a disassembler (language.md §3.3). |
 | 11 | Not Loimi's. |
 
 Spec tests after these changes: all 90 non-SIMD files pass in all three
@@ -471,18 +471,6 @@ within noise each.
   changes above were made instead (3 and 4 cover the recurring ones),
   and only `I32_ADDK; I32_ADDK` was added.
 
-**Not done, the next candidates.** Local-to-local `MOV`s are 7–10% of
-dispatches in binarytrees, coremark, fannkuchredux and mandelbrot
-(clang's own copies, often loop-carried: coalescing them needs liveness
-over the wasm locals). `CONST32` into locals and as call arguments (12%
-of binarytrees' dispatches). `GLOBAL_GET`/`GLOBAL_SET` of the stack
-pointer read `ctx.globals[g]` and then the cell: globals of the instance
-in one array would save a dependent load. An address that is
-`local.tee`d (fannkuchredux) or used with a nonzero offset keeps its
-`I32_ADDK`. A held-out benchmark set would show how much of this is
-specific to these seven programs; all four changes are about how clang
-compiles C, not about one program.
-
 ### A held-out set (PolyBench/C), and round two (2026-11-04)
 
 Every change above was measured on the same seven programs, so
@@ -753,15 +741,9 @@ about 1.0.
   without SSE4.1), the bulk memory and table ops, and `I8X16_SHUFFLE`;
   none of them runs in either set.
 
-**Next candidates.** Placement still moves single programs by 3–4%
-either way (fannkuchredux and coremark between builds that differ in
-other handlers), probably uop-cache set conflicts or branch predictor
-aliasing among the 40-odd hot handlers; ordering hot handlers together
-from a `--vm-stats` profile (docs/lowering.md §12 lists it as not
-implemented) would make that steadier. The R forms for stores need the
-sum pending (the store's address is computed before its value), like
-`Loc.AddK`. MOVs remain 7–20% of the dispatches of seidel-2d,
-floyd-warshall, fannkuchredux and coremark.
+**Since then:** the vm orders its handlers from a recorded profile
+(`#[profile("wasm.vmprofile")]`, docs/lowering.md §12), which the
+paragraph that stood here asked for against placement noise.
 
 ## Summary
 
@@ -785,7 +767,8 @@ bulk memory (`memory.copy/fill/init`, `data.drop`, `table.init/copy`,
 `elem.drop`). Imports and exports of every kind across instances
 (calls into another instance switch memory, globals and tables and
 come back through a verified RESTORE stub). Traps with the spec's
-messages. Not built: SIMD, threads, GC, tail calls, multi-memory, the
+messages. Fixed-width SIMD was added after the study ("Fixed-width
+SIMD" above). Not supported: threads, GC, tail calls, multi-memory, the
 text format.
 
 **Spec tests** (WebAssembly/testsuite f3f04866, the commit wabt 1.0.36
@@ -794,7 +777,8 @@ pins; `bench/wasm/spec_run.py`): **all 90 non-SIMD .wast files pass,
 commands are skipped: text-format modules (`assert_malformed` on `.wat`,
 `module quote`), which a binary-only interpreter cannot read, and a few
 actions whose arguments are non-null funcref constants. The 57 SIMD
-files fail (not implemented: 121 commands pass by accident). Per file:
+files failed at the time (not implemented: 121 commands passed by
+accident); with SIMD built, all 57 pass. Per file:
 `python3 bench/wasm/spec_run.py --wasm WASM --skip simd`.
 
 **Time.** First doc read 01:51 (by the clock in this container); first

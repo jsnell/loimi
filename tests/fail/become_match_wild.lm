@@ -1,0 +1,19 @@
+enum Kind { Zero, Many }
+
+vm Q {
+    state { pc: *u32 }
+    operand imm = it;
+    encoding fixed(u32) { format A { op: 8, a: 24 } }
+    family F(v: imm) : A {
+        generic {
+            let k = if v == 0 { Kind.Zero } else { Kind.Many };
+            become match k { Zero => F_ZERO, _ => F }
+            next
+        }
+        F_ZERO { next }
+    }
+    entry run(code: *u32) { pc = code; jump pc }
+}
+
+fn main() {}
+// error: `become match` takes no `_` arm: a value no arm names keeps the current op

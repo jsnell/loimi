@@ -351,7 +351,7 @@ pub vm Pip {
     // instruction that failed, and `fp` at its function's frame.
     on raise(msg: str) {
         let p = fp.proto;
-        let i = ((pc as u64) - (p.code.start() as u64)) / 4;
+        let i = p.code.index_of(pc);
         ctx.error_line = p.lines[i];
         fail msg
     }

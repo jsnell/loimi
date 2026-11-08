@@ -128,8 +128,8 @@ With `std.bc`, `let at = code.op(w);` then
 - **Python** was not ported: its slice `idiv` divides by the slice
   step, a run-time value, and steps of ±1 already skip the division.
 
-## Not built
+## Limitations
 
-- Negative divisors, divisors of 2^32 and more, and i64.min / u64
-  dividends of 2^63 and more (libdivide's 65-bit "add" form would cover
-  them at two more instructions).
+- `Divisor` does not handle negative divisors, divisors of 2^32 and
+  more, or i64.min / u64 dividends of 2^63 and more (libdivide's 65-bit
+  "add" form would cover them at two more instructions).

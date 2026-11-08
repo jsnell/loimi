@@ -264,5 +264,6 @@ whole suite cross-compiled (see `cross()` in `tests/golden.rs`).
 - [`docs/status.md`](docs/status.md): what is built and how it differs
   from the design; [`CHANGELOG.md`](CHANGELOG.md): what is new.
 - [`docs/results.md`](docs/results.md): benchmark results;
-  [`docs/roadmap.md`](docs/roadmap.md): plan and open questions.
+  [`docs/roadmap.md`](docs/roadmap.md): design decisions (GC, threads,
+  JIT, decoding).
 - The examples above, and their `FRICTION.md` usability reports.

@@ -8,10 +8,9 @@ This page replaces the ratios quoted elsewhere (README, `status.md`,
 `FRICTION.md`) keep their dated history.
 
 The tables below are the **2026-11-07 run at 9dce087**. They supersede
-the 2026-11-05 run at c7e94ae, whose summary is in "Changes since the
-previous run (c7e94ae)" below; the dated A/Bs made between the two runs
-(2026-11-05 to 2026-11-07, further down) are kept as they were written,
-and their changes are in this run's tables.
+the 2026-11-05 run at c7e94ae, compared in "Changes since the previous
+run (c7e94ae)" below; the A/Bs of single changes made between the two
+runs are in the documents linked from its "What changed".
 
 ## Setup
 
@@ -160,6 +159,7 @@ bench/wasm/bench.py -n 1 --dir bench/wasm/polybench-out --interp="wasm3=bench/wa
 | prolog (30) | jit | 0.94 (0.93 without sieve) | swipl 0.45, trealla 0.11 (swipl 0.43, trealla 0.10 over 29, without sieve) |
 | mini (14) | jit + AOT traces ‡ | 0.764 of jit | luajit-joff 0.44, luajit (JIT on) 1.58 |
 | minijs (14) | jit + AOT traces ‡ | 0.866 of jit | (not run against the references) |
+| scheme (43) | jit + AOT traces ‡ | 0.773 of jit (2026-11-08) | (not run against the references) |
 
 (n) is the number of benchmarks. *vs tailcall* is the geometric mean of
 that build's times over the tail-call build's. Suites: `mini` (Mini, a
@@ -175,10 +175,11 @@ PolyBench/C kernels, a held-out set; not run by `run_all.py`), `stack`
 suite).
 
 ‡ Not from `run_all.py`: `--jit-stencils` builds with ahead-of-time
-traces from a profile of the suite's own 14 programs, **trained on the
+traces from a profile of the suite's own programs, **trained on the
 benchmark inputs themselves**, against the same run's JIT build, user+sys
 CPU time; see "Trace tier in this run" below. Trained on quarter-size
-inputs instead, Mini's is 0.765.
+inputs instead, Mini's is 0.765. Scheme's was measured on 2026-11-08 at
+cf92210's code plus the trace change (§13.7 of the design note).
 
 ## Notes
 
@@ -319,19 +320,24 @@ references: PolyBench correlation 1.54 (1.87× the tail-call time),
 Prolog tak 1.33, Mini string_build 1.30 (Lua's own drift above),
 PolyBench gramschmidt 1.24.
 
-What changed, from `git log c7e94ae..9dce087` (the dated sections below
-measured each):
+What changed, from `git log c7e94ae..9dce087`, with where each was
+measured on its own:
 
-- **Hot-handler placement** (`#[profile]`, 2026-11-05): Lox properties
+- **Hot-handler placement** (`#[profile]`, 2026-11-05; [lowering.md
+  §12](lowering.md#12-driver-settings), "Handler order"): Lox properties
   and PolyBench goto-mode gemm (1.42× tail-call before, 1.08× now).
-- **Value accumulators** in Mini and MiniJS (2026-11-06): Mini
+- **Value accumulators** in Mini and MiniJS (2026-11-06;
+  [design/speed-audit.md](design/speed-audit.md), item 1): Mini
   mandelbrot 0.90, MiniJS nbody 0.94.
-- **`nanbox(int_high)`** in Python and Prolog (2026-11-06): Python 0.93,
+- **`nanbox(int_high)`** in Python and Prolog (2026-11-06;
+  [design/speed-audit.md](design/speed-audit.md), item 7): Python 0.93,
   Prolog 0.90 (the JIT build 0.85).
 - **`std.rt.ValueStack`** in Lox, Scheme and MiniJS and **re-fusion** in
-  Lox (2026-11-06, 2026-11-07): Lox 0.93 (fib 0.87, properties and zoo
-  0.85); Scheme and MiniJS unchanged.
-- **Mini's direct SWITCH and quickened coroutine CALLs** (2026-11-06):
+  Lox (2026-11-06, 2026-11-07; [design/speed-audit.md](design/speed-audit.md),
+  items 8 and 9): Lox 0.93 (fib 0.87, properties and zoo 0.85); Scheme
+  and MiniJS unchanged.
+- **Mini's direct SWITCH and quickened coroutine CALLs** (2026-11-06;
+  [design/speed-audit.md](design/speed-audit.md), items 11 and 13):
   interp 0.97, the coroutine suite 0.91 (the JIT build 0.89).
 - **`Divisor`**, cold-by-default errors, `rel`/`data`, supers groups,
   `--vm-prof`: no suite-level change; the cold-by-default commit is the
@@ -407,10 +413,70 @@ spectral_norm, fannkuch, bitops, sort) are 0.59–0.95 here, against
 0.53–0.95 there (nbody 0.58, spectral_norm 0.53, fannkuch 0.79, bitops
 0.89, sort 0.95; a loaded machine).
 
+**Scheme (2026-11-08)**, measured separately by the same method on the
+43 programs of `bench/scheme/compare.py`'s inputs (one profile of all 43;
+109 traces, 74 side traces), with a third trace build recorded and
+profiled with a quarter of each program's iteration count (*¼ count*)
+and a round of all three builds at `--align-functions=128` (*at 128*).
+The runs are short (9–580 ms), so single programs move by up to 15% in
+the A/A pair (quicksort, sum, sboyer); the column ratios are against the
+JIT's minimum.
+
+| program | JIT | JIT A/A | trace | trace off | trace (¼ count) | trace/JIT | (medians) | at 128 | ¼/JIT |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| ack | 0.299 | 0.296 | 0.269 | 0.295 | 0.266 | 0.90 | 0.93 | 0.80 | 0.89 |
+| array1 | 0.274 | 0.265 | 0.150 | 0.267 | 0.136 | **0.55** | 0.51 | 0.49 | 0.50 |
+| browse | 0.012 | 0.012 | 0.009 | 0.012 | 0.009 | **0.77** | 0.78 | 0.77 | 0.77 |
+| chudnovsky | 0.152 | 0.153 | 0.153 | 0.154 | 0.154 | 1.00 | 1.00 | 0.94 | 1.01 |
+| conform | 0.071 | 0.071 | 0.072 | 0.072 | 0.078 | 1.03 | 1.04 | 0.99 | 1.11 |
+| cpstak | 0.192 | 0.195 | 0.195 | 0.190 | 0.190 | 1.02 | 0.99 | 0.95 | 0.99 |
+| ctak | 0.016 | 0.016 | 0.016 | 0.016 | 0.016 | 1.03 | 1.02 | 0.99 | 1.00 |
+| deriv | 0.106 | 0.106 | 0.107 | 0.107 | 0.107 | 1.00 | 1.01 | 1.00 | 1.00 |
+| destruc | 0.090 | 0.090 | 0.061 | 0.090 | 0.061 | **0.68** | 0.68 | 0.68 | 0.68 |
+| diviter | 0.123 | 0.124 | 0.095 | 0.124 | 0.093 | **0.77** | 0.77 | 0.71 | 0.76 |
+| divrec | 0.157 | 0.158 | 0.158 | 0.158 | 0.157 | 1.01 | 1.03 | 1.00 | 1.00 |
+| earley | 0.029 | 0.029 | 0.030 | 0.029 | 0.029 | 1.03 | 1.02 | 0.97 | 1.00 |
+| fft | 0.043 | 0.042 | 0.021 | 0.042 | 0.021 | **0.50** | 0.51 | 0.48 | 0.50 |
+| fib | 0.340 | 0.354 | 0.355 | 0.346 | 0.343 | 1.05 | 0.94 | 0.99 | 1.01 |
+| fibc | 0.029 | 0.028 | 0.022 | 0.025 | 0.022 | **0.77** | 0.90 | 0.91 | 0.75 |
+| fibfp | 0.122 | 0.123 | 0.123 | 0.120 | 0.126 | 1.01 | 1.01 | 0.93 | 1.03 |
+| gcbench | 0.009 | 0.008 | 0.009 | 0.009 | 0.008 | 1.02 | 1.04 | 1.04 | 0.98 |
+| graphs | 0.121 | 0.107 | 0.105 | 0.112 | 0.118 | **0.87** | 1.06 | 0.91 | 0.98 |
+| lattice | 0.040 | 0.040 | 0.039 | 0.037 | 0.040 | 0.97 | 1.09 | 1.01 | 0.99 |
+| matrix | 0.059 | 0.062 | 0.051 | 0.053 | 0.052 | **0.87** | 0.79 | 0.99 | 0.88 |
+| maze | 0.022 | 0.022 | 0.022 | 0.022 | 0.022 | 0.97 | 0.98 | 0.98 | 0.97 |
+| mazefun | 0.095 | 0.094 | 0.082 | 0.096 | 0.085 | **0.86** | 0.79 | 0.78 | 0.89 |
+| mbrot | 0.039 | 0.041 | 0.015 | 0.039 | 0.015 | **0.39** | 0.31 | 0.40 | 0.39 |
+| mperm | 0.125 | 0.123 | 0.108 | 0.119 | 0.093 | **0.87** | 0.87 | 0.97 | 0.74 |
+| nboyer | 0.503 | 0.493 | 0.504 | 0.522 | 0.506 | 1.00 | 0.92 | 1.06 | 1.01 |
+| nqueens | 0.236 | 0.235 | 0.134 | 0.234 | 0.152 | **0.57** | 0.54 | 0.65 | 0.65 |
+| ntakl | 0.167 | 0.162 | 0.075 | 0.165 | 0.075 | **0.45** | 0.44 | 0.49 | 0.45 |
+| nucleic | 0.086 | 0.084 | 0.083 | 0.087 | 0.085 | 0.96 | 1.01 | 1.01 | 0.99 |
+| paraffins | 0.036 | 0.036 | 0.037 | 0.037 | 0.038 | 1.04 | 1.02 | 1.02 | 1.05 |
+| peval | 0.096 | 0.103 | 0.086 | 0.080 | 0.073 | **0.90** | 0.87 | 0.85 | 0.76 |
+| pi | 0.131 | 0.133 | 0.133 | 0.131 | 0.132 | 1.02 | 0.97 | 0.98 | 1.01 |
+| pnpoly | 0.064 | 0.064 | 0.026 | 0.064 | 0.025 | **0.40** | 0.40 | 0.37 | 0.40 |
+| primes | 0.131 | 0.113 | 0.113 | 0.114 | 0.112 | **0.86** | 0.81 | 0.76 | 0.86 |
+| puzzle | 0.114 | 0.119 | 0.072 | 0.081 | 0.070 | **0.63** | 0.65 | 0.52 | 0.61 |
+| quicksort | 0.127 | 0.088 | 0.102 | 0.097 | 0.112 | **0.80** | 0.86 | 0.88 | 0.88 |
+| sboyer | 0.581 | 0.496 | 0.558 | 0.529 | 0.585 | 0.96 | 0.96 | 0.99 | 1.01 |
+| simplex | 0.113 | 0.126 | 0.063 | 0.114 | 0.068 | **0.56** | 0.59 | 0.61 | 0.61 |
+| string | 0.020 | 0.020 | 0.017 | 0.019 | 0.017 | **0.85** | 0.96 | 0.89 | 0.84 |
+| sum | 0.314 | 0.254 | 0.075 | 0.302 | 0.075 | **0.24** | 0.26 | 0.27 | 0.24 |
+| sumfp | 0.071 | 0.072 | 0.031 | 0.070 | 0.030 | **0.44** | 0.33 | 0.38 | 0.43 |
+| tak | 0.383 | 0.361 | 0.374 | 0.409 | 0.462 | 0.98 | 1.04 | 0.91 | 1.21 |
+| takl | 0.079 | 0.068 | 0.033 | 0.063 | 0.030 | **0.42** | 0.55 | 0.42 | 0.38 |
+| triangl | 0.118 | 0.115 | 0.117 | 0.116 | 0.115 | 0.99 | 0.95 | 1.02 | 0.98 |
+| **geometric mean** | | | | | | **0.773** | 0.773 | 0.767 | 0.774 |
+
+Controls: JIT A/A 0.978, trace off / JIT 0.963 (at 128: 0.994, 0.976);
+an earlier, quieter round of the same profile: 0.779, A/A 1.004, trace
+off 1.003.
+
 ## GC: mark bitmaps instead of sweeping (2026-11-04)
 
-A dated A/B of one change, made before the 2026-11-04 run (95a227e); its
-effect is in the "Changes from 95a227e to c7e94ae" section. `std.gc`
+A dated A/B of one change, made before the 2026-11-04 run (95a227e);
+its effect is in the later runs' tables. `std.gc`
 stopped sweeping: marking sets a bit per 16-byte granule in each chunk's
 bitmap, and each size class bump-allocates through the runs of clear
 bits ([stdlib/gc.md](stdlib/gc.md#heap-layout)).
@@ -481,343 +547,6 @@ refill to 21 ms but grew its peak to 33.5-35 MB). Dropped: tracing
 through a FIFO of popped objects without prefetching (no change), and a
 plain load instead of the prefetch (boyer mark 252 ms, slower than
 before).
-
-## Changes from 95a227e to c7e94ae (the 2026-11-05 run; superseded)
-
-Superseded by the 2026-11-07 run above: this section compared the
-2026-11-05 run (c7e94ae), whose tables this page no longer shows (see
-`git show 9dce087:docs/results.md`), with the run before it; "these",
-"this run" and "the tables below" in it mean the 2026-11-05 run.
-
-The previous tables (commit 573511e, a run at 95a227e, 2026-11-04, same
-machine and method) against these, over the benchmarks both runs have.
-The host ran this run's programs in about 0.75–0.8 of the time (*references'
-time*, new/old geometric mean of every reference of the suite), so the
-mode columns divide that out: each is the geometric mean over benchmarks
-of (ours / first reference) new over old, below 1 when ours gained on
-the reference. *ratio* is the tail-call (or JIT) build over the first
-reference, old → new.
-
-| suite | references' time | tailcall | goto | switch | jit | ratio old → new |
-|---|---:|---:|---:|---:|---:|---|
-| mini (14) | 0.78 | 0.91 | 0.93 | 0.91 | 0.91 | lua 0.52 → 0.47, jit 0.40 → 0.36 |
-| mini-coro (3) | 0.77 | 0.98 | 0.96 | 0.97 | 0.92 | lua 0.37 → 0.36, jit 0.31 → 0.29 |
-| minijs (14) | 0.76–0.77 | 0.96 | 0.97 | 1.04 | 0.93 | node-jitless 0.50 → 0.48, jit 0.43 → 0.40 |
-| scheme (43) | 0.75–0.77 | 0.88 | 0.88 | 0.91 | 0.85 | guile 0.94 → 0.80, jit 0.76 → 0.63 |
-| lox (10) | 0.79 | 1.01 | 0.94 | 1.04 | | clox 0.44 → 0.45 |
-| regex (8) | 0.79 | 0.99 | 1.02 | 1.03 | | pcre2 0.44 → 0.44 |
-| wasm (7) | 0.78 | 0.98 | 0.98 | 0.99 | | wasm3 0.87 → 0.85 |
-| wasm-simd (3) | (mvp) | 1.00 | 1.00 | 0.99 | | mvp 0.98 → 0.98 |
-| wasm-polybench (30) | 0.77 | 0.93 | 0.96 | 0.94 | | wasm3 0.90 → 0.83 |
-| stack (5) | | 0.77 | 0.78 | 0.72 | | (own time new/old; no reference) |
-| python (11) | 0.77–0.78 | 0.89 | 0.94 | 0.88 | | cpython 0.37 → 0.33 |
-| prolog (30) | 0.76–0.77 | 0.99 | 0.98 | 1.00 | 0.79 (0.88 over 29) | swipl 0.53 → 0.52, jit 0.66 → 0.52 (29: 0.58 → 0.51) |
-
-Stak's own times fell with the host's (0.77 against the references'
-0.75–0.79): unchanged. No suite lost more than 4% against its references
-by geometric mean (MiniJS and Lox switch builds, 1.04). The largest
-single-benchmark losses: PolyBench goto-mode gemm 1.29, MiniJS
-switch-mode nbody 1.22, Scheme goto-mode primes 1.18, Lox switch-mode zoo
-1.17, Python goto-mode nbody 1.16, Scheme switch-mode takl 1.16, Lox
-tail-call properties 1.15. What changed, from `git log 95a227e..c7e94ae`:
-
-- **Mini, third and fourth passes** (`bench/mini/RESULTS.md`, third and
-  fourth phases): a word-at-a-time `std.hash.bytes`, `%` by
-  multiplication, rotated while loops, frameless table and return
-  handlers, young-only sweeps of the string table, constant locals
-  folded into nested functions, if/elseif chains on one local as a jump
-  table. 0.91 relative to Lua (interp 0.77, sieve 0.72, string_build
-  0.75, oo_methods 0.87, hash_strings 0.88; binary_trees 1.06, nbody
-  1.07); the JIT build 0.91 (sieve 0.63). Coroutines 0.98.
-- **MiniJS, second pass** (`bench/minijs/RESULTS.md`, second
-  performance pass): arithmetic slow paths inline, a DIV family, constant
-  compares, frameless handlers, calls that do not clear registers. 0.96
-  relative to node --jitless (bitops 0.85, strings 0.88, closures 0.91;
-  the pass's own A/B: 0.939), the JIT build 0.93; switch mode 1.04
-  (nbody 1.22, fannkuch 1.10).
-- **Scheme, third and fourth rounds, std.bigint**
-  ([bench/scheme/README.md](../bench/scheme/README.md)): builtins as ops,
-  allocation without a stack frame, no register clearing on calls,
-  aliases, loop-invariant free variables, known calls as `CALLK`, record
-  ops, `call/cc` as an op, strings with `std.gc`'s `new_uninit`; GMP-style
-  division and Newton square roots in `std.bigint`. 0.88 relative to
-  Gauche (gcbench 0.44, deriv 0.61, browse 0.70, paraffins 0.71, conform
-  0.75; pi 0.86, chudnovsky 0.88; the rounds' own A/Bs: 0.894 and 0.941),
-  the JIT build 0.85.
-- **Python, third round**
-  ([examples/python/FRICTION.md](../examples/python/FRICTION.md#optimizations-third-round-calls-generator-expressions-slices-2026-11-04)):
-  class instantiation and default arguments without the generic call
-  path, generator expressions consumed by builtins run inline,
-  `super(..).m(..)` as one op, list slices with raw copies. 0.89 relative
-  to CPython (nqueens 0.63, fannkuch 0.79, hexiom 0.80); goto 0.94 (nbody
-  1.16).
-- **The Prolog JIT** (a5db063, 691e424;
-  [design/copy-and-patch.md §14](design/copy-and-patch.md#14-prolog-2026-11-04)):
-  jumps to resume points count like calls, the code-object registry is a
-  treap. The JIT build 0.88 relative to SWI-Prolog over the 29 programs
-  other than sieve (times10 0.68, divide10 and poly_10 0.70, tak 0.73,
-  meta_qsort 0.75), sieve 58 s → 1.3 s. The interpreter is unchanged
-  (0.99).
-- **Wasm translator, round three** (98074d4, 2e849e0;
-  `examples/wasm/FRICTION.md`, "Round three"): bounds checks against the
-  end of the access, array-element loads as one op, result variants for
-  ops with several only-assigned operands. 0.98 relative to wasm3 on the
-  seven programs, 0.93 on PolyBench (nussinov 0.86, cholesky 0.89; the
-  round's own A/B: 0.838 against 0.932 for the old build, 0.90).
-- **Branch alignment against the JCC erratum** (476f1a7; [lowering.md
-  §12](lowering.md#12-driver-settings)): every x86-64 vm build pads
-  branches, dispatch jumps included, off 32-byte boundaries, so every
-  interpreter's machine code moved. On the build of the wasm round it
-  fixed the 1.4× cholesky, lu and ludcmp took. Over a suite it is a wash:
-  this run's binaries against the same code built with
-  `--no-branch-align` (user+sys CPU time, MiniJS wall-clock, minimum
-  of 2–5 interleaved runs),
-  aligned/unaligned: Scheme tail-call 1.00, MiniJS 1.01, Lox 1.02, wasm
-  tail-call on PolyBench 1.00, goto 1.01. It has two single-benchmark
-  losses of its own, the two above that are not explained by the
-  rounds: Lox `properties` 1.13 (0.210 s against 0.186) and PolyBench
-  goto-mode gemm 1.37 (0.129 s against 0.094). Not investigated
-  further here.
-- **No speed change intended**: `--gc-check-roots` fixes, the GC
-  allocator's documented invariants, `new_uninit` tests, Mini's and
-  Python's `--cfg debug` builds. Regex, Stak, the wasm SIMD builds and
-  the Prolog interpreter moved within ±3% relative to their references.
-
-## Hot-handler ordering and the two alignment losses (2026-11-05)
-
-A dated A/B after the 2026-11-05 run; its effect is in the 2026-11-07
-run's tables above
-([lowering.md §12](lowering.md#12-driver-settings), "What the two
-alignment losses were" and "Handler order"). Both single-benchmark
-losses that branch alignment brought (Lox `properties` tail-call 1.13,
-PolyBench `gemm` goto 1.37) are placement draws rather than the
-padding: `gemm` is fast again when the whole text moves by any of 63
-other multiples of 64 bytes, and `properties` when its three hot
-handlers sit together. Lox, Mini, MiniJS, Stak, Python, the Prolog
-interpreter and the wasm interpreter now carry `#[profile]` (their
-`*.vmprofile`, from `--vm-stats` over their suites; wasm's over the
-seven programs, so PolyBench stays held out), which lays out tail-call
-and goto builds hottest handler first in a section of their own. Same
-machine, user+sys, minimum of two interleaved passes, ordered over
-`--vm-profile=none`:
-
-| suite | tailcall | goto |
-|---|---:|---:|
-| lox (9) | 0.982 | 0.996 |
-| mini (14) | 1.001 | 0.996 |
-| mini-coro (3) | 0.974 | 1.016 |
-| minijs (14) | 0.999 | 0.996 |
-| wasm (7) | 1.001 | 0.999 |
-| wasm-polybench (30) | 1.001 | 0.988 |
-| stack (5) | 1.003 | 0.999 |
-| python (11) | 1.002 | 1.000 |
-| prolog (30) | 0.999 | 0.997 |
-| scheme (43, not opted in) | 1.008 | 1.000 |
-
-Lox `properties` tail-call 0.212 s → 0.188 s, PolyBench `gemm` goto
-0.131 s → 0.094 s (cholesky, lu and ludcmp unchanged, keeping the gains
-alignment brought). Switch and `--jit-stencils` builds are not ordered.
-In goto builds, `--align-functions=128` moved single benchmarks 1.22% on
-average and up to 33% in declaration order, 0.47% and at most 3.1%
-ordered (between identical binaries: 0.55%); tail-call builds were as
-steady either way. The other two mode ratios that grew in this run are
-not placement: unaligned (`--no-branch-align`) builds give MiniJS
-switch/tail-call 1.198 against 1.215 aligned, Python goto/tail-call
-1.091 against 1.104.
-
-## Value accumulators (2026-11-06)
-
-A dated A/B after the 2026-11-05 run; its effect is in the 2026-11-07
-run's tables above
-([language.md §7.4](language.md#74-accumulators), "Value accumulators";
-[design/speed-audit.md](design/speed-audit.md), item 1, "As built").
-Mini keeps a nanbox value's word in an `f64` accumulator between its
-float ops, compare-and-branch forms and DIV, with supers over the
-variants. User+sys CPU, median of 9 paired interleaved rounds against
-the previous build (A/A in brackets; load 4 to 6 from other agents):
-
-| suite | align 64 | align 128 | float benchmark |
-|---|---:|---:|---|
-| mini (14) | 0.994 (1.000) | 0.996 (0.996) | mandelbrot 0.912 / 0.902 |
-| minijs (14), not kept | 1.004 (0.998) | 1.007 (0.982) | nbody 0.944 / 0.942 |
-| scheme (43), not kept | 1.003 (0.998) | 1.002 (0.996) | mbrot 0.885 / 0.87 |
-
-The accumulator is a seventh register argument of every handler's tail
-call in these three, which stops LLVM folding the dispatch table's load
-into the `jmp` ([lowering.md §3](lowering.md#3-handlers-in-tailcall-mode)).
-Interpreters without a value accumulator compile to the same code
-(`loimi ir-diff`, all three dispatch modes: Lox, Stak, Python, Prolog;
-wasm differs only in `W.accumulate`, which now resets earlier variants
-first, and the host-side `W.disasm_op`).
-
-**Later the same day: MiniJS ported after all; the fold was not the
-cost.** The fold is lost to LLVM's `X86tcret_6regs`, which counts the
-tail call's register operands. A pass that folded the load back in the
-assembly (commit 0c3bb46, reverted) measured no gain on Mini, MiniJS or
-Scheme and lost 2% on the wasm interpreter, which it also folded
-([lowering.md §3](lowering.md#3-handlers-in-tailcall-mode)). Remeasured
-with more rounds (Mini 11 at align 64), a control build with the
-accumulator declared and unselected is within the A/A spread of none
-(`bench/mini/RESULTS.md`, item 44), so the "4% on fib" above was noise.
-The ports against master, as built (unfolded):
-
-| suite | align 64 | align 128 | float benchmark |
-|---|---:|---:|---|
-| mini (14), unchanged | 0.999 (0.998) | 0.993 (1.002) | mandelbrot 0.906 / 0.907 |
-| minijs (14), **kept** | 0.990 (0.996) | 0.997 (1.003) | nbody 0.974 / 0.931 |
-| scheme (43), not kept | 1.007 (1.006) | 0.999 (0.992) | mbrot 0.965 / 0.887 |
-
-Scheme stays out: over five runs, folded or not, it averages 0.3%
-slower, with tak and fib slower in every run (a `movq` to the
-accumulator on ADD/SUB/MUL's integer paths).
-
-## Side traces (2026-11-07)
-
-Superseded by "Trace tier in this run" above (same build, a quiet
-machine: 0.764). Not a run of the suites: the trace tier's Mini benchmarks with side
-traces and loops inside loops
-([design/trace-tier.md §13](design/trace-tier.md#13-side-traces-and-loops-inside-loops-m2)),
-`--jit-stencils` with ahead-of-time traces from a profile of the 14
-programs against the same binary's JIT, user+sys CPU seconds, minimum
-of 7 interleaved runs.
-
-| | M4 | now, `--align-functions=64` | 128 |
-|---|---:|---:|---:|
-| trace / JIT, geometric mean | 0.858 | **0.759** | 0.773 |
-| JIT A/A | 0.996 | 0.989 | 1.004 |
-| trace off / JIT | 1.003 | 0.991 | 1.007 |
-
-Side traces took the suite from 0.812 to 0.763 in a separate round
-(`interp` 0.85 → 0.71, fannkuch 0.52 → 0.35, sort 0.79 → 0.68), loops
-inside loops from 0.835 to 0.812 (nbody 0.76 → 0.66), and branch weights
-and the rest from 0.858 to 0.835. binary_trees, fib, closures,
-oo_methods and string_build stay at 0.95–1.00.
-
-## Traces through calls (2026-11-06)
-
-Superseded by "Side traces" and "Trace tier in this run". Not a run
-of the suites: the trace tier's Mini benchmarks
-([design/trace-tier.md §12](design/trace-tier.md#12-cheaper-exits-and-traces-through-calls-m4-in-part)),
-`--jit-stencils` with ahead-of-time traces from a profile of the 14
-programs against the same binary's JIT, user+sys CPU seconds, minimum
-of 7 interleaved runs.
-
-| | M1 | now, `--align-functions=64` | 128 |
-|---|---:|---:|---:|
-| trace / JIT, geometric mean | 0.932 | **0.858** | 0.862 |
-| JIT A/A | 0.998 | 0.996 | 1.000 |
-| trace off / JIT | 1.004 | 1.003 | 1.004 |
-
-Exits that write back only dirty slots took nbody from 1.11 to 0.76;
-inlining monomorphic calls took spectral_norm from 1.00 to 0.64. No
-program is slower than the JIT; binary_trees, fib, `interp`,
-string_build, closures and oo_methods are at 0.99–1.01.
-
-## Re-fusion on `become`; load facts (2026-11-06)
-
-In the 2026-11-07 run's tables above. Not a run of the suites: speed-audit items 8 and 4
-([design/speed-audit.md](design/speed-audit.md)), tail-call builds,
-user+sys CPU, interleaved runs, an A/A copy of the baseline in the
-same interleave (geometric means, min / median of the runs).
-
-| Change | Suite | 64 | A/A | 128 | A/A |
-|---|---|---:|---:|---:|---:|
-| `refuse fp.cl.proto.code;` + six supers of quickened members | Lox (9) | 0.973 / 0.986 | 1.013 / 0.997 | 0.985 / 0.984 | 1.002 / 1.005 |
-| `refuse` in place of the hand-written one | Mini (14) | 0.999 / 0.995 | 0.997 / 0.994 | 1.002 / 1.002 | 1.000 / 1.001 |
-| same, reverted (64: the first cut, which also re-fused after misses) | MiniJS (14) | 1.010 / 1.013 | 1.004 / 1.004 | 1.003 / 1.005 | 0.997 / 1.001 |
-| hand `refuse` + supers of quickened members, reverted | Python (11) | 0.998 / 0.994 | 1.007 / 0.990 | | |
-| same, reverted | Scheme (11) | 0.999 / 1.002 | 0.997 / 1.005 | | |
-| `Gc` facts + `!invariant.load` (prototype, not built) | Python deltablue, go, richards | 1.007 / 0.993 | 1.003 / 0.994 | | |
-| same | MiniJS properties, deltablue, richards, raytrace | 1.003 / 0.999 | 0.999 / 0.997 | | |
-| same | Mini interp | 1.007 / 1.002 | 1.005 / 0.997 | | |
-
-Lox's zoo is 0.88 at both alignments. MiniJS's deltablue is 1.06
-slower with the port: re-fusing after property quickening forms
-`GETMETHOD_P_CALL` and two `GETPROP_IN` supers, with 10% fewer
-dispatches. The load facts change no hot handler of Mini or MiniJS.
-
-## SWITCH to the target; coroutine switch sites (2026-11-06)
-
-In the 2026-11-07 run's tables above. Not a run of the suites: speed-audit items 13 and 11
-([design/speed-audit.md](design/speed-audit.md)), Mini, tail-call,
-user+sys CPU, minimum of 11 interleaved runs (the 14 programs: 7, the
-JIT suite: 5), against the commit before each change, with an A/A copy
-of the baseline in the same interleave.
-
-| Change | Benchmark | 64 | A/A | 128 |
-|---|---|---:|---:|---:|
-| SWITCH straight to its target, `real_word` inline, computed jumps enter compiled code | interp | 0.977 | 0.998 | 0.947 |
-| same, `LOIMI_JIT=1` (21 runs) | interp | 0.998 | 0.991 | 1.002 |
-| same, `LOIMI_JIT=1` | 14 programs | 0.997 | 0.995 | |
-| CALL_RESUME, CALL_WRAP, CALL_YIELD members and supers | chameneos | 0.925 | 1.002 | 0.919 |
-| same | coroutine_ring | 0.961 | 1.002 | 0.971 |
-| same | coroutine sieve | 0.944 | 1.003 | 0.927 |
-| same | 14 programs | 0.994 | 1.001 | 0.993 |
-
-Against LuaJIT `-joff` in the same interleave: chameneos 0.91 (it was
-1.0), coroutine_ring 0.89, sieve 0.88.
-
-## Shifted-int nanbox (2026-11-06)
-
-In the 2026-11-07 run's tables above. Not a run of the suites: speed-audit item 7
-([design/speed-audit.md](design/speed-audit.md)), Python's `Value` on
-`repr nanbox(int_high)` against master's plain nanbox, tail-call
-builds, user+sys CPU, 11 interleaved runs, an A/A copy of the baseline
-in the same interleave (geometric means, min / median of the runs).
-
-| Change | Suite | 64 | A/A | 128 | A/A |
-|---|---|---:|---:|---:|---:|
-| `nanbox(int_high)` | Python (11) | 0.932 / 0.928 | 1.000 / 0.997 | 0.942 / 0.952 | 0.999 / 1.002 |
-
-A second round gave 0.934 / 0.939 and 0.951 / 0.957. Integer
-benchmarks 0.87–0.97 (fannkuch 0.87, go, hexiom and nqueens 0.91–0.93);
-chaos and raytrace 0.91 (pointer payloads are a shift, with no 48-bit
-mask constant); float 1.00; nbody 0.99 at 64 and 1.01 / 1.06 at 128;
-spectral_norm 0.92 at 64 and 1.00 / 1.07 at 128 (its int ops got
-cheaper and its float accumulation dearer).
-
-## Shifted-int nanbox on the other vms (2026-11-06)
-
-In the 2026-11-07 run's tables above. Not a run of the suites: speed-audit item 7, "Ports"
-([design/speed-audit.md](design/speed-audit.md)). Each vm's value type
-on `repr nanbox(int_high)` against master's build, tail-call builds,
-user+sys CPU, minimum of 7 (Scheme, Prolog) or 9 interleaved runs, an
-A/A copy of the baseline in the same interleave (geometric means).
-
-| Change | Suite | 64 | A/A | 128 | A/A | Kept |
-|---|---|---:|---:|---:|---:|---|
-| `Term` on `int_high` | Prolog (30) | 0.917 | 1.003 | 0.920 | 1.008 | yes |
-| fixnums `i48` on `int_high` | Scheme (43) | 0.979 | 0.994 | 0.978 | 0.998 | no: sumfp 1.27, mbrot 1.15 |
-| `Int(i48)` on `int_high` | MiniJS (14) | 0.941 | 0.993 | 0.958 | 1.049 | no: nbody 1.25–1.47 |
-| `Int(i48)` on `int_high` | Mini (14) | 1.034 | 1.003 | 1.030 | 1.001 | no: mandelbrot 1.80, nbody 1.32 |
-| `Native` as the zero-tag variant | Lox (9) | 1.005 | 0.987 | 1.030 | 1.007 | no: all numbers are floats |
-
-Integer benchmarks gained 5–25% in every vm; float kernels lost 12–80%,
-as each float operand from a register costs a decode on the loop's
-dependency chain. Per benchmark: `bench/prolog/README.md`,
-`bench/scheme/README.md`, `bench/minijs/RESULTS.md`,
-`bench/mini/RESULTS.md`.
-
-## Value stacks; quickening flip-flop (2026-11-07)
-
-In the 2026-11-07 run's tables above. Not a run of the suites: speed-audit items 9 and 10
-([design/speed-audit.md](design/speed-audit.md)). Tail-call builds
-against master's, user+sys CPU, minimum of 7 (Scheme, MiniJS) or 9
-(Lox) interleaved runs, with an A/A copy of the baseline in the same
-interleave (geometric means). The 128 column ran with an A/A copy only for MiniJS (1.004).
-
-| Change | Suite | 64 | A/A | 128 | Kept |
-|---|---|---:|---:|---:|---|
-| No register clearing at calls (`std.rt.ValueStack`) | Lox (9) | 0.970 | 1.004 | 0.966 | yes: fib 0.86, binary_trees 0.92–0.94 |
-| Hand-written mark → `std.rt.ValueStack` | Scheme (43) | 1.000 | 1.000 | 0.995 | yes |
-| Hand-written mark → `std.rt.ValueStack` | MiniJS (14) | 0.995 | 0.998 | 1.002 | yes |
-
-Item 10: `--vm-stats` now counts `become`s per site. The later ones
-(re-quickenings and deopts) are at most 0.055% of dispatches (MiniJS
-deltablue), and are 0 in Mini and Scheme. An oracle build in which
-MiniJS's ADD never quickens bounds warmup and backoff counters at
-0.982–0.986 on bitops and 0.994–0.996 on strings, so they were not
-built.
 
 ## Per suite
 
