@@ -159,6 +159,7 @@ bench/wasm/bench.py -n 1 --dir bench/wasm/polybench-out --interp="wasm3=bench/wa
 | prolog (30) | jit | 0.94 (0.93 without sieve) | swipl 0.45, trealla 0.11 (swipl 0.43, trealla 0.10 over 29, without sieve) |
 | mini (14) | jit + AOT traces ‡ | 0.764 of jit | luajit-joff 0.44, luajit (JIT on) 1.58 |
 | minijs (14) | jit + AOT traces ‡ | 0.866 of jit | (not run against the references) |
+| scheme (43) | jit + AOT traces ‡ | 0.773 of jit (2026-11-08) | (not run against the references) |
 
 (n) is the number of benchmarks. *vs tailcall* is the geometric mean of
 that build's times over the tail-call build's. Suites: `mini` (Mini, a
@@ -174,10 +175,11 @@ PolyBench/C kernels, a held-out set; not run by `run_all.py`), `stack`
 suite).
 
 ‡ Not from `run_all.py`: `--jit-stencils` builds with ahead-of-time
-traces from a profile of the suite's own 14 programs, **trained on the
+traces from a profile of the suite's own programs, **trained on the
 benchmark inputs themselves**, against the same run's JIT build, user+sys
 CPU time; see "Trace tier in this run" below. Trained on quarter-size
-inputs instead, Mini's is 0.765.
+inputs instead, Mini's is 0.765. Scheme's was measured on 2026-11-08 at
+cf92210's code plus the trace change (§13.7 of the design note).
 
 ## Notes
 
@@ -410,6 +412,66 @@ more than 1% slower than the JIT; §13.5's five programs (nbody,
 spectral_norm, fannkuch, bitops, sort) are 0.59–0.95 here, against
 0.53–0.95 there (nbody 0.58, spectral_norm 0.53, fannkuch 0.79, bitops
 0.89, sort 0.95; a loaded machine).
+
+**Scheme (2026-11-08)**, measured separately by the same method on the
+43 programs of `bench/scheme/compare.py`'s inputs (one profile of all 43;
+109 traces, 74 side traces), with a third trace build recorded and
+profiled with a quarter of each program's iteration count (*¼ count*)
+and a round of all three builds at `--align-functions=128` (*at 128*).
+The runs are short (9–580 ms), so single programs move by up to 15% in
+the A/A pair (quicksort, sum, sboyer); the column ratios are against the
+JIT's minimum.
+
+| program | JIT | JIT A/A | trace | trace off | trace (¼ count) | trace/JIT | (medians) | at 128 | ¼/JIT |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| ack | 0.299 | 0.296 | 0.269 | 0.295 | 0.266 | 0.90 | 0.93 | 0.80 | 0.89 |
+| array1 | 0.274 | 0.265 | 0.150 | 0.267 | 0.136 | **0.55** | 0.51 | 0.49 | 0.50 |
+| browse | 0.012 | 0.012 | 0.009 | 0.012 | 0.009 | **0.77** | 0.78 | 0.77 | 0.77 |
+| chudnovsky | 0.152 | 0.153 | 0.153 | 0.154 | 0.154 | 1.00 | 1.00 | 0.94 | 1.01 |
+| conform | 0.071 | 0.071 | 0.072 | 0.072 | 0.078 | 1.03 | 1.04 | 0.99 | 1.11 |
+| cpstak | 0.192 | 0.195 | 0.195 | 0.190 | 0.190 | 1.02 | 0.99 | 0.95 | 0.99 |
+| ctak | 0.016 | 0.016 | 0.016 | 0.016 | 0.016 | 1.03 | 1.02 | 0.99 | 1.00 |
+| deriv | 0.106 | 0.106 | 0.107 | 0.107 | 0.107 | 1.00 | 1.01 | 1.00 | 1.00 |
+| destruc | 0.090 | 0.090 | 0.061 | 0.090 | 0.061 | **0.68** | 0.68 | 0.68 | 0.68 |
+| diviter | 0.123 | 0.124 | 0.095 | 0.124 | 0.093 | **0.77** | 0.77 | 0.71 | 0.76 |
+| divrec | 0.157 | 0.158 | 0.158 | 0.158 | 0.157 | 1.01 | 1.03 | 1.00 | 1.00 |
+| earley | 0.029 | 0.029 | 0.030 | 0.029 | 0.029 | 1.03 | 1.02 | 0.97 | 1.00 |
+| fft | 0.043 | 0.042 | 0.021 | 0.042 | 0.021 | **0.50** | 0.51 | 0.48 | 0.50 |
+| fib | 0.340 | 0.354 | 0.355 | 0.346 | 0.343 | 1.05 | 0.94 | 0.99 | 1.01 |
+| fibc | 0.029 | 0.028 | 0.022 | 0.025 | 0.022 | **0.77** | 0.90 | 0.91 | 0.75 |
+| fibfp | 0.122 | 0.123 | 0.123 | 0.120 | 0.126 | 1.01 | 1.01 | 0.93 | 1.03 |
+| gcbench | 0.009 | 0.008 | 0.009 | 0.009 | 0.008 | 1.02 | 1.04 | 1.04 | 0.98 |
+| graphs | 0.121 | 0.107 | 0.105 | 0.112 | 0.118 | **0.87** | 1.06 | 0.91 | 0.98 |
+| lattice | 0.040 | 0.040 | 0.039 | 0.037 | 0.040 | 0.97 | 1.09 | 1.01 | 0.99 |
+| matrix | 0.059 | 0.062 | 0.051 | 0.053 | 0.052 | **0.87** | 0.79 | 0.99 | 0.88 |
+| maze | 0.022 | 0.022 | 0.022 | 0.022 | 0.022 | 0.97 | 0.98 | 0.98 | 0.97 |
+| mazefun | 0.095 | 0.094 | 0.082 | 0.096 | 0.085 | **0.86** | 0.79 | 0.78 | 0.89 |
+| mbrot | 0.039 | 0.041 | 0.015 | 0.039 | 0.015 | **0.39** | 0.31 | 0.40 | 0.39 |
+| mperm | 0.125 | 0.123 | 0.108 | 0.119 | 0.093 | **0.87** | 0.87 | 0.97 | 0.74 |
+| nboyer | 0.503 | 0.493 | 0.504 | 0.522 | 0.506 | 1.00 | 0.92 | 1.06 | 1.01 |
+| nqueens | 0.236 | 0.235 | 0.134 | 0.234 | 0.152 | **0.57** | 0.54 | 0.65 | 0.65 |
+| ntakl | 0.167 | 0.162 | 0.075 | 0.165 | 0.075 | **0.45** | 0.44 | 0.49 | 0.45 |
+| nucleic | 0.086 | 0.084 | 0.083 | 0.087 | 0.085 | 0.96 | 1.01 | 1.01 | 0.99 |
+| paraffins | 0.036 | 0.036 | 0.037 | 0.037 | 0.038 | 1.04 | 1.02 | 1.02 | 1.05 |
+| peval | 0.096 | 0.103 | 0.086 | 0.080 | 0.073 | **0.90** | 0.87 | 0.85 | 0.76 |
+| pi | 0.131 | 0.133 | 0.133 | 0.131 | 0.132 | 1.02 | 0.97 | 0.98 | 1.01 |
+| pnpoly | 0.064 | 0.064 | 0.026 | 0.064 | 0.025 | **0.40** | 0.40 | 0.37 | 0.40 |
+| primes | 0.131 | 0.113 | 0.113 | 0.114 | 0.112 | **0.86** | 0.81 | 0.76 | 0.86 |
+| puzzle | 0.114 | 0.119 | 0.072 | 0.081 | 0.070 | **0.63** | 0.65 | 0.52 | 0.61 |
+| quicksort | 0.127 | 0.088 | 0.102 | 0.097 | 0.112 | **0.80** | 0.86 | 0.88 | 0.88 |
+| sboyer | 0.581 | 0.496 | 0.558 | 0.529 | 0.585 | 0.96 | 0.96 | 0.99 | 1.01 |
+| simplex | 0.113 | 0.126 | 0.063 | 0.114 | 0.068 | **0.56** | 0.59 | 0.61 | 0.61 |
+| string | 0.020 | 0.020 | 0.017 | 0.019 | 0.017 | **0.85** | 0.96 | 0.89 | 0.84 |
+| sum | 0.314 | 0.254 | 0.075 | 0.302 | 0.075 | **0.24** | 0.26 | 0.27 | 0.24 |
+| sumfp | 0.071 | 0.072 | 0.031 | 0.070 | 0.030 | **0.44** | 0.33 | 0.38 | 0.43 |
+| tak | 0.383 | 0.361 | 0.374 | 0.409 | 0.462 | 0.98 | 1.04 | 0.91 | 1.21 |
+| takl | 0.079 | 0.068 | 0.033 | 0.063 | 0.030 | **0.42** | 0.55 | 0.42 | 0.38 |
+| triangl | 0.118 | 0.115 | 0.117 | 0.116 | 0.115 | 0.99 | 0.95 | 1.02 | 0.98 |
+| **geometric mean** | | | | | | **0.773** | 0.773 | 0.767 | 0.774 |
+
+Controls: JIT A/A 0.978, trace off / JIT 0.963 (at 128: 0.994, 0.976);
+an earlier, quieter round of the same profile: 0.779, A/A 1.004, trace
+off 1.003.
 
 ## GC: mark bitmaps instead of sweeping (2026-11-04)
 

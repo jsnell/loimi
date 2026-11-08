@@ -685,6 +685,15 @@ impl TraceBuilds {
             .unwrap_or(0)
     }
 
+    /// The iterations `exe` ran in traces on `prog` (`LOIMI_JIT_STATS`).
+    fn iterations(&self, exe: &Path, prog: &Path, env: &[(&str, &str)]) -> u64 {
+        let out = program(exe).arg(prog).envs(env.iter().copied()).env("LOIMI_JIT_STATS", "1").output().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        err.lines()
+            .filter_map(|l| l.strip_prefix("jit:   trace ").and_then(|r| r.split(": ").nth(1)).and_then(|r| r.split(' ').next()).and_then(|n| n.parse::<u64>().ok()))
+            .sum()
+    }
+
     /// Each NAME.lua in `dir` must print NAME.expected; returns failures.
     fn check_benchmarks(&self, exe: &Path, dir: &Path, env: &[(&str, &str)]) -> Vec<String> {
         let mut failures = Vec::new();
@@ -1051,14 +1060,30 @@ fn scheme_programs_with(flags: &[&str], env: &[(&str, &str)]) {
     let exe = std::env::temp_dir().join(format!("loimi-scheme-{}{}", std::process::id(), flags.join("").replace(['-', '='], "")));
     let out = loimi().arg("build").args(["-W", "error"]).args(flags).arg(root.join("examples/scheme/main.lm")).arg("--release").arg("-o").arg(&exe).output().unwrap();
     assert!(out.status.success(), "building scheme {:?} failed:\n{}", flags, String::from_utf8_lossy(&out.stderr));
-    let mut failures = Vec::new();
+    let failures = scheme_programs_on(&exe, &flags.join(" "), env);
+    let _ = std::fs::remove_file(&exe);
+    if !failures.is_empty() {
+        panic!("{} failure(s):\n\n{}", failures.len(), failures.join("\n\n"));
+    }
+}
+
+/// examples/scheme/tests/*.scm, sorted.
+fn scheme_tests() -> Vec<PathBuf> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut programs: Vec<PathBuf> = std::fs::read_dir(root.join("examples/scheme/tests"))
         .unwrap()
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().is_some_and(|x| x == "scm"))
         .collect();
     programs.sort();
-    for f in programs {
+    programs
+}
+
+/// Every Scheme test program run by `exe` (with `env`) in every GC mode;
+/// returns the failures.
+fn scheme_programs_on(exe: &Path, label: &str, env: &[(&str, &str)]) -> Vec<String> {
+    let mut failures = Vec::new();
+    for f in scheme_tests() {
         let text = std::fs::read_to_string(&f).unwrap();
         let scm_directives = |key: &str| -> Vec<String> {
             let pat = format!("; {}:", key);
@@ -1079,7 +1104,7 @@ fn scheme_programs_with(flags: &[&str], env: &[(&str, &str)]) {
             let out = cmd.output().unwrap();
             let stdout = String::from_utf8_lossy(&out.stdout);
             let stderr = String::from_utf8_lossy(&out.stderr);
-            let name = format!("{}{} {}", f.file_name().unwrap().to_string_lossy(), gc_mode_name(mode), flags.join(" "));
+            let name = format!("{}{} {}", f.file_name().unwrap().to_string_lossy(), gc_mode_name(mode), label);
             let got: Vec<&str> = stdout.lines().collect();
             if got != expect.iter().map(|s| s.as_str()).collect::<Vec<_>>() {
                 failures.push(format!("{}: stdout mismatch\n--- expected\n{}\n--- got\n{}\n--- stderr\n{}", name, expect.join("\n"), stdout, stderr));
@@ -1095,10 +1120,39 @@ fn scheme_programs_with(flags: &[&str], env: &[(&str, &str)]) {
             }
         }
     }
-    let _ = std::fs::remove_file(&exe);
-    if !failures.is_empty() {
-        panic!("{} failure(s):\n\n{}", failures.len(), failures.join("\n\n"));
+    failures
+}
+
+/// Ahead-of-time traces of the Scheme interpreter (as `mini_traces`;
+/// docs/design/trace-tier.md section 13.7): its test programs recorded,
+/// profiled and traced, then all of them run with the traces in every GC
+/// mode, and again with guards that fail and with blacklisting at every
+/// failure. trace_loops.scm must run in traces.
+#[test]
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn scheme_traces() {
+    if cross() {
+        return;
     }
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    // (the err_ programs stop at their error: their loops are not hot)
+    let inputs: Vec<PathBuf> = scheme_tests().into_iter().filter(|p| !p.file_name().unwrap().to_string_lossy().starts_with("err_")).collect();
+    let bt = build_traces("scheme", &root.join("examples/scheme/main.lm"), &inputs, &[("LOIMI_JIT_HOT", "2")]);
+    let n = bt.ntraces(&bt.normal);
+    assert!(n >= 10, "only {} traces from the Scheme tests", n);
+    let env = [("LOIMI_JIT", "1"), ("LOIMI_JIT_HOT", "2")];
+    let mut failures = Vec::new();
+    let loops = root.join("examples/scheme/tests/trace_loops.scm");
+    let ran = bt.iterations(&bt.normal, &loops, &env);
+    if ran < 10000 {
+        failures.push(format!("trace_loops.scm: {} iterations in traces", ran));
+    }
+    failures.extend(scheme_programs_on(&bt.normal, "traces", &env));
+    failures.extend(scheme_programs_on(&bt.forced, "traces, guards failing", &env));
+    let env1 = [("LOIMI_JIT", "1"), ("LOIMI_JIT_HOT", "2"), ("LOIMI_TRACE_FAILS", "1")];
+    failures.extend(scheme_programs_on(&bt.forced, "traces, guards failing, blacklisting at once", &env1));
+    bt.cleanup();
+    assert!(failures.is_empty(), "{} failure(s):\n\n{}", failures.len(), failures.join("\n\n"));
 }
 
 /// The MiniJS interpreter (examples/minijs): every NAME.js in

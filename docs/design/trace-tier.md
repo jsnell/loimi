@@ -345,10 +345,7 @@ programs, and loses on one:
   nbody, fannkuch, bitops and sort); every output equal to the JIT's.
   Its handlers return `i64` (`%r = musttail call ..; ret i64 %r`), which
   the generator now follows.
-- **Scheme and Prolog** were not run through the workflow in this
-  milestone. Prolog has no `regs` state register: the generator then
-  keeps no window (every access is memory), which is supported but
-  untested.
+- **Scheme and Prolog**: §13.7.
 
 ### 11.8 Build time
 
@@ -771,8 +768,7 @@ recorded, profiled and traced (22 traces, 14 side traces), every output equal to
 (5 interleaved runs, minimum, a loaded machine: JIT A/A 1.03): nbody
 0.58, spectral_norm 0.53, fannkuch 0.79 (§12.8: its traces did not
 install, 1.00), bitops 0.89, sort 0.95; 0.730 by geometric mean, no
-program slower.
-Scheme and Prolog were not run through the workflow.
+program slower. Scheme and Prolog: §13.7.
 
 ### 13.6 Results
 
@@ -838,3 +834,40 @@ loads its `state[4]`; there are no counters on the way in. The trace has
 73 steps (68 of them on side traces) and 158 guards; the run stays in it
 from its first entry (29.7 million iterations, no guard failures).
 
+### 13.7 Scheme and Prolog
+
+**Scheme** (examples/scheme) runs through the workflow of §11.1 with one
+generic fix: a dispatch into the same code object is a path edge only
+if the step passes on its own register file (a jump table) or goes to
+the next instruction (a native call's end); a static continuation that
+passes another frame's registers is not one either. Before, recursive
+procedures got traces through a return into their own code or a
+`CALLSELF` to its word 0, which the register-file check left at every
+iteration (ack 1.55 of the JIT, tak 1.23). Its 43 benchmarks (the
+inputs of `bench/scheme/compare.py`) make 109 traces with 74 side
+traces; the workflow takes about 3 minutes. User+sys CPU, minimum of 7
+interleaved runs, every output checked, controls as in §11.5; the full
+table is in `results.md`:
+
+- **0.773 of the JIT by geometric mean at `--align-functions=64`, 0.767
+  at 128**; trained on a quarter of each iteration count, 0.774. JIT
+  A/A 0.978 and trace-off 0.963 (a loaded round; a quieter one of the
+  same profile: 0.779, A/A 1.004, trace-off 1.003).
+- sum 0.24, mbrot 0.39, pnpoly 0.40, takl 0.42, sumfp 0.44, ntakl 0.45,
+  fft 0.50, array1 0.55, simplex 0.56, nqueens 0.57, puzzle 0.63,
+  destruc 0.68. At 1.00 (±5%): recursion (fib, tak, cpstak, ctak,
+  divrec), bignums (pi, chudnovsky), allocation (nboyer, sboyer, deriv,
+  gcbench). No program is over 1.05 in two rounds but string (20 ms:
+  1.18 in one, 0.85 in another).
+- Tests: `scheme_traces` (tests/golden.rs) traces the Scheme test
+  programs with `examples/scheme/tests/trace_loops.scm` (fixnums turning
+  flonums, nested vector loops, a dispatch loop, recursion next to
+  loops, allocation) and runs them all in every GC mode, with guards
+  failing and with blacklisting at every failure.
+
+**Prolog** has no backward jumps: its loops are recursion, so the
+workflow makes no traces. Taking a dispatch to a code object's own word
+0 (EXECUTE of its own predicate) as a loop gave 11 traces over the 30
+programs and 1.001 of the JIT (A/A 1.002; queens_8 0.86, the rest
+0.96–1.10, as the A/A pair): its registers are in memory, so a trace
+saves only dispatch. Not kept.

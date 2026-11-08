@@ -8,6 +8,14 @@ implementation; `git log` has the details.
 
 ### `vm` declarations and dispatch
 
+- **Traces for Scheme**: the trace tier's workflow runs on the Scheme
+  example; a dispatch into the same code object is a path edge only if
+  it keeps the frame's register file or goes to the next instruction
+  (recursive procedures no longer get traces that leave at every
+  iteration). Scheme's 43 benchmarks: 0.773 of the JIT by geometric mean
+  (0.767 at `--align-functions=128`; sum 0.24, mbrot 0.39, nqueens 0.57).
+  Prolog gets none: its loops are recursion
+  ([design/trace-tier.md §13.7](docs/design/trace-tier.md#137-scheme-and-prolog)).
 - **Side traces, and loops inside loops** (trace tier M2): a trace is
   now a graph in one function: its root path goes through the loops
   inside its loop, and the hot paths from its exits are side traces
