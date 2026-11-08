@@ -1,12 +1,9 @@
 # The Loimi language
 
-Design draft. Syntax is provisional; the semantics and the reasons behind them
-are the point. Code samples are illustrative. For a gentle introduction
-that uses only what is implemented, see the [tutorial](tutorial/README.md).
-
-Features described here that do not exist are marked **Not built:**
-where they appear; [`status.md`](status.md) lists every difference
-between this design and the compiler.
+The reference for the language as the compiler implements it, with the
+reasons behind the semantics. For a gentle introduction, see the
+[tutorial](tutorial/README.md); [`status.md`](status.md) lists what is
+implemented and its limitations.
 
 **Contents**
 
@@ -99,11 +96,9 @@ closure fn(A) -> R      // escaping closure { code, env }, env from an allocator
 Gc<closure fn(A) -> R>  // escaping closure in the GC heap
 ```
 
-Plus `struct`, `enum` (tagged unions), `bits` (packed bitfield integers),
-`object` (GC-managed structs, section 8), and `value` (section 2).
-**Not built:** `bits` (`bits Insn: u32 { op: 8, a: 8, b: 8, c: 8 }`,
-where `insn.a` reads bits 8..16; use shifts and masks, or a vm's
-generated field readers, section 3.3).
+Plus `struct`, `enum` (tagged unions), `object` (GC-managed structs,
+section 8), and `value` (section 2). Bitfields are read with shifts and
+masks, or with a vm's generated field readers (section 3.3).
 
 ### 1.2 Basics
 
@@ -439,15 +434,20 @@ fn main() {}
   name is an error. `loimi build -W error` (or `--deny-warnings`) turns
   the warnings that remain into errors. The lints are `match_fallout`,
   `unreachable_arm` (above), `super_overlap` (section 7.3),
-  `value_layout` (section 2) and `next_pc_then` (section 3.5), and the
+  `value_layout` (section 2), `next_pc_then` (section 3.5) and
+  `state_registers` (section 3.1), and the
   opt-in `hot_gc`, turned on with `-W hot_gc`: a call that may collect
   (`uses gc`) on an op handler's fast path, outside `cold`, which syncs
   the vm state and roots the live traced locals on every execution
   (often right, as for an allocation the op exists to make: `#[allow(hot_gc)]`).
   The opt-in `handler_frame` (`-W handler_frame`) reports tail-call op
   handlers whose fast path sets up a stack frame (section 4), naming the
-  calls in the handler that can cause it (with the message of each panic
-  site: `.unwrap()`, bounds checks); it compiles the IR to assembly a
+  calls in the handler that can cause it. A panic is named by what it
+  checks and where ("the overflow check of `/` at vm.lm:512", "the
+  bounds check of an index at value.lm:224", "an `.unwrap()` of `None`
+  at ops.lm:156"), from a table codegen keeps of its panic sites; when
+  LLVM merged several panic calls into one, the warning lists the
+  handler's panic sites as candidates. It compiles the IR to assembly a
   second time, so it roughly doubles the build's clang time.
   `redo_effect` (section 4, "`redo`, polls"), an effect on a path before
   a `redo`, is an error unless an `#[allow(redo_effect)]` covers the
@@ -555,6 +555,16 @@ fn main() { Sym { id: 5 }.show_line(); }
     instance is needed (`Vec<f64>` is not `Show` if `f64` is not). The
     methods are the generic type's (`fn Vec<T>.show`). Each parameter of
     the impl must appear in the type.
+  - **Impls do not overlap.** Two impls of one trait (with the same
+    trait arguments) may not apply to the same type: `impl Show for
+    Vec<i64>;` next to `impl<T: Show> Show for Vec<T>;` is an error
+    ("overlapping impls of `Show`: both apply to `Vec<i64>`"), and so are
+    two generic impls whose types unify (`Pair<T, i64>` and
+    `Pair<str, T>`). Bounds are not consulted, so a new impl of a bound's
+    trait cannot make two existing impls start to overlap. There is no
+    orphan rule: a program is compiled as a whole, so the overlap check
+    sees every impl, and an impl may sit in any module that can name the
+    trait and the type.
   - **Static functions** of a trait (no `Self` parameter needed) are
     called on the type: `T.zero()` for a bounded `T`.
 
@@ -872,8 +882,8 @@ fn main() { Sym { id: 5 }.show_line(); }
   release builds. Explicit forms: `a +% b`, `a -% b`, `a *% b` (wrapping),
   `a.add_checked(b) -> ?T` (and `sub_checked`, `mul_checked`). These map
   directly to LLVM's `*.with.overflow` intrinsics, which guest integer
-  semantics need constantly. **Not built:** `a.add_overflow(b) -> (T, bool)`
-  as a method; `std.num.add_overflow(a, b)` is a function over `i64`.
+  semantics need constantly; `std.num.add_overflow(a, b)` is a function
+  over `i64`.
   Other built-in methods: `clz`, `ctz`, `popcount` on integers,
   `mul_wide`, `mul_add_wide` and `div_wide` on `u64` (128-bit product,
   product plus two limbs, and quotient) and `add_carry`/`sub_borrow` on
@@ -1223,11 +1233,9 @@ allocator copies `v` into memory from `a.alloc_bytes` and gives a `*T`
 
 ### 1.4 Compile-time evaluation
 
-`comptime` expressions and `const fn` run in the compiler, Zig-style. This is
-how tables (lexer DFAs, operator precedence tables, op variants) are built.
-**Not built:** `comptime` and `const fn`; `inline for` (below) and
-`#[cfg(..)]` are the only compile-time evaluation, and tables are filled
-at run time.
+`inline for` (below) and `#[cfg(..)]` are the compile-time evaluation;
+there is no `comptime` or `const fn`, and tables (lexer classes, operator
+precedence) are filled at run time.
 `inline for` unrolls at compile time and can generate items, including ops:
 
 <!-- snippet: check
@@ -1411,11 +1419,9 @@ Available representations:
 | `nanbox` | 64-bit word. Doubles stored directly; other variants in the NaN space with payloads of up to 48 bits. `nanbox(int_high)`: the same rotated, so that an integer is `payload << 16` and doubles cost a decode (below) | JS engines, LuaJIT |
 | `lowtag` | 64-bit word. Aligned pointers with tag bits in the low bits; integers of up to 61 bits shifted | Ruby, OCaml, many Schemes |
 | `boxed` | Two words `{tag, payload}`, passed and returned in two registers | PUC Lua (`TValue`) |
-| `pointer` | **Not built:** everything is a `Gc<_>` with a header type tag | CPython |
 
 The compiler chooses tag assignments. You can pin a variant's block
-width (`Int(i32) block 48`, below; **Not built:** pinning the tag
-itself, `Int(i32) = tag 0b001`). In return you get:
+width (`Int(i32) block 48`, below), not the tag itself. In return you get:
 
 - **Constructors and patterns.** `Int(3)`, `match v { Int(x) => ... }`,
   `if v is Nil` and `v as! Int` (section 1.2). No macros.
@@ -1430,10 +1436,8 @@ itself, `Int(i32) = tag 0b001`). In return you get:
 - **Canonicalization.** For `nanbox`, constructing `Num(x)` canonicalizes
   NaNs, so a guest NaN can never forge a pointer. This is a safety property
   hand-written NaN-boxing regularly gets wrong.
-- **Portability.** `nanbox` requires 48-bit pointers. On targets where that
-  doesn't hold, or in wasm32, the compiler can fall back to `boxed` with a
-  warning, and the source does not change. **Not built:** the fallback
-  (only x86-64 and AArch64 are targets today).
+- **Portability.** `nanbox` requires 48-bit pointers, which both targets
+  (x86-64 and AArch64) have.
 
 **Payload widths and the number of variants.** A variant's payload is an
 integer (`iN`/`uN`, section 1.1), `bool`, a pointer (`*T`, `Gc<T>`), or
@@ -1673,7 +1677,7 @@ handlers. It is the center of the language.
 ```loimi
 vm Mini {
     context ctx: *Interp;                 // cold state, reachable from all handlers
-    state { pc: Cursor<u32>, regs: Window<Value>, k: *const Value }
+    state { pc: *u32, regs: *Value, k: *Value }
     operand ...;                           // how operand fields are interpreted
     encoding ... { format ... }            // how instructions are laid out
     cache ...;                             // inline cache layouts
@@ -1699,25 +1703,16 @@ live in machine registers for the entire life of the interpreter:
 frame stack, globals, interned strings). Fields accessed through `ctx` cost a
 load, which is the right price for cold-ish data.
 
-The compiler warns when `state` + `context` exceeds the target's argument
-registers under `preserve_none` (about 12 general-purpose registers on x86-64
-and more on AArch64, but fewer is better: 3 to 6 is typical). **Not built:**
-the warning.
+In tail-call mode every handler takes the context, the state and the
+instruction word as `preserve_none` arguments: 12 general-purpose and 8
+floating-point registers on x86-64, 24 and 8 on AArch64 (LLVM 19). A vm
+that needs more gets the warning `state_registers` (the rest would be
+passed on the stack, a store and a load in every handler); 3 to 6 state
+variables is typical.
 
-State variables have **state kinds**, which are thin typed wrappers over a
-single pointer that the verifier understands:
-
-| Kind | Meaning |
-|---|---|
-| `Cursor<W>` | instruction pointer over code words of type `W` |
-| `Window<T>` | base of the current register window (register VMs) |
-| `StackTop<T>` | operand stack top (stack VMs); `push`, `pop`, `peek(n)` |
-| plain types | anything else (`*const Value`, `u32`, ...) |
-
-**Not built:** state kinds. State variables are plain types (`pc: *u32`,
-`regs: *Value`); `Cursor`, `Window` and `StackTop` are not types. A stack
-VM keeps a plain pointer, and its ops declare stack effects for the
-verifier (§3.4a).
+State variables have plain types (`pc: *u32`, `regs: *Value`). A stack
+VM keeps a plain pointer to its stack top, and its ops declare stack
+effects for the verifier (§3.4a).
 
 ### 3.2 Operand kinds
 
@@ -1829,23 +1824,7 @@ encoding fixed(u32) {                 // every instruction is one u32 word
 }
 ```
 
-<!-- snippet: fail "only `encoding fixed(T)` is supported so far"
-vm V {
-    state { pc: *u8 }
-{snippet}
-    op HALT() : Z { exit 0 }
-    entry run(code: *u8) -> i64 { jump code }
-}
--->
-```loimi
-encoding bytes {                       // variable length
-    format Z    { op: u8 }
-    format U8   { op: u8, x: u8 }
-    format U16  { op: u8, x: u16le }
-}
-```
-
-**Not built:** `encoding bytes` (variable-length instructions). The code
+Instructions are fixed-width words: the code
 word of `encoding fixed(W)` is `u8`, `u16`, `u32` or `u64`. A format's
 fields are listed from the low bits up; `N` is an unsigned field of N bits
 and `sN` a signed one, and the fields need not fill the word. One field
@@ -1855,7 +1834,28 @@ An op lists its operands and names its format. Operands map to the
 format's non-`op` fields by position, whatever their names; an op may
 have fewer operands than the format has fields, and the rest encode as 0
 and are ignored (`op HALT() : ABC`, `op DUP() : N` with `N` holding a
-24-bit `x`). The compiler type-checks the mapping.
+24-bit `x`). The compiler type-checks the mapping. An operand can name
+its field instead, `name: kind @ field`; the other operands take the
+fields not named, in order:
+
+<!-- snippet: check
+vm V {
+    state { pc: *u32, regs: *i64, k: *i64 }
+    operand reg = regs[it];
+    operand kst = k[it];
+    encoding fixed(u32) { format ABx { op: 8, a: 8, bx: 16 } format ABC { op: 8, a: 8, b: 8, c: 8 } }
+{snippet}
+    op RET(a: reg) : ABC { exit a }
+    entry run(code: *u32, r: *i64, ks: *i64) -> i64 { regs = r; k = ks; jump code }
+}
+-->
+```loimi
+op DELGLOBAL(name: kst @ bx) : ABx { next }   // `a` unused, encodes as 0
+op JLT(a: reg @ b, b: reg @ c) : ABC { next }            // `a` left for the compare it was
+```
+
+The encoder and emitter take the operands in the order written
+(`V.DELGLOBAL(k)`), and the disassembler shows only them.
 
 **Generated API.** Each item is `Vm.NAME` (`Vm__NAME` in the vm's module;
 private to the module unless the vm is `pub vm`). `W` is the code word
@@ -2021,7 +2021,6 @@ A handler body has type `never`: **every path must end in a control word**.
 | `exit v` | leave the run loop; the entry returns `v` (its declared result type: `exit Ok(x)` for a `Result`) |
 | `raise e` | transfer to the `on raise` handler with the current `pc` |
 | `fail e` | leave the run loop, returning `Err(e)` |
-| `suspend v` | **Not built:** leave the run loop with state saved for resumption (generators, coroutines, async) |
 
 An operand may be in parentheses: `jump (t as *u32)`, `exit (x)`. In vm
 code the control words are not function names, so `fail (..)` never
@@ -2228,29 +2227,55 @@ the op acts on.
 
 ### 3.6 Entries and the error path
 
-<!-- snippet: skip design sketch: frame stack and window helpers (std.rt) are not built -->
+MiniJS's entry and error path:
+
+<!-- snippet: excerpt examples/minijs/vm.lm -->
 ```loimi
-entry run(c: Gc<Closure>) {
-    ctx.frames.push_entry_marker();
-    regs = ctx.stack.window_at_top(c.proto.nregs)?;
-    k = c.proto.consts.ptr();
-    jump c.proto.code
+entry run(c: *Ctx, cl: Gc<Fn>) -> V uses gc {
+    ctx = c;
+    let p = cl.proto;
+    c.vs.base[0] = Undef;
+    regs = c.vs.base + 1;
+    for i in 0..p.nregs as u64 { regs[i] = Undef; }
+    if !c.vs.ensure(regs + p.nregs as u64 + 1) { exit Undef }
+    fp = c.frames;
+    fp.cl = cl;
+    fp.base = regs;
+    fp.flags = rt.FR_BOTTOM;
+    k = p.consts.data.ptr;
+    fp.k = k;
+    c.fp = fp;
+    jump p.code
 }
 
-on raise(err: Value) {
+on raise(e: V) {
+    var f = fp;
+    var at = pc;
     loop {
-        if let Some(h) = ctx.proto.handlers.find(pc) {
-            regs[h.reg] = err; jump h.target
+        let p = f.cl.proto;
+        if let Some((target, r)) = find_handler(p, at) {
+            // `verify handlers` checked that `target` starts an
+            // instruction of `p.code` and that `r` is in the frame.
+            fp = f;
+            regs = f.base;
+            k = f.k;
+            regs[r] = e;
+            jump p.code.start() + target
         }
-        let Some(f) = ctx.frames.pop_guest() else { fail err };
-        restore(f);
+        if f == ctx.frames { break; }
+        f = f - 1;
+        at = f.resume - 1;
     }
+    ctx.error = e;
+    ctx.failed = true;
+    ctx.fp = fp;
+    exit Undef
 }
 ```
 
-The compiler generates `Mini.run(ctx, c) -> Result<Value, Value>` with the C
-ABI. (**Not built:** the C ABI; an entry is an internal Loimi function, and
-a library wraps it in an `export "C"` function, section 10.1.) `c.proto.code` is a `Verified<Mini>` (section 6): with
+An entry is an internal Loimi function (`JS.run(c, cl)`); a library
+exposes it to C by wrapping it in an `export "C"` function (section
+10.1). `p.code` is verified code (`verified [u32] by JS`, section 6): with
 `#[require_verified]` on the vm, an entry can only start in verified
 code. `on raise` is an ordinary handler: it receives the live state, so the
 `pc` it sees is exact without any syncing.
@@ -2363,15 +2388,11 @@ op ADD(dst: reg, a: reg, b: reg) : ABC {
 }
 ```
 
-A `cold` block is **outlined** into a separate function that uses a
-callee-saves-everything convention (`preserve_most`, or `preserve_all` on
-request). The handler's state registers survive the call untouched, so the fast
-path is compiled as if the slow path weren't there. The block can still use
-state and control words: the outlined function returns a small code ("next",
-"jump to X", "raise E") and the handler performs the transfer.
-**Not built** as described: in tail-call mode a cold block that ends in
+A `cold` block is **outlined** so that the fast path is compiled as if
+the slow path weren't there: in tail-call mode a cold block that ends in
 control words becomes its own handler-shaped function reached with
-`musttail` (no call, no return code). A cold block that falls through
+`musttail` (no call, no return code), taking the state registers as
+arguments, and it can use state and control words. A cold block that falls through
 but sits in an `if` whose enclosing block goes on to end in a control
 word (`if unlikely(c) { cold { gc.collect(&ctx.heap); } } ..; next`, at
 any nesting depth in the op) gets a copy of that rest, so that it ends
@@ -2604,7 +2625,7 @@ Loimi has three ordered **effects** on functions:
 
 | Effect | Meaning | Requires at the call site |
 |---|---|---|
-| `sync` | callee reads VM state (`pc` for tracebacks, `top`) | state written to `ctx.sync` (as built: the vm's `sync { .. }` block runs) |
+| `sync` | callee reads VM state (`pc` for tracebacks, `top`) | the vm's `sync { .. }` block runs (it stores `pc`, `top`, ... where the callee reads them) |
 | `gc` | callee may run a garbage collection | `sync`, plus every live `Gc`/`Value` local made visible as a root |
 | `reenter` | callee may run guest code (call into the VM) | `gc`, plus state reloaded afterwards (the vm's `reload` block) |
 
@@ -2617,19 +2638,16 @@ fn call_meta(ctx: *Interp, f: Value, args: []Value) -> Result<Value, Value> uses
 
 Rules:
 
-- Effects are part of public signatures and inferred for private functions.
-  **Not built:** inference; every function declares its effects.
+- Effects are part of signatures: every function declares its effects
+  (they are not inferred, and there is no effect polymorphism).
 - A function may only call effectful functions if it has at least that effect
   itself, or if it is a handler or `cold` block. Forgetting `Protect()` becomes
   a type error.
 - **In handlers**, the compiler inserts the sync at each effectful call site:
-  store `pc` and the stack top to `ctx.sync`, and spill live `Value`/`Gc`
-  locals, and state variables of those types, into a per-vm temporary
-  root area. With a moving collector it also
-  reloads them afterwards. Calls without effects pay nothing. (As built:
-  the sync is the vm's `sync` block, and traced locals go into a
+  it runs the vm's `sync` block, and puts live `Value`/`Gc` locals into a
   shadow-stack frame, with copies of the traced state variables taken at
-  the call (section 8). **Not built:** a moving collector.)
+  the call (section 8). The heap never moves objects, so nothing is
+  reloaded afterwards. Calls without effects pay nothing.
 - **In plain vm functions** (section 3.5), effectful calls are synced in
   place exactly as in a handler, without declaring the effect: a vm
   function sees the calling handler's state through pointers and is
@@ -2838,8 +2856,10 @@ time. Only the vm's generated functions can build one: its field is
 private to the vm's expansion (fields whose names start with `__` are
 private to the file declaring their struct), so a struct literal or a
 field write outside it is an error. It offers `v.start() -> *W`,
-`v.len()`, and `v.words() -> []W` for reading (disassembly, line
-tables; writing through it voids the proof). In vm code, `jump v` starts
+`v.len()`, `v.words() -> []W` for reading (disassembly, line
+tables; writing through it voids the proof), and `v.index_of(at: *W) ->
+u64`, the index of the word `at` points at (`(at - start) / (W's size
+in bytes)`, for line tables and exception ranges). In vm code, `jump v` starts
 running the verified code. The escape hatches:
 
 - `unsafe { Mini.assume_verified(code) }`, for code the host built
@@ -3296,9 +3316,48 @@ instruction word to its family's generic op, splits superinstructions
 (the head becomes its first part's generic op) and zeroes inline caches,
 which gives the code the emitters produced.
 
-Rewrites are single-word stores. With multiple guest threads they need an
-atomic store, which the compiler would emit when the vm is declared
-`#[threads(shared_code)]` (**Not built**).
+**`become match`** picks the member from a value, usually the state an
+inline-cache miss handler returns (`std.obj`'s `IcState`):
+
+<!-- snippet: check
+enum IcState { Generic, OwnIn, OwnOut, Proto, Poly, Mega }
+fn miss(k: u64) -> IcState { if k == 0 { IcState.OwnIn } else { IcState.Mega } }
+vm V {
+    state { pc: *u32, regs: *i64 }
+    operand reg = regs[it];
+    operand imm = it;
+    encoding fixed(u32) { format AB { op: 8, a: 8, b: 16 } }
+    family GET(dst: reg, k: imm) : AB {
+        generic {
+            let st = miss(k);
+{snippet}
+            next
+        }
+        GET_IN { next }
+        GET_OUT { next }
+        GET_POLY { next }
+    }
+    entry run(code: *u32, r: *i64) -> i64 { regs = r; jump code }
+}
+-->
+```loimi
+become match st {
+    OwnIn => GET_IN,
+    OwnOut | Proto => GET_OUT,
+    Poly => GET_POLY,
+}
+```
+
+Each arm is a pattern of variants of the scrutinee's enum and an op;
+the scrutinee is evaluated once. It is the ladder `if st ==
+IcState.OwnIn { become GET_IN; } if st == IcState.OwnOut or st ==
+IcState.Proto { become GET_OUT; } ..` and compiles to the same code
+(Lox's and MiniJS's 11 ladders were ported with `loimi ir-diff`
+reporting the same code). A value no arm names keeps the current op, so
+there is no `_` arm.
+
+Rewrites are single-word, non-atomic stores: code is not shared
+between threads that run at the same time (section 10.1, threads).
 
 ### 7.3 Superinstructions
 
@@ -3570,8 +3629,7 @@ commented-out list that names what it overlaps. So the first list can
 be pasted whole without warnings, and the second lists alternatives.
 In a library (`--lib`, `--shared`) the report prints when the host
 process exits; several such libraries can link into one host (the stats
-runtime's symbols are weak, and named by a hash of its source). (**Not built:** a separate `loimi vm suggest-supers`
-command.)
+runtime's symbols are weak, and named by a hash of its source).
 
 The report also counts how often each `cold` block was entered, after
 the op counts: one line per block and op it is generated in (a block in
@@ -3661,7 +3719,7 @@ by guest pc (the vm's pc when the op started):
 - **By guest pc**: the vm's `pc` when the op started (in JIT code, the
   compiled instruction's word) with its location: which instructions of
   the guest program are hot. Pcs are addresses; mapping them to guest
-  source lines is up to the interpreter (a hook for it is not built).
+  source lines is up to the interpreter.
 
 How code is named:
 - **Tail-call mode.** Handlers and outlined cold blocks are functions,
@@ -4077,18 +4135,14 @@ enough to make it precise and cheap:
   It converts to a raw pointer or a `u64` address with `as`. The way back
   (`p as Gc<T>` from a pointer, a `u64`, or another `Gc`) is only allowed
   inside `unsafe { }`, since nothing checks that `p` points to a live `T`.
-- **Write barriers.** Stores of `Gc`/`Value` into object fields are lowered
-  through the heap policy's barrier, which is a compile-time parameter
-  (`#![heap = std.gc.MarkSweep]`). Non-incremental mark-sweep has no barrier,
-  so stores cost nothing. A generational policy adds a card-mark at each such
-  store, and the source does not change. (**Not built:** the `heap`
-  attribute and card marking. As implemented: Every such store, including `o.items.ptr[i] = v`,
-  calls `std.gc.barrier(o)`, an object-logging barrier that tests one
-  header byte, and a heap is made generational at run time with
-  `heap.set_generational(true)`; see
+- **Write barriers.** Every store of a `Gc`/`Value` into an object field,
+  including `o.items.ptr[i] = v`, calls `std.gc.barrier(o)`, an
+  object-logging barrier that tests one header byte (there is no card
+  marking); a heap is made generational at run time with
+  `heap.set_generational(true)`, and the source does not change; see
   [`stdlib/gc.md`](stdlib/gc.md#as-implemented). Stores through other
   raw pointers into objects need `gc.write_barrier(h, obj)`, and
-  `heap.set_verify(true)` finds the missing ones.)
+  `heap.set_verify(true)` finds the missing ones.
 - **Slices of trailing arrays.** `o.items` is a `[]T` slice, which does
   not know its object, so the compiler restricts where one with traced
   elements can go (in every module): it may be indexed, sub-sliced,
@@ -4182,12 +4236,10 @@ enough to make it precise and cheap:
   `unsafe { }`: the callback is then called with pointers of the types
   it was written for only if its caller says so, as `add_scanner<T>`
   does.
-- **Roots.** These come from three places: the VM stacks (described by the
-  `state` kinds and the `ctx.sync` area), compiler-managed temporary roots at
-  effectful calls (section 5), and explicit `Root<T>` handles for host data
-  structures. (As implemented: traced locals in shadow-stack frames, and
-  root scanners registered with `heap.add_scanner`. **Not built:**
-  `Root<T>`, the `ctx.sync` area and roots generated from state kinds.)
+- **Roots.** These come from traced locals in compiler-managed
+  shadow-stack frames at effectful calls (section 5), traced state
+  variables (below), and root scanners registered with
+  `heap.add_scanner` for the VM stacks and host data structures.
   A **state variable of a traced type** (a stack VM's cached top of stack,
   `state { .., tos: Value }`, or a current closure, `cl: Gc<Closure>`)
   is rooted by the compiler: neither `sync` nor a root scanner needs to
@@ -4218,8 +4270,6 @@ enough to make it precise and cheap:
     its own state the same way. `rt.catch_panic`, `rt.protect` and
     `#[catch_panic]` restore the saved shadow-stack top, which drops the
     frames (and copies) of the calls they unwound.
-  - *Moving collectors* (not built) would also copy each slot back into
-    its variable after the call, next to the reload of spilled locals.
 
   The lint `state_root`, which warned when `sync` did not store such a
   variable, is retired: `#[allow(state_root)]` is still accepted and does
@@ -4231,10 +4281,9 @@ enough to make it precise and cheap:
   one), build with `--gc-check-roots`: the collector then checks every
   reference it is handed and fills freed objects with a pattern
   ([`stdlib/gc.md`](stdlib/gc.md#checking-roots---gc-check-roots)).
-- **Moving is opt-in.** The default `MarkSweep` is non-moving and
-  size-segregated, which keeps interior pointers into the stack and objects
-  stable across handlers. A moving policy makes the compiler reload spilled
-  references after `gc` calls. **Not built:** moving policies.
+- **Objects never move.** The heap is non-moving and size-segregated,
+  which keeps interior pointers into the stack and objects stable across
+  handlers, so nothing is reloaded after `gc` calls (roadmap.md, question 2).
 
 Loimi uses compiler-managed roots instead of LLVM's statepoint/stackmap
 machinery. Statepoints constrain the optimizer everywhere, while the effect
@@ -4291,8 +4340,9 @@ variant line_hook wraps [JMP, JLT, JLE, JEQ, CALL, RETURN] {
 Each variant generates a separate dispatch table of wrapper handlers, each
 wrapping the original handler. Switching is a single register update
 (`use_variant debug` in vm code, `use_variant default` to switch back), and
-the new table takes effect at the next dispatch. (**Not built:**
-`set_dispatch(Mini.tables.debug)` from outside the vm.) **Normal execution pays nothing**: no flag check in any handler, and
+the new table takes effect at the next dispatch; host code switches by
+entering through an entry that runs `use_variant` (Mini's `--cfg debug`
+entries do). **Normal execution pays nothing**: no flag check in any handler, and
 no second copy of the interpreter to maintain. This is how debuggers, profilers,
 coverage, and `sys.settrace`-style hooks are implemented.
 
@@ -4407,23 +4457,21 @@ What keeps this sound:
 - *Inline caches.* The breakpoint op keeps the instruction's cache
   words, and `Vm.deopt` leaves them alone.
 
-**Not built:** breakpoints with `--jit-stencils` (an error for now; the
-design invalidates compiled code of the patched object), stack vms, and
-atomic patching for code shared between threads.
+`on break` works in interpreted code of register vms: it is an error
+with `--jit-stencils`, and stack vms do not support it.
 
 ---
 
 ## 10. Calls, reentrancy, coroutines, embedding
 
-**Not built:** `std.rt` (`FrameStack`, `Fiber`) and
-`suspend`. A vm's `entry` functions are ordinary internal Loimi
-functions (not C-ABI exports), and the example interpreters keep their
-own frame stacks in vm state. Embedding (below) wraps entries in
-`export "C"` functions the interpreter writes itself. Host-to-guest
-calls are implemented as nested entries (below).
+A vm's `entry` functions are ordinary internal Loimi functions (not
+C-ABI exports), and each interpreter keeps its own frame stack in vm
+state. Embedding (below) wraps entries in `export "C"` functions the
+interpreter writes itself. Host-to-guest calls are nested entries
+(below).
 
-- **Guest-to-guest calls** should stay in the loop: push a frame (`std.rt.FrameStack`),
-  slide the register window, and `jump`. This uses no C stack, so deep guest
+- **Guest-to-guest calls** stay in the loop: push a frame on the
+  interpreter's own frame stack, slide the register window, and `jump`. This uses no C stack, so deep guest
   recursion is bounded by the VM stack, not the C stack.
 - **Host-to-guest calls** (metamethods, callbacks, `sort` comparators)
   run a nested loop on top of the same VM stack, through an entry
@@ -4481,14 +4529,12 @@ calls are implemented as nested entries (below).
     the `Result` and decides. If it re-raises, the outer `on raise` sees
     the error again: Mini marks errors that already carry their position
     (`ctx.rethrow`) so it does not prefix a second line number.
-- **Not built:** **coroutines and generators** fall out of the explicit state: a coroutine is
-  a separate `ValueStack` plus `FrameStack`, `suspend v` leaves the loop with
-  state saved, and resuming re-enters through an entry that restores it.
-  Suspending across a host frame is an error (as with Lua's "yield across a
-  C-call boundary") unless the coroutine runs on a `std.rt.Fiber`, which has
-  its own stack. *Built today:* Mini's coroutines (examples/mini/COROUTINES.md)
-  need neither `suspend` nor a new entry form; they use what handlers
-  and entries already have:
+- **Coroutines and generators** are written with what handlers and
+  entries already have; Mini's coroutines (examples/mini/COROUTINES.md)
+  work this way. (A `suspend` primitive, a state snapshot and restore,
+  was prototyped and rejected: it saves at most 2 loads per switch, while
+  quickened CALL members in Mini gave chameneos 0.925; `design/speed-audit.md`
+  item 11.)
   - **Switching inside the run.** A guest coroutine with its own value
     and frame stacks is switched to like a call: a handler (Mini's
     CALL of `coroutine.resume`, of `coroutine.yield`, and its RET from a
@@ -4746,12 +4792,9 @@ loimi build embed.lm --shared -o libmini.so --header mini.h   # shared object
     (`oo_methods`, `mandelbrot`, `closures`, `fib`: calls and tight
     loops), from the poll's two loads and a branch; the hand-over
     itself is a mutex and a condition variable.
-  - **Not built: free threading.** Threads running vm code in one heap at
-    the same time need atomic (or per-thread) inline caches and opcode
-    rewrites (`#[threads(shared_code)]` in the roadmap), a collector
-    that stops every mutator at safepoints (the polls are where), per
-    thread allocation buffers, and barriers for shared objects;
-    roadmap, open question 4.
+  - **No free threading.** Threads share a heap one at a time; running
+    vm code in one heap on several threads at once is not supported
+    (roadmap.md, question 4).
 
   `examples/embed/threads.c` runs four Mini states on four threads at
   once (two under GC stress, nested runs through C natives, a caught
@@ -4817,7 +4860,9 @@ compile to the same IR as without the catches.
 - **No optimizing JIT.** Each handler is a separate LLVM function with a known
   register interface, which is exactly the input a copy-and-patch baseline JIT
   needs (CPython 3.13 builds its JIT from LLVM-compiled templates); a
-  prototype of one exists (`--jit-stencils`, `status.md`). See `roadmap.md`.
+  prototype of one exists (`--jit-stencils`, `design/copy-and-patch.md`),
+  with traces built ahead of time from a recorded profile on top of it
+  (`design/trace-tier.md`); there is no run-time trace compiler.
 - **No borrow checker or ownership types.** Arenas and the GC cover
   interpreter workloads. The complexity budget goes to the hot loop.
 - **No exceptions or unwinding in host code.** Guest exceptions are a VM

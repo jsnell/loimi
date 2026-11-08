@@ -1,0 +1,59 @@
+// `become match e { A => OP, B | C => OP2 }`: the op a value selects,
+// as the ladder `if e == E.A { become OP; } ..` (a value no arm names
+// keeps the current op). Shown with the disassembler.
+import std.io;
+import std.text;
+
+enum Kind { Zero, One, Two, Many }
+
+fn kind(v: u64) -> Kind {
+    if v == 0 { Kind.Zero } else if v == 1 { Kind.One } else if v == 2 { Kind.Two } else { Kind.Many }
+}
+
+vm Q {
+    state { pc: *u32, regs: *i64 }
+    operand reg = regs[it] display "r{}";
+    operand imm = it;
+    encoding fixed(u32) { format AB { op: 8, a: 8, b: 16 } }
+
+    family ADD(dst: reg, v: imm) : AB {
+        generic {
+            dst = dst + v as i64;
+            become match kind(v) {
+                Zero => ADD_ZERO,
+                One | Two => ADD_SMALL,
+            }
+            next
+        }
+        ADD_ZERO { next }
+        ADD_SMALL { dst = dst + v as i64; next }
+    }
+    op RET(a: reg) : AB { exit a }
+
+    entry run(code: *u32, r: *i64) -> i64 { pc = code; regs = r; jump pc }
+}
+
+fn main() {
+    var code: [u32; 8] = [0; 8];
+    var at: u64 = 0;
+    at = Q.emit.ADD(code[..], at, 0, 0);
+    at = Q.emit.ADD(code[..], at, 0, 1);
+    at = Q.emit.ADD(code[..], at, 0, 2);
+    at = Q.emit.ADD(code[..], at, 0, 7);
+    at = Q.emit.RET(code[..], at, 0);
+    let Ok(v) = Q.verify(code[..at]) else { return; };
+    var regs: [i64; 1] = [0];
+    io.print_int(Q.run(v.start(), &regs[0])); io.println("");
+    regs[0] = 0;
+    io.print_int(Q.run(v.start(), &regs[0])); io.println("");
+    var b = text.StrBuf.new();
+    Q.disasm(v.words(), &b);
+    io.print(b.as_str());
+}
+// expect: 10
+// expect: 10
+// expect:     0  ADD_ZERO dst=r0 v=0
+// expect:     1  ADD_SMALL dst=r0 v=1
+// expect:     2  ADD_SMALL dst=r0 v=2
+// expect:     3  ADD dst=r0 v=7
+// expect:     4  RET a=r0

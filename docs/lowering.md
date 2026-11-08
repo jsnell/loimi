@@ -520,32 +520,13 @@ Notes:
   gave a geometric mean of 1.007 of the original's time (per benchmark
   0.96 to 1.03, within run-to-run noise).
 
-  **Folding it in the assembly: tried, not kept (2026-11-06).** Nothing
-  in the IR gets the fold back with seven values: an `undef` or
-  `poison` argument still takes a register operand (`-print-after=finalize-isel`
-  shows `TCRETURNri64` after a separate load, against `TCRETURNmi64`
-  with six), a `<2 x i64>` counts once but costs a shuffle at every use
-  of the lane, and dropping the instruction word (the callee reloads it
-  from `pc`; with that, all of Mini's dispatches fold) trades the `mov`
-  for a load. A pass that compiled such programs to assembly and
-  rewrote `movq T(,%rI,8),%rD; ...; jmpq *%rD` to `jmpq *T(,%rI,8)`
-  (commit 0c3bb46, reverted) folded 1043 of Mini's 1051 indirect jumps
-  and all but 18 of the wasm interpreter's 1217, and measured, in
-  paired rounds, folded over unfolded: Mini 0.996 and 1.001 (align 64,
-  128), Mini with the accumulator declared and unselected 1.000 and
-  0.999, MiniJS's port 0.996 and 0.995, Scheme's 0.996 and 1.005, the
-  wasm interpreter 1.022 at 64 (spectralnorm 1.08 at both alignments).
-  A dispatch microbenchmark (four handlers that add to a register and
-  dispatch the next of 4096 words, 10^9 dispatches, i7-6700) gives the
-  reason: 1.405 s with six arguments, 1.371 s with seven, 1.399 s with
-  seven folded when the opcodes repeat, 7.6 to 8.3 s for all three when
-  they are random. The dispatch waits on two dependent loads, the word
-  and then the target, which the fold does not shorten, and the extra
-  `mov` is a µop the front end has room for; where LLVM had hoisted
-  the load away from the `jmp`, folding sinks it. The 3.8% on Mini's
-  fib that a control build blamed on the fold did not reproduce with
-  more rounds (`bench/mini/RESULTS.md`, item 44): it was the noise of a
-  machine at load 4 to 6.
+  **Folding it in the assembly: tried, not kept (2026-11-06).** No IR
+  form gets the fold back with seven register values. An assembly pass
+  that rewrote the load and `jmp` into `jmpq *T(,%rI,8)` (commit 0c3bb46,
+  reverted) measured folded/unfolded 0.996–1.005 on Mini, MiniJS and
+  Scheme and 1.022 on the wasm interpreter: dispatch waits on two
+  dependent loads (the word, then the target), which the fold does not
+  shorten.
   A table address passed as an argument does not fold on x86-64 at any
   count (`mov (%r14,%rax,8),%rax; jmp *%rax`), which is one reason the
   table stays a global there.
@@ -568,8 +549,8 @@ Notes:
   wasm interpreter's handlers went from 8045 to 7174 instructions in all
   (most handlers 2 to 4 fewer; the rest is LLVM duplicating the cheaper
   dispatch into branches that jumped to a shared one), Mini's hot
-  handlers mostly 2 to 4 fewer. Not timed: there is no AArch64 hardware
-  here, and qemu timings mean nothing.
+  handlers mostly 2 to 4 fewer. This is untimed on hardware (qemu
+  timings mean nothing).
 
 - **Why slow-path calls give handlers a frame (measured 2026-11-03, not
   changed).** `-W handler_frame` reports 175–218 framed tail-call
@@ -584,14 +565,11 @@ Notes:
   the entry block. A different calling convention for the callee
   (`preserve_most`/`preserve_all`) does not help by itself.
 
-  An experiment on branch `cold-stub-experiment` (not merged) calls
-  these slow paths through inline asm that realigns the stack and calls
-  a `preserve_all` stub, so LLVM sees no call. It removes the frame from
-  43 of 218 handlers on x86-64 and 96 of 132 on AArch64, but the
-  geometric mean over 102 benchmarks was 0.995 (noise), tail-call
-  `.text` grew 8–30%, and using it in goto mode made Stak 1.34× slower.
-  Not merged for that reason. It could be revisited with AArch64
-  hardware, where most of the frames disappeared.
+  Calling these slow paths through inline asm and a `preserve_all` stub,
+  so that LLVM sees no call (branch `cold-stub-experiment`, not merged),
+  removed the frame from 43 of 218 handlers but measured 0.995 over 102
+  benchmarks, grew tail-call `.text` 8–30% and made Stak's goto build
+  1.34× slower.
 
   Since then (2026-11-03) the two commonest causes are gone without
   that machinery. The barrier's slow path (`std.gc.log_obj`) pushes onto
@@ -602,10 +580,6 @@ Notes:
   (`-W handler_frame`): Lox 26 to 22, Mini 40 to 38, MiniJS 67 to 59,
   Python 51 to 47, Scheme 12 to 7; Prolog stays at 4 with its free-list
   workaround replaced by `try_new`; Stak 8, Wasm 15, regex 0 unchanged.
-  Compiling the barrier's slow path as an implicit cold block instead
-  was not built: a cold block is outlined only where the rest of its
-  block ends in a control word, which a barrier inside a helper function
-  (`table_set`, inlined by LLVM, not by the compiler) never is.
 
   The inline slow path has a cost outside handlers: each barrier site
   adds the slow path's instructions (where there was one call) to LLVM's
@@ -628,7 +602,7 @@ Notes:
 | `next` | `pc' = pc + size(op) + size(cache)`. Load handler from `tbl[opcode(*pc')]`, `musttail call` |
 | `jump t` | same, with `pc' = t` |
 | `redo` | same, with `pc' = pc` |
-| `become X` | `store i8 X, ptr %pc` (opcode is in the low byte, little-endian; big-endian targets adjust the offset). Would become `store atomic ... monotonic` under `#[threads(shared_code)]` (not yet implemented) |
+| `become X` | `store i8 X, ptr %pc` (opcode is in the low byte, little-endian; big-endian targets adjust the offset). |
 | `exit v` | `store v` to `ctx.exit`, `ret void`. The `musttail` chain unwinds straight back to the entry function. *As implemented:* a result that is a scalar (an integer, pointer, float or non-boxed value) is returned in registers, and handlers return the entry's type; any aggregate result (a `Result`, struct, tuple, option of a non-pointer) is stored to a thread-local `Vm.ret_slot` and handlers return `void`, since a `musttail` call cannot return through a hidden `sret` pointer. The entry loads the slot after its call returns |
 | `raise e` | `store e` to `ctx.pending`, `musttail call @Mini.on_raise` |
 
@@ -769,9 +743,8 @@ through `examples/embed/minirun.c` (minimum of 5 runs, on a loaded
 about ±5%, so the local-dynamic cost is 0–7% on call-heavy code
 (`closures`, `oo_methods`) and not measurable elsewhere. TLSDESC
 (`-mtls-dialect=gnu2`, tried by hand) replaces the `__tls_get_addr` call
-with a cheaper descriptor call and shrinks the frame to one `push`; it
-may halve the cost, but within the noise, so the driver does not use it
-yet. A host that links the shared object at startup (not `dlopen`) can
+with a cheaper descriptor call and shrinks the frame to one `push`, but
+measured within the noise, so the driver does not use it. A host that links the shared object at startup (not `dlopen`) can
 build with `--tls=initial-exec` and pay nothing.
 
 Position-independent code itself (the static archive in a PIE host, or a
@@ -1291,7 +1264,6 @@ interleaved, `--align-functions=64`).
 | handlers `nounwind`; whole program `-fno-exceptions`-equivalent | no unwind tables in the hot path |
 | `cold` functions placed in `.text.unlikely` | i-cache locality for handlers |
 | a vm with `#[profile("file")]` (or `--vm-profile=FILE`): its handlers in profile order, the profiled ones in a page-aligned `.text.hot.<vm>` section, its outlined cold blocks in `.text.<vm>.cold` after it ("Handler order", below) | the hot handlers' layout depends only on their own code |
-| target check: `preserve_none` available? otherwise warn and fall back to `goto` (not implemented: both targets have it) | portability |
 | executables `-fno-pic -no-pie`; `--lib`/`--shared` `-fPIC` | absolute dispatch-table addresses; libraries link anywhere |
 | initial-exec TLS; local-dynamic for `--shared` (`--tls=`) | `dlopen`-safe shared objects (§4) |
 | x86-64 programs with a vm: `-mllvm -x86-align-branch-boundary=32 -x86-align-branch=fused+jcc+jmp+indirect -x86-pad-max-prefix-size=5` (`--no-branch-align` drops them) | no branch, dispatch jumps included, crosses or ends at a 32-byte boundary (the JCC erratum, below) |

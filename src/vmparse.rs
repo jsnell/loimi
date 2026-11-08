@@ -741,7 +741,8 @@ impl Parser {
             let n = self.ident()?;
             self.expect(":")?;
             let k = self.ident()?;
-            params.push(OpParam { name: n, kind: k });
+            let field = if self.eat("@") { Some(self.ident()?) } else { None };
+            params.push(OpParam { name: n, kind: k, field });
             if !self.eat(",") {
                 break;
             }

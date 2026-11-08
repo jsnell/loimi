@@ -1,0 +1,7 @@
+struct Pair<A, B> { a: A, b: B }
+trait Show { fn show(x: Self); }
+fn Pair<A, B>.show(p: Pair<A, B>) {}
+impl<T> Show for Pair<T, i64>;
+impl<T> Show for Pair<str, T>;
+fn main() {}
+// error: overlapping impls of `Show`: some type matches both

@@ -1,0 +1,9 @@
+import std.mem.{Vec};
+trait Show { fn show(x: Self); }
+fn Vec<T>.show(v: Vec<T>) {}
+fn i64.show(x: i64) {}
+impl Show for i64;
+impl<T: Show> Show for Vec<T>;
+impl Show for Vec<i64>;
+fn main() {}
+// error: overlapping impls of `Show`: both apply to `Vec<i64>`

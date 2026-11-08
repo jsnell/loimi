@@ -1,39 +1,39 @@
-# Design note: a trace tier stitched from stencils (experiment, 2026-11-06)
+# Design note: a trace tier stitched from stencils
 
-**Status: M1 built** (§11): `loimi build --jit-stencils
---trace-regions=REC` and `--traces=PROF` make ahead-of-time traces from a
-profile, with the generator in the compiler (`src/tracegen.rs`). **Then
-cheaper exits and traces through calls** (§12, M4 in part): Mini at 0.858
-of the JIT by geometric mean (M1: 0.932), no program slower. **Then side
-traces and loops inside loops** (§13, M2): 0.759 (`interp` 0.72). §1–§10
-describe the experiment as it was run; its hooks were replaced
-(`LOIMI_TRACE_DUMP` is `LOIMI_TRACE_RECORD`, `LOIMI_TRACE_IR` is
-`--traces`, `loimi_trace_blacklist` is `loimi_trace_failing`).
+The trace tier compiles the hot loops of a program, ahead of time, into
+one LLVM function each, stitched from the vm's own `--jit-stencils`
+stencils (`src/tracegen.rs`). Traces are made from a profile in three
+plain steps (record, profile, rebuild: §11.1), and the JIT runtime
+(`src/jit_rt.c`) enters a trace at its loop header. Nothing is compiled
+at run time beyond what the copy-and-patch JIT does: code that was not
+in the profile runs on the stencils.
 
-**Question.** Is there a "moral equivalent of a tracing JIT" for
-Loimi's interpreters? That means compiling the common path through a
-hot loop as one unit, with automatic fallback to the interpreter when a
-guard fails. The strongest form is meta-tracing or partial evaluation
-(PyPy's RPython, Truffle/Graal). The framework records a hot path
-through the *interpreter* and compiles the handlers' code for that path
-as one unit:
+- §11: the generator, the register window, guards, exits and
+  invalidation (M1).
+- §12: exits that copy only what they must, and calls inlined into
+  traces (M4, in part).
+- §13: side traces and loops inside loops (M2). Mini at 0.759 of the
+  JIT's time by geometric mean, MiniJS 0.866 (all 14 programs;
+  [results.md](../results.md#trace-tier-in-this-run)), no program more
+  than 1% slower.
 
-- bytecode operands become constants;
-- every branch the trace did not take becomes a guard that exits to the
-  interpreter;
-- LLVM optimizes the whole unit.
+Limitations:
 
-`copy-and-patch.md` §13 measured the prize by hand. With guest
-registers in host registers and the checks removed, mandelbrot's inner
-loop runs at 0.56–0.68 of the copy-and-patch JIT's time. That section
-ended: "start an optimizing tier over traces or loops, not more stencil
-variants". Speed audit item 14 says the same.
+- Traces need `--jit-stencils`, so they have its limits: x86-64 Linux,
+  one vm per program, tail-call dispatch.
+- `--cfg debug` builds cannot use `--jit-stencils` (`on break` is not
+  supported there), so there are no traces under the debugger.
+- A profile names the build it came from (a hash of the stencils); a
+  trace build takes profiles of the same compiler and vm only.
 
-**Answer: yes, and Loimi gets most of it almost for free.** This
-experiment built the trace offline, with no runtime compiler. It
-recorded a loop in the running program, generated one LLVM function
-from the vm's own stencils, linked it back into the program, and
-entered it at the loop header. LLVM did the rest. The results:
+## The first experiment (2026-11-06)
+
+Before §11, a Python generator (`tools/trace-exp/`, kept for reference,
+not maintained) built traces of four Mini loops by hand-run steps, to see
+whether stitched handler IR plus LLVM gets near the hand-written bound of
+`copy-and-patch.md` §13 (0.56–0.68 of the JIT on mandelbrot's inner
+loop). Whole-program times, minimum of 11 interleaved runs, user+sys
+CPU, `--align-functions=64`:
 
 | traced loop | trace / JIT | trace / interpreter |
 |---|---:|---:|
@@ -41,588 +41,43 @@ entered it at the loop header. LLVM did the rest. The results:
 | nbody's inner loop (calls `math.sqrt`) | **0.73** | 0.55 |
 | fannkuch's swap loop | 0.82 | 0.64 |
 | sieve's two loops (memory-bound) | 0.87 | 0.70 |
-
-These are whole-program times: minimum of 11 interleaved runs, user+sys
-CPU, `--align-functions=64`; medians agree within 0.07 (§3). On
-mandelbrot the stitched trace lands inside the hand-written bound
-(0.56–0.68), although it keeps every NaN and tag check. Values stay in
-xmm registers across the whole loop, which has 53 instructions and no
-memory access. Stores to the register file are sunk to the exits.
-Operands, constants and `pc` are folded, and dispatch is gone.
-
-Every stitching step was mechanical: register-file promotion, guards,
-exits, entry, and the inlining of an outlined cold block (nbody's
-`sqrt`). The manual parts were choosing which loop to trace in three
-of the five programs (nbody, sieve, fannkuch), and a build–run–build
-cycle that a runtime tier would do by
-itself (§5).
-
-**Recommendation: go**, staged (§8). Build the first runtime tier on the
-same idea: stitch handler IR along a recorded path, and keep the
-shared-frame exits. Do not write a new optimizer.
-
-## 1. What was built
-
-```
- run with LOIMI_TRACE_DUMP   ->  recording: code words (quickened), ops, patched constants, hot loop pc
- tracegen.py --mode region   ->  the loop's instructions as one function, every block counted
- run with LOIMI_TRACE_PROFILE->  block and edge counts
- tracegen.py --mode trace    ->  the hottest path; untaken branches become guards
- loimi build (LOIMI_TRACE_IR)->  the trace appended to the program's IR, compiled with it (-O3)
- run (LOIMI_JIT=1)           ->  the JIT runtime points the loop header at the trace
-```
-
-Two flag-gated hooks are in master (this commit):
-
-- **`src/jit_rt.c`.** With `LOIMI_TRACE_DUMP=file`, each compile writes
-  the code object's words, the op of each instruction, the constants
-  patched into its stencil, and the loop that triggered the compile
-  (the recording). A weak table, `loimi_traces`, lists generated traces.
-  Each entry gives a code object's length, a hash of the instruction
-  words in the trace's range, and the loop header. After a compile of a
-  matching object, the header's home gets a 5-byte `jmp` to the trace,
-  and its enter word's entry points there too, so both compiled code
-  and the interpreter enter it. With `LOIMI_TRACE=0` the hook installs
-  nothing (the A/B switch). `LOIMI_TRACE_PROFILE=file` writes the
-  trace's block counters at exit. `loimi_trace_blacklist(name)`, called
-  by a trace whose guards have failed too often, restores the header's
-  five bytes and its entry, and bans the trace.
-- **`src/main.rs`.** With `--jit-stencils` and `LOIMI_TRACE_IR=file`,
-  the file's IR is appended to the program's.
-
-The generator (`tracegen.py`, about 850 lines of Python) and the driver
-scripts are not committed; they are listed in §10. The generator reads:
-
-- the stencil module (`LOIMI_KEEP_STENCILS`): every op handler, already
-  in the form the JIT needs, with operand fields, words and constants as
-  holes and `next`/label jumps as calls to `__jit.n.D`/`__jit.j.*`;
-- the program IR, for the names it defines;
-- the recording.
-
-For each instruction (a *step*) of the trace, it copies the stencil's
-body, renaming its values and blocks, and then:
-
-- **Holes become literals.** Fields are decoded from the recorded word,
-  and constants come from the recorded pool. A constant that is a heap
-  pointer (a field name in nbody) is loaded from `k[i]` instead, since
-  its address changes between runs.
-- **Continuations.** A `next` or label jump to the trace's next step
-  becomes a `br` to that step's head, with phis for `ctx`, `k` and `fp`.
-  `pc` is `trace_pc + offset`, a constant, at every step. Any other
-  continuation is an exit: it dispatches through the table at the
-  target pc.
-- **The register window.** `regs` becomes a local `[N x i64]` alloca
-  (N: the largest register field + 4). It is copied in at entry, and
-  written back before every exit and before every call that may see the
-  register file or collect (anything but LLVM intrinsics and functions
-  with no stores and no calls). It is reloaded after such a call.
-  Pointers into the window passed to calls are rebased onto the real
-  file. SROA turns the window into SSA values; the copy-in becomes loads
-  at entry, and the writebacks become stores in the exit blocks.
-- **Changes of `regs`.** The handler may switch to another frame
-  (`CALL`), reload `regs = fp.base` after a native, or store a
-  register-file pointer into a frame. Each case is handled at run time:
-  - the real file maps back to the window;
-  - a pointer into the window is rebased onto the real file, after a
-    writeback;
-  - any other frame makes the code continue on real memory, and exits
-    pass it on.
-
-  LLVM folds all of this away on the paths where `regs` does not change.
-- **Outlined cold blocks are inlined once.** `Mini.CALL` handles
-  natives in a `cold` block, an outlined function with the handler's
-  signature, so `math.sqrt` in nbody is "cold". The generator inlines
-  such calls. Their `next` is a dispatch through the table; it becomes a
-  `switch` on `pc - trace_pc` that branches to the matching step.
-- **Guards.** In trace mode, an on-trace block whose branch goes to a
-  block the profile never ran gets a *guard*, if no effect lies on any
-  on-trace path to it. The guard writes back the window as it was at the
-  step's start, then dispatches at the step's pc, so the interpreter
-  re-executes the whole instruction. Effects are stores outside the
-  step's locals and the register file, atomics, and unsafe calls. This
-  is the condition the `redo_effect` check already enforces for `redo`
-  (`src/redocheck.rs`, `lowering.md` §10). Where an effect came first,
-  the untaken code stays in the trace, but all its continuations exit,
-  so it never merges back into the trace.
-- **Peeling** (`--peel`, optional): the trace is emitted twice, as a
-  preamble and then the loop, as LuaJIT's LOOP pass does.
-
-The *region* mode is the profiling build. It covers every instruction
-between the loop header and the last back edge, with all internal edges
-and a counter per block and per dynamic edge. It is also the "method
-JIT" baseline: the loop compiled as a whole, without pruning.
-
-## 2. Correctness
-
-- Every timed run printed the benchmark's expected output (the bench
-  harness compares each run).
-- **A failing guard.** `progs/mandg.lua` is mandelbrot with
-  `if y >= SWITCH then ci = 0 end`. It was recorded and profiled with
-  `SWITCH = 2000` (never true). The trace was then run on `mandg650.lua`,
-  identical except `SWITCH = 650`: from row 650 on, `zi = 2.0*zr*zi + ci`
-  adds an integer. The output matched the interpreter's (inside 1075833,
-  checksum 288560). The guard in `MUL_F_ADD_F__f2` (the `(Num, Int)`
-  arm, which the profile never saw) fired 38,062,700 times, once per
-  iteration (in a build with counters and without blacklisting): the
-  interpreter re-executes the super, the loop jumps back to the header,
-  and the trace is entered again.
-- **Blacklisting.** With no side traces, such a trace costs more than
-  the JIT: mandg650 ran at 1.08 of the JIT's time. Each guard exit now
-  counts its failures in the trace. At 1000 failures it calls
-  `loimi_trace_blacklist`, which puts the stencil code back at the
-  header and keeps the trace from being installed again. In that run,
-  `LOIMI_JIT_DEBUG` showed `trace mgtr blacklisted`, the guard counter
-  stopped at 1000, and the output was still right. mandg650 then ran at
-  0.87 of the JIT's time: the trace for the first 650 rows, stencils
-  after.
-- The trace is installed only when its words match (a hash of the
-  instruction words in its range). Rewrites through `become`/`deopt`
-  recompile the code object, and the hook then re-checks. A family
-  member rewritten *after* installation leaves the trace running the
-  old member's code. That is correct for Mini, because every member
-  handles every type (`vm.lm`: "both members handle every type"), but a
-  real tier must invalidate (§7).
-
-Not tested: GC stress (`mini main.lm script stress`) with a trace, the
-golden suites with traces, and coroutines. The traced loops do not
-allocate. The writeback-around-calls rule is what makes collection safe
-(§7.1), but it was exercised only by nbody's off-trace paths.
-
-## 3. Results
-
-Machine: the shared 8-core x86-64 box, with two other agents running.
-Load average 3.9–5.3. User+sys CPU seconds, minimum of 11 runs
-interleaved per benchmark (7 for the guard programs), with the median
-also shown. `--align-functions=64` throughout.
-
-- *interp*: Mini's default build.
-- *JIT*: `--jit-stencils` with `LOIMI_JIT=1`.
-- *JIT A/A*: the same binary and settings again, as a noise control.
-- *trace*: the same binary, with the trace hook on.
-
-The JIT and the trace come from one binary, switched by `LOIMI_TRACE=0`.
-Every run's output was checked.
-
-| program (traced loop) | interp | JIT | JIT A/A | trace | trace/JIT | trace/JIT, medians |
-|---|---:|---:|---:|---:|---:|---:|
-| mandelbrot (inner `for i`) | 0.662 | 0.373 | 0.370 | 0.235 | **0.63** | 0.63 |
-| nbody (inner `for j`, with `math.sqrt`) | 0.463 | 0.347 | 0.348 | 0.255 | **0.73** | 0.80 |
-| sieve (marking loop and the `for i` loop, two traces) | 0.727 | 0.581 | 0.578 | 0.506 | 0.87 | 0.88 |
-| fannkuch (the swap `repeat`, 1–4 iterations per entry) | 1.185 | 0.918 | 0.911 | 0.757 | 0.82 | 0.82 |
-| mandg (mandelbrot with a dead `if`) | 0.648 | 0.377 | | 0.232 | 0.62 | 0.64 |
-| mandg650 (guard fails from row 650) | 1.060 | 0.635 | | 0.552 | 0.87 | 0.89 |
-| mandg650, without blacklisting | | | | 0.687 | 1.08 | 1.11 |
-
-The A/A pairs differ by under 1%. An earlier batch under heavier load
-(4.6–5.9) gave mandelbrot 0.54 and nbody 0.73, with a 2× spread
-between runs. The table above is the steadier batch.
-
-Variants of the mandelbrot trace (same batch):
-
-| variant | seconds | / JIT |
-|---|---:|---:|
-| region: the loop's instructions as one function, all paths, cold blocks inlined, no pruning | 0.356 | 0.95 |
-| trace, no guards: untaken code kept, its continuations exit | 0.304 | 0.82 |
-| trace with guards | 0.235 | 0.63 |
-| trace with guards, peeled | 0.238 | 0.64 |
-
-Pruning is what pays. A loop compiled whole (the "method JIT" shape)
-gains almost nothing over the stencils: the slow paths and inlined cold
-blocks merge back into every step, and LLVM must keep their values
-alive. Peeling removes one tag test per iteration but no time.
-
-## 4. What LLVM did, and what it could not do
-
-The hot loop of the mandelbrot trace is 53 instructions per iteration.
-The stencils need about 9 per float op plus `JGTKN` and `FORLOOP`, about
-100 in all (`copy-and-patch.md` §7).
-
-```
-loop:                                        ; zi = 2*zr*zi + ci; zr = zrq - ziq + cr; ...
-  movapd %xmm0,%xmm10 ; addsd %xmm8,%xmm10   ; ADD_F
-  ucomisd %xmm10,%xmm10 ; jp guard           ;   its NaN test (r == r)
-  movapd %xmm6,%xmm7 ; subsd %xmm3,%xmm7     ; SUB_F ...
-  ...                                        ; 9 float ops, 7 NaN tests
-  movq %xmm5,%r11 ; cmp %rbx,%r11 ; jae x    ; JGTKN: not an Int (both tag tests in one compare)
-  ucomisd %xmm12,%xmm5 ; ja escape           ;   zrq + ziq > 4.0 (the constant from .rodata)
-  mov %rax,%rbp ; and %rsi,%rbp ; cmp %r8,%rbp ; jne x   ; FORLOOP: counter is an Int
-  test %eax,%eax ; je done                   ;   count left
-  ... and/cmp/jne                            ;   step is an Int
-  dec %rax ; add %r9d,%ecx ; or %r8,%rcx     ;   count down, i += s, retag
-  ... 4 movapd (phi copies) ; jnp loop
-```
-
-**What fired** (LLVM 19, `-O3`, no extra passes or hints):
-
-- **SROA/mem2reg of the register window.** There is no load or store to
-  `regs` in the loop. The writebacks are in the exit blocks, so stores
-  are sunk to exits as a side effect of SSA construction. No LICM
-  promotion was needed.
-- **Constant folding of operands.** Field decoding, `k[c]` constants
-  (`2.0`, `4.0`) and every `pc` computation folded. The hot loop has no
-  `pc` arithmetic and no dispatch.
-- **Instcombine and GVN on the tag tests.** `JGTKN`'s two tuple tests
-  (both Int, then both Num) merged into one unsigned compare against
-  the NaN-box boundary. The constant operand's tests vanished.
-- **Loop rotation.** The first iteration's loads from the window are
-  outside the loop.
-- In nbody: the inlined cold `sqrt` path became one `sqrtsd`, after
-  the native-id and tag tests. Inline-cache words are loaded from the
-  code stream on every iteration (see below).
-
-**What did not fire, and why:**
-
-- **The NaN test after each float op (7 per iteration).** It is
-  semantic, not a type test. `inf - inf` and `0 * inf` give NaN, which
-  must be canonicalized, so no compiler can drop it. LuaJIT does not
-  pay for it only because its NaN encoding needs no canonicalization
-  after arithmetic. This is a cost of Mini's value representation, not
-  of the tier.
-- **JGTKN's tag test on `zrq + ziq`.** The value comes from `ADD_F`'s
-  fast path, which already checked `r == r`, so it cannot be a boxed
-  value. LLVM does not derive bit facts from `fcmp ord`. A Loimi-level
-  fix: when a handler builds a `V` from an `f64` known not to be NaN
-  (`dst = r.to_bits() as V` after `likely(r == r)`), codegen could emit
-  `llvm.assume(bits < 0xfff8000000000000)`, i.e. "this is a `Num`".
-  That is a change to how values lower, and it helps the interpreter
-  too.
-- **FORLOOP's tag tests (counter and step).** These are loop-carried.
-  The phi merges the entry value (unknown, from memory) with the
-  back-edge value (`(i + s) | 0xfff9 << 48`, whose tag *is* known).
-  Peeling one iteration removes the test on the step and index. The
-  counter test stays, because Mini decrements the raw word
-  (`((regs[a + 1] as u64) - 1) as V`, "the payload is not zero, so
-  decrementing the word decrements it"). LLVM cannot prove that the tag
-  survives the subtraction. Writing `Int(c - 1)` would make it
-  provable. "Retag, don't do raw arithmetic on boxed words" is a vm
-  style note that costs the interpreter nothing.
-- **Inline caches are not promoted.** nbody's `GETFIELD` reads its
-  cached shape and slot from the code stream on every iteration. They
-  are plain memory that any handler may write, so LLVM must reload them
-  after every store to the heap. A tier needs RPython's `promote`:
-  read the cache at record time, bake it in, and guard it. The guard is
-  the same shape compare the handler already does, but against a
-  constant. The slot then becomes an immediate.
-- **Calls into Mini functions are not traced.** `CALL` of a closure
-  pushes a frame and jumps to the callee. The trace exits there, with
-  the window written back. Inlining calls into a trace needs frames that
-  exist only on exit (LuaJIT's snapshots). That is the one piece of real
-  deoptimization machinery the shared-frame design does not give for
-  free.
-- **Aliasing of the register file was never the problem.** Once `regs`
-  is a local alloca, nothing aliases it. In the region build (no
-  pruning) it was promoted as well. Pruning matters because untaken
-  paths merge back: the `noguard` variant keeps the untaken code with
-  exits only at continuations, and is 0.82 of the JIT where the guarded
-  trace is 0.63.
-- **GC polls** cost nothing in these loops: Mini's `FORLOOP` polls only
-  `gil` and `pause`, which are empty without their cfgs. A gc poll in a
-  traced loop would be a load, a compare and a branch to an exit or to
-  an inlined collect with writeback and reload (§7.1).
-
-**Compile latency.** Measured with `llvm-extract` of the trace function
-alone, then `clang -c`, best of 3. Clang on an empty module takes
-0.038 s, which is included below. Callees are declarations here, so
-LLVM inlines less than in the program build.
-
-| function | IR lines | `-O1` | `-O2` | `-O3` | code |
-|---|---:|---:|---:|---:|---:|
-| mandelbrot trace | 4,407 | 0.063 s | 0.072 s | 0.082 s | 5.6–7.2 KB |
-| nbody trace | 19,513 | 0.24 s | 0.42 s | 0.41 s | 22 KB |
-| mandelbrot region (no pruning) | 17,438 | 0.17 s | 0.26 s | 0.25 s | 16 KB |
-
-That is 30–400 ms of real work per trace. It is far too slow for a JIT that compiles at the first loop (the
-stencil JIT takes 7–30 µs per function), but acceptable for a tier
-entered after millions of iterations. LuaJIT compiles a trace in tens of
-microseconds; ORC with `-O2` on these functions would sit in between.
-
-## 5. Automatic versus manual
-
-| step | here |
-|---|---|
-| finding the hot loop | automatic: the JIT's hot counter names the loop header that triggered the compile (mandelbrot, mandg). Manual for nbody, sieve and fannkuch: the last trigger was a function entry or the wrong loop, so `--code`/`--header` were given by hand. |
-| recording operands, quickened ops, constants | automatic (`LOIMI_TRACE_DUMP`) |
-| choosing the path | automatic: block and edge counts of the region build, then the hottest successor at each step |
-| stitching, holes, continuations, register window, writeback, calls, `regs` changes, cold-block inlining | automatic (the generator knows the stencil conventions, not Mini) |
-| guards | automatic, from the profile and an effect analysis |
-| linking and entry | automatic, through the JIT runtime hook |
-| the cycle build, profile run, build | a script; a runtime tier does it in process |
-| a failing guard | the input `mandg650.lua` was made by hand |
-
-Mini-specific knowledge in the generator: the dispatch table's name
-(`vm.Mini.table`), the stencil hole naming, and the NaN-box tag range
-used to spot heap constants. All of it is available from the vm
-declaration.
-
-## 6. The gap to the bound
-
-The hand-written bound (`copy-and-patch.md` §13) ran the loop alone on
-a Skylake. These are whole-program times on a different, loaded
-machine. Mandelbrot spends about 97% of its samples in this loop under
-the JIT, so the two are close to comparable.
-
-| | of the JIT's time |
-|---|---:|
-| guest registers in host registers, spilled at exits (bound) | 0.68 |
-| registers, no type checks, `pc` updates or jumps (bound) | 0.56 |
-| **stitched trace, mechanical** | **0.63** (0.54 in the noisier batch) |
-
-The trace beats the bound's register-allocated row (0.68), which kept
-the stencils' checks, `pc` updates and jumps. It falls short of the
-best row (0.56) by about the cost of the checks it still does: 7 NaN
-tests and 3 tag tests per iteration. The loop is a chain of dependent
-float operations, so those tests partly hide in the shadow of the
-`mulsd`/`addsd` latency. The two tag-test fixes in §4 (the `assume` and
-the retagged counter) would close part of that gap. The NaN tests stay.
-The remaining 1.5× to LuaJIT (`copy-and-patch.md` §6: 0.159 s against
-the JIT's 0.410 s there) is the NaN canonicalization, the remaining
-tests, and the 4 `movapd` phi copies per iteration that LLVM's register
-allocator left in the rotated loop.
-
-nbody's gap is the untraced outer loop (18% of samples in `GETFIELD`
-and `SETFIELD` stencils of the `i` loop), inline caches read from
-memory, and the field stores with their write-barrier tests.
-
-## 7. Sketch of a real tier
-
-A runtime tier on top of `--jit-stencils`, reusing everything this
-experiment used:
-
-1. **Trace selection.** The hot loop counters exist already (the
-   JIT's `hotloop`). Loop headers are the targets of backward `label`
-   operands; the vm declaration already marks label kinds, so no
-   `jit_merge_point` hint is needed. A trace that reaches the header of
-   an inner loop with its own trace links to it instead of failing
-   (fannkuch's outer loop ran into this: "inner cycle at 40").
-2. **Recording.** An instrumentation variant (`language.md`,
-   instrumentation tables) whose handlers append their branch
-   directions to a buffer for one or a few iterations. This is
-   meta-tracing of the handler IR, which is exactly what the block
-   counters gave here. The compiler numbers handler blocks once, for the
-   variant and for the trace templates alike.
-3. **Templates.** Per handler, the compiler ships its body as LLVM
-   bitcode (the stencil module, in effect) with the hole conventions
-   used here, plus per block an *effect-free-so-far* bit from the
-   `redo_effect` analysis. That bit is what decides guard placement.
-4. **Backend.** Stitch the bitcode at run time and run an `-O2` pipeline
-   through LLVM ORC. That is the shortest path, and it keeps the property
-   that the optimizer is not ours. The costs: linking LLVM (tens of MB)
-   into every interpreter that enables the tier, and 10–100 ms per
-   trace (§4). Option: compile traces on a background thread and patch
-   the header's home when they are ready, as the JIT patches enter words
-   today. A lighter backend (LuaJIT-style SSA plus a linear-scan
-   allocator) is a far larger project: the instruction selection that
-   LLVM does here for free would have to be rewritten for x86-64 and
-   AArch64.
-5. **Exits and deopt metadata.** No frame reconstruction, as long as
-   traces do not inline calls. An exit is:
-   - a writeback of the registers the trace holds (SSA values, known
-     at compile time);
-   - then a tail call: to the dispatch table at a pc (re-execution), or
-     to the outlined cold function (the handler's own continuation).
-
-   The metadata is the writeback set, which LLVM produces as code.
-   Inlining calls adds frame snapshots: the callee frame is
-   materialized only on exit.
-6. **Side traces.** Count guard failures per guard. Past a threshold,
-   record from the exit's pc and patch the exit's jump to the new trace.
-   `mandg650` shows the cost without them: 1.08 of the JIT, or 0.87
-   with the prototype's blacklisting (§2, §3). The blacklist stays as
-   the backstop for traces that cannot be repaired.
-7. **Invalidation.** A trace depends on the words in its range and, with
-   `promote`, on inline-cache contents. Word rewrites already go through
-   the JIT runtime (`rewrite`, `recompile`), so they can drop the traces
-   that cover them. Cache writes are plain stores in handlers. Promoted
-   caches need a guard per use (as here) or a write hook.
-8. **Hints** worth adding to the language, none required for a first
-   version:
-   - `promote(e)`: treat `e` as a constant at record time and guard
-     it, for inline caches and shapes;
-   - "known `Num`" facts from value constructors (an `assume`);
-   - a lint for raw arithmetic on boxed words.
-
-### 7.1 GC: polls and roots in registers
-
-- **Polls stay.** At a poll that may collect (`ctx.heap.allocated >
-  threshold`), the trace exits, or calls the collector inline with a
-  writeback before and a reload after, as the generator does for every
-  unsafe call. Mini's collector scans frames through `ctx.fp` and
-  `regs`, so the written-back window is the root set.
-- **Handler-local temporaries.** These are values in a handler's own
-  locals across a `uses gc` call, already rooted by the shadow-stack
-  frames codegen emits per call site (`lowering.md` §9). Stitching
-  copies those frames with the code.
-- **The heap is non-moving.** Values held in SSA across a collection
-  stay valid once rooted. A moving nursery would need every register
-  and interior pointer (`aptr`) re-derived after each poll, which is one
-  more reason to keep the non-moving design.
-- **Write barriers.** They are in the handler code and come along
-  (nbody's `SETFIELD`).
-
-### 7.2 The lifetimes checker
-
-Stitching works on IR, after checking, so the lifetimes rules
-(`lifetimes.md`) are not in play: LLVM's own dependence analysis keeps
-loads after the stores they depend on across steps. The risk is
-metadata. If handlers start carrying per-handler aliasing facts
-(`!invariant.load`, `noalias` scopes, speed audit item 4), those facts
-are valid within one handler instance, so a stitcher must rename scopes
-per step and drop `invariant.load` on memory that another step may
-write. The stencils carry none today.
-
-### 7.3 `redo`, `redo_effect` and polls
-
-`redo` in a step is a continuation to the step's own pc, so it is an
-exit, which is correct. The `redo_effect` analysis is the guard
-analysis: a guard may re-execute an instruction exactly where the
-handler could have `redo`ne. The generator computed this on IR. A real
-tier should take it from `redocheck.rs`, which also exempts what IR
-cannot see: `become`, cache stores and allocation of unreferenced
-objects.
-
-### 7.4 Accumulators (`src/vmacc.rs`, in progress)
-
-An accumulator is a state register. In a trace it is one more SSA
-value: the generator must pass it at exits like `ctx`/`k`/`fp`, and
-pick the accumulator variant of a handler where the recording ran one.
-Inside traces, register-window promotion subsumes what an accumulator
-buys (every register is in a host register), so the two are
-complementary: accumulators speed up the interpreter and the
-copy-and-patch tier, and traces do not need them. Accumulator variants
-multiply the templates to ship, but not the work per trace.
-
-### 7.5 The debugger
-
-The debugger switches tables (`use_variant`) and rewrites words for
-breakpoints.
-
-- **Breakpoints** are word rewrites, so they invalidate the traces that
-  cover them (§7).
-- **Pause requests.** The `pause` poll must stay in traces in
-  `--cfg debug` builds. A set flag is an exit at an instruction
-  boundary.
-- **Stepping** never needs to see a trace: exits are at instruction
-  boundaries or in handler cold paths, and the shared frame means the
-  debugger sees the same state as in the interpreter.
-
-### 7.6 Dispatch modes
-
-The prototype needs tail-call dispatch: a trace has a handler's
-signature, it is entered by a jump, and it leaves by tail calls, as
-stencils do. `goto` and `switch` modes have one loop function, so a
-trace would be called from the dispatch loop and return the exit pc,
-after the writeback. That is possible, but it costs a call per entry.
-The JIT is tail-call only today, and the tier would be too.
-
-## 8. Costs, risks and recommendation
-
-**Costs:**
-- LLVM at run time (ORC), or an offline tier only (as here);
-- 10–100 ms per trace;
-- shipping handler bitcode with the program, about the stencil
-  module's size;
-- the recording variant;
-- trace linking and side traces;
-- invalidation;
-- one more axis in the test matrix: GC stress, coroutines and the
-  debugger, each with traces.
-
-**Risks:**
-- **Calls.** Traces stop at Mini calls. fib, spectral_norm, oo_methods
-  and closures gain nothing until calls are inlined, and that needs
-  snapshots.
-- **Short trip counts.** fannkuch's swap loop runs 1–4 iterations per
-  entry, but still gained (0.82). The writeback cost per exit is
-  proportional to the window (NR slots), not to what changed. Computing
-  the dirty set per exit is easy at the template level.
-- **Code growth.** In the program build the mandelbrot trace is 5.8 KB
-  (1.4 KB before cold blocks were inlined) and nbody's 26 KB. The
-  unpruned region for mandelbrot is 16 KB. Most of it is exit code: one
-  writeback of the whole window per exit. The hot loop is about 200
-  bytes.
-- **Correctness surface.** Exits, regs changes and calls were all
-  handled mechanically here, but they were tested only on these loops.
-
-**Recommendation: go**, in stages, each with a stop rule:
-
-1. **M1: AOT traces from a profile (1–2 weeks).** Turn the generator
-   into a compiler mode: `loimi build --trace-profile=file` reads a
-   recording and emits traces into the binary. Do the stitching in Rust
-   on the stencil IR. Run all Mini golden tests, GC stress and
-   conformance with traces of every hot loop. *Measure the 14 Mini
-   benchmarks.* Stop if the geometric mean gain over the JIT is under
-   10% (expected: mandelbrot, nbody and spectral_norm's inner loops
-   carry it).
-2. **M2: tighter traces (1 week).**
-   - the `Num` assume;
-   - retagged FORLOOP;
-   - `promote` for inline caches;
-   - dirty-set writeback;
-   - linking to inner-loop traces.
-
-   Stop rule: nbody < 0.65 of the JIT.
-3. **M3: a runtime tier (3–4 weeks).** Recording variant, ORC backend
-   on a background thread, side traces, invalidation, the debugger's
-   pause poll. Stop if compile latency or binary size is unacceptable
-   for the embedding use case. Then the AOT form (M1) remains, which
-   already serves benchmark-style and profile-guided builds.
-4. **M4: calls (open).** Inlining Mini calls with snapshot frames. This
-   is the only part that needs real deoptimization metadata, and the
-   only route to LuaJIT on fib and spectral_norm.
-
-Do not build more stencil variants, and do not build a separate
-optimizer. Stitched handler IR plus LLVM is already within the
-hand-written bound.
-
-## 9. Things learned about Loimi itself
-
-- Stencils are a good intermediate form for more than copy-and-patch.
-  They hold each handler's semantics with every operand, constant and
-  continuation named, so a tool that knows nothing about Mini could
-  stitch them.
-- Outlined `cold` blocks with the handler's signature double as
-  ready-made exit points *and* as inlinable continuations.
-- Shared frames make exits cheap: write back the window, then dispatch.
-  No exit in this experiment needed state reconstruction.
-- Value representation shows through once dispatch is gone: in
-  mandelbrot's trace, the remaining cost is NaN canonicalization and
-  tag tests on loop-carried raw words.
-
-## 10. Reproducing
-
-The scripts are in the session scratch directory `trace-exp-r7q3/` (not
-committed): `tracegen.py` (the generator), `merge.py` (several traces in
-one file), `gen.sh`, `genall.sh`, `buildmerged.sh`, `guard.sh`,
-`guard2.sh`, `bench.py` (interleaved runs, user+sys CPU, output check),
-`myprof.py` and `annot.py` (SIGPROF sampler, by symbol and by
-instruction), `ctime.sh`, `measure.sh`. Outline:
-
-```sh
-# a --jit-stencils build that keeps its stencil module and IR
-LOIMI_KEEP_STENCILS=$S/keep loimi build examples/mini/main.lm --release --align-functions=64 \
-    --jit-stencils --keep-ll -o $S/mini-jit
-# record
-LOIMI_JIT=1 LOIMI_TRACE_DUMP=$S/mandelbrot.dump $S/mini-jit bench/mini/programs/mandelbrot.lua
-# region build, profile, trace build
-tracegen.py --stencils $S/keep/main.stencils.ll --main $S/mini-jit.ll --dump $S/mandelbrot.dump \
-    --mode region --name mandreg --out $S/mandreg.ll --mapout $S/mandreg.json
-LOIMI_TRACE_IR=$S/mandreg.ll loimi build ... --jit-stencils -o $S/mini-mandreg
-LOIMI_JIT=1 LOIMI_TRACE_PROFILE=$S/mandreg.prof $S/mini-mandreg bench/mini/programs/mandelbrot.lua
-tracegen.py ... --mode trace --profile $S/mandreg.prof --map $S/mandreg.json --name mandtr --out $S/mandtr.ll
-LOIMI_TRACE_IR=$S/mandtr.ll loimi build ... --jit-stencils -o $S/mini-mandtr
-# A/B: LOIMI_TRACE=0 turns the trace off in the same binary
-LOIMI_JIT=1 $S/mini-mandtr bench/mini/programs/mandelbrot.lua
-```
-
-nbody: `--code 0 --header 23`; sieve: `--header 32` and `--header 23`,
-merged; fannkuch: `--header 40`.
+| mandelbrot with a guard that fails from row 650, blacklisted | 0.87 | |
+| the same, without blacklisting | 1.08 | |
+
+Variants of the mandelbrot trace: the loop compiled whole as a *region*
+(all paths, no pruning: the "method JIT" shape) 0.95 of the JIT;
+untaken code kept with exits at its continuations 0.82; guards 0.63;
+peeled 0.64. **Pruning is what pays**: untaken paths that merge back
+into every step keep their values alive. Aliasing of the register file
+was never the problem: once `regs` is a local array, SROA turns it into
+SSA values in every variant.
+
+What LLVM (19, `-O3`, no extra passes) did with the stitched IR:
+register-file promotion with stores sunk to the exits, operands,
+constants and every `pc` computation folded (no dispatch left), `JGTKN`'s
+two tag tests merged into one compare, loop rotation. The hot loop is 53
+instructions against about 100 in the stencils. What stays:
+
+- **The NaN test after each float op** (7 per iteration in mandelbrot)
+  is semantic: `inf - inf` gives a NaN that Mini must canonicalize, so no
+  compiler drops it. It is a cost of the value representation, not of
+  the tier.
+- **3 tag tests per iteration**: `JGTKN` on a value an `ADD_F` just made
+  (LLVM derives no bit facts from `fcmp ord`) and FORLOOP's loop-carried
+  counter and step. Removing them does not pay (`speed-audit.md` §3).
+- **Inline-cache words** are plain memory, reloaded after every heap
+  store (nbody's `GETFIELD`).
+
+Compile time of one trace with `clang -c` is 30–400 ms (mandelbrot's
+4,400 lines of IR 0.08 s at `-O3`, nbody's 19,500 lines 0.41 s), against
+7–30 µs per function for the stencil JIT; this is why traces are built
+ahead of time.
 
 ## 11. M1 as built: ahead-of-time traces from a profile
 
 M1 turned the experiment into a compiler mode. The generator is
-`src/tracegen.rs`, in Rust and in the compiler; the hooks in
-`src/jit_rt.c` became a supported runtime; `tools/trace-exp/` stays as
-the experiment's record.
+`src/tracegen.rs`, in Rust and in the compiler; the runtime side is in
+`src/jit_rt.c`.
 
 ### 11.1 Workflow
 
@@ -672,10 +127,6 @@ LOIMI_JIT=1 ./vm-fast prog
 by running the handlers' blocks, and the stencils are machine code
 without counters. The middle build compiles each loop as a region whose
 every block counts, which is the experiment's method, made automatic.
-A one-build alternative (counters in the stencils, with a hole for a
-per-instruction counter base) would also need counters in the
-interpreter's outlined cold blocks, which the stencils call; it is left
-for M3, where a recording variant of the handlers replaces both.
 
 **Why Rust.** The generator works on the compiler's own unoptimized
 handler IR, which the compiler already has in memory (the program's IR
@@ -695,9 +146,8 @@ with `target <= pc`) is a header, its loop runs to its last back edge.
 A region is that range without the ranges of inner loops, whose headers
 are exits (they have regions of their own). The trace is the hottest
 path from the header by the region's edge counts; a loop gets a trace if
-that path closes at the header at least `LOIMI_TRACE_MIN` times. A path
-that leaves the loop first (an outer loop whose hot path goes into an
-inner one) gets none: linking to inner traces is M2.
+that path closes at the header at least `LOIMI_TRACE_MIN` times. Since
+§13.1 the path goes on through the loops inside the loop.
 
 ### 11.3 The register window
 
@@ -832,8 +282,9 @@ checked. Master at 102aa44 (value accumulators) merged.
 JIT/interp is 0.752; the A/A pair is 0.998 and trace-off/JIT 1.004, so
 noise is about 1% here (single programs: up to 4%, `fib`, `interp`).
 
-**Stop rule (§8, M1): the gain over the JIT is 6.8% by geometric mean,
-under the 10% the rule asks for.** The tier does what the experiment
+**The gain over the JIT was 6.8% by geometric mean**, under the 10%
+the experiment had set as the bar for going on; §12 and §13 are what
+followed. The tier does what the experiment
 measured where it applies: mandelbrot 0.66 (experiment 0.63),
 fannkuch 0.73 (0.82), sieve 0.88 (0.87), plus sort 0.86 and queens
 0.92, which the experiment did not try. But it applies to 7 of the 14
@@ -851,8 +302,7 @@ programs, and loses on one:
   writeback of all of them at each exit. Two cheaper fixes were made
   and measured on the way (named-slot copies instead of a `memcpy`:
   nbody 1.38 → 1.26; read-only write-barrier tests without writeback:
-  1.26 → 1.11). The rest is M2's dirty-set writeback and
-  snapshots of only the slots a guard's step changes.
+  1.26 → 1.11). §12.1 removed the rest (0.76).
 
 ### 11.6 Tests
 
@@ -887,11 +337,6 @@ programs, and loses on one:
   interpreter prints (159 runs, stderr included). Traces were not run in
   this mode (its stencils differ, so it needs its own recording and
   profile).
-- During the work the tests caught: dispatching a header guard's
-  re-execution through the enter word (an endless re-entry), heap
-  constants named by Mini's state order (`%k`), branches with `!prof`
-  metadata, locals passed by reference (`for_count(&regs, ..)`), the
-  experiment's window bugs (§11.3).
 
 ### 11.7 Other vms
 
@@ -900,27 +345,17 @@ programs, and loses on one:
   nbody, fannkuch, bitops and sort); every output equal to the JIT's.
   Its handlers return `i64` (`%r = musttail call ..; ret i64 %r`), which
   the generator now follows.
-- **Scheme and Prolog** were not run through the workflow in this
-  milestone. Prolog has no `regs` state register: the generator then
-  keeps no window (every access is memory), which is supported but
-  untested.
+- **Scheme and Prolog**: §13.7.
 
-### 11.8 Costs and what remains
+### 11.8 Build time
 
-- **Build time.** A trace build takes as long as a JIT build plus LLVM
-  on the traces (35 s for Mini with 21 traces). A *profiling* build is
-  slow: 36 regions (500,000 lines of handler IR) took 3.4 minutes. They
-  were `optnone` first, which is worse: in an `-O3` module such
-  functions still get the optimizing register allocator, superlinear
-  in their thousands of locals (9.3 minutes; one region alone compiles
-  in under 2 s). The tests bound it (`LOIMI_TRACE_MAXTOTAL`). Compiling
-  regions in a module of their own at `-O0`, or counters in the
-  stencils instead of regions, is for M2/M3.
-- **Not done in M1**, for M2: linking traces to inner-loop traces (the
-  outer loops of mandelbrot and nbody), side traces, `promote` for inline
-  caches, the `Num` assume, retagged FORLOOP, dirty-set writeback and
-  per-guard snapshots (nbody), traces through calls (M4). The last two
-  are §12.
+A trace build takes as long as a JIT build plus LLVM on the traces (35 s
+for Mini with 21 traces). A *profiling* build is slow: 36 regions
+(500,000 lines of handler IR) took 3.4 minutes (§13.3 made regions
+smaller). Regions marked `optnone` were slower still (9.3 minutes): in
+an `-O3` module such functions still get the optimizing register
+allocator, superlinear in their thousands of locals. The tests bound
+the regions' total size (`LOIMI_TRACE_MAXTOTAL`).
 
 ## 12. Cheaper exits, and traces through calls (M4, in part)
 
@@ -957,13 +392,11 @@ copy:
 nbody's inner loop went from 1.11 of the JIT to 0.75 (0.76 in
 §12.6); mandelbrot and fannkuch gained a few percent too.
 
-**Declining a trace.** The report now gives iterations per entry (the
-loop's runs over its entries, from the region's counts), and
-`LOIMI_TRACE_MINRUN=x` declines traces under `x`. It is off by default:
-after the copies above, the short-trip traces measured are all faster
-than the JIT (nbody's inner loop runs 1.5 iterations per entry and is
-0.76; fannkuch's 1.1 and wins too), so no threshold separates good from
-bad. Two other rules decline traces where the cost is known (§12.4).
+**Declining a trace.** The report gives iterations per entry. Declining
+short-trip traces (`LOIMI_TRACE_MINRUN=x`, off by default) does not
+pay: after the copies above every short-trip trace measured beats the
+JIT (nbody's inner loop: 1.5 iterations per entry, 0.76). Traces are
+declined where the cost is known instead (§12.4).
 
 ### 12.2 Profiles of calls
 
@@ -1082,22 +515,15 @@ are generic problems:
 
 ### 12.5 Recursion, and `interp`
 
-- **Recursive calls are exits.** fib has no loop, and binary_trees'
-  loops call recursive functions whose usual path (the leaves) is not
-  what the loop's call site runs: a path through one level would fail at
-  the first recursive call. The design's options (a trace from a
-  function's entry that calls itself through its own entry, unrolling
-  one level) keep the frame chain in memory and save only dispatch
-  between straight-line stencils, which the JIT already lays out; they
-  were not built.
-- **`interp`'s dispatch loop** (856,000 lines of IR as a region) could
-  be profiled in chunks under the budget, now that regions have an
-  entry at every instruction. It was not, because the trace would not
-  pay: the loop is an `if` chain over 13 opcodes and the hottest arm
-  (PUSH) is 24% of its iterations, so a one-path trace fails its first
-  guard three times in four and is blacklisted. It needs side traces
-  (M3), not a smaller region. (Done in §13: the region was quadratic, and side
-  traces cover the arms.)
+- **Recursive calls are exits**, and traces start only at loop headers.
+  fib has no loop, and binary_trees' loops call recursive functions whose
+  usual path (the leaves) is not what the loop's call site runs. A trace
+  of recursion keeps the frame chain in memory and saves only dispatch
+  between straight-line stencils, which the JIT already lays out.
+- **`interp`'s dispatch loop** is an `if` chain over 13 opcodes whose
+  hottest arm (PUSH) is 24% of its iterations, so a one-path trace fails
+  its first guard three times in four. It takes side traces and a
+  smaller region, which §13 added.
 
 ### 12.6 Results
 
@@ -1140,20 +566,16 @@ The controls: JIT A/A 0.996, trace-off/JIT 1.003 (1.000 and 1.004 at
   loop is declined (§12.4); binary_trees, fib, `interp` and
   string_build get nothing (§12.5).
 
-**Stop rule (the goal was 0.85 by geometric mean, stopping if a serious
-attempt at calls could not get under 0.90): not met: 0.858 (0.862 at 128), between the goal and the line.**
-Calls pay where the callee is arithmetic on registers, which the window
+The goal was 0.85 by geometric mean; this step reached 0.858 (0.862 at
+128). Calls pay where the callee is arithmetic on registers, which the window
 keeps in SSA values across the call: spectral_norm went from 1.00 to
 0.64. Elsewhere in this suite Mini's calls do heap work that a trace
 does exactly as the stencils do: method lookups through inline caches
 (oo_methods), closure creation and upvalue boxes (closures), allocation
 (binary_trees), and an inlined frame adds the window's costs around it
 (a writeback before each call that may write, a reload after, checks of
-heap pointers). Three programs need things this milestone does not
-have: recursion that is not in a loop (fib, binary_trees), side traces
-(`interp`, oo_methods' polymorphic shapes loop), and allocation removal
-for closures that do not escape. Without the four programs that get no
-trace at all the geometric mean is 0.81.
+heap pointers). Without the four programs that get no trace at all the
+geometric mean is 0.81.
 
 ### 12.7 Tests
 
@@ -1181,9 +603,6 @@ trace at all the geometric mean is 0.81.
   sort, queens, hash_strings, spectral_norm, closures and oo_methods ran
   correct and without reports (closures bound 14 callees), and Mini's
   scripts without reports.
-- Found on the way: the open-upvalue alias (§12.4), site hashes taken
-  before quickening (§12.2), `redo` edges taken for the path (§12.3),
-  and entry regions crowding loops out of a bounded profiling build.
 
 ### 12.8 Other vms
 
@@ -1322,9 +741,9 @@ workflow (§11.1); results in §13.6.
   its root runs on.
 - The tests' recording and profiling runs are retried when they leave no
   file: under the tests' 2 GB address-space cap the JIT cannot always
-  map its code region (about 1 run in 40 of a JIT build compiled nothing,
-  silently), and a program whose profile is missing makes no traces. Two
-  failures of the new checks while other builds ran came from that.
+  map its code region (about 1 run in 40 of a JIT build compiles
+  nothing, silently), and a program whose profile is missing makes no
+  traces.
 - `mini_traces_fuzz`: the generator makes jump tables and `elseif` chains
   whose arms run more or less often by the input (side traces whose
   guards fail with another input), and every program ends with a
@@ -1336,17 +755,11 @@ workflow (§11.1); results in §13.6.
   and the trace of `interp`'s profile (its dispatch loop with 14 side
   traces) ran `interp` correct and without reports (29.7 million
   iterations in the trace), and Mini's scripts without reports. Only that
-  profile: the build took 15 minutes; with the traces of five profiles
-  (interp, fannkuch, mandelbrot, nbody, sort) and with all 14, ASan
-  builds did not finish in 50 and 60 minutes (a build without traces took
-  18, on a loaded machine), although each of the six largest trace
-  functions compiles with ASan alone in seconds. Why the whole module is
-  that slow was not found.
-- Found on the way: the quadratic regions, superinstruction resumes as
-  opaque exits (§13.3), missing branch weights (§13.3), a wrong filter
-  of side-trace starts under `LOIMI_TRACE_MINFRAC` (a site's per-target
-  count is not its block's), and `LOIMI_TRACE_SIDE_MIN` ignoring
-  `LOIMI_TRACE_MIN` (the fuzz programs' loops run 1,000 times).
+  profile: the build took 15 minutes. ASan builds with many traces do
+  not finish in practice (five profiles: over 50 minutes, all 14: over
+  60; a build without traces took 18 on a loaded machine), although each
+  of the six largest trace functions compiles with ASan alone in seconds;
+  the cause is unknown.
 
 ### 13.5 Other vms
 
@@ -1355,8 +768,7 @@ recorded, profiled and traced (22 traces, 14 side traces), every output equal to
 (5 interleaved runs, minimum, a loaded machine: JIT A/A 1.03): nbody
 0.58, spectral_norm 0.53, fannkuch 0.79 (§12.8: its traces did not
 install, 1.00), bitops 0.89, sort 0.95; 0.730 by geometric mean, no
-program slower.
-Scheme and Prolog were not run through the workflow.
+program slower. Scheme and Prolog: §13.7.
 
 ### 13.6 Results
 
@@ -1407,9 +819,9 @@ traces, 0.835 without side traces or nesting. So:
   took it from 0.858 to 0.835: `interp` 1.01 → 0.85 with a root trace
   alone (its loop is now profiled), mandelbrot 0.64 → 0.61.
 
-**Stop rule (M2 as asked here: stop if `interp` stays over 0.90 and the
-geometric mean over 0.83): met on both.** `interp` is 0.72 (0.72 at 128),
-the geometric mean 0.759 (0.773). Still at 1.00: binary_trees and fib
+The targets for this step (`interp` under 0.90, the geometric mean
+under 0.83) were met: `interp` is 0.72 (0.72 at 128), the geometric mean
+0.759 (0.773). Still at 1.00: binary_trees and fib
 (recursion outside loops), closures, oo_methods and string_build (heap
 work, which a trace does as the stencils do; oo_methods' methods are
 inlined on side traces, 0.97).
@@ -1422,3 +834,47 @@ loads its `state[4]`; there are no counters on the way in. The trace has
 73 steps (68 of them on side traces) and 158 guards; the run stays in it
 from its first entry (29.7 million iterations, no guard failures).
 
+### 13.7 Scheme and Prolog
+
+**Scheme** (examples/scheme) runs through the workflow of §11.1 with one
+generic fix: a dispatch into the same code object is a path edge only
+if the step passes on its own register file (a jump table) or goes to
+the next instruction (a native call's end); a static continuation that
+passes another frame's registers is not one either. Before, recursive
+procedures got traces through a return into their own code or a
+`CALLSELF` to its word 0, which the register-file check left at every
+iteration (ack 1.55 of the JIT, tak 1.23). Its 43 benchmarks (the
+inputs of `bench/scheme/compare.py`) make 109 traces with 74 side
+traces; the workflow takes about 3 minutes. User+sys CPU, minimum of 7
+interleaved runs, every output checked, controls as in §11.5; the full
+table is in `results.md`:
+
+- **0.773 of the JIT by geometric mean at `--align-functions=64`, 0.767
+  at 128**; trained on a quarter of each iteration count, 0.774. JIT
+  A/A 0.978 and trace-off 0.963 (a loaded round; a quieter one of the
+  same profile: 0.779, A/A 1.004, trace-off 1.003).
+- sum 0.24, mbrot 0.39, pnpoly 0.40, takl 0.42, sumfp 0.44, ntakl 0.45,
+  fft 0.50, array1 0.55, simplex 0.56, nqueens 0.57, puzzle 0.63,
+  destruc 0.68. At 1.00 (±5%): recursion (fib, tak, cpstak, ctak,
+  divrec), bignums (pi, chudnovsky), allocation (nboyer, sboyer, deriv,
+  gcbench). No program is over 1.05 in two rounds but string (20 ms:
+  1.18 in one, 0.85 in another).
+- Tests: `scheme_traces` (tests/golden.rs) traces the Scheme test
+  programs with `examples/scheme/tests/trace_loops.scm` (fixnums turning
+  flonums, nested vector loops, a dispatch loop, recursion next to
+  loops, allocation) and runs them all in every GC mode, with guards
+  failing and with blacklisting at every failure.
+
+**Prolog** has no backward jumps: its loops are recursion, so the
+workflow makes no traces. Taking a dispatch to a code object's own word
+0 (EXECUTE of its own predicate) as a loop gave 11 traces over the 30
+programs and 1.001 of the JIT (A/A 1.002; queens_8 0.86, the rest
+0.96–1.10, as the A/A pair): its registers are in memory, so a trace
+saves only dispatch. Not kept.
+
+**`promote` of inline-cache words (2026-11-08): measured, not built.**
+Recorded cache values folded into every trace (with or without a guard
+per load): MiniJS richards, deltablue, raytrace, properties, Mini
+oo_methods, nbody within the A/A spread (0.94–1.15, loaded machine). The
+bound is coverage: richards, deltablue, raytrace run 1.3%, 0.8%, 0.5% of
+their instructions in traces; properties' traced sites are megamorphic.

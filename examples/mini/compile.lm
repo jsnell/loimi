@@ -1416,7 +1416,14 @@ fn Parser.statement_inner(p: *Parser) {
                 p.patch(p.jump(), start);
                 p.patch(exit, p.pc());
             } else {
-                #[cfg(not(debug))] p.fs.code.patch_list(&f, start); #[cfg(debug)] { let exit = p.jump(); p.patch_here(&f); p.patch(p.jump(), start); p.patch(exit, p.pc()); } // --cfg debug: the jump back is a JMP, which polls for a pause
+                #[cfg(not(debug))] p.fs.code.patch_list(&f, start);
+                // --cfg debug: the jump back is a JMP, which polls for a pause.
+                #[cfg(debug)] {
+                    let exit = p.jump();
+                    p.patch_here(&f);
+                    p.patch(p.jump(), start);
+                    p.patch(exit, p.pc());
+                }
             }
             f.free();
             p.leave_block();

@@ -308,13 +308,6 @@ deltablue and richards; SETATTR 5-9% (its barrier's `remember` call
 gives it a frame, item 6); instance creation in float, raytrace and
 chaos is `call_slow`'s class path plus the `__init__` frame (5-8%).
 
-Next candidates: a CALL fast path for classes whose `__init__` is a
-simple function (allocate, push the frame, no `call_slow` loop);
-caching class attributes read through instances (`self.CONST`) with
-the shape (an absent-name proof per shape) and the class epoch; and
-attribute reads of `self` in methods could skip the tag test when the
-compiler knows the register holds the receiver.
-
 ## Optimizations, third round: calls, generator expressions, slices (2026-11-04)
 
 Same method as the second round: the timer sampler (now also with a
@@ -392,13 +385,6 @@ of nbody, `sin`/`cos` 15% of float); nqueens: set building (`put_by`,
 `hash_key` 12%), slicing, the `pool` cell the generator expression's
 fallback still captures (LOADCELL 3%); hexiom: `x in list` and
 `__getitem__` through `call2`.
-
-Next candidates: frames with fewer stores (`k` and `proto` follow from
-the function, `gen` matters only with `F_GEN`); operator dunders on
-instances (`Vector - Vector`: SUB's cold block, 3% of raytrace) as
-family members like CALL_NEW; generators that resume without copying
-their registers when the window is where they left it; set/dict
-building from comprehensions sized up front.
 
 ## Friction, by impact
 

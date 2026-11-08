@@ -146,11 +146,14 @@ so an error inside a function reports the line inside the function:
 ```loimi
     on raise(msg: str) {
         let p = fp.proto;
-        let i = ((pc as u64) - (p.code.start() as u64)) / 4;
+        let i = p.code.index_of(pc);
         ctx.error_line = p.lines[i];
         fail msg
     }
 ```
+
+`p.code.index_of(pc)` is the index of the instruction `pc` points at,
+in words of the vm's encoding (`(pc - start) / 4` here).
 
 ## Verifying a function
 

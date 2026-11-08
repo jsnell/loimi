@@ -10,7 +10,7 @@
 //! of the program. The JIT runtime (jit_rt.c) enters the function at the
 //! loop header once the code object it was made for is compiled.
 //!
-//! The workflow (three steps, docs/design/copy-and-patch.md section 15):
+//! The workflow (three steps, docs/design/trace-tier.md section 11.1):
 //! 1. a JIT build run with `LOIMI_TRACE_RECORD=file` writes a *recording*:
 //!    each compiled code object's words, ops and patched constants;
 //! 2. `--trace-regions=REC` builds a *profiling* binary: every loop of the
@@ -3079,6 +3079,44 @@ fn call_regs(st: &Step, prof: Option<&Prof>, regs_idx: Option<usize>, nsig: usiz
     }
 }
 
+/// How the continuations of the instruction at pc treat its frame, in a
+/// vm with a register file: the static targets it continues at with
+/// another frame's registers (a call of its own code), and whether one of
+/// its dispatches passes on its own register file (a jump table). A jump
+/// into the same code object with another frame (a recursive call, a
+/// return from one) is not a path inside the loop: the trace would leave
+/// there at every iteration.
+fn frame_moves(m: &Module, vm: &VmInfo, code: &Code, pc: usize) -> (BTreeSet<usize>, bool) {
+    let mut other = BTreeSet::new();
+    let Some(ri) = vm.regs_idx else { return (other, true) };
+    let mut t = Trace::new(m, code, vm, 0);
+    let Ok(st) = t.build_step(Node::new(0, pc)) else { return (other, false) };
+    let mut keeps = false;
+    for (_, ls) in &st.blocks {
+        for l in ls {
+            let rhs = def_of(l).1;
+            if !rhs.starts_with("musttail call") {
+                continue;
+            }
+            let Some(c) = parse_call(rhs) else { continue };
+            if c.args.len() != t.sig.len() + 1 {
+                continue;
+            }
+            let v = val_of(&st.vals, c.args[ri].1);
+            if c.global {
+                if let (Some(Some(tg)), Val::Regs(Some(o), _)) = (cont_target(code, pc, c.callee), v) {
+                    if o != 0 {
+                        other.insert(tg);
+                    }
+                }
+            } else if v == Val::Regs(Some(0), false) {
+                keeps = true;
+            }
+        }
+    }
+    (other, keeps)
+}
+
 /// The function `kind` for loop h of frame 0's code, over `order`.
 #[allow(clippy::too_many_arguments)]
 fn generate_fn(m: &Module, vm: &VmInfo, frames: &[PathFrame], h: usize, order: &[Node], kind: Kind, name: &str, index: usize, shape: Shape, prof: Option<Prof>, opts: &Options) -> Result<GenFn, String> {
@@ -3560,6 +3598,8 @@ struct Former<'p> {
     entries: HashMap<(usize, u64), usize>,
     /// The trace's header (frame 0).
     h: usize,
+    /// `frame_moves` per (code, pc).
+    moves: HashMap<(u64, usize), (BTreeSet<usize>, bool)>,
 }
 
 impl<'p> Former<'p> {
@@ -3609,15 +3649,17 @@ impl<'p> Former<'p> {
             let x: Vec<(usize, u64)> = rd.exits.range(r).map(|(k, n)| (k.1, *n)).collect();
             (e, x, rd.sites.get(&node.pc).cloned())
         };
+        let (m, vm) = (self.m, self.vm);
+        let (other, keeps) = self.moves.entry((code.key(), node.pc)).or_insert_with(|| frame_moves(m, vm, code, node.pc)).clone();
         // (an edge to the instruction itself, `redo`, is not a path: the
         // step goes around itself)
         for (t, n) in edges {
-            if t != node.pc && n > 0 {
+            if t != node.pc && n > 0 && !other.contains(&t) {
                 add(n, Next::Same(t));
             }
         }
         for (t, n) in exits {
-            if t != node.pc && n > 0 && self.region_of(code, t).is_some() {
+            if t != node.pc && n > 0 && !other.contains(&t) && self.region_of(code, t).is_some() {
                 add(n, Next::Same(t));
             }
         }
@@ -3640,7 +3682,11 @@ impl<'p> Former<'p> {
                     continue;
                 }
                 // a jump to a computed pc in the same code (a jump table)
-                if t.n == code.n && t.hash == code.hash && t.off != node.pc && g.frames[node.f].parent.is_none_or(|pf| (self.code(g, pf).n, self.code(g, pf).hash) != (t.n, t.hash)) {
+                // (one that may change frames only to the next
+                // instruction: the end of a call of a native, which
+                // dispatches through the table as a cold block's `next`)
+                let same_frame = keeps || (node.pc + 1..code.n).find(|&i| code.op[i].is_some()) == Some(t.off);
+                if t.n == code.n && t.hash == code.hash && t.off != node.pc && same_frame && g.frames[node.f].parent.is_none_or(|pf| (self.code(g, pf).n, self.code(g, pf).hash) != (t.n, t.hash)) {
                     if self.region_of(code, t.off).is_some() {
                         add(t.count, Next::Same(t.off));
                     }
@@ -3878,7 +3924,7 @@ pub fn traces(ir: &str, stencils: &str, vm: &VmInfo, profs: &[ProfRegion], opts:
             by_code.entry(pr.code.key()).or_default().push((i, pcs.into_iter().collect()));
         }
     }
-    let mut fm = Former { m: &m, vm, profs, opts, data: HashMap::new(), by_code, entries, h: 0 };
+    let mut fm = Former { m: &m, vm, profs, opts, data: HashMap::new(), by_code, entries, h: 0, moves: HashMap::new() };
     for (pi, pr) in profs.iter().enumerate() {
         let code = &pr.code;
         let h = pr.header;

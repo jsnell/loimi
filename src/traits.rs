@@ -59,6 +59,8 @@ pub struct Traits {
     /// (trait, trait arguments, type) → index into `impl_decls`.
     pub impls: HashMap<(u32, Vec<Ty>, Ty), usize>,
     pub gen_impls: Vec<GenImpl>,
+    /// Per generic impl: its index into `impl_decls`.
+    pub gen_impl_decl: Vec<usize>,
     pub opaques: Vec<OpaqueInfo>,
     /// Generic functions already checked against their bounds, with the
     /// arguments of their unbounded parameters.
@@ -195,7 +197,9 @@ impl<'a> Checker<'a> {
                 }
             }
             self.traits.gen_impls.push(GenImpl { module: m, trait_id: t, params, bounds: d.bounds.clone(), ty, args: targs });
+            self.traits.gen_impl_decl.push(i);
         }
+        self.check_impl_overlap()?;
         let mut all: Vec<(usize, Vec<Bounds>)> = Vec::new();
         for gt in &self.generics.types {
             all.push((gt.module, gt.bounds.clone()));
@@ -215,6 +219,104 @@ impl<'a> Checker<'a> {
             self.check_bounds(&bounds, &args, needed_by, span)?;
         }
         Ok(())
+    }
+
+    /// Two impls of one trait must not apply to the same (type, trait
+    /// arguments): a generic impl against a plain one, or two generic
+    /// impls against each other. Bounds are ignored, as in Rust: an impl
+    /// whose pattern matches is taken to apply, so adding an impl of a
+    /// bound's trait elsewhere cannot make two impls start to overlap.
+    fn check_impl_overlap(&self) -> Res<()> {
+        let plain: Vec<(usize, u32, Vec<Ty>, Ty)> =
+            self.traits.impls.iter().map(|((t, a, ty), i)| (*i, *t, a.clone(), ty.clone())).collect();
+        let gens = &self.traits.gen_impls;
+        // (later impl, earlier impl, what both apply to if it has no parameters)
+        let mut found: Option<(usize, usize, Option<String>)> = None;
+        let mut report = |a: usize, b: usize, what: Option<String>| {
+            let (later, earlier) = if a > b { (a, b) } else { (b, a) };
+            if found.as_ref().is_none_or(|f| later < f.0) {
+                found = Some((later, earlier, what));
+            }
+        };
+        for (gi, g) in gens.iter().enumerate() {
+            let gd = self.traits.gen_impl_decl[gi];
+            for (pi, t, a, ty) in &plain {
+                if *t == g.trait_id && self.unify_impls(&[(&g.ty, ty)], &g.args, a) {
+                    report(gd, *pi, Some(self.ty_name(ty)));
+                }
+            }
+            for (hi, h) in gens.iter().enumerate().skip(gi + 1) {
+                if h.trait_id == g.trait_id && self.unify_impls(&[(&g.ty, &h.ty)], &g.args, &h.args) {
+                    report(gd, self.traits.gen_impl_decl[hi], None);
+                }
+            }
+        }
+        let Some((later, earlier, what)) = found else { return Ok(()) };
+        let (m, d) = &self.traits.impl_decls[later];
+        let tname = self.trait_name(self.resolve_trait(*m, &d.trait_ref.path)?);
+        let msg = match what {
+            Some(ty) => format!("overlapping impls of `{}`: both apply to `{}`", tname, ty),
+            None => format!("overlapping impls of `{}`: some type matches both", tname),
+        };
+        Err(Diag::new(d.span, msg).note(self.traits.impl_decls[earlier].1.span, "the other impl"))
+    }
+
+    /// Do the types (and trait arguments) of two impls have a common
+    /// instance? Two-sided unification: the left side's `Param(i)` and the
+    /// right side's are different variables.
+    fn unify_impls(&self, tys: &[(&Ty, &Ty)], la: &[Ty], ra: &[Ty]) -> bool {
+        let mut s: HashMap<(bool, u32), (bool, Ty)> = HashMap::new();
+        let pairs = tys.iter().map(|(l, r)| ((*l).clone(), (*r).clone())).chain(la.iter().cloned().zip(ra.iter().cloned()));
+        pairs.into_iter().all(|(l, r)| self.unify2(false, &l, true, &r, &mut s, 0))
+    }
+
+    fn unify2(&self, ls: bool, l: &Ty, rs: bool, r: &Ty, s: &mut HashMap<(bool, u32), (bool, Ty)>, depth: u32) -> bool {
+        if depth > 64 {
+            return true;
+        }
+        let (ls, l) = walk(ls, l, s);
+        let (rs, r) = walk(rs, r, s);
+        match (&l, &r) {
+            (Ty::Param(i), Ty::Param(j)) if ls == rs && i == j => true,
+            (Ty::Param(i), _) => {
+                s.insert((ls, *i), (rs, r.clone()));
+                true
+            }
+            (_, Ty::Param(j)) => {
+                s.insert((rs, *j), (ls, l.clone()));
+                true
+            }
+            (Ty::Ptr(x), Ty::Ptr(y))
+            | (Ty::Slice(x), Ty::Slice(y))
+            | (Ty::Option(x), Ty::Option(y))
+            | (Ty::Gc(x), Ty::Gc(y)) => self.unify2(ls, x, rs, y, s, depth + 1),
+            (Ty::Array(x, n), Ty::Array(y, m)) => n == m && self.unify2(ls, x, rs, y, s, depth + 1),
+            (Ty::Vector(x, n), Ty::Vector(y, m)) => n == m && self.unify2(ls, x, rs, y, s, depth + 1),
+            (Ty::Result(a1, b1), Ty::Result(a2, b2)) => {
+                self.unify2(ls, a1, rs, a2, s, depth + 1) && self.unify2(ls, b1, rs, b2, s, depth + 1)
+            }
+            (Ty::Tuple(xs), Ty::Tuple(ys)) => {
+                xs.len() == ys.len() && xs.iter().zip(ys).all(|(x, y)| self.unify2(ls, x, rs, y, s, depth + 1))
+            }
+            (Ty::Fn(p1, r1, e1), Ty::Fn(p2, r2, e2))
+            | (Ty::Block(p1, r1, e1), Ty::Block(p2, r2, e2))
+            | (Ty::Closure(p1, r1, e1), Ty::Closure(p2, r2, e2)) => {
+                std::mem::discriminant(&l) == std::mem::discriminant(&r)
+                    && e1 == e2
+                    && p1.len() == p2.len()
+                    && p1.iter().zip(p2).all(|(x, y)| self.unify2(ls, x, rs, y, s, depth + 1))
+                    && self.unify2(ls, r1, rs, r2, s, depth + 1)
+            }
+            (Ty::Struct(_), Ty::Struct(_)) | (Ty::Enum(_), Ty::Enum(_)) if l != r => {
+                match (self.generics.inst_of.get(&l), self.generics.inst_of.get(&r)) {
+                    (Some((g1, a1)), Some((g2, a2))) if g1 == g2 => {
+                        a1.iter().zip(a2.iter()).all(|(x, y)| self.unify2(ls, x, rs, y, s, depth + 1))
+                    }
+                    _ => false,
+                }
+            }
+            _ => l == r,
+        }
     }
 
     /// After all signatures are declared: every impl provides each trait
@@ -642,4 +744,19 @@ fn mentions_param(t: &Ty, i: u32, g: &crate::generics::Generics) -> bool {
         },
         _ => false,
     }
+}
+
+/// Follow the bindings of `unify2`'s variables.
+fn walk(mut side: bool, t: &Ty, s: &HashMap<(bool, u32), (bool, Ty)>) -> (bool, Ty) {
+    let mut t = t.clone();
+    while let Ty::Param(i) = t {
+        match s.get(&(side, i)) {
+            Some((s2, t2)) => {
+                side = *s2;
+                t = t2.clone();
+            }
+            None => break,
+        }
+    }
+    (side, t)
 }

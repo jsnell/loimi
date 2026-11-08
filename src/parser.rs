@@ -1910,6 +1910,9 @@ impl Parser {
                 w, w
             ));
         }
+        if w == "become" && self.is_kw("match") {
+            return self.parse_become_match(start);
+        }
         if matches!(w.as_str(), "become" | "use_variant") && !matches!(self.peek(), Tok::Ident(_)) {
             let what = if w == "become" { "an op name" } else { "a variant name" };
             return self.err(format!("`{}` takes {}, found {}", w, what, self.describe()));
@@ -1926,6 +1929,54 @@ impl Parser {
             _ => unreachable!(),
         };
         Ok(Expr { kind: ExprKind::Vm(kind), span: start.to(self.prev_span()) })
+    }
+
+    /// `become match e { A => OP_A, B | C => OP_B, .. }`: the op a value
+    /// (usually a cache state) selects. Sugar for the ladder
+    /// `if e is A { become OP_A; } if e is B | C { become OP_B; } ..`; a
+    /// value no arm names keeps the current op. The scrutinee is
+    /// evaluated once (into a hidden local unless it is a plain name).
+    fn parse_become_match(&mut self, start: Span) -> Res<Expr> {
+        self.bump();
+        let scrut = self.parse_expr_no_struct()?;
+        self.expect("{")?;
+        let mut stmts = Vec::new();
+        let subject = match &scrut.kind {
+            ExprKind::Ident(_) => scrut.clone(),
+            _ => {
+                // A name no source can spell.
+                let name = "become match".to_string();
+                let sp = scrut.span;
+                stmts.push(Stmt::Let {
+                    pat: Pat { kind: PatKind::Ident(name.clone(), false), span: sp },
+                    mutable: false,
+                    ty: None,
+                    init: Some(scrut),
+                    els: None,
+                    span: sp,
+                });
+                Expr { kind: ExprKind::Ident(name), span: sp }
+            }
+        };
+        while !self.is("}") {
+            let pat = self.parse_pat()?;
+            if matches!(pat.kind, PatKind::Wild) {
+                return Err(Diag::new(pat.span, "`become match` takes no `_` arm: a value no arm names keeps the current op"));
+            }
+            self.expect("=>")?;
+            let op = self.ident()?;
+            let sp = pat.span.to(op.span);
+            let test = Expr { kind: ExprKind::Is(Box::new(subject.clone()), pat), span: sp };
+            let bec = Expr { kind: ExprKind::Vm(VmExpr::Become(op)), span: sp };
+            let body = Block { stmts: vec![Stmt::Expr { expr: bec, semi: true }], span: sp };
+            stmts.push(Stmt::Expr { expr: Expr { kind: ExprKind::If(vec![Cond::Expr(test)], body, None), span: sp }, semi: false });
+            if !self.eat(",") && !self.is("}") {
+                return self.err(format!("expected `,` after `become match` arm, found {}", self.describe()));
+            }
+        }
+        self.expect("}")?;
+        let span = start.to(self.prev_span());
+        Ok(Expr { kind: ExprKind::Block(Block { stmts, span }), span })
     }
 
     fn ends_expr(&self) -> bool {
