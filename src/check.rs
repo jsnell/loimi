@@ -653,7 +653,7 @@ impl<'a> Checker<'a> {
             if let Some(d) = const_overflow(&init) {
                 return Err(d);
             }
-            if let Some(bad) = self.static_init_error(&init) {
+            if let Some(bad) = static_init_error(&init) {
                 return Err(Diag::new(
                     bad,
                     "the initializer of a module-level `var` must be a constant expression (literals, `[x; N]`, struct, tuple, array and enum literals of constants, functions, `0 as *T`)",
@@ -5342,27 +5342,6 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// The span of the first part of a global's initializer that cannot be
-    /// emitted as an LLVM constant, if any.
-    fn static_init_error(&self, e: &TExpr) -> Option<Span> {
-        let all = |es: &[TExpr]| es.iter().find_map(|x| self.static_init_error(x));
-        match &e.kind {
-            TK::Int(_) | TK::Float(_) | TK::Bool(_) | TK::Str(_) | TK::Unit | TK::FnRef(_) => {
-                if matches!(e.ty, Ty::Value(_)) { Some(e.span) } else { None }
-            }
-            TK::Zeroed => None,
-            TK::Struct(es) | TK::Tuple(es) | TK::Array(es) => all(es),
-            TK::ArrayRepeat(v, _) => self.static_init_error(v),
-            TK::Variant(_, es) => match &e.ty {
-                Ty::Enum(_) | Ty::Option(_) | Ty::Result(..) if es.is_empty() => None,
-                Ty::Enum(_) => Some(e.span),
-                Ty::Option(_) | Ty::Result(..) => all(es),
-                _ => Some(e.span),
-            },
-            _ => Some(e.span),
-        }
-    }
-
     fn check_assignable(&self, cx: &FnCx, e: &TExpr, span: Span) -> Res<()> {
         match &e.kind {
             TK::Local(id) => {
@@ -5551,6 +5530,27 @@ fn arbitrary_int(name: &str) -> Option<IntTy> {
     }
     let bits: u8 = digits.parse().ok()?;
     (1..=64).contains(&bits).then_some(IntTy { signed, bits })
+}
+
+/// The span of the first part of a global's initializer that cannot be
+/// emitted as an LLVM constant, if any.
+pub fn static_init_error(e: &TExpr) -> Option<Span> {
+    let all = |es: &[TExpr]| es.iter().find_map(|x| static_init_error(x));
+    match &e.kind {
+        TK::Int(_) | TK::Float(_) | TK::Bool(_) | TK::Str(_) | TK::Unit | TK::FnRef(_) => {
+            if matches!(e.ty, Ty::Value(_)) { Some(e.span) } else { None }
+        }
+        TK::Zeroed => None,
+        TK::Struct(es) | TK::Tuple(es) | TK::Array(es) => all(es),
+        TK::ArrayRepeat(v, _) => static_init_error(v),
+        TK::Variant(_, es) => match &e.ty {
+            Ty::Enum(_) | Ty::Option(_) | Ty::Result(..) if es.is_empty() => None,
+            Ty::Enum(_) => Some(e.span),
+            Ty::Option(_) | Ty::Result(..) => all(es),
+            _ => Some(e.span),
+        },
+        _ => Some(e.span),
+    }
 }
 
 pub fn is_place(e: &TExpr) -> bool {

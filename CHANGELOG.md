@@ -348,6 +348,17 @@ implementation; `git log` has the details.
 
 ### Core language
 
+- **`const` arrays indexed at run time are read in place.** `TAB[i]` (and
+  `TAB[i].field`, `NEST[i][j]`) of a `const` array is a load from a
+  `private unnamed_addr constant` global; it used to build the whole
+  array on the stack at every access (two lookups in a 617-entry table
+  of `(u64, u64)`: 1.2 µs a call before, 10 ns now, as with a `var`).
+  Constant indices fold to the element as before. A method call with a
+  `*Self` receiver on such an element, `&TAB[i]`, `TAB[..]` and a
+  whole-array use still get a stack copy. `std.bigint`'s `INV_TAB` is
+  one (its `reciprocal` now inlines into the division loops); Prolog's
+  `OPNAMES` another.
+
 - **Overlapping impls are an error.** `impl Show for Vec<i64>;` next to
   `impl<T: Show> Show for Vec<T>;`, or two generic impls whose types
   unify, no longer let the first matching impl win silently: "overlapping

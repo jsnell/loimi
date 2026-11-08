@@ -82,6 +82,9 @@ pub struct Codegen<'p> {
     pub decls: Decls,
     pub str_count: u32,
     pub str_count_jc: u32,
+    /// Constant arrays indexed in place (`const_global`): (the
+    /// expression, of a counting copy) → global.
+    pub const_aggs: HashMap<(String, bool), String>,
     /// Emitting a counting copy (`--jit-stencils`).
     pub in_jit_copy: bool,
     pub mark_fns: std::collections::HashMap<String, String>,
@@ -218,6 +221,7 @@ impl<'p> Codegen<'p> {
             decls: Decls::default(),
             str_count: 0,
             str_count_jc: 0,
+            const_aggs: HashMap::new(),
             in_jit_copy: false,
             mark_fns: Default::default(),
             gc_barrier: None,
@@ -274,6 +278,28 @@ impl<'p> Codegen<'p> {
             }
         }
         let _ = writeln!(self.globals, "{} = private unnamed_addr constant [{} x i8] c\"{}\"", name, s.len(), enc);
+        name
+    }
+
+    /// A `private unnamed_addr constant` global holding the constant
+    /// aggregate `e` (one per distinct value), for indexing it in place:
+    /// `TAB[i]` of a `const TAB: [T; N]` loads from the table rather than
+    /// building the array on the stack at every access.
+    pub fn const_global(&mut self, e: &TExpr) -> String {
+        // Keyed by the expression (a `const`'s value is the same tree,
+        // spans included, at every use), not by its LLVM text: making that
+        // emits the strings in it.
+        let key = (format!("{:?} {:?}", e.ty, e.kind), self.in_jit_copy);
+        if let Some(g) = self.const_aggs.get(&key) {
+            return g.clone();
+        }
+        let n = self.const_aggs.keys().filter(|k| k.1 == self.in_jit_copy).count();
+        let name = format!("@.const{}.{}", if self.in_jit_copy { ".jc" } else { "" }, n);
+        let t = llty(self.p, &e.ty);
+        let init = self.const_init(e);
+        let align = layout::align_of(self.p, &e.ty).max(1);
+        let _ = writeln!(self.globals, "{} = private unnamed_addr constant {} {}, align {}", name, t, init, align);
+        self.const_aggs.insert(key, name.clone());
         name
     }
 
@@ -1135,6 +1161,36 @@ impl<'a, 'p> FnGen<'a, 'p> {
         }
     }
 
+    /// For reading an element (or a field of one) of a constant array
+    /// that is not a place, a `const`'s value most often: its address in a
+    /// constant global (`Codegen::const_global`). None if `e` is not such
+    /// a read. Only for reads: a place may be written or have its address
+    /// taken (a method's `*Self` receiver), and the global is read-only.
+    fn const_elem_place(&mut self, e: &TExpr) -> Option<String> {
+        match &e.kind {
+            TK::Index(b, idx) => {
+                let Ty::Array(_, n) = &b.ty else { return None };
+                let n = *n;
+                let base = if const_array(b) {
+                    self.cg.const_global(b)
+                } else {
+                    self.const_elem_place(b)?
+                };
+                let i = self.index_val(idx);
+                let bad = self.inst(format!("icmp uge i64 {}, {}", i, n));
+                self.check(&bad, "index out of bounds", e.span);
+                let bt = self.ty(&b.ty);
+                Some(self.inst(format!("getelementptr inbounds {}, ptr {}, i64 0, i64 {}", bt, base, i)))
+            }
+            TK::Field(b, i) if !matches!(b.ty, Ty::Slice(_)) => {
+                let base = self.const_elem_place(b)?;
+                let bt = self.ty(&b.ty);
+                Some(self.inst(format!("getelementptr inbounds {}, ptr {}, i32 0, i32 {}", bt, base, i)))
+            }
+            _ => None,
+        }
+    }
+
     /// Index value, extended to i64.
     pub fn index_val(&mut self, idx: &TExpr) -> String {
         let v = self.val(idx);
@@ -1167,6 +1223,10 @@ impl<'a, 'p> FnGen<'a, 'p> {
                 format!("{{ ptr {}, i64 {} }}", g, s.len())
             }
             TK::Unit | TK::Zeroed => "zeroinitializer".into(),
+            TK::Index(..) | TK::Field(..) if !e.ty.is_unitlike() && !crate::check::is_place(e) && const_elem(e) => {
+                let p = self.const_elem_place(e).expect("const_elem");
+                self.load(&e.ty, &p)
+            }
             TK::Local(_) | TK::Global(_) | TK::Deref(_) | TK::Index(..) => {
                 if self.stencil.is_some() {
                     if let Some(v) = crate::jitgen::delayed_reg_read(self, e) {
@@ -2894,6 +2954,22 @@ pub fn has_vector(p: &Program, t: &Ty) -> bool {
         Ty::Result(a, b) => has_vector(p, a) || has_vector(p, b),
         Ty::Tuple(ts) => ts.iter().any(|t| has_vector(p, t)),
         Ty::Struct(i) => p.structs[*i as usize].fields.iter().any(|(_, t)| has_vector(p, t)),
+        _ => false,
+    }
+}
+
+/// Whether `e` is a constant array value that `Codegen::const_global` can
+/// emit.
+fn const_array(e: &TExpr) -> bool {
+    matches!(e.kind, TK::Array(_) | TK::ArrayRepeat(..)) && !e.ty.is_unitlike() && crate::check::static_init_error(e).is_none()
+}
+
+/// Whether `e` reads an element, or a field of one, of a constant array
+/// (`FnGen::const_elem_place`).
+fn const_elem(e: &TExpr) -> bool {
+    match &e.kind {
+        TK::Index(b, _) => matches!(b.ty, Ty::Array(..)) && (const_array(b) || const_elem(b)),
+        TK::Field(b, _) => !matches!(b.ty, Ty::Slice(_)) && const_elem(b),
         _ => false,
     }
 }
