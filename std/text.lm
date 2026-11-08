@@ -4,8 +4,8 @@
 
 import std.mem;
 import std.hash;
+import std.num;
 
-extern "C" fn snprintf(buf: *u8, n: u64, fmt: *u8, ...) -> i32;
 extern "C" fn strtod(s: *u8, end: **u8) -> f64;
 
 /// A growable byte string.
@@ -31,23 +31,10 @@ pub fn StrBuf.push_int(b: *StrBuf, x: i64) {
     b.push_str(buf[i..24]);
 }
 
-/// Shortest representation that reads back as the same double ("%.17g"
-/// trimmed: tries increasing precision).
-pub fn StrBuf.push_f64(b: *StrBuf, x: f64) {
-    var buf: [u8; 40] = [0; 40];
-    var prec = 1;
-    var n: i32 = 0;
-    while prec <= 17 {
-        // unsafe: C calls on `buf`, whose size snprintf is given and which it NUL-terminates
-        let back = unsafe {
-            n = snprintf(&buf[0], 40, "%.*g\0".ptr, prec, x);
-            strtod(&buf[0], 0 as **u8)
-        };
-        if back == x or x != x { break; }
-        prec += 1;
-    }
-    b.push_str(buf[0..n as u64]);
-}
+/// The shortest representation that reads back as the same double, as
+/// C's `"%.{p}g"` writes it for the fewest digits p that do
+/// (`num.write_g_shortest`: `0.1`, `1e+02`).
+pub fn StrBuf.push_f64(b: *StrBuf, x: f64) { num.write_g_shortest(b, x); }
 
 pub fn StrBuf.as_str(b: *StrBuf) -> str { b.bytes.items() }
 

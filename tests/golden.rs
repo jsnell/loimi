@@ -1885,6 +1885,29 @@ fn keep_ll() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A `const` array indexed at run time is a `private unnamed_addr
+/// constant` global, read with a GEP and a load: no function of
+/// tests/run/const_array_index.lm that only reads its tables allocates or
+/// builds an array (`insertvalue`) on the stack.
+#[test]
+fn const_array_ir() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let out = loimi().arg("build").arg(root.join("tests/run/const_array_index.lm")).args(["--emit-llvm", "-o", "-"]).output().unwrap();
+    assert!(out.status.success(), "build failed:\n{}", String::from_utf8_lossy(&out.stderr));
+    let ir = String::from_utf8_lossy(&out.stdout);
+    for (g, ty) in [("TAB", "[5 x i64]"), ("PS", "[3 x %\"main.P\"]"), ("NEST", "[2 x [3 x i8]]")] {
+        assert!(ir.lines().any(|l| l.starts_with("@.const.") && l.contains(&format!("= private unnamed_addr constant {} ", ty))), "no constant global for {}:\n{}", g, ir);
+    }
+    for f in ["elem", "fields", "nested", "constant"] {
+        let head = format!(" @\"main.{}\"(", f);
+        let body: Vec<&str> = ir.lines().skip_while(|l| !(l.starts_with("define") && l.contains(&head))).take_while(|l| *l != "}").collect();
+        assert!(!body.is_empty(), "no main.{} in the IR", f);
+        let text = body.join("\n");
+        assert!(text.contains("ptr @.const."), "main.{} does not read a constant global:\n{}", f, text);
+        assert!(!text.contains("alloca [") && !text.contains("insertvalue"), "main.{} builds an array on the stack:\n{}", f, text);
+    }
+}
+
 /// Hot-handler ordering (docs/lowering.md §12, "Handler order"): the
 /// handlers tests/run/vm_profile.vmprofile names come first, hottest
 /// first, in the vm's hot section (page-aligned), the rest after in

@@ -362,6 +362,17 @@ implementation; `git log` has the details.
 
 ### Core language
 
+- **`const` arrays indexed at run time are read in place.** `TAB[i]` (and
+  `TAB[i].field`, `NEST[i][j]`) of a `const` array is a load from a
+  `private unnamed_addr constant` global; it used to build the whole
+  array on the stack at every access (two lookups in a 617-entry table
+  of `(u64, u64)`: 1.2 µs a call before, 10 ns now, as with a `var`).
+  Constant indices fold to the element as before. A method call with a
+  `*Self` receiver on such an element, `&TAB[i]`, `TAB[..]` and a
+  whole-array use still get a stack copy. `std.bigint`'s `INV_TAB` is
+  one (its `reciprocal` now inlines into the division loops); Prolog's
+  `OPNAMES` another.
+
 - **Overlapping impls are an error.** `impl Show for Vec<i64>;` next to
   `impl<T: Show> Show for Vec<T>;`, or two generic impls whose types
   unify, no longer let the first matching impl win silently: "overlapping
@@ -617,6 +628,20 @@ implementation; `git log` has the details.
   ([README](README.md#getting-started), [status.md](docs/status.md), Targets row).
 
 ### Standard library
+
+- **Shortest float formatting by Schubfach**: `std.num`'s
+  `write_shortest`, `shortest` and `write_js`, the new
+  `write_g_shortest`, and `text.StrBuf.push_f64` no longer try
+  `%.{1..17}e` with snprintf and strtod, one call each per digit count.
+  Their output is unchanged, including C's choice of digits at powers of
+  two (`2^-24` is `5.9604644775390625e-08`). About 80 ns per number
+  instead of 10 us; loops that convert floats to strings run 55 to 80
+  times faster in Python, MiniJS and Scheme, loops that print them 13 to
+  56 times; the benchmark suites are unchanged (geometric means 0.99
+  to 1.02, A/A 0.99 to 1.00).
+  `tests/run/std_num_shortest.lm` compares against the old search
+  (checked once by hand on 20 million doubles)
+  ([stdlib.md](docs/stdlib.md#stdnum)).
 
 - **`std.rt.ValueStack<T>`**: a vm's value stack with a high-water
   mark, so that calls do not clear their registers for the collector.
