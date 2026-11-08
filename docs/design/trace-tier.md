@@ -871,3 +871,10 @@ workflow makes no traces. Taking a dispatch to a code object's own word
 programs and 1.001 of the JIT (A/A 1.002; queens_8 0.86, the rest
 0.96–1.10, as the A/A pair): its registers are in memory, so a trace
 saves only dispatch. Not kept.
+
+**`promote` of inline-cache words (2026-11-08): measured, not built.**
+Recorded cache values folded into every trace (with or without a guard
+per load): MiniJS richards, deltablue, raytrace, properties, Mini
+oo_methods, nbody within the A/A spread (0.94–1.15, loaded machine). The
+bound is coverage: richards, deltablue, raytrace run 1.3%, 0.8%, 0.5% of
+their instructions in traces; properties' traced sites are megamorphic.
