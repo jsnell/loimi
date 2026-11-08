@@ -20,7 +20,6 @@
          20727    2.1%  MOVE_CALL
          20252    2.0%  JLTKN
          19767    2.0%  TESTT
-         17539    1.8%  MUL_F_ADD_F__RRA
          17097    1.7%  MODK
          16809    1.7%  JEQKN
          14216    1.4%  GETGLOBAL_C
@@ -36,10 +35,6 @@
          10479    1.0%  GETUPVAL_GETINDEX_TESTT__f5
           9174    0.9%  GETUPVAL_GETINDEX__f1
           8935    0.9%  MULK
-          8665    0.9%  JGTKN__A
-          8665    0.9%  MULK_F_MUL_F__RAR
-          8665    0.9%  ADD_F__RAR_SUB_F
-          8665    0.9%  ADD_F__RAR_MUL_F__RRA__f1
           8467    0.8%  JLTN
           8325    0.8%  MUL
           8322    0.8%  SETFIELD
@@ -60,13 +55,11 @@
           4899    0.5%  ADDI_ADDI__f1
           4769    0.5%  GETFIELD_SUB_F__f2
           4769    0.5%  GETFIELD_MUL_F
-          4769    0.5%  ADD_F__RRA_SETFIELD__f2
           4550    0.5%  NEWTABLE
           4463    0.4%  ADDK
           3533    0.4%  FORPREP
           3278    0.3%  JGEKN
           3180    0.3%  MUL_F
-          3180    0.3%  MUL_F_SUB_F__RRA
           3109    0.3%  ADDI_SETINDEX__f2
           2788    0.3%  CLOSURE
           2749    0.3%  LEN
@@ -74,11 +67,7 @@
           2250    0.2%  SETLIST
           2114    0.2%  GETINDEX_ADDI
           1787    0.2%  JLT
-          1590    0.2%  ADD_F__RRA
-          1590    0.2%  SUB_F__RRA
           1590    0.2%  GETFIELD_MUL_F__f1
-          1590    0.2%  MUL_F__RRA
-          1590    0.2%  DIV__RRA
           1590    0.2%  MUL_F_MUL_F
           1294    0.1%  JEQ
           1289    0.1%  LOADNIL
@@ -90,7 +79,6 @@
            544    0.1%  DIV
            527    0.1%  DIVK
            496    0.0%  JLE
-           355    0.0%  SUBK_F__RA
            142    0.0%  NEXT
             56    0.0%  SETGLOBAL
             47    0.0%  GEK

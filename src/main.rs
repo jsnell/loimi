@@ -63,8 +63,10 @@ struct Opts {
     warn: Vec<String>,
     align_functions: Option<u32>,
     /// `--no-branch-align` (or `LOIMI_BRANCH_ALIGN=0`) clears it: x86-64
-    /// vm programs keep indirect branches off 32-byte boundaries
-    /// (`BRANCH_ALIGN_LLVM_ARGS`).
+    /// `--release` vm programs keep indirect branches off 32-byte
+    /// boundaries (`BRANCH_ALIGN_LLVM_ARGS`). Development builds never
+    /// pad: the assembler's padding pass costs more than the rest of
+    /// code generation on a large vm.
     branch_align: bool,
     /// `--vm-profile=FILE`: lay out every vm's handlers by FILE (a
     /// dispatch profile, `hotorder`) instead of its `#[profile]`;
@@ -486,7 +488,7 @@ fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, O
     if prog.vms.iter().any(|v| v.dispatch == tir::Dispatch::Switch) {
         llvm_args.extend(SWITCH_LLVM_ARGS);
     }
-    if opts.branch_align && !prog.vms.is_empty() && opts.target.as_ref().map_or(codegen::Arch::host(), |t| t.arch) == codegen::Arch::X86_64 {
+    if opts.release && opts.branch_align && !prog.vms.is_empty() && opts.target.as_ref().map_or(codegen::Arch::host(), |t| t.arch) == codegen::Arch::X86_64 {
         llvm_args.extend(BRANCH_ALIGN_LLVM_ARGS);
     }
     let library = opts.kind != OutKind::Exe;

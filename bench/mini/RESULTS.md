@@ -546,7 +546,10 @@ Tried and dropped:
     selected (`accumulate DIVK;`, no `Mini.accumulate`) measured fib
     1.038, queens 1.022, sort 1.007, sieve 1.007 (geomean of eight
     benchmarks 1.006). Mini's suite still comes out ahead or even, so the
-    port stays; MiniJS's did not (`bench/minijs/RESULTS.md`).
+    port stayed; MiniJS's did not (`bench/minijs/RESULTS.md`).
+    **Removed 2026-11-08**: the 20 accumulated ops, their 28 variants and
+    the ten supers over them took Mini's IR from 293k to 374k lines and
+    its build from 8 s to 14 s (bisected), for the suite's 0.99-1.00.
 
 44. **The dispatch fold: recovered, measured, not kept; it was not the
     cost.** The cause of the lost fold is LLVM's x86 isel pattern

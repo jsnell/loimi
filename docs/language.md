@@ -4029,7 +4029,8 @@ that make them, and an integer writer moves its result into it. With
 nothing selected Mini measures within noise of no accumulator. MiniJS
 uses one too (nbody 0.93-0.97, suite 0.99-1.00); in Scheme, whose
 benchmarks are mostly integer code, the port averaged 0.3% slower and
-is not kept.
+is not kept. Mini's port is not kept either: 0.99-1.00 over its suite,
+for 27% more IR and build time.
 
 **Op selectors.** The ops of an `accumulate` list, and of a variant's
 `wraps [..]` (section 9), are given by selectors, each naming one or

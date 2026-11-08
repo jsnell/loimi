@@ -243,10 +243,10 @@ of `regs[0..NR)`:
 - **Code not in the profile** (other programs, code loaded later, a
   changed script) matches no trace and runs on the stencils.
 - **State**: the vm's handler arguments come from its declaration, so
-  the accumulator of `docs/language.md` §7.4 (`vacc`, Mini) is carried
+  an accumulator (`docs/language.md` §7.4) is carried
   through the trace in SSA like the context and frame registers, live
-  into every step and out at every exit; accumulator variants
-  (`ADD_F__RAR`, `JGTKN__A`) stitch like any op.
+  into every step and out at every exit; accumulator variants stitch
+  like any op.
 
 ### 11.5 Results (Mini, 14 benchmarks)
 

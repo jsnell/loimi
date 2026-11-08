@@ -326,9 +326,10 @@ measured on its own:
 - **Hot-handler placement** (`#[profile]`, 2026-11-05; [lowering.md
   §12](lowering.md#12-driver-settings), "Handler order"): Lox properties
   and PolyBench goto-mode gemm (1.42× tail-call before, 1.08× now).
-- **Value accumulators** in Mini and MiniJS (2026-11-06;
-  [design/speed-audit.md](design/speed-audit.md), item 1): Mini
-  mandelbrot 0.90, MiniJS nbody 0.94.
+- **Value accumulators** in MiniJS (2026-11-06;
+  [design/speed-audit.md](design/speed-audit.md), item 1): nbody 0.94.
+  Mini's port (mandelbrot 0.90, suite 0.99-1.00) was removed on
+  2026-11-08: it added 27% to Mini's IR and its build time.
 - **`nanbox(int_high)`** in Python and Prolog (2026-11-06;
   [design/speed-audit.md](design/speed-audit.md), item 7): Python 0.93,
   Prolog 0.90 (the JIT build 0.85).

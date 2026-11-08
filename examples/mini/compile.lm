@@ -1794,7 +1794,7 @@ fn Parser.finish(p: *Parser, fs: *FuncState) -> Gc<Proto> {
             internal_error(b.as_str())
         }
     };
-    Mini.accumulate(proto.code.words(), 0); Mini.optimize(proto.code); #[cfg(debug)] debugger.finish_proto(fs as *u8, proto);
+    Mini.optimize(proto.code); #[cfg(debug)] debugger.finish_proto(fs as *u8, proto);
     fs.code.free();
     fs.consts.free();
     fs.locals.free();

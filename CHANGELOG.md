@@ -6,6 +6,14 @@ implementation; `git log` has the details.
 
 ## Since 2026-11-02
 
+### Build time
+
+- Development builds (no `--release`) no longer pad x86-64 vm branches
+  away from 32-byte boundaries: the assembler's padding took more than
+  half of a large vm's build (Mini 20 s of 28). `--release` still pads.
+- Mini drops its value accumulator (0.99-1.00 over its suite, 27% of
+  its IR). A Mini build: 28 s before, 9 s now.
+
 ### `vm` declarations and dispatch
 
 - **`const` inline cache fields**: `cache KIx { const k: u32 verify it <
