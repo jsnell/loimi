@@ -247,8 +247,10 @@ The tests come in three tiers (`RUST_TEST_THREADS=2` on an 8-core machine):
   Run it before every merge.
 - **Heavy** (`-- --include-ignored`): the `#[ignore = "heavy ..."]` tests
   as well: AArch64 under qemu (`aarch64_qemu`, `vm_prof_stress_aarch64`),
-  the trace fuzzer (`mini_traces_fuzz`), the DAP session in the goto and
-  switch builds, two minutes of GC rooting fuzzing. Run it before merging
+  the trace fuzzer (`mini_traces_fuzz`), the DAP session and the Mini
+  and Python debuggers in the goto and switch builds, the Mini C hosts
+  against every library build, ThreadSanitizer, two minutes of GC
+  rooting fuzzing. Run it before merging
   changes to code generation, dispatch, the JIT or traces, the GC or the
   C ABI, or anything target-specific. (ASan and TSan tests run only
   without `ulimit -v`.)
@@ -259,7 +261,10 @@ clang's time on a large vm and only moves code. Mini's scripts and
 conformance tests and `tests/run` keep it; `LOIMI_TEST_BRANCH_ALIGN=1`
 keeps it everywhere. Builds are shared between tests within a run, and
 `LOIMI_TEST_JOBS` (default 3) bounds the builds and programs a test
-runs at once.
+runs at once. To see where the time goes, `LOIMI_TEST_TIMES=FILE` logs
+each build and the trace tests' phases, and libtest times each test:
+`RUSTC_BOOTSTRAP=1 cargo test --release --test golden -- -Z
+unstable-options --report-time NAME`.
 
 Cross-compiling for AArch64 Linux (links with `ld.lld`; tested under qemu
 user-mode, built from source with an extracted Debian sysroot, no root):

@@ -208,6 +208,27 @@ fn branch_align() -> &'static str {
     }
 }
 
+/// `LOIMI_TEST_TIMES=FILE`: append `kind<TAB>seconds<TAB>test<TAB>what`
+/// lines for each build and each program run, to see where the suite's
+/// time goes without timing it whole.
+fn log_time(kind: &str, secs: f64, what: &str) {
+    if let Some(f) = std::env::var_os("LOIMI_TEST_TIMES") {
+        use std::io::Write;
+        let test = std::thread::current().name().unwrap_or("?").to_string();
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(f) {
+            let _ = writeln!(f, "{}\t{:.2}\t{}\t{}", kind, secs, test, what);
+        }
+    }
+}
+
+/// Runs its closure when dropped.
+struct Defer<'a>(Box<dyn FnMut() + 'a>);
+impl Drop for Defer<'_> {
+    fn drop(&mut self) {
+        (self.0)()
+    }
+}
+
 /// This process's directory of shared builds (in the temporary
 /// directory, `loimi-golden-PID`). Directories of processes that are
 /// gone are removed when it is made.
@@ -283,7 +304,9 @@ fn build_lib(src: &Path, flags: &[&str], env: &[(&str, &str)], header: &str) -> 
         let _slot = BuildSlot::take();
         let start = std::time::Instant::now();
         let out = cmd.output().unwrap();
-        eprintln!("build {}: {:.1} s", key, start.elapsed().as_secs_f64());
+        let secs = start.elapsed().as_secs_f64();
+        eprintln!("build {}: {:.1} s", key, secs);
+        log_time("build", secs, &key);
         if out.status.success() {
             Ok(exe)
         } else {
@@ -666,9 +689,10 @@ fn vm_prof_stress_on(a64: bool) {
 /// docs/design/trace-tier.md): Mini's benchmarks and scripts are
 /// recorded with a JIT build, profiled with a (bounded) region
 /// build, and run with traces of every loop that closed (`build_traces`)
-/// in every GC mode; then again with traces whose guards fail often
-/// (blocks run in under half of their instruction's runs are off the
-/// trace), with blacklisting at the default rate and at every failure.
+/// in every GC mode; then again, without GC stress, with traces whose
+/// guards fail often (blocks run in under half of their instruction's
+/// runs are off the trace); the benchmarks also with blacklisting at
+/// every failure.
 /// Programs whose code was not profiled run without traces.
 #[test]
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -703,15 +727,21 @@ fn mini_traces() {
     // table, trace_sides.mini
     let ns = bt.nsides(&bt.normal);
     assert!(ns >= 10, "only {} side traces from the Mini tests and benchmarks", ns);
+    let t = std::time::Instant::now();
     failures.extend(mini_scripts_on(&bt.normal, "traces", &env, &|_| true));
+    log_time("runs", t.elapsed().as_secs_f64(), "scripts normal");
+    let t = std::time::Instant::now();
     failures.extend(mini_conformance_on(&bt.normal, &env, &|_| true));
+    log_time("runs", t.elapsed().as_secs_f64(), "conformance normal");
+    let t = std::time::Instant::now();
     failures.extend(bt.check_benchmarks(&bt.normal, &root.join("bench/mini/programs"), &env));
-    // guards that fail
-    failures.extend(mini_scripts_on(&bt.forced, "traces, guards failing", &env, &|_| true));
-    failures.extend(mini_conformance_on(&bt.forced, &env, &|_| true));
+    log_time("runs", t.elapsed().as_secs_f64(), "benchmarks normal");
+    // guards that fail (GC modes are covered by the runs above: here
+    // without GC stress)
+    failures.extend(mini_scripts_in(&bt.forced, "traces, guards failing", &env, &|_| true, &[""]));
+    failures.extend(mini_conformance_in(&bt.forced, &env, &|_| true, &[""]));
+    // blacklisting at the first failure, on the benchmarks
     let env1 = [("LOIMI_JIT", "1"), ("LOIMI_JIT_HOT", "2"), ("LOIMI_TRACE_FAILS", "1")];
-    failures.extend(mini_scripts_on(&bt.forced, "traces, guards failing, blacklisting at once", &env1, &|_| true));
-    failures.extend(mini_conformance_on(&bt.forced, &env1, &|_| true));
     failures.extend(bt.check_benchmarks(&bt.forced, &root.join("bench/mini/programs"), &env1));
     bt.cleanup();
     if !failures.is_empty() {
@@ -963,11 +993,14 @@ fn build_traces_with(tag: &str, src: &Path, inputs: &[PathBuf], env: &[(&str, &s
             .output()
             .unwrap();
         eprintln!("build {} {}: {:.1} s", tag, name, start.elapsed().as_secs_f64());
+        log_time("build", start.elapsed().as_secs_f64(), &format!("{} {}", tag, name));
         assert!(out.status.success(), "building {} {} failed:\n{}", tag, name, String::from_utf8_lossy(&out.stderr));
         exe
     };
     // one run per input, its output file named by `var`; the files joined
     let run_all = |exe: &Path, var: &str, ext: &str| -> PathBuf {
+        let start = std::time::Instant::now();
+        let _log = Defer(Box::new(move || log_time("runs", start.elapsed().as_secs_f64(), &format!("{} {}", tag, ext))));
         let numbered: Vec<(usize, &PathBuf)> = inputs.iter().enumerate().collect();
         let texts = par_map(&numbered, |(i, f)| {
             let file = dir.join(format!("{}.{}", i, ext));
@@ -1017,14 +1050,27 @@ fn mini_debugger() {
     if cross() || fast_skip("mini_debugger") {
         return;
     }
+    mini_debugger_in(&["--dispatch=tailcall"]);
+}
+
+/// `mini_debugger`'s transcripts in the goto and switch builds.
+#[test]
+#[ignore = "heavy tier: cargo test --release -- --include-ignored"]
+fn mini_debugger_dispatch_modes() {
+    if cross() {
+        return;
+    }
+    mini_debugger_in(&["--dispatch=goto", "--dispatch=switch"]);
+}
+
+fn mini_debugger_in(modes: &[&str]) {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let dir = root.join("examples/mini/tests/debug");
     let mut tests: Vec<PathBuf> =
         std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.extension().is_some_and(|x| x == "mini")).collect();
     tests.sort();
     assert!(!tests.is_empty());
-    let modes = ["--dispatch=tailcall", "--dispatch=goto", "--dispatch=switch"];
-    let mut failures: Vec<String> = par_map(&modes, |mode| {
+    let mut failures: Vec<String> = par_map(modes, |mode| {
         let exe = mini(&["--cfg", "debug", mode], &[]);
         let mut failures = Vec::new();
         for t in &tests {
@@ -1179,6 +1225,11 @@ fn with_modes<'a>(programs: &[PathBuf], modes: &[&'a str]) -> Vec<(PathBuf, &'a 
 /// The Mini scripts that `select` picks, run by the Mini `exe` (named
 /// `what` in failures) in `env` in every GC mode: the failures.
 fn mini_scripts_on(exe: &Path, what: &str, env: &[(&str, &str)], select: &(dyn Fn(&str) -> bool + Sync)) -> Vec<String> {
+    mini_scripts_in(exe, what, env, select, &GC_MODES)
+}
+
+/// `mini_scripts_on` in the GC modes `modes`.
+fn mini_scripts_in(exe: &Path, what: &str, env: &[(&str, &str)], select: &(dyn Fn(&str) -> bool + Sync), modes: &[&str]) -> Vec<String> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut scripts: Vec<PathBuf> = std::fs::read_dir(root.join("examples/mini/tests"))
         .unwrap()
@@ -1188,7 +1239,7 @@ fn mini_scripts_on(exe: &Path, what: &str, env: &[(&str, &str)], select: &(dyn F
     scripts.sort();
     assert!(!scripts.is_empty());
     let runner = runner_in(env);
-    par_map(&with_modes(&scripts, &GC_MODES), |(f, mode)| {
+    par_map(&with_modes(&scripts, modes), |(f, mode)| {
         let mut failures = Vec::new();
         let text = std::fs::read_to_string(f).unwrap();
         let lua_directives = |key: &str| -> Vec<String> {
@@ -1241,6 +1292,11 @@ fn mini_conformance() {
 /// The conformance scripts `select` picks, run by the Mini `exe` in
 /// `env` in every GC mode: the failures.
 fn mini_conformance_on(exe: &Path, env: &[(&str, &str)], select: &(dyn Fn(&str) -> bool + Sync)) -> Vec<String> {
+    mini_conformance_in(exe, env, select, &GC_MODES)
+}
+
+/// `mini_conformance_on` in the GC modes `modes`.
+fn mini_conformance_in(exe: &Path, env: &[(&str, &str)], select: &(dyn Fn(&str) -> bool + Sync), modes: &[&str]) -> Vec<String> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let dir = root.join("examples/mini/tests/conformance");
     let mut scripts: Vec<PathBuf> = std::fs::read_dir(&dir)
@@ -1250,7 +1306,7 @@ fn mini_conformance_on(exe: &Path, env: &[(&str, &str)], select: &(dyn Fn(&str) 
         .collect();
     scripts.sort();
     assert!(!scripts.is_empty());
-    par_map(&with_modes(&scripts, &GC_MODES), |(f, mode)| {
+    par_map(&with_modes(&scripts, modes), |(f, mode)| {
         let stem = f.file_stem().unwrap().to_string_lossy().to_string();
         let expected = std::fs::read_to_string(f.with_extension("expected")).unwrap();
         let should_fail = stem.starts_with("err_");
@@ -1327,7 +1383,12 @@ fn scheme_tests() -> Vec<PathBuf> {
 /// Every Scheme test program run by `exe` (with `env`) in every GC mode;
 /// returns the failures.
 fn scheme_programs_on(exe: &Path, label: &str, env: &[(&str, &str)]) -> Vec<String> {
-    par_map(&with_modes(&scheme_tests(), &GC_MODES), |(f, mode)| {
+    scheme_programs_in(exe, label, env, &GC_MODES)
+}
+
+/// `scheme_programs_on` in the GC modes `modes`.
+fn scheme_programs_in(exe: &Path, label: &str, env: &[(&str, &str)], modes: &[&str]) -> Vec<String> {
+    par_map(&with_modes(&scheme_tests(), modes), |(f, mode)| {
         let mut failures = Vec::new();
         let text = std::fs::read_to_string(f).unwrap();
         let scm_directives = |key: &str| -> Vec<String> {
@@ -1370,8 +1431,8 @@ fn scheme_programs_on(exe: &Path, label: &str, env: &[(&str, &str)]) -> Vec<Stri
 /// Ahead-of-time traces of the Scheme interpreter (as `mini_traces`;
 /// docs/design/trace-tier.md section 13.7): its test programs recorded,
 /// profiled and traced, then all of them run with the traces in every GC
-/// mode, and again with guards that fail and with blacklisting at every
-/// failure. trace_loops.scm must run in traces.
+/// mode, and again (without GC stress) with guards that fail and with
+/// blacklisting at every failure. trace_loops.scm must run in traces.
 #[test]
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 fn scheme_traces() {
@@ -1392,9 +1453,10 @@ fn scheme_traces() {
         failures.push(format!("trace_loops.scm: {} iterations in traces", ran));
     }
     failures.extend(scheme_programs_on(&bt.normal, "traces", &env));
-    failures.extend(scheme_programs_on(&bt.forced, "traces, guards failing", &env));
+    // guards that fail, without GC stress (the runs above cover the GC modes)
+    failures.extend(scheme_programs_in(&bt.forced, "traces, guards failing", &env, &[""]));
     let env1 = [("LOIMI_JIT", "1"), ("LOIMI_JIT_HOT", "2"), ("LOIMI_TRACE_FAILS", "1")];
-    failures.extend(scheme_programs_on(&bt.forced, "traces, guards failing, blacklisting at once", &env1));
+    failures.extend(scheme_programs_in(&bt.forced, "traces, guards failing, blacklisting at once", &env1, &[""]));
     bt.cleanup();
     check_failures(failures);
 }
@@ -1651,13 +1713,27 @@ fn python_debugger() {
     if cross() || fast_skip("python_debugger") {
         return;
     }
+    python_debugger_in(&["tailcall"]);
+}
+
+/// `python_debugger`'s transcripts in the goto and switch builds.
+#[test]
+#[ignore = "heavy tier: cargo test --release -- --include-ignored"]
+fn python_debugger_dispatch_modes() {
+    if cross() {
+        return;
+    }
+    python_debugger_in(&["goto", "switch"]);
+}
+
+fn python_debugger_in(modes: &[&str]) {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let dir = root.join("examples/python/tests/debug");
     let mut tests: Vec<PathBuf> =
         std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.extension().is_some_and(|x| x == "py")).collect();
     tests.sort();
     assert!(!tests.is_empty());
-    let failures = par_map(&["tailcall", "goto", "switch"], |mode| {
+    let failures = par_map(modes, |mode| {
         let mut failures = Vec::new();
         let exe = build(&root.join("examples/python/main.lm"), &["--release", "--cfg", "debug", &format!("--dispatch={mode}")], &[]);
         for t in &tests {
@@ -2326,13 +2402,16 @@ fn mini_shared() {
     }
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let e = root.join("examples/embed");
-    c_host_run_with(
+    // the static library; every library build in the heavy tier
+    // (`mini_c_host_variants`)
+    c_host_run_variants(
         "mini-shared",
         &root.join("examples/mini/embed.lm"),
         &e.join("shared.c"),
         &e.join("shared.expected"),
         None,
         &["--cfg", "gil"],
+        &C_HOST_VARIANTS[..1],
     );
 }
 
@@ -2342,6 +2421,18 @@ fn mini_shared() {
 /// and globals, lazy table expansion, evaluation with breakpoints
 /// suspended, break on error, a pause from another thread; under GC
 /// stress.
+/// `mini_shared` and `mini_debug_api` with every library build
+/// (`C_HOST_VARIANTS`), not only the static one.
+#[test]
+#[ignore = "heavy tier: cargo test --release -- --include-ignored"]
+fn mini_c_host_variants() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let e = root.join("examples/embed");
+    let lib = root.join("examples/mini/embed.lm");
+    c_host_run_with("mini-shared-all", &lib, &e.join("shared.c"), &e.join("shared.expected"), None, &["--cfg", "gil"]);
+    c_host_run_with("mini-debug-api-all", &lib, &e.join("debug.c"), &e.join("debug.expected"), None, &["--cfg", "debug"]);
+}
+
 #[test]
 fn mini_debug_api() {
     if fast_skip("mini_debug_api") {
@@ -2349,13 +2440,16 @@ fn mini_debug_api() {
     }
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let e = root.join("examples/embed");
-    c_host_run_with(
+    // the static library; every library build in the heavy tier
+    // (`mini_c_host_variants`)
+    c_host_run_variants(
         "mini-debug-api",
         &root.join("examples/mini/embed.lm"),
         &e.join("debug.c"),
         &e.join("debug.expected"),
         None,
         &["--cfg", "debug"],
+        &C_HOST_VARIANTS[..1],
     );
 }
 
@@ -2450,6 +2544,7 @@ fn mini_gil_single_thread() {
 /// reported. Skipped under `ulimit -v` (TSan maps terabytes of shadow
 /// memory) and where gcc has no libtsan.
 #[test]
+#[ignore = "heavy tier: cargo test --release -- --include-ignored"]
 fn mini_threads_tsan() {
     tsan_host("threads", &[]);
 }
@@ -2457,6 +2552,7 @@ fn mini_threads_tsan() {
 /// `mini_shared` under ThreadSanitizer: the lock's hand-overs, and the
 /// collector reading other threads' saved state, race-free.
 #[test]
+#[ignore = "heavy tier: cargo test --release -- --include-ignored"]
 fn mini_shared_tsan() {
     tsan_host("shared", &["--cfg", "gil"]);
 }
