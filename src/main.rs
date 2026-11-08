@@ -62,8 +62,9 @@ struct Opts {
     /// `-W lint`: opt-in lints turned on.
     warn: Vec<String>,
     align_functions: Option<u32>,
-    /// `--no-branch-align` clears it: x86-64 vm programs keep indirect
-    /// branches off 32-byte boundaries (`BRANCH_ALIGN_LLVM_ARGS`).
+    /// `--no-branch-align` (or `LOIMI_BRANCH_ALIGN=0`) clears it: x86-64
+    /// vm programs keep indirect branches off 32-byte boundaries
+    /// (`BRANCH_ALIGN_LLVM_ARGS`).
     branch_align: bool,
     /// `--vm-profile=FILE`: lay out every vm's handlers by FILE (a
     /// dispatch profile, `hotorder`) instead of its `#[profile]`;
@@ -824,7 +825,10 @@ fn parse_args() -> Result<Opts, String> {
         deny_warnings: false,
         warn: vec![],
         align_functions: None,
-        branch_align: true,
+        // `LOIMI_BRANCH_ALIGN=0`: a default for `--no-branch-align` (the
+        // padding costs most of the build time of a large vm; test suites
+        // build many interpreters whose speed they do not measure).
+        branch_align: std::env::var("LOIMI_BRANCH_ALIGN").map_or(true, |v| v != "0"),
         vm_profile: None,
         kind: OutKind::Exe,
         header: None,

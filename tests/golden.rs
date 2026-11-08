@@ -118,6 +118,181 @@ fn loimi() -> Command {
     c
 }
 
+// ---------------------------------------------------------------------------
+// Tiers, shared builds, parallel runs.
+//
+// Three tiers (docs/testing.md):
+//   fast     `LOIMI_TEST_FAST=1 cargo test --release`: the compiler's own
+//            tests and one build of each smaller example; tests outside
+//            it return at once (`fast_skip`).
+//   default  `cargo test --release`.
+//   heavy    `cargo test --release -- --include-ignored`: the tests marked
+//            `#[ignore = "heavy ..."]` too.
+// Most of the time goes to clang compiling whole interpreters, so tests
+// share them: `build` caches each (source, flags, environment) for the
+// life of the test process, and `par_map` runs a test's programs side by
+// side.
+
+/// In the fast tier (`LOIMI_TEST_FAST=1`), whether to skip the calling
+/// test (it says so on stderr).
+fn fast_skip(name: &str) -> bool {
+    let fast = std::env::var("LOIMI_TEST_FAST").is_ok_and(|v| !v.is_empty() && v != "0");
+    if fast {
+        eprintln!("{}: skipped in the fast tier (LOIMI_TEST_FAST)", name);
+    }
+    fast
+}
+
+/// How many processes a test runs at once (`LOIMI_TEST_JOBS`, default 3),
+/// and how many builds the whole test process runs at once.
+fn jobs() -> usize {
+    std::env::var("LOIMI_TEST_JOBS").ok().and_then(|s| s.parse().ok()).filter(|&n| n > 0).unwrap_or(3)
+}
+
+/// `f` over `items` on `jobs()` threads, results in order.
+fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let next = AtomicUsize::new(0);
+    let results: Vec<std::sync::Mutex<Option<R>>> = items.iter().map(|_| std::sync::Mutex::new(None)).collect();
+    std::thread::scope(|s| {
+        for _ in 0..jobs().min(items.len()) {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::SeqCst);
+                if i >= items.len() {
+                    break;
+                }
+                let r = f(&items[i]);
+                *results[i].lock().unwrap() = Some(r);
+            });
+        }
+    });
+    results.into_iter().map(|m| m.into_inner().unwrap().unwrap()).collect()
+}
+
+/// Bounds the builds running at once in the test process (`jobs()`):
+/// clang on a whole interpreter is the expensive step, and tests run
+/// side by side.
+struct BuildSlot;
+
+static BUILD_SLOTS: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+static BUILD_FREED: std::sync::Condvar = std::sync::Condvar::new();
+
+impl BuildSlot {
+    fn take() -> BuildSlot {
+        let mut n = BUILD_SLOTS.lock().unwrap();
+        while *n >= jobs() {
+            n = BUILD_FREED.wait(n).unwrap();
+        }
+        *n += 1;
+        BuildSlot
+    }
+}
+
+impl Drop for BuildSlot {
+    fn drop(&mut self) {
+        *BUILD_SLOTS.lock().unwrap() -= 1;
+        BUILD_FREED.notify_one();
+    }
+}
+
+/// `LOIMI_BRANCH_ALIGN` for the tests' builds of interpreters: "0" (no
+/// x86-64 branch padding: it takes most of clang's time on a large vm
+/// and only moves code), "1" with `LOIMI_TEST_BRANCH_ALIGN=1`.
+fn branch_align() -> &'static str {
+    if std::env::var("LOIMI_TEST_BRANCH_ALIGN").is_ok_and(|v| v == "1") {
+        "1"
+    } else {
+        "0"
+    }
+}
+
+/// This process's directory of shared builds (in the temporary
+/// directory, `loimi-golden-PID`). Directories of processes that are
+/// gone are removed when it is made.
+fn build_dir() -> &'static Path {
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let tmp = std::env::temp_dir();
+        if let Ok(rd) = std::fs::read_dir(&tmp) {
+            for e in rd.filter_map(|e| e.ok()) {
+                let name = e.file_name().to_string_lossy().to_string();
+                if let Some(pid) = name.strip_prefix("loimi-golden-") {
+                    if pid.parse::<u32>().is_ok() && !Path::new("/proc").join(pid).exists() {
+                        let _ = std::fs::remove_dir_all(e.path());
+                    }
+                }
+            }
+        }
+        let d = tmp.join(format!("loimi-golden-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    })
+}
+
+/// `loimi build -W error <src> <flags> -o OUT` in `env`, once per test
+/// process: tests that build the same thing share it (a test asking for
+/// a build another is running waits for it). The tests' builds of the
+/// interpreters drop the x86-64 branch padding (`LOIMI_BRANCH_ALIGN=0`),
+/// which costs most of their clang time, unless `env` sets it;
+/// `mini_scripts`, `run_programs` and the heavy tier build with it.
+/// Panics (in every test that asks) if the build fails.
+fn build(src: &Path, flags: &[&str], env: &[(&str, &str)]) -> PathBuf {
+    build_lib(src, flags, env, "lib.h")
+}
+
+/// `build` of a library (`--lib`, `--shared`) whose C header (next to
+/// it) is named `header`; for an executable `header` is not used.
+fn build_lib(src: &Path, flags: &[&str], env: &[(&str, &str)], header: &str) -> PathBuf {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    type Slot = Arc<OnceLock<Result<PathBuf, String>>>;
+    static BUILDS: Mutex<Option<HashMap<String, Slot>>> = Mutex::new(None);
+    let mut env: Vec<(&str, &str)> = env.to_vec();
+    if !env.iter().any(|(k, _)| *k == "LOIMI_BRANCH_ALIGN") {
+        env.push(("LOIMI_BRANCH_ALIGN", branch_align()));
+    }
+    env.sort();
+    let lib = flags.contains(&"--lib") || flags.contains(&"--shared");
+    let key = format!("{} {:?} {:?}{}", src.display(), flags, env, if lib { header } else { "" });
+    let slot: Slot = {
+        let mut m = BUILDS.lock().unwrap();
+        m.get_or_insert_with(HashMap::new).entry(key.clone()).or_default().clone()
+    };
+    let r = slot.get_or_init(|| {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let stem = src.file_stem().unwrap().to_string_lossy();
+        let ext = if flags.contains(&"--shared") {
+            ".so"
+        } else if flags.contains(&"--lib") {
+            ".a"
+        } else {
+            ""
+        };
+        let dir = build_dir().join(format!("{}-{}", n, stem));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join(format!("{}{}", if ext.is_empty() { stem.to_string() } else { format!("lib{}", stem) }, ext));
+        let mut cmd = loimi();
+        cmd.envs(env.iter().copied()).arg("build").args(["-W", "error"]).arg(src).args(flags).arg("-o").arg(&exe);
+        if lib {
+            cmd.arg("--header").arg(dir.join(header));
+        }
+        let _slot = BuildSlot::take();
+        let start = std::time::Instant::now();
+        let out = cmd.output().unwrap();
+        eprintln!("build {}: {:.1} s", key, start.elapsed().as_secs_f64());
+        if out.status.success() {
+            Ok(exe)
+        } else {
+            Err(format!("building {}: {}", key, String::from_utf8_lossy(&out.stderr)))
+        }
+    });
+    match r {
+        Ok(p) => p.clone(),
+        Err(e) => panic!("{}", e),
+    }
+}
+
 #[test]
 fn run_programs() {
     run_programs_with(&[], |_, _| true);
@@ -125,13 +300,13 @@ fn run_programs() {
 
 /// The tests/run programs that `select(file name, text)` picks, with
 /// `xenv` in loimi's environment (`LOIMI_TARGET`, `LOIMI_RUNNER`, ...).
-fn run_programs_with(xenv: &[(String, String)], select: impl Fn(&str, &str) -> bool) {
+fn run_programs_with(xenv: &[(String, String)], select: impl Fn(&str, &str) -> bool + Sync) {
     let cross = cross() || xenv.iter().any(|(k, _)| k == "LOIMI_TARGET");
-    let mut failures = Vec::new();
-    for f in files("tests/run") {
+    let failures = par_map(&files("tests/run"), |f| {
+        let mut failures = Vec::new();
         let text = std::fs::read_to_string(&f).unwrap();
         if !select(&f.file_name().unwrap().to_string_lossy(), &text) {
-            continue;
+            return failures;
         }
         let expect: Vec<String> = directives(&text, "expect");
         let exit: i32 = directives(&text, "expect-exit").first().map(|s| s.trim().parse().unwrap()).unwrap_or(0);
@@ -143,7 +318,7 @@ fn run_programs_with(xenv: &[(String, String)], select: impl Fn(&str, &str) -> b
             .flat_map(|s| s.split_whitespace().filter_map(|kv| kv.split_once('=').map(|(k, v)| (k.to_string(), v.to_string()))).collect::<Vec<_>>())
             .collect();
         if cross && extra.iter().any(|a| a == "--jit-stencils") {
-            continue;
+            return failures;
         }
         let matrix = directives(&text, "matrix");
         let modes: Vec<(Vec<String>, Vec<(String, String)>)> = if matrix.iter().any(|m| m.trim() == "dispatch") {
@@ -193,10 +368,9 @@ fn run_programs_with(xenv: &[(String, String)], select: impl Fn(&str, &str) -> b
                 }
             }
         }
-    }
-    if !failures.is_empty() {
-        panic!("{} failure(s):\n\n{}", failures.len(), failures.join("\n\n"));
-    }
+        failures
+    });
+    check_failures(failures.concat());
 }
 
 /// The errors in a compiler's output: `error: ..` and `error[lint]: ..`
@@ -290,8 +464,8 @@ fn std_test() {
 /// `std_test` with `xenv` in loimi's environment.
 fn std_test_with(xenv: &[(String, String)]) {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/test");
-    let mut failures = Vec::new();
-    for f in files("tests/test") {
+    let failures = par_map(&files("tests/test"), |f| {
+        let mut failures = Vec::new();
         let text = std::fs::read_to_string(&f).unwrap();
         let args: Vec<String> = directives(&text, "args").iter().flat_map(|s| s.split_whitespace().map(String::from).collect::<Vec<_>>()).collect();
         let exit: i32 = directives(&text, "expect-exit").first().map(|s| s.trim().parse().unwrap()).unwrap_or(0);
@@ -304,18 +478,19 @@ fn std_test_with(xenv: &[(String, String)]) {
         } else if out.status.code() != Some(exit) {
             failures.push(format!("{}: exit {:?}, expected {}", name, out.status.code(), exit));
         }
-    }
-    if !failures.is_empty() {
-        panic!("{} failure(s):\n\n{}", failures.len(), failures.join("\n\n"));
-    }
+        failures
+    });
+    check_failures(failures.concat());
 }
 
 /// The Mini interpreter (examples/mini): run every script in
-/// examples/mini/tests normally and with GC stress (collect at every
-/// safepoint), comparing with `-- expect:` lines.
+/// examples/mini/tests normally, with GC stress (collect at every
+/// safepoint) and in verify mode, comparing with `-- expect:` lines.
+/// This Mini (shared with `mini_conformance`) keeps the default x86-64
+/// branch padding that the other test builds drop (`build`).
 #[test]
 fn mini_scripts() {
-    mini_scripts_with(&[], &[], |_| true);
+    mini_scripts_with(&[], &[("LOIMI_BRANCH_ALIGN", "1")], |_| true);
 }
 
 /// The copy-and-patch JIT (`--jit-stencils`, x86-64 Linux):
@@ -327,15 +502,17 @@ fn mini_scripts() {
 #[test]
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 fn mini_jit_stencils() {
-    if cross() {
+    if cross() || fast_skip("mini_jit_stencils") {
         return;
     }
-    let env = [("LOIMI_JIT", "1"), ("LOIMI_JIT_HOT", "1")];
-    mini_scripts_with(&["--jit-stencils"], &env, |_| true);
-    mini_conformance_with(&["--jit-stencils"], &env, |_| true);
-    let env = [("LOIMI_JIT", "1"), ("LOIMI_JIT_HOT", "1"), ("LOIMI_JIT_RECOMPILE", "1")];
-    mini_scripts_with(&["--jit-stencils"], &env, |_| true);
-    mini_conformance_with(&["--jit-stencils"], &env, |_| true);
+    let exe = mini(&["--jit-stencils"], &[]);
+    let mut failures = Vec::new();
+    for env in [&[("LOIMI_JIT", "1"), ("LOIMI_JIT_HOT", "1")][..], &[("LOIMI_JIT", "1"), ("LOIMI_JIT_HOT", "1"), ("LOIMI_JIT_RECOMPILE", "1")]] {
+        let what = format!("--jit-stencils {:?}", env);
+        failures.extend(mini_scripts_on(&exe, &what, env, &|_| true));
+        failures.extend(mini_conformance_on(&exe, env, &|_| true));
+    }
+    check_failures(failures);
 }
 
 /// The rows (samples, location) of the `--vm-prof` report's table whose
@@ -372,14 +549,12 @@ fn vm_prof_ranks() {
         assert!(ok(&names("by vm location"), "CALL"), "vm_prof.lm {}: vm table out of order:\n{}", mode, report);
         assert!(ok(&names("by guest pc"), "CALL"), "vm_prof.lm {}: pc table out of order:\n{}", mode, report);
     }
-    if cross() || !cfg!(all(target_arch = "x86_64", target_os = "linux")) {
+    if cross() || !cfg!(all(target_arch = "x86_64", target_os = "linux")) || fast_skip("vm_prof_ranks (Mini)") {
         return;
     }
     let dir = std::env::temp_dir().join(format!("loimi-vmprof-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let exe = dir.join("mini");
-    let out = loimi().args(["build", "--release", "--jit-stencils", "--vm-prof"]).arg(root.join("examples/mini/main.lm")).arg("-o").arg(&exe).output().unwrap();
-    assert!(out.status.success(), "building mini --jit-stencils --vm-prof failed:\n{}", String::from_utf8_lossy(&out.stderr));
+    let exe = mini(&["--release", "--jit-stencils", "--vm-prof"], &[]);
     let script = dir.join("loop.lua");
     std::fs::write(&script, "local function f(n)\n  local s = 0\n  for i = 1, n do s = s + i end\n  return s\nend\nprint(f(60000000))\n").unwrap();
     let out = program(&exe).arg(&script).envs([("LOIMI_JIT", "1"), ("LOIMI_JIT_HOT", "1"), ("LOIMI_PROF_HZ", "4000")]).output().unwrap();
@@ -539,7 +714,7 @@ fn mini_traces_sides() {
     // (traces of this script alone: the bounded profiling build of
     // mini_traces may leave its loops out)
     let sides = root.join("examples/mini/tests/trace_sides.mini");
-    let bs = build_traces("sides", &root.join("examples/mini/main.lm"), std::slice::from_ref(&sides), &[("LOIMI_JIT_HOT", "2")]);
+    let bs = build_traces_with("sides", &root.join("examples/mini/main.lm"), std::slice::from_ref(&sides), &[("LOIMI_JIT_HOT", "2")], false);
     let mut out = program(&bs.forced).arg(&sides).envs(env.iter().copied()).env("LOIMI_JIT_STATS", "1").output().unwrap();
     for _ in 0..3 {
         // (the JIT's code region cannot always be mapped under the memory
@@ -727,20 +902,41 @@ impl TraceBuilds {
 
 /// Records `inputs` with a `--jit-stencils` build of `src` (run with
 /// `env`), builds the profiling binary (`--trace-regions`), profiles the
-/// inputs, and builds the trace binaries (`TraceBuilds`).
+/// inputs, and builds the trace binaries (`TraceBuilds`). The JIT build
+/// is shared (`build`); the runs go side by side (`par_map`), and so do
+/// the two trace builds.
 fn build_traces(tag: &str, src: &Path, inputs: &[PathBuf], env: &[(&str, &str)]) -> TraceBuilds {
+    build_traces_with(tag, src, inputs, env, true)
+}
+
+/// `build_traces`, with the `normal` build only if `with_normal` (else its
+/// path is empty).
+fn build_traces_with(tag: &str, src: &Path, inputs: &[PathBuf], env: &[(&str, &str)], with_normal: bool) -> TraceBuilds {
     let dir = std::env::temp_dir().join(format!("loimi-traces-{}-{}", tag, std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let build = |name: &str, flags: &[String], benv: &[(&str, &str)]| -> PathBuf {
+    let build_in = |name: &str, flags: &[String], benv: &[(&str, &str)]| -> PathBuf {
         let exe = dir.join(name);
-        let out = loimi().envs(benv.iter().copied()).arg("build").args(["-W", "error", "--release", "--jit-stencils"]).args(flags).arg(src).arg("-o").arg(&exe).output().unwrap();
+        let _slot = BuildSlot::take();
+        let start = std::time::Instant::now();
+        let out = loimi()
+            .env("LOIMI_BRANCH_ALIGN", branch_align())
+            .envs(benv.iter().copied())
+            .arg("build")
+            .args(["-W", "error", "--release", "--jit-stencils"])
+            .args(flags)
+            .arg(src)
+            .arg("-o")
+            .arg(&exe)
+            .output()
+            .unwrap();
+        eprintln!("build {} {}: {:.1} s", tag, name, start.elapsed().as_secs_f64());
         assert!(out.status.success(), "building {} {} failed:\n{}", tag, name, String::from_utf8_lossy(&out.stderr));
         exe
     };
     // one run per input, its output file named by `var`; the files joined
     let run_all = |exe: &Path, var: &str, ext: &str| -> PathBuf {
-        let mut all = String::new();
-        for (i, f) in inputs.iter().enumerate() {
+        let numbered: Vec<(usize, &PathBuf)> = inputs.iter().enumerate().collect();
+        let texts = par_map(&numbered, |(i, f)| {
             let file = dir.join(format!("{}.{}", i, ext));
             // (again when the JIT compiled nothing, which leaves no file:
             // under the memory cap its code region cannot always be mapped,
@@ -754,26 +950,27 @@ fn build_traces(tag: &str, src: &Path, inputs: &[PathBuf], env: &[(&str, &str)])
                     break;
                 }
             }
-            all.push_str(&text.unwrap_or_default());
-        }
+            text.unwrap_or_default()
+        });
         let p = dir.join(format!("all.{}", ext));
-        std::fs::write(&p, all).unwrap();
+        std::fs::write(&p, texts.concat()).unwrap();
         p
     };
-    let jit = build("jit", &[], &[]);
+    let jit = build(src, &["--release", "--jit-stencils"], &[]);
     let rec = run_all(&jit, "LOIMI_TRACE_RECORD", "rec");
     // (a bounded profiling build: LLVM takes minutes and gigabytes on a
     // few hundred regions)
-    let reg = build("regions", &[format!("--trace-regions={}", rec.display())], &[("LOIMI_TRACE_MAXTOTAL", "400000")]);
+    let reg = build_in("regions", &[format!("--trace-regions={}", rec.display())], &[("LOIMI_TRACE_MAXTOTAL", "400000")]);
     let prof = run_all(&reg, "LOIMI_TRACE_PROFILE", "prof");
+    let _ = std::fs::remove_file(&reg);
     let tflag = [format!("--traces={}", prof.display())];
     // (calls inlined whatever their callees call, which the default
     // declines for speed: collections inside inlined frames)
-    let normal = build("traces", &tflag, &[("LOIMI_TRACE_MIN", "1"), ("LOIMI_TRACE_INLINE_WRITERS", "1")]);
-    let forced = build("traces-forced", &tflag, &[("LOIMI_TRACE_MIN", "1"), ("LOIMI_TRACE_INLINE_WRITERS", "1"), ("LOIMI_TRACE_MINFRAC", "0.5"), ("LOIMI_TRACE_CHECK", "1")]);
-    for p in [&jit, &reg] {
-        let _ = std::fs::remove_file(p);
-    }
+    let (normal, forced) = std::thread::scope(|s| {
+        let normal = s.spawn(|| if with_normal { build_in("traces", &tflag, &[("LOIMI_TRACE_MIN", "1"), ("LOIMI_TRACE_INLINE_WRITERS", "1")]) } else { PathBuf::new() });
+        let forced = build_in("traces-forced", &tflag, &[("LOIMI_TRACE_MIN", "1"), ("LOIMI_TRACE_INLINE_WRITERS", "1"), ("LOIMI_TRACE_MINFRAC", "0.5"), ("LOIMI_TRACE_CHECK", "1")]);
+        (normal.join().unwrap(), forced)
+    });
     TraceBuilds { dir, normal, forced }
 }
 
@@ -784,7 +981,7 @@ fn build_traces(tag: &str, src: &Path, inputs: &[PathBuf], env: &[(&str, &str)])
 /// the vm (sort comparators, coroutines) without the debugger.
 #[test]
 fn mini_debugger() {
-    if cross() {
+    if cross() || fast_skip("mini_debugger") {
         return;
     }
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -793,17 +990,10 @@ fn mini_debugger() {
         std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.extension().is_some_and(|x| x == "mini")).collect();
     tests.sort();
     assert!(!tests.is_empty());
-    let mut failures = Vec::new();
-    for mode in ["tailcall", "goto", "switch"] {
-        let exe = std::env::temp_dir().join(format!("loimi-mini-debug-{}-{}", std::process::id(), mode));
-        let out = loimi()
-            .args(["build", "-W", "error", "--cfg", "debug", &format!("--dispatch={mode}")])
-            .arg(root.join("examples/mini/main.lm"))
-            .arg("-o")
-            .arg(&exe)
-            .output()
-            .unwrap();
-        assert!(out.status.success(), "building mini --cfg debug ({mode}) failed:\n{}", String::from_utf8_lossy(&out.stderr));
+    let modes = ["--dispatch=tailcall", "--dispatch=goto", "--dispatch=switch"];
+    let mut failures: Vec<String> = par_map(&modes, |mode| {
+        let exe = mini(&["--cfg", "debug", mode], &[]);
+        let mut failures = Vec::new();
         for t in &tests {
             let cmds = std::fs::File::open(t.with_extension("cmds")).unwrap();
             let want = std::fs::read_to_string(t.with_extension("out")).unwrap();
@@ -817,12 +1007,12 @@ fn mini_debugger() {
                 ));
             }
         }
-        let _ = std::fs::remove_file(&exe);
-    }
-    if !failures.is_empty() {
-        panic!("{} failure(s):\n\n{}", failures.len(), failures.join("\n\n"));
-    }
-    mini_scripts_with(&["--cfg", "debug"], &[], |name| ["sort", "coroutine", "functions", "closures"].iter().any(|p| name.starts_with(p)));
+        failures
+    })
+    .concat();
+    let exe = mini(&["--cfg", "debug", "--dispatch=tailcall"], &[]);
+    failures.extend(mini_scripts_on(&exe, "--cfg debug", &[], &|name| ["sort", "coroutine", "functions", "closures"].iter().any(|p| name.starts_with(p))));
+    check_failures(failures);
 }
 
 /// Re-entry (table.sort's comparator runs as a nested run of the
@@ -832,10 +1022,17 @@ fn mini_debugger() {
 /// conformance test (each in every GC mode).
 #[test]
 fn mini_reentry_dispatch_modes() {
-    for mode in ["--dispatch=goto", "--dispatch=switch"] {
-        mini_scripts_with(&[mode], &[], |name| ["sort", "err_sort", "coroutine", "err_coroutine"].iter().any(|p| name.starts_with(p)));
-        mini_conformance_with(&[mode], &[], |name| name.starts_with("coroutine"));
+    if fast_skip("mini_reentry_dispatch_modes") {
+        return;
     }
+    let modes = ["--dispatch=goto", "--dispatch=switch"];
+    let failures = par_map(&modes, |mode| {
+        let exe = mini(&[mode], &[]);
+        let mut f = mini_scripts_on(&exe, mode, &[], &|name| ["sort", "err_sort", "coroutine", "err_coroutine"].iter().any(|p| name.starts_with(p)));
+        f.extend(mini_conformance_on(&exe, &[], &|name| name.starts_with("coroutine")));
+        f
+    });
+    check_failures(failures.concat());
 }
 
 /// AArch64 Linux under qemu user-mode, when the cross toolchain is
@@ -848,7 +1045,9 @@ fn mini_reentry_dispatch_modes() {
 /// throw, with GC stress and barrier verification; and Stak's suite
 /// (examples/stack/check.sh: every dispatch mode, GC stress). The whole
 /// suite runs cross-compiled with `LOIMI_TARGET` (see `cross`).
+/// Heavy tier: qemu runs every program about 10x slower.
 #[test]
+#[ignore = "heavy tier (qemu): cargo test --release -- --include-ignored"]
 fn aarch64_qemu() {
     if cross() {
         return;
@@ -914,26 +1113,45 @@ fn target_tag(env: &[(&str, &str)]) -> String {
     env.iter().find(|(k, _)| *k == "LOIMI_TARGET").map(|(_, v)| format!("-{}", v)).unwrap_or_default()
 }
 
-/// The Mini scripts that `select` picks, with Mini built with `flags`.
-/// `env` is the environment of the build and of the scripts' runs
-/// (`LOIMI_TARGET`, `LOIMI_SYSROOT` and `LOIMI_RUNNER` cross-compile).
-fn mini_scripts_with(flags: &[&str], env: &[(&str, &str)], select: impl Fn(&str) -> bool) {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let exe = std::env::temp_dir().join(format!("loimi-mini-{}{}{}", std::process::id(), flags.join("").replace(['-', '='], ""), target_tag(env)));
-    let out = loimi().envs(env.iter().copied()).arg("build").args(["-W", "error"]).args(flags).arg(root.join("examples/mini/main.lm")).arg("-o").arg(&exe).output().unwrap();
-    assert!(out.status.success(), "building mini {:?} failed:\n{}", flags, String::from_utf8_lossy(&out.stderr));
-    let failures = mini_scripts_on(&exe, &flags.join(" "), env, &select);
-    let _ = std::fs::remove_file(&exe);
+/// The part of `env` that a build reads (the target, sysroot and CPU),
+/// so that builds whose runs differ in environment are shared.
+fn build_env<'a>(env: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
+    env.iter().copied().filter(|(k, _)| ["LOIMI_TARGET", "LOIMI_SYSROOT", "LOIMI_CPU", "LOIMI_BRANCH_ALIGN"].contains(k)).collect()
+}
+
+/// Mini (examples/mini/main.lm) built with `flags` in `env` (`build_env`), shared.
+fn mini(flags: &[&str], env: &[(&str, &str)]) -> PathBuf {
+    build(&Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/mini/main.lm"), flags, &build_env(env))
+}
+
+/// Panics with `failures` if there are any.
+fn check_failures(failures: Vec<String>) {
     if !failures.is_empty() {
         panic!("{} failure(s):\n\n{}", failures.len(), failures.join("\n\n"));
     }
 }
 
+/// The Mini scripts that `select` picks, with Mini built with `flags`.
+/// `env` is the environment of the build and of the scripts' runs
+/// (`LOIMI_TARGET`, `LOIMI_SYSROOT` and `LOIMI_RUNNER` cross-compile).
+fn mini_scripts_with(flags: &[&str], env: &[(&str, &str)], select: impl Fn(&str) -> bool + Sync) {
+    check_failures(mini_scripts_on(&mini(flags, env), &flags.join(" "), env, &select));
+}
+
+/// `(program, GC mode)` for each of `programs` in each of `modes`.
+fn with_modes<'a>(programs: &[PathBuf], modes: &[&'a str]) -> Vec<(PathBuf, &'a str)> {
+    programs.iter().flat_map(|p| modes.iter().map(move |m| (p.clone(), *m))).collect()
+}
+
 /// The Mini scripts that `select` picks, run by the Mini `exe` (named
 /// `what` in failures) in `env` in every GC mode: the failures.
-fn mini_scripts_on(exe: &Path, what: &str, env: &[(&str, &str)], select: &dyn Fn(&str) -> bool) -> Vec<String> {
+fn mini_scripts_on(exe: &Path, what: &str, env: &[(&str, &str)], select: &(dyn Fn(&str) -> bool + Sync)) -> Vec<String> {
+    mini_scripts_in_modes(exe, what, env, select, &GC_MODES)
+}
+
+/// `mini_scripts_on` in the GC modes `modes` (of `GC_MODES`).
+fn mini_scripts_in_modes(exe: &Path, what: &str, env: &[(&str, &str)], select: &(dyn Fn(&str) -> bool + Sync), modes: &[&str]) -> Vec<String> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut failures = Vec::new();
     let mut scripts: Vec<PathBuf> = std::fs::read_dir(root.join("examples/mini/tests"))
         .unwrap()
         .filter_map(|e| e.ok().map(|e| e.path()))
@@ -941,8 +1159,10 @@ fn mini_scripts_on(exe: &Path, what: &str, env: &[(&str, &str)], select: &dyn Fn
         .collect();
     scripts.sort();
     assert!(!scripts.is_empty());
-    for f in scripts {
-        let text = std::fs::read_to_string(&f).unwrap();
+    let runner = runner_in(env);
+    par_map(&with_modes(&scripts, modes), |(f, mode)| {
+        let mut failures = Vec::new();
+        let text = std::fs::read_to_string(f).unwrap();
         let lua_directives = |key: &str| -> Vec<String> {
             let pat = format!("-- {}:", key);
             text.lines()
@@ -952,61 +1172,52 @@ fn mini_scripts_on(exe: &Path, what: &str, env: &[(&str, &str)], select: &dyn Fn
         let expect = lua_directives("expect");
         let exit: i32 = lua_directives("expect-exit").first().map(|s| s.trim().parse().unwrap()).unwrap_or(0);
         let stderr_want = lua_directives("expect-stderr");
-        for mode in GC_MODES {
-            let mut cmd = program_under(&runner_in(env), &exe);
-            cmd.arg(&f);
-            cmd.envs(env.iter().copied());
-            if !mode.is_empty() {
-                cmd.arg(mode);
-            }
-            let out = cmd.output().unwrap();
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let name = format!("{}{} {}", f.file_name().unwrap().to_string_lossy(), gc_mode_name(mode), what);
-            let got: Vec<&str> = stdout.lines().collect();
-            if got != expect.iter().map(|s| s.as_str()).collect::<Vec<_>>() {
-                failures.push(format!("{}: stdout mismatch\n--- expected\n{}\n--- got\n{}\n--- stderr\n{}", name, expect.join("\n"), stdout, stderr));
-                continue;
-            }
-            if out.status.code() != Some(exit) {
-                failures.push(format!("{}: exit {:?}, expected {}\n{}", name, out.status.code(), exit, stderr));
-            }
-            for s in &stderr_want {
-                if !stderr.contains(s.as_str()) {
-                    failures.push(format!("{}: stderr lacks `{}`:\n{}", name, s, stderr));
-                }
+        let mut cmd = program_under(&runner, exe);
+        cmd.arg(f);
+        cmd.envs(env.iter().copied());
+        if !mode.is_empty() {
+            cmd.arg(mode);
+        }
+        let out = cmd.output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let name = format!("{}{} {}", f.file_name().unwrap().to_string_lossy(), gc_mode_name(mode), what);
+        let got: Vec<&str> = stdout.lines().collect();
+        if got != expect.iter().map(|s| s.as_str()).collect::<Vec<_>>() {
+            failures.push(format!("{}: stdout mismatch\n--- expected\n{}\n--- got\n{}\n--- stderr\n{}", name, expect.join("\n"), stdout, stderr));
+            return failures;
+        }
+        if out.status.code() != Some(exit) {
+            failures.push(format!("{}: exit {:?}, expected {}\n{}", name, out.status.code(), exit, stderr));
+        }
+        for s in &stderr_want {
+            if !stderr.contains(s.as_str()) {
+                failures.push(format!("{}: stderr lacks `{}`:\n{}", name, s, stderr));
             }
         }
-    }
-    failures
+        failures
+    })
+    .concat()
 }
 
 /// The clean-room conformance tests (examples/mini/tests/conformance):
 /// NAME.lua must print exactly NAME.expected (output of real Lua 5.4).
 /// err_*.lua must also exit with a nonzero status; their .expected holds
-/// the output before the error. Run normally and with GC stress.
+/// the output before the error. Run in every GC mode, by the same Mini
+/// as `mini_scripts` (built with the branch padding).
 #[test]
 fn mini_conformance() {
-    mini_conformance_with(&[], &[], |_| true);
-}
-
-/// The conformance scripts whose name `select` picks, with Mini built
-/// with `flags` and run in `env`.
-fn mini_conformance_with(flags: &[&str], env: &[(&str, &str)], select: impl Fn(&str) -> bool) {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let exe = std::env::temp_dir().join(format!("loimi-mini-conf-{}{}", std::process::id(), flags.join("").replace(['-', '='], "")));
-    let out = loimi().arg("build").args(["-W", "error"]).args(flags).arg(root.join("examples/mini/main.lm")).arg("-o").arg(&exe).output().unwrap();
-    assert!(out.status.success(), "building mini failed:\n{}", String::from_utf8_lossy(&out.stderr));
-    let failures = mini_conformance_on(&exe, env, &select);
-    let _ = std::fs::remove_file(&exe);
-    if !failures.is_empty() {
-        panic!("{} failure(s):\n\n{}", failures.len(), failures.join("\n\n"));
-    }
+    check_failures(mini_conformance_on(&mini(&[], &[("LOIMI_BRANCH_ALIGN", "1")]), &[], &|_| true));
 }
 
 /// The conformance scripts `select` picks, run by the Mini `exe` in
 /// `env` in every GC mode: the failures.
-fn mini_conformance_on(exe: &Path, env: &[(&str, &str)], select: &dyn Fn(&str) -> bool) -> Vec<String> {
+fn mini_conformance_on(exe: &Path, env: &[(&str, &str)], select: &(dyn Fn(&str) -> bool + Sync)) -> Vec<String> {
+    mini_conformance_in_modes(exe, env, select, &GC_MODES)
+}
+
+/// `mini_conformance_on` in the GC modes `modes`.
+fn mini_conformance_in_modes(exe: &Path, env: &[(&str, &str)], select: &(dyn Fn(&str) -> bool + Sync), modes: &[&str]) -> Vec<String> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let dir = root.join("examples/mini/tests/conformance");
     let mut scripts: Vec<PathBuf> = std::fs::read_dir(&dir)
@@ -1015,42 +1226,41 @@ fn mini_conformance_on(exe: &Path, env: &[(&str, &str)], select: &dyn Fn(&str) -
         .filter(|p| p.extension().is_some_and(|x| x == "lua") && select(&p.file_name().unwrap().to_string_lossy()))
         .collect();
     scripts.sort();
-    let mut failures = Vec::new();
-    let mut ran = 0;
-    for f in scripts {
+    assert!(!scripts.is_empty());
+    par_map(&with_modes(&scripts, modes), |(f, mode)| {
         let stem = f.file_stem().unwrap().to_string_lossy().to_string();
-        ran += 1;
         let expected = std::fs::read_to_string(f.with_extension("expected")).unwrap();
         let should_fail = stem.starts_with("err_");
-        for mode in GC_MODES {
-            let mut cmd = program(&exe);
-            cmd.arg(&f);
-            cmd.envs(env.iter().copied());
-            if !mode.is_empty() {
-                cmd.arg(mode);
-            }
-            let out = cmd.output().unwrap();
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let name = format!("{}{}", stem, gc_mode_name(mode));
-            if stdout != expected {
-                failures.push(format!("{}: stdout mismatch\n--- expected\n{}--- got\n{}--- stderr\n{}", name, expected, stdout, stderr));
-                continue;
-            }
-            if should_fail == out.status.success() {
-                failures.push(format!("{}: exit {:?}, expected {}\n{}", name, out.status.code(), if should_fail { "nonzero" } else { "0" }, stderr));
-            }
+        let mut cmd = program(exe);
+        cmd.arg(f);
+        cmd.envs(env.iter().copied());
+        if !mode.is_empty() {
+            cmd.arg(mode);
         }
-    }
-    assert!(ran > 0);
-    failures
+        let out = cmd.output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let name = format!("{}{}", stem, gc_mode_name(mode));
+        if stdout != expected {
+            return vec![format!("{}: stdout mismatch\n--- expected\n{}--- got\n{}--- stderr\n{}", name, expected, stdout, stderr)];
+        }
+        if should_fail == out.status.success() {
+            return vec![format!("{}: exit {:?}, expected {}\n{}", name, out.status.code(), if should_fail { "nonzero" } else { "0" }, stderr)];
+        }
+        vec![]
+    })
+    .concat()
 }
 
 /// The Scheme interpreter (examples/scheme): run every program in
-/// examples/scheme/tests normally and with GC stress, comparing with
-/// `; expect:` lines (and `; expect-exit:` / `; expect-stderr:`).
+/// examples/scheme/tests normally, with GC stress and in verify mode,
+/// comparing with `; expect:` lines (and `; expect-exit:` /
+/// `; expect-stderr:`).
 #[test]
 fn scheme_programs() {
+    if fast_skip("scheme_programs") {
+        return;
+    }
     scheme_programs_with(&[], &[]);
 }
 
@@ -1059,23 +1269,24 @@ fn scheme_programs() {
 #[test]
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 fn scheme_jit_stencils() {
-    if cross() {
+    if cross() || fast_skip("scheme_jit_stencils") {
         return;
     }
-    scheme_programs_with(&["--jit-stencils"], &[("LOIMI_JIT", "1"), ("LOIMI_JIT_HOT", "1")]);
-    scheme_programs_with(&["--jit-stencils"], &[("LOIMI_JIT", "1"), ("LOIMI_JIT_HOT", "1"), ("LOIMI_JIT_RECOMPILE", "1")]);
+    let exe = scheme(&["--jit-stencils"]);
+    let mut failures = scheme_programs_on(&exe, "--jit-stencils", &[("LOIMI_JIT", "1"), ("LOIMI_JIT_HOT", "1")]);
+    failures.extend(scheme_programs_on(&exe, "--jit-stencils, no recompiles", &[("LOIMI_JIT", "1"), ("LOIMI_JIT_HOT", "1"), ("LOIMI_JIT_RECOMPILE", "1")]));
+    check_failures(failures);
+}
+
+/// The Scheme interpreter built (`--release`) with `flags`, shared.
+fn scheme(flags: &[&str]) -> PathBuf {
+    let mut f = vec!["--release"];
+    f.extend(flags);
+    build(&Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/scheme/main.lm"), &f, &[])
 }
 
 fn scheme_programs_with(flags: &[&str], env: &[(&str, &str)]) {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let exe = std::env::temp_dir().join(format!("loimi-scheme-{}{}", std::process::id(), flags.join("").replace(['-', '='], "")));
-    let out = loimi().arg("build").args(["-W", "error"]).args(flags).arg(root.join("examples/scheme/main.lm")).arg("--release").arg("-o").arg(&exe).output().unwrap();
-    assert!(out.status.success(), "building scheme {:?} failed:\n{}", flags, String::from_utf8_lossy(&out.stderr));
-    let failures = scheme_programs_on(&exe, &flags.join(" "), env);
-    let _ = std::fs::remove_file(&exe);
-    if !failures.is_empty() {
-        panic!("{} failure(s):\n\n{}", failures.len(), failures.join("\n\n"));
-    }
+    check_failures(scheme_programs_on(&scheme(flags), &flags.join(" "), env));
 }
 
 /// examples/scheme/tests/*.scm, sorted.
@@ -1093,9 +1304,14 @@ fn scheme_tests() -> Vec<PathBuf> {
 /// Every Scheme test program run by `exe` (with `env`) in every GC mode;
 /// returns the failures.
 fn scheme_programs_on(exe: &Path, label: &str, env: &[(&str, &str)]) -> Vec<String> {
-    let mut failures = Vec::new();
-    for f in scheme_tests() {
-        let text = std::fs::read_to_string(&f).unwrap();
+    scheme_programs_in_modes(exe, label, env, &GC_MODES)
+}
+
+/// `scheme_programs_on` in the GC modes `modes`.
+fn scheme_programs_in_modes(exe: &Path, label: &str, env: &[(&str, &str)], modes: &[&str]) -> Vec<String> {
+    par_map(&with_modes(&scheme_tests(), modes), |(f, mode)| {
+        let mut failures = Vec::new();
+        let text = std::fs::read_to_string(f).unwrap();
         let scm_directives = |key: &str| -> Vec<String> {
             let pat = format!("; {}:", key);
             text.lines()
@@ -1105,33 +1321,32 @@ fn scheme_programs_on(exe: &Path, label: &str, env: &[(&str, &str)]) -> Vec<Stri
         let expect = scm_directives("expect");
         let exit: i32 = scm_directives("expect-exit").first().map(|s| s.trim().parse().unwrap()).unwrap_or(0);
         let stderr_want = scm_directives("expect-stderr");
-        for mode in GC_MODES {
-            let mut cmd = program(&exe);
-            cmd.arg(&f);
-            cmd.envs(env.iter().copied());
-            if !mode.is_empty() {
-                cmd.arg(mode);
-            }
-            let out = cmd.output().unwrap();
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let name = format!("{}{} {}", f.file_name().unwrap().to_string_lossy(), gc_mode_name(mode), label);
-            let got: Vec<&str> = stdout.lines().collect();
-            if got != expect.iter().map(|s| s.as_str()).collect::<Vec<_>>() {
-                failures.push(format!("{}: stdout mismatch\n--- expected\n{}\n--- got\n{}\n--- stderr\n{}", name, expect.join("\n"), stdout, stderr));
-                continue;
-            }
-            if out.status.code() != Some(exit) {
-                failures.push(format!("{}: exit {:?}, expected {}\n{}", name, out.status.code(), exit, stderr));
-            }
-            for s in &stderr_want {
-                if !stderr.contains(s.as_str()) {
-                    failures.push(format!("{}: stderr lacks `{}`:\n{}", name, s, stderr));
-                }
+        let mut cmd = program(exe);
+        cmd.arg(f);
+        cmd.envs(env.iter().copied());
+        if !mode.is_empty() {
+            cmd.arg(mode);
+        }
+        let out = cmd.output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let name = format!("{}{} {}", f.file_name().unwrap().to_string_lossy(), gc_mode_name(mode), label);
+        let got: Vec<&str> = stdout.lines().collect();
+        if got != expect.iter().map(|s| s.as_str()).collect::<Vec<_>>() {
+            failures.push(format!("{}: stdout mismatch\n--- expected\n{}\n--- got\n{}\n--- stderr\n{}", name, expect.join("\n"), stdout, stderr));
+            return failures;
+        }
+        if out.status.code() != Some(exit) {
+            failures.push(format!("{}: exit {:?}, expected {}\n{}", name, out.status.code(), exit, stderr));
+        }
+        for s in &stderr_want {
+            if !stderr.contains(s.as_str()) {
+                failures.push(format!("{}: stderr lacks `{}`:\n{}", name, s, stderr));
             }
         }
-    }
-    failures
+        failures
+    })
+    .concat()
 }
 
 /// Ahead-of-time traces of the Scheme interpreter (as `mini_traces`;
@@ -1142,7 +1357,7 @@ fn scheme_programs_on(exe: &Path, label: &str, env: &[(&str, &str)]) -> Vec<Stri
 #[test]
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 fn scheme_traces() {
-    if cross() {
+    if cross() || fast_skip("scheme_traces") {
         return;
     }
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -1163,38 +1378,41 @@ fn scheme_traces() {
     let env1 = [("LOIMI_JIT", "1"), ("LOIMI_JIT_HOT", "2"), ("LOIMI_TRACE_FAILS", "1")];
     failures.extend(scheme_programs_on(&bt.forced, "traces, guards failing, blacklisting at once", &env1));
     bt.cleanup();
-    assert!(failures.is_empty(), "{} failure(s):\n\n{}", failures.len(), failures.join("\n\n"));
+    check_failures(failures);
 }
 
 /// The MiniJS interpreter (examples/minijs): every NAME.js in
 /// examples/minijs/tests and examples/minijs/tests/conformance must print
 /// exactly NAME.expected (node's output). err_*.js must also exit with a
 /// nonzero status; their .expected holds the output before the uncaught
-/// exception. Run normally and with GC stress.
+/// exception. Run normally, with GC stress and in verify mode.
 #[test]
 fn minijs_programs() {
+    if fast_skip("minijs_programs") {
+        return;
+    }
     minijs_programs_with(&[], &[]);
 }
 
 /// The MiniJS interpreter with the copy-and-patch JIT forced on (as
-/// `mini_jit_stencils`).
+/// `mini_jit_stencils`); then rewrites of compiled code without
+/// recompiles: out-of-line copies, retargets, and sites left to the
+/// interpreter.
 #[test]
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 fn minijs_jit_stencils() {
-    if cross() {
+    if cross() || fast_skip("minijs_jit_stencils") {
         return;
     }
     minijs_programs_with(&["--jit-stencils"], &[("LOIMI_JIT", "1"), ("LOIMI_JIT_HOT", "1")]);
-    // Rewrites of compiled code without recompiles: out-of-line copies,
-    // retargets, and sites left to the interpreter.
     minijs_programs_with(&["--jit-stencils"], &[("LOIMI_JIT", "1"), ("LOIMI_JIT_HOT", "1"), ("LOIMI_JIT_RECOMPILE", "1")]);
 }
 
 fn minijs_programs_with(flags: &[&str], env: &[(&str, &str)]) {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let exe = std::env::temp_dir().join(format!("loimi-minijs-{}{}", std::process::id(), flags.join("").replace(['-', '='], "")));
-    let out = loimi().arg("build").args(["-W", "error"]).args(flags).arg(root.join("examples/minijs/main.lm")).arg("--release").arg("-o").arg(&exe).output().unwrap();
-    assert!(out.status.success(), "building minijs {:?} failed:\n{}", flags, String::from_utf8_lossy(&out.stderr));
+    let mut f = vec!["--release"];
+    f.extend(flags);
+    let exe = build(&root.join("examples/minijs/main.lm"), &f, &[]);
     let mut programs: Vec<PathBuf> = Vec::new();
     for dir in ["examples/minijs/tests", "examples/minijs/tests/conformance"] {
         programs.extend(
@@ -1205,40 +1423,34 @@ fn minijs_programs_with(flags: &[&str], env: &[(&str, &str)]) {
         );
     }
     programs.sort();
-    let mut failures = Vec::new();
-    for f in &programs {
+    assert!(programs.len() > 50);
+    let failures = par_map(&with_modes(&programs, &GC_MODES), |(f, mode)| {
         let stem = f.file_stem().unwrap().to_string_lossy().to_string();
         let expected = std::fs::read(f.with_extension("expected")).unwrap();
         let should_fail = stem.starts_with("err_");
-        for mode in GC_MODES {
-            let mut cmd = program(&exe);
-            cmd.arg(f);
-            cmd.envs(env.iter().copied());
-            if !mode.is_empty() {
-                cmd.arg(mode);
-            }
-            let out = cmd.output().unwrap();
-            let name = format!("{}{} {}", stem, gc_mode_name(mode), flags.join(" "));
-            if out.stdout != expected {
-                failures.push(format!(
-                    "{}: stdout mismatch\n--- expected\n{}--- got\n{}--- stderr\n{}",
-                    name,
-                    String::from_utf8_lossy(&expected),
-                    String::from_utf8_lossy(&out.stdout),
-                    String::from_utf8_lossy(&out.stderr)
-                ));
-                continue;
-            }
-            if should_fail == out.status.success() {
-                failures.push(format!("{}: exit {:?}, expected {}\n{}", name, out.status.code(), if should_fail { "nonzero" } else { "0" }, String::from_utf8_lossy(&out.stderr)));
-            }
+        let mut cmd = program(&exe);
+        cmd.arg(f);
+        cmd.envs(env.iter().copied());
+        if !mode.is_empty() {
+            cmd.arg(mode);
         }
-    }
-    let _ = std::fs::remove_file(&exe);
-    assert!(programs.len() > 50);
-    if !failures.is_empty() {
-        panic!("{} failure(s):\n\n{}", failures.len(), failures.join("\n\n"));
-    }
+        let out = cmd.output().unwrap();
+        let name = format!("{}{} {} {:?}", stem, gc_mode_name(mode), flags.join(" "), env);
+        if out.stdout != expected {
+            return vec![format!(
+                "{}: stdout mismatch\n--- expected\n{}--- got\n{}--- stderr\n{}",
+                name,
+                String::from_utf8_lossy(&expected),
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            )];
+        }
+        if should_fail == out.status.success() {
+            return vec![format!("{}: exit {:?}, expected {}\n{}", name, out.status.code(), if should_fail { "nonzero" } else { "0" }, String::from_utf8_lossy(&out.stderr))];
+        }
+        vec![]
+    });
+    check_failures(failures.concat());
 }
 
 /// The Lox VM (examples/lox): every tests/NAME.lox prints its
@@ -1249,9 +1461,7 @@ fn minijs_programs_with(flags: &[&str], env: &[(&str, &str)]) {
 #[test]
 fn lox_programs() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let exe = std::env::temp_dir().join(format!("loimi-lox-{}", std::process::id()));
-    let out = loimi().arg("build").args(["-W", "error"]).arg(root.join("examples/lox/main.lm")).arg("--release").arg("-o").arg(&exe).output().unwrap();
-    assert!(out.status.success(), "building lox failed:\n{}", String::from_utf8_lossy(&out.stderr));
+    let exe = build(&root.join("examples/lox/main.lm"), &["--release"], &[]);
     let mut programs: Vec<PathBuf> = std::fs::read_dir(root.join("examples/lox/tests"))
         .unwrap()
         .filter_map(|e| e.ok().map(|e| e.path()))
@@ -1288,7 +1498,6 @@ fn lox_programs() {
             }
         }
     }
-    let _ = std::fs::remove_file(&exe);
     assert!(programs.len() >= 5);
     if !failures.is_empty() {
         panic!("{} failure(s):\n\n{}", failures.len(), failures.join("\n\n"));
@@ -1319,6 +1528,7 @@ fn stack_programs() {
         .arg(root.join("examples/stack/check.sh"))
         .env("LOIMI", env!("CARGO_BIN_EXE_loimi"))
         .env("LOIMI_STD", root)
+        .env("LOIMI_BRANCH_ALIGN", branch_align())
         .output()
         .unwrap();
     assert!(
@@ -1341,6 +1551,7 @@ fn prolog_programs() {
         .arg("-q")
         .env("LOIMI", env!("CARGO_BIN_EXE_loimi"))
         .env("LOIMI_STD", root)
+        .env("LOIMI_BRANCH_ALIGN", branch_align())
         .output()
         .unwrap();
     assert!(
@@ -1366,6 +1577,7 @@ fn prolog_jit_stencils() {
         .arg("-j")
         .env("LOIMI", env!("CARGO_BIN_EXE_loimi"))
         .env("LOIMI_STD", root)
+        .env("LOIMI_BRANCH_ALIGN", branch_align())
         .output()
         .unwrap();
     assert!(
@@ -1388,6 +1600,7 @@ fn python_programs() {
         .arg("-q")
         .env("LOIMI", env!("CARGO_BIN_EXE_loimi"))
         .env("LOIMI_STD", root)
+        .env("LOIMI_BRANCH_ALIGN", branch_align())
         .output()
         .unwrap();
     assert!(
@@ -1405,7 +1618,7 @@ fn python_programs() {
 /// examples/python/tests program without the debugger.
 #[test]
 fn python_debugger() {
-    if cross() {
+    if cross() || fast_skip("python_debugger") {
         return;
     }
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -1414,17 +1627,9 @@ fn python_debugger() {
         std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.extension().is_some_and(|x| x == "py")).collect();
     tests.sort();
     assert!(!tests.is_empty());
-    let mut failures = Vec::new();
-    for mode in ["tailcall", "goto", "switch"] {
-        let exe = std::env::temp_dir().join(format!("loimi-python-debug-{}-{}", std::process::id(), mode));
-        let out = loimi()
-            .args(["build", "-W", "error", "--release", "--cfg", "debug", &format!("--dispatch={mode}")])
-            .arg(root.join("examples/python/main.lm"))
-            .arg("-o")
-            .arg(&exe)
-            .output()
-            .unwrap();
-        assert!(out.status.success(), "building python --cfg debug ({mode}) failed:\n{}", String::from_utf8_lossy(&out.stderr));
+    let failures = par_map(&["tailcall", "goto", "switch"], |mode| {
+        let mut failures = Vec::new();
+        let exe = build(&root.join("examples/python/main.lm"), &["--release", "--cfg", "debug", &format!("--dispatch={mode}")], &[]);
         for t in &tests {
             let cmds = std::fs::File::open(t.with_extension("cmds")).unwrap();
             let want = std::fs::read_to_string(t.with_extension("out")).unwrap();
@@ -1438,7 +1643,7 @@ fn python_debugger() {
                 ));
             }
         }
-        if mode == "tailcall" {
+        if *mode == "tailcall" {
             let progs = root.join("examples/python/tests");
             let mut ps: Vec<PathBuf> = std::fs::read_dir(&progs)
                 .unwrap()
@@ -1454,11 +1659,9 @@ fn python_debugger() {
                 }
             }
         }
-        let _ = std::fs::remove_file(&exe);
-    }
-    if !failures.is_empty() {
-        panic!("{} failure(s):\n\n{}", failures.len(), failures.join("\n\n"));
-    }
+        failures
+    });
+    check_failures(failures.concat());
 }
 
 /// std.bigint against Python's int (tests/bigint/diff.py): 3000 random
@@ -1505,6 +1708,7 @@ fn wasm_interpreter() {
         .arg("--fast")
         .env("LOIMI", env!("CARGO_BIN_EXE_loimi"))
         .env("LOIMI_STD", root)
+        .env("LOIMI_BRANCH_ALIGN", branch_align())
         .output()
         .unwrap();
     assert!(
@@ -1528,6 +1732,7 @@ fn regex_library() {
         .args(["--fast", "--random", "100", "--seed", "1"])
         .env("LOIMI", env!("CARGO_BIN_EXE_loimi"))
         .env("LOIMI_STD", root)
+        .env("LOIMI_BRANCH_ALIGN", branch_align())
         .env("RX_OUT", &out_dir)
         .output()
         .unwrap();
@@ -1553,6 +1758,7 @@ fn tutorial_steps() {
         .arg(root.join("examples/tutorial/check.sh"))
         .env("LOIMI", env!("CARGO_BIN_EXE_loimi"))
         .env("LOIMI_STD", root)
+        .env("LOIMI_BRANCH_ALIGN", branch_align())
         .output()
         .unwrap();
     assert!(
@@ -1741,53 +1947,59 @@ fn c_host_run(name: &str, lib: &Path, host: &Path, expected: &Path, header_golde
 
 /// `c_host_run` with extra build flags for the library (`--cfg gil`).
 fn c_host_run_with(name: &str, lib: &Path, host: &Path, expected: &Path, header_golden: Option<&Path>, extra: &[&str]) {
+    c_host_run_variants(name, lib, host, expected, header_golden, extra, &C_HOST_VARIANTS);
+}
+
+/// The library builds a C host is linked with: (name, flags).
+const C_HOST_VARIANTS: [(&str, &[&str]); 4] = [
+    ("static", &["--lib"]),
+    ("static-release", &["--lib", "--release"]),
+    ("shared", &["--shared"]),
+    ("shared-initial-exec", &["--shared", "--release", "--tls=initial-exec"]),
+];
+
+/// `c_host_run_with` for the library builds `variants` (of
+/// `C_HOST_VARIANTS`), side by side; the libraries are shared (`build`).
+fn c_host_run_variants(name: &str, lib: &Path, host: &Path, expected: &Path, header_golden: Option<&Path>, extra: &[&str], variants: &[(&str, &[&str])]) {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let dir = std::env::temp_dir().join(format!("loimi-{}-{}", name, std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let want = std::fs::read_to_string(expected).unwrap();
     let clang = std::env::var("LOIMI_CLANG").unwrap_or_else(|_| "clang-19".into());
-    let variants: [(&str, &[&str]); 4] = [
-        ("static", &["--lib"]),
-        ("static-release", &["--lib", "--release"]),
-        ("shared", &["--shared"]),
-        ("shared-initial-exec", &["--shared", "--release", "--tls=initial-exec"]),
-    ];
-    let mut failures = Vec::new();
-    for (variant, flags) in variants {
+    let failures = par_map(variants, |(variant, flags)| {
         let vdir = dir.join(variant);
         std::fs::create_dir_all(&vdir).unwrap();
         let shared = flags.contains(&"--shared");
-        let libfile = vdir.join(if shared { "liblm.so" } else { "liblm.a" });
-        let header = vdir.join(header_file(host));
-        let out = loimi().arg("build").arg(lib).args(flags).args(extra).arg("-o").arg(&libfile).arg("--header").arg(&header).output().unwrap();
-        if !out.status.success() {
-            failures.push(format!("{} {}: build failed:\n{}", name, variant, String::from_utf8_lossy(&out.stderr)));
-            continue;
-        }
+        let mut all: Vec<&str> = flags.to_vec();
+        all.extend(extra);
+        let hname = header_file(host);
+        let libfile = build_lib(lib, &all, &[], &hname);
+        let header = libfile.with_file_name(&hname);
         if let Some(g) = header_golden {
             let got = std::fs::read_to_string(&header).unwrap();
             if got != std::fs::read_to_string(g).unwrap() {
-                failures.push(format!("{} {}: header differs from {}:\n{}", name, variant, g.display(), got));
+                return vec![format!("{} {}: header differs from {}:\n{}", name, variant, g.display(), got)];
             }
         }
         let exe = vdir.join("host");
         let mut cc = cc(&clang);
-        cc.arg("-Wall").arg("-Werror").arg("-pthread").arg("-I").arg(&vdir).arg(host);
+        cc.arg("-Wall").arg("-Werror").arg("-pthread").arg("-I").arg(libfile.parent().unwrap()).arg(host);
         if shared {
-            cc.arg("-L").arg(&vdir).arg("-llm").arg(format!("-Wl,-rpath,{}", vdir.display()));
+            let stem = libfile.file_stem().unwrap().to_string_lossy().to_string();
+            let libdir = libfile.parent().unwrap();
+            cc.arg("-L").arg(libdir).arg(format!("-l{}", stem.trim_start_matches("lib"))).arg(format!("-Wl,-rpath,{}", libdir.display()));
         } else {
             cc.arg(&libfile);
         }
         let out = cc.arg("-lm").arg("-o").arg(&exe).output().unwrap();
         if !out.status.success() {
-            failures.push(format!("{} {}: compiling {} failed:\n{}", name, variant, host.display(), String::from_utf8_lossy(&out.stderr)));
-            continue;
+            return vec![format!("{} {}: compiling {} failed:\n{}", name, variant, host.display(), String::from_utf8_lossy(&out.stderr))];
         }
         let out = program(&exe).current_dir(root).output().unwrap();
         let got = String::from_utf8_lossy(&out.stdout);
         if !out.status.success() || got != want {
-            failures.push(format!(
+            return vec![format!(
                 "{} {}: exit {:?}\n--- expected\n{}--- got\n{}--- stderr\n{}",
                 name,
                 variant,
@@ -1795,13 +2007,12 @@ fn c_host_run_with(name: &str, lib: &Path, host: &Path, expected: &Path, header_
                 want,
                 got,
                 String::from_utf8_lossy(&out.stderr)
-            ));
+            )];
         }
-    }
+        vec![]
+    });
     let _ = std::fs::remove_dir_all(&dir);
-    if !failures.is_empty() {
-        panic!("{} failure(s):\n\n{}", failures.len(), failures.join("\n\n"));
-    }
+    check_failures(failures.concat());
 }
 
 /// The header a host includes: the first `#include "..."`.
@@ -2080,11 +2291,29 @@ fn mini_debug_api() {
 /// conditional, hit-counted, set while the program runs), stepping,
 /// stack traces, scopes, nested table expansion, evaluation, a pause,
 /// break on error, the program's output as events. The transcript must
-/// be examples/mini/tests/dap/session.out, in every dispatch mode.
+/// be examples/mini/tests/dap/session.out (tail-call dispatch).
 #[test]
 fn mini_dap() {
+    // (the adapter is C over the debugging API, the same in every
+    // dispatch mode; the debug hooks in each mode: `mini_debugger`, and
+    // the session in goto and switch: `mini_dap_dispatch_modes`)
+    mini_dap_in(&["tailcall"]);
+}
+
+/// `mini_dap` with the library built in the goto and switch dispatch
+/// modes (heavy tier).
+#[test]
+#[ignore = "heavy tier: cargo test --release -- --include-ignored"]
+fn mini_dap_dispatch_modes() {
+    mini_dap_in(&["goto", "switch"]);
+}
+
+fn mini_dap_in(modes: &[&str]) {
     if cross() || Command::new("python3").arg("--version").output().is_err() {
         eprintln!("mini_dap: skipped (cross-compiling, or no python3)");
+        return;
+    }
+    if fast_skip("mini_dap") {
         return;
     }
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -2094,24 +2323,18 @@ fn mini_dap() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let clang = std::env::var("LOIMI_CLANG").unwrap_or_else(|_| "clang-19".into());
-    let mut failures = Vec::new();
-    for mode in ["tailcall", "goto", "switch"] {
-        let lib = dir.join(format!("libmini-{mode}.a"));
-        let header = dir.join("mini.h");
-        let out = loimi()
-            .args(["build", "-W", "error", "--cfg", "debug", "--lib", &format!("--dispatch={mode}")])
-            .arg(root.join("examples/mini/embed.lm"))
-            .arg("-o")
-            .arg(&lib)
-            .arg("--header")
-            .arg(&header)
-            .output()
-            .unwrap();
-        assert!(out.status.success(), "building the debug library ({mode}) failed:\n{}", String::from_utf8_lossy(&out.stderr));
+    let failures = par_map(modes, |mode| {
+        // (tail-call: the library of `mini_debug_api`'s static variant)
+        let dispatch = format!("--dispatch={mode}");
+        let mut flags = vec!["--lib", "--cfg", "debug"];
+        if *mode != "tailcall" {
+            flags.push(&dispatch);
+        }
+        let lib = build_lib(&root.join("examples/mini/embed.lm"), &flags, &[], "mini.h");
         let exe = dir.join(format!("mini-dap-{mode}"));
         let out = cc(&clang)
             .args(["-Wall", "-Wextra", "-Werror", "-pthread", "-I"])
-            .arg(&dir)
+            .arg(lib.parent().unwrap())
             .arg(dap.join("mini_dap.c"))
             .arg(&lib)
             .args(["-lm", "-o"])
@@ -2122,17 +2345,16 @@ fn mini_dap() {
         let out = limited("python3").arg(dap.join("test_dap.py")).arg(&exe).output().unwrap();
         let got = String::from_utf8_lossy(&out.stdout);
         if !out.status.success() || got != want {
-            failures.push(format!(
+            return vec![format!(
                 "{mode}: transcript mismatch (exit {:?})\n--- expected\n{want}\n--- got\n{got}\n--- stderr\n{}",
                 out.status.code(),
                 String::from_utf8_lossy(&out.stderr)
-            ));
+            )];
         }
-    }
+        vec![]
+    });
     let _ = std::fs::remove_dir_all(&dir);
-    if !failures.is_empty() {
-        panic!("{} failure(s):\n\n{}", failures.len(), failures.join("\n\n"));
-    }
+    check_failures(failures.concat());
 }
 
 /// Mini built with the lock (`--cfg gil`) and run by one thread: every
@@ -2140,8 +2362,13 @@ fn mini_dap() {
 /// and calls never hand over).
 #[test]
 fn mini_gil_single_thread() {
-    mini_scripts_with(&["--cfg", "gil"], &[], |_| true);
-    mini_conformance_with(&["--cfg", "gil"], &[], |_| true);
+    if fast_skip("mini_gil_single_thread") {
+        return;
+    }
+    let exe = mini(&["--cfg", "gil"], &[]);
+    let mut failures = mini_scripts_on(&exe, "--cfg gil", &[], &|_| true);
+    failures.extend(mini_conformance_on(&exe, &[], &|_| true));
+    check_failures(failures);
 }
 
 /// The same under ThreadSanitizer: `--sanitize=thread` instruments the

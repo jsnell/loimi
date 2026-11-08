@@ -226,7 +226,9 @@ clang-19 -I. examples/embed/host.c libmini.a -lm -o host && ./host   # Mini embe
 Testing and benchmarking:
 
 ```sh
-cargo test --release                                   # everything, including the doc snippets
+LOIMI_TEST_FAST=1 cargo test --release                 # fast tier: while iterating
+cargo test --release                                   # default tier: before every merge
+cargo test --release -- --include-ignored              # heavy tier: before merging risky changes
 tests/fuzz/run.sh -t 600 vm mini                       # bytecode fuzzing under ASan
 bench/run.sh                                           # Loimi VM vs hand-written C
 bench/lua/install.sh && bench/mini/compare.py          # Mini vs PUC-Lua / LuaJIT

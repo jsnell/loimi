@@ -16,6 +16,7 @@
 # A step's NAME_test.lm files are unit tests, run with `loimi test` in
 # each dispatch mode.
 # -u rewrites the .expected files from the tailcall build's output.
+# Steps run side by side, CHECK_JOBS (default 3) at a time.
 # Run by `cargo test` (tests/golden.rs, tutorial_steps).
 
 set -u
@@ -30,10 +31,14 @@ if [ ${#STEPS[@]} -eq 0 ]; then
 fi
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
-FAIL=0
-COUNT=0
+JOBS=${CHECK_JOBS:-3}
 
-for step in "${STEPS[@]}"; do
+# One step: its messages on stdout, then a last line `COUNT n FAIL f`.
+check_step() {
+    local step=$1
+    local FAIL=0 COUNT=0
+    local TMP=$TMP/$step
+    mkdir -p "$TMP"
     dir=$ROOT/examples/tutorial/$step
     modes=(tailcall)
     if grep -qE '^(pub )?vm ' "$dir"/*.lm; then modes=(tailcall goto switch); fi
@@ -96,6 +101,22 @@ for step in "${STEPS[@]}"; do
             done
         done
     done
+    echo "COUNT $COUNT FAIL $FAIL"
+}
+
+for step in "${STEPS[@]}"; do
+    while [ "$(jobs -rp | wc -l)" -ge "$JOBS" ]; do wait -n; done
+    check_step "$step" > "$TMP/$step.log" 2>&1 &
+done
+wait
+FAIL=0
+COUNT=0
+for step in "${STEPS[@]}"; do
+    last=$(tail -1 "$TMP/$step.log")
+    sed '$d' "$TMP/$step.log"
+    read -r _ c _ f <<< "$last"
+    if [ "${c:-}" = "" ] || [ "${f:-1}" != 0 ]; then FAIL=1; fi
+    COUNT=$((COUNT + ${c:-0}))
 done
 
 if [ $FAIL = 0 ]; then echo "ok: $COUNT runs"; fi
