@@ -727,6 +727,13 @@ implementation; `git log` has the details.
 
 ### Examples
 
+- **Crammed `#[cfg]` lines unpacked and `bool as` casts**: Mini's and
+  Python's longest debug-only lines (233 and 268 characters) are one item
+  per line, Wasm's `b2i` helper is gone (`(a < b) as i32`), and 13 of
+  Python's `if b { 1 } else { 0 }` are `b as T`; `loimi ir-diff --release`
+  reports the same code (default and `--cfg debug` builds). The 6 Python
+  sites where the cast changed the optimized code (`bind_args`, `unary`,
+  one builtin) keep the `if`.
 - No `unsafe` left in the example interpreters: `f64.from_bits(a as
   u64)` on a register operand compiles to a `double` load of the slot
   ([language.md](docs/language.md), [lowering.md §2](docs/lowering.md)),

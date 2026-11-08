@@ -70,7 +70,12 @@ pub struct Ctx {
     /// The values that coroutine.yield passed, or that the return that
     /// ended a run returned (RETN; RET1 and RET0 set only `nxfer`).
     xfer: *V,
-    nxfer: u64, #[cfg(gil)] gil: *gil.Gil, #[cfg(debug)] dbg: ?*debugger.Dbg, #[cfg(debug)] pause: u32, // --cfg gil: the lock of threads sharing the state (threads.lm); --cfg debug: the debugger, when running under one (debugger.lm)
+    nxfer: u64,
+    /// --cfg gil: the lock of threads sharing the state (threads.lm).
+    #[cfg(gil)] gil: *gil.Gil,
+    /// --cfg debug: the debugger, when running under one (debugger.lm).
+    #[cfg(debug)] dbg: ?*debugger.Dbg,
+    #[cfg(debug)] pause: u32,
 }
 
 pub const HOST_NATIVE: i32 = 1000;

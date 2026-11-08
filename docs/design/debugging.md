@@ -254,9 +254,8 @@ a small but real cost in the hot loop. The option is what makes the
 default build's IR byte-identical: every Mini example, in all three
 dispatch modes, compiles to the same `--release --emit-llvm` as before
 (with std paths in panic strings normalized), and so does every other
-example. Mini's `#[cfg(debug)]` additions sit on existing lines, or at
-the end of the vm, so that a build without the debugger keeps its
-source positions in panic messages. (`#[cfg(gil)]` already did this.)
+example. `loimi ir-diff` ignores source positions, so `#[cfg(debug)]`
+additions go on lines of their own.
 
 **Compiled in.** The 14 Mini benchmarks (`bench/mini/programs`), best of
 5, interleaved, tail-call dispatch, x86-64, on a machine shared with
@@ -339,8 +338,7 @@ nested runs from natives (`sorted` keys, `next(g)`, `g.send`,
 
 **Size.** `examples/python/debugger.lm` is 554 lines of code (Mini's,
 before the editor API of section 9: 333),
-plus 25 `#[cfg(debug)]` items in the vm, compiler and `main`, on
-existing lines but for two helpers at the end of `compile.lm` (Mini: 15). The difference is display and locals, not stepping:
+plus 25 `#[cfg(debug)]` items in the vm, compiler and `main` (Mini: 15). The difference is display and locals, not stepping:
 showing values without running Python code (Python's `repr` may call
 `__repr__`, so the debugger has its own, 107 lines; Mini reuses
 `write_value`), and tracking where locals are bound (102 lines; Mini's
@@ -437,8 +435,8 @@ breakpoint and stepping parts (`on break`, the variant, `stop`,
    cleared on entry (reading a local before assignment is not detected),
    so a register may hold another call's value. Initializing them in
    debug builds would cost every call; instead the compiler reports where
-   each name is first stored in code order (`store` on the existing lines
-   that bind names), and `locals` shows a local from there on (a local
+   each name is first stored in code order (`store` next to the code
+   that binds names), and `locals` shows a local from there on (a local
    assigned later in a loop than it is read is hidden on the first part
    of the second iteration). Comprehension targets have live ranges, as
    Mini's block locals. Cells and free variables are read through their
@@ -449,19 +447,17 @@ breakpoint and stepping parts (`on break`, the variant, `stop`,
    debugger prints values without running Python code, and has no
    expression evaluation (Mini's, section 9.2, runs guest code with the
    debugger suspended).
-9. **Source positions.** The vm is not at the end of `vm.lm` (host
-   functions follow it), so `on break` and the variant had to go on the
-   existing line that closes `on raise`, to keep the default build's
-   panic messages, and IR, unchanged. A layout constraint, not a
-   missing feature.
+9. **Source positions.** `on break` and the variant sit after `on
+   raise`, each on its own lines: `loimi ir-diff` ignores source
+   positions, so the default build's code is checked unchanged even
+   though its panic messages' line numbers move.
 
 The debugger state is a module variable rather than a `Ctx` field (the
 Python `Ctx` is built with a full literal in `main`), and the bottom of
 the program's prototypes is recorded before compiling the file, to tell
 the program's code from the prelude's.
 
-Mini's debugger gained the `left` hook (one `#[cfg(debug)]` on an
-existing line); its other transcripts are the same, and its default
+Mini's debugger gained the `left` hook (one `#[cfg(debug)]` line); its other transcripts are the same, and its default
 build's IR too.
 
 ### 8.3 Cost
@@ -650,8 +646,8 @@ the program is stopped is dropped when it continues.
 ### 9.4 Break on error
 
 Mini's `on raise` gets every error at the instruction that raised it,
-with the frames intact. The hook (`debugger.on_error`, `#[cfg(debug)]`
-on the existing line) runs there for an error raised in this run (not
+with the frames intact. The hook (`debugger.on_error`, under
+`#[cfg(debug)]`) runs there for an error raised in this run (not
 one passed on from a nested run, whose own run had it first), and
 stops if nothing will catch it. Mini has no `pcall`: an error is caught
 only by `coroutine.resume` (which returns `false, msg`). So it is

@@ -1494,7 +1494,13 @@ pub vm Py {
             regs = fp.base;
             k = fp.k;
         }
-    } #[cfg(debug)] on break { debugger.on_break(ctx, pc, fp); use_variant step; jump pc } #[cfg(debug)] #[unfused] variant step wraps all { before { if !debugger.on_step(ctx, pc, fp) { use_variant default; } } } // --cfg debug: the debugger (see the end of this file)
+    }
+
+    // --cfg debug: the debugger (see the end of this file).
+    #[cfg(debug)] on break { debugger.on_break(ctx, pc, fp); use_variant step; jump pc }
+    #[cfg(debug)] #[unfused] variant step wraps all {
+        before { if !debugger.on_step(ctx, pc, fp) { use_variant default; } }
+    }
 }
 
 /// Number of prototypes, for the verifier (set before verification).

@@ -250,7 +250,7 @@ pub fn hash_of(v: Value) -> ?u64 {
     match v {
         Str(s) => Some(str_hash(s)),
         Int(i) => Some(hash_int(i as i64)),
-        Bool(b) => Some(if b { 1 } else { 0 }),
+        Bool(b) => Some(b as u64),
         Nil => Some(0x5ca1ab1e),
         Float(f) => {
             if let Some(i) = num.to_i64_exact(f) { return Some(hash_int(i)); }
@@ -319,8 +319,8 @@ pub fn eq_builtin(a: Value, b: Value) -> bool {
         (Int(x), Float(y)) => (x as f64) == y,
         (Float(x), Int(y)) => x == (y as f64),
         (Float(x), Float(y)) => x == y,
-        (Bool(x), Int(y)) => (if x { 1 } else { 0 }) == (y as i64),
-        (Int(x), Bool(y)) => (x as i64) == (if y { 1 } else { 0 }),
+        (Bool(x), Int(y)) => (x as i64) == (y as i64),
+        (Int(x), Bool(y)) => (x as i64) == (y as i64),
         (Tuple(x), Tuple(y)) => {
             if x.items.len != y.items.len { return false; }
             for i in 0..x.items.len { if !eq_builtin(x.items[i], y.items[i]) { return false; } }
@@ -499,7 +499,7 @@ pub fn int_val(h: *gc.Heap, x: i64) -> Value {
 pub fn as_i64(v: Value) -> ?i64 {
     match v {
         Int(i) => Some(i as i64),
-        Bool(b) => Some(if b { 1 } else { 0 }),
+        Bool(b) => Some(b as i64),
         Long(b) => big.to_i64(b),
         _ => None,
     }

@@ -717,7 +717,13 @@ fn C.for_stmt(c: *C, t: *Expr, iter: *Expr, body: Body, orelse: Body) {
     }
     if !direct and !pair { dst = c.alloc(1); }
     if pair { c.emit(Py.FORITER2(dst as u8, it as u8, dst2 as u8)); } else { c.emit(Py.FORITER(dst as u8, it as u8)); }
-    c.code.jump(Py.JMP(0), els); #[cfg(debug)] if let Name(n) = t.e and direct { debugger.store(c as *u8, n, c.pc32()); } #[cfg(debug)] if pair { for i: u64 in 0..2 { if let Name(n) = seq_items(t).unwrap().at(i).e { debugger.store(c as *u8, n, c.pc32()); } } }
+    c.code.jump(Py.JMP(0), els);
+    #[cfg(debug)] if let Name(n) = t.e and direct { debugger.store(c as *u8, n, c.pc32()); }
+    #[cfg(debug)] if pair {
+        for i: u64 in 0..2 {
+            if let Name(n) = seq_items(t).unwrap().at(i).e { debugger.store(c as *u8, n, c.pc32()); }
+        }
+    }
     if !direct and !pair { c.assign(t, dst); }
     c.loops.push(Loop { brk: brk, cont: top, fdepth: c.fins.len });
     let m2 = c.regs.mark();

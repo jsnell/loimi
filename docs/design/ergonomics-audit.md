@@ -202,8 +202,13 @@ the vm: Python's 26 `#[cfg(debug)]` all sit on existing lines
 **As built.** `loimi ir-diff A B` compares two builds function by
 function, ignoring source locations and names
 ([status.md](../status.md#comparing-builds-loimi-ir-diff)); every IR
-comparison in this note uses it. The examples' `#[cfg]` lines are not
-unpacked yet.
+comparison in this note uses it. The crammed `#[cfg]` lines were then
+unpacked: Mini's `Ctx` fields (`vm.lm:73`, 233 characters), Python's
+`on break` and `variant step` (`vm.lm:1497`, 268 characters) and the
+two longest debug-only lines of the compilers (Mini's loop back-jump,
+Python's `for` target stores) are now one item per line; `ir-diff
+--release` reports the same code, in the default and `--cfg debug`
+builds.
 
 ### 5. Cache layouts from structs
 
@@ -472,10 +477,6 @@ LOOP, CALL]`. Code and op set the same in all nine (see item 3).
   item 11 removes the list-keeping.
 - **Trailing arrays in plain structs** (Prolog frames): 4 helpers and one
   operand kind; too few sites.
-- **`bool as i32`** (Wasm FRICTION 1072, still listed as open). It
-  works on master: `true as i64` compiles and prints 1. Wasm's `b2i`
-  helper (`vm.lm:138`) and Python's 21 `if b { 1 } else { 0 }` can just
-  use it. The Wasm log's follow-up table should be updated.
 - **A `sync` shorthand in `state { .. }`**: `sync`/`reload` are one or
   two lines per vm.
 - **Derived state registers** (`regs = fp.base` reloaded whenever `fp`
