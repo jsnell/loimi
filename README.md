@@ -1,6 +1,6 @@
 # Loimi
 
-*Loimi* (Finnish: the warp threads on a loom) is a statically typed systems
+*Loimi* is a statically typed systems
 language for **writing bytecode interpreters**. It compiles to LLVM bitcode and
 is designed around a single goal: the code you write for an interpreter's inner
 loop should compile to what an expert would write by hand in assembly, without
@@ -13,11 +13,11 @@ the tools that must agree with it: encoders, a disassembler, a bytecode
 verifier, a superinstruction peephole pass, GC tracing and even a
 copy-and-patch JIT.
 
-Status: **working, pre-1.0**. Eight example interpreters, from a Lua
-subset to Python and WebAssembly, are written in Loimi, and most take
-less time than the established interpreters they are compared with. See
-[`docs/status.md`](docs/status.md) for what is built and how it
-differs from the design, and [`CHANGELOG.md`](CHANGELOG.md) for what is new.
+AI disclosure: All the code, and 99% of this README was written by AI. There
+was at best minimal human oversight.
+
+Status: working and extensively tested, but I don't expect anyone else to use this.
+(Just vibe-code your own if you like the concept).
 
 ## Why a new language?
 
