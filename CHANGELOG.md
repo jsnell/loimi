@@ -8,6 +8,12 @@ implementation; `git log` has the details.
 
 ### `vm` declarations and dispatch
 
+- **`become match st { OwnIn => GETPROP_IN, OwnOut | Proto => .. }`**
+  picks a family member from an enum value, replacing ladders of `if st
+  == obj.IcState.X { become Y; }` (Lox and MiniJS ported, same code by
+  `loimi ir-diff`). `x is A | B` on a local of a payload-less enum now
+  compiles to `x == A or x == B`
+  ([language.md §7.2](docs/language.md#72-families-and-become)).
 - **Side traces, and loops inside loops** (trace tier M2): a trace is
   now a graph in one function: its root path goes through the loops
   inside its loop, and the hot paths from its exits are side traces

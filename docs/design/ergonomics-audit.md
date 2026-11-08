@@ -439,11 +439,14 @@ LOOP, CALL]`. Code and op set the same in all nine (see item 3).
   `scheme/vm.lm:61`, `minijs/vm.lm:364`, `lox/vm.lm:216`,
   `python/vm.lm:202`, `:1433`, `:1505`, `stack/vm.lm:525`,
   `python/debugger.lm:373`, `:502`). It is the same arithmetic. S.
-- **`become match st { OwnIn => GETPROP_IN, .. }`.** It would replace
-  48 `if st == obj.IcState.X { become Y; }` ladders: Lox 25
-  (`vm.lm:540`–`:543`, `:567`–`:571`) and MiniJS 23. The ladders map
-  `std.obj`'s cache state to a family member, the same way at each
-  site. The compiled code is the same `if` chain. S.
+- **`become match st { OwnIn => GETPROP_IN, .. }`.** Built
+  (`language.md` §7.2): sugar in the parser for the ladder `if st is
+  OwnIn { become GETPROP_IN; } ..`, and `x is A | B` on a local of a
+  payload-less enum is checked as `x == A or x == B`, the comparisons
+  the ladders had (as a `match` it came out as a differently ordered
+  switch in Lox's INVOKE_MISS). Lox's 6 and MiniJS's 5 multi-arm
+  ladders (40 lines) were ported; `loimi ir-diff --release` reports the
+  same code for both. One-arm tests stay plain `if`s.
 
 ## 3. Considered and rejected
 

@@ -3286,6 +3286,46 @@ instruction word to its family's generic op, splits superinstructions
 (the head becomes its first part's generic op) and zeroes inline caches,
 which gives the code the emitters produced.
 
+**`become match`** picks the member from a value, usually the state an
+inline-cache miss handler returns (`std.obj`'s `IcState`):
+
+<!-- snippet: check
+enum IcState { Generic, OwnIn, OwnOut, Proto, Poly, Mega }
+fn miss(k: u64) -> IcState { if k == 0 { IcState.OwnIn } else { IcState.Mega } }
+vm V {
+    state { pc: *u32, regs: *i64 }
+    operand reg = regs[it];
+    operand imm = it;
+    encoding fixed(u32) { format AB { op: 8, a: 8, b: 16 } }
+    family GET(dst: reg, k: imm) : AB {
+        generic {
+            let st = miss(k);
+{snippet}
+            next
+        }
+        GET_IN { next }
+        GET_OUT { next }
+        GET_POLY { next }
+    }
+    entry run(code: *u32, r: *i64) -> i64 { regs = r; jump code }
+}
+-->
+```loimi
+become match st {
+    OwnIn => GET_IN,
+    OwnOut | Proto => GET_OUT,
+    Poly => GET_POLY,
+}
+```
+
+Each arm is a pattern of variants of the scrutinee's enum and an op;
+the scrutinee is evaluated once. It is the ladder `if st ==
+IcState.OwnIn { become GET_IN; } if st == IcState.OwnOut or st ==
+IcState.Proto { become GET_OUT; } ..` and compiles to the same code
+(Lox's and MiniJS's 11 ladders were ported with `loimi ir-diff`
+reporting the same code). A value no arm names keeps the current op, so
+there is no `_` arm.
+
 Rewrites are single-word, non-atomic stores: code is not shared
 between threads that run at the same time (section 10.1, threads).
 
