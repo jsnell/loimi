@@ -701,8 +701,9 @@ instructions before each store.
   (`push %rbp`) on every path; only `cold` keeps it off, reliably only
   for a cold block that ends in a control word (`next`, `redo`, ...):
   one that falls through may stay inline with its call (item 38).
-- `cvtsi2sd` into a register with a stale upper half (no `xorps`
-  break): a false dependency in the mixed int/float members.
+- `cvtsi2sd` without an `xorps` break (`ADD_FI`, `MULK_IF`) costs
+  nothing: breaking all 702 in the assembly gave spectral_norm 1.010
+  and 0.997 at align 64 and 128 (A/A 1.029 and 1.025), 2026-11-08.
 - No way to say "this pointer is dereferenceable" (load facts were
   prototyped 2026-11-06, speed-audit item 4: no handler changed, no
   gain). Verify clauses that relate two operands decode the word

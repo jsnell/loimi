@@ -64,7 +64,7 @@ instructions against about 100 in the stencils. What stays:
   the tier.
 - **3 tag tests per iteration**: `JGTKN` on a value an `ADD_F` just made
   (LLVM derives no bit facts from `fcmp ord`) and FORLOOP's loop-carried
-  counter (Mini decrements the raw word).
+  counter and step. Removing them does not pay (`speed-audit.md` §3).
 - **Inline-cache words** are plain memory, reloaded after every heap
   store (nbody's `GETFIELD`).
 
