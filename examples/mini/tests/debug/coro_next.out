@@ -1,0 +1,28 @@
+coro_next.mini:1 in main chunk
+1	local co = coroutine.create(function(a)
+(mdb) break 8
+breakpoint 1 at coro_next.mini:8
+(mdb) continue
+breakpoint 1, coro_next.mini:8 in function 'deep'
+8	    local ok, v = coroutine.resume(co, 10)
+(mdb) next
+coro_next.mini:9 in function 'deep'
+9	    print("yielded", v)
+(mdb) next
+yielded	11
+coro_next.mini:10 in function 'deep'
+10	    return v
+(mdb) break 3
+breakpoint 2 at coro_next.mini:3
+(mdb) continue
+breakpoint 2, coro_next.mini:3 in function 'anonymous'
+3	  local x = b * 2
+(mdb) next
+coro_next.mini:4 in function 'anonymous'
+4	  return x
+(mdb) next
+coro_next.mini:16 in main chunk
+16	print("returned", r)
+(mdb) continue
+returned	10
+[program finished]

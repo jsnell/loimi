@@ -186,7 +186,11 @@ does the last part from the first two:
 Lines are compared within a frame, so a loop that jumps back to its own
 line does not stop (gdb's behavior; Lua's line hook stops there). The
 interpreter supplies line and depth: Mini's are `Proto.lines[pc -
-code]` and the frame index. Neither can be generated: the vm
+code]` and the frame index, plus the frames of the threads that resumed
+the running coroutine (each counted up to the frame that called
+`resume`), so that `next` over a `coroutine.resume` steps over the
+coroutine and a yield or return steps out to the resumer
+(`examples/mini/tests/debug/coro_next`). Neither can be generated: the vm
 declaration does not know where the current function's line table or
 the frame stack are. (A vm-level `debug_info { line, depth }` construct
 was rejected: it saves two small functions.)
@@ -299,10 +303,6 @@ nothing (*attached*).
 - **Serialization, `optimize`, `verify` with breakpoints set**: clear
   them first (`Breakpoints.clear_all`). `optimize` and `deopt` are safe
   with breakpoints set, but a code cache must not save breakpoint ops.
-- **Coroutines**: Mini's depth is the frame index in the running
-  coroutine's stack, so `next` across a `coroutine.resume` treats the
-  coroutine's frames as shallower or deeper by accident. A per-thread
-  depth (the stack of resumers) would fix it.
 - **JIT**: section 2.4.
 - **Stack vms**: `on break` is rejected there (the breakpoint ops
   would need the stack effect of the instruction they stand for).
@@ -365,8 +365,8 @@ breakpoint and stepping parts (`on break`, the variant, `stop`,
   at a `for` over a generator stops at the line the generator resumes
   at, `next` over a `yield` stops in the resumer (pdb's behavior), and a
   breakpoint in a generator body is an ordinary site. (Mini's coroutines
-  have stacks of their own, which is why its depth is wrong across a
-  `resume`, section 7.)
+  have stacks of their own, so its depth adds the resumers' frames,
+  section 3.1.)
 - **Exceptions.** `on raise` finds the handler and `jump`s to it through
   the current table, so the variant sees the handler's first
   instruction: `next` over a call that raises, or `finish` from the

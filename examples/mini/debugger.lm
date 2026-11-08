@@ -425,8 +425,20 @@ pub fn left(c: *Ctx, fi: u64) {
 }
 
 /// The line and call depth of the instruction at `pc` in frame `fp`.
+/// The line and call depth at `pc` in frame `fp`. The depth counts the
+/// frames of the threads that resumed the running coroutine too (each
+/// stopped in the frame that called `resume`), so that `next` over a
+/// `coroutine.resume` steps over the coroutine's frames, and a step out
+/// of a coroutine (a yield or its return) lands in the resumer.
 fn where_at(c: *Ctx, pc: *u32, fp: *Frame) -> (u32, u64) {
-    (line_of(fp.cl.proto, pc), ((fp as u64) - (c.frames as u64)) / size_of<Frame>())
+    let sz = size_of<Frame>();
+    var depth = ((fp as u64) - (c.frames as u64)) / sz;
+    var r = c.cur.prev;
+    while let Some(t) = r {
+        depth += ((t.fp as u64) - (t.frames as u64)) / sz + 1;
+        r = t.prev;
+    }
+    (line_of(fp.cl.proto, pc), depth)
 }
 
 fn line_of(p: Gc<Proto>, pc: *u32) -> u32 {

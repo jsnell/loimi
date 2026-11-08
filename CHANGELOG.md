@@ -727,6 +727,12 @@ implementation; `git log` has the details.
 
 ### Examples
 
+- **Mini debugger: `next` across `coroutine.resume`** steps over the
+  coroutine: the depth now adds the frames of the threads that resumed
+  the running coroutine (it was the frame index in the coroutine's own
+  stack, so `next` stopped inside the coroutine or skipped the
+  resumer's next line). Test `examples/mini/tests/debug/coro_next`
+  ([design/debugging.md §3.1](docs/design/debugging.md#31-generic-and-specific-parts)).
 - **Crammed `#[cfg]` lines unpacked and `bool as` casts**: Mini's and
   Python's longest debug-only lines (233 and 268 characters) are one item
   per line, Wasm's `b2i` helper is gone (`(a < b) as i32`), and 13 of

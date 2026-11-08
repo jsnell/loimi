@@ -1,0 +1,16 @@
+local co = coroutine.create(function(a)
+  local b = coroutine.yield(a + 1)
+  local x = b * 2
+  return x
+end)
+local function deep(n)
+  if n == 0 then
+    local ok, v = coroutine.resume(co, 10)
+    print("yielded", v)
+    return v
+  end
+  return deep(n - 1)
+end
+deep(3)
+local ok, r = coroutine.resume(co, 5)
+print("returned", r)
