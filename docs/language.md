@@ -3237,9 +3237,8 @@ code is still alive: the vm keeps it reachable.
 **No GC references.** A cache field cannot hold `Gc<T>`, a `value` type
 or anything else the collector traces: the collector does not scan
 bytecode, so the reference would neither keep its target alive nor be
-updated if it moved. (**Not built:** `weak` fields, which the GC would clear when their
-target dies: the collector does not scan bytecode, so it could not clear
-them.) Cache something whose
+updated if it moved. (For the same reason there are no `weak` fields
+that the GC clears when their target dies.) Cache something whose
 lifetime the interpreter controls instead: a shape id that is never
 reused, a pointer to a structure that is never freed or moved (shapes
 kept alive by a table), or a version number, and validate it on use.
@@ -4859,8 +4858,8 @@ compile to the same IR as without the catches.
 
 - **No optimizing JIT.** Each handler is a separate LLVM function with a known
   register interface, which is exactly the input a copy-and-patch baseline JIT
-  needs (CPython 3.13 builds its JIT from LLVM-compiled templates); a
-  prototype of one exists (`--jit-stencils`, `design/copy-and-patch.md`),
+  needs (CPython 3.13 builds its JIT from LLVM-compiled templates); Loimi
+  has one (`--jit-stencils`, `design/copy-and-patch.md`),
   with traces built ahead of time from a recorded profile on top of it
   (`design/trace-tier.md`); there is no run-time trace compiler.
 - **No borrow checker or ownership types.** Arenas and the GC cover

@@ -318,7 +318,7 @@ fn mini_scripts() {
     mini_scripts_with(&[], &[], |_| true);
 }
 
-/// The copy-and-patch JIT prototype (`--jit-stencils`, x86-64 Linux):
+/// The copy-and-patch JIT (`--jit-stencils`, x86-64 Linux):
 /// every script and conformance test with the JIT on and its hot
 /// threshold at 1, so code is compiled at its first call or backward
 /// jump (and again after each rewrite of its words), then again with

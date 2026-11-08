@@ -28,8 +28,8 @@ Limitations:
 
 ## The first experiment (2026-11-06)
 
-Before §11, a Python generator (`tools/trace-exp/`, kept for reference,
-not maintained) built traces of four Mini loops by hand-run steps, to see
+Before §11, a Python generator (`tools/trace-exp/`, last in commit
+7c579f7) built traces of four Mini loops by hand-run steps, to see
 whether stitched handler IR plus LLVM gets near the hand-written bound of
 `copy-and-patch.md` §13 (0.56–0.68 of the JIT on mandelbrot's inner
 loop). Whole-program times, minimum of 11 interleaved runs, user+sys
