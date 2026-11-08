@@ -170,6 +170,9 @@ pub struct Checker<'a> {
     /// Tail-call vms keep their dispatch table's address in a state
     /// register (AArch64: saves the `adrp`+`add` of every dispatch).
     pub table_in_state: bool,
+    /// The target is AArch64 (for `state_registers`: how many argument
+    /// registers `preserve_none` has).
+    pub target_aarch64: bool,
     pub vms: Vec<crate::vmcheck::VmInfo>,
     pub traits: crate::traits::Traits,
     pub aliases: Vec<AliasInfo>,
@@ -312,6 +315,7 @@ impl<'a> Checker<'a> {
             vm_decls: vec![],
             dispatch_override: None,
             table_in_state: false,
+            target_aarch64: false,
             vms: vec![],
             generics: Default::default(),
             traits: Default::default(),
@@ -3306,6 +3310,24 @@ impl<'a> Checker<'a> {
             TPK::Or(alts) => alts,
             _ => vec![p],
         };
+        // On a local of a payload-less enum, `x is A | B` is `x == A or
+        // x == B`: the code of the comparison ladders it replaces
+        // (`become match`), where a match can come out as a differently
+        // ordered switch.
+        let plain = matches!(&s.ty, Ty::Enum(e) if !self.prog.enums[*e as usize].has_payload());
+        if plain && matches!(s.kind, TK::Local(_)) && alts.iter().all(|a| matches!(a.kind, TPK::Variant(_, ref f) if f.is_empty())) {
+            let mut out: Option<TExpr> = None;
+            for a in alts {
+                let TPK::Variant(v, _) = a.kind else { unreachable!() };
+                let c = mk(s.ty.clone(), TK::Variant(v, vec![]), span);
+                let eq = mk(Ty::Bool, TK::Binary(BinOp::Eq, Box::new(s.clone()), Box::new(c)), span);
+                out = Some(match out {
+                    None => eq,
+                    Some(o) => mk(Ty::Bool, TK::Binary(BinOp::LOr, Box::new(o), Box::new(eq)), span),
+                });
+            }
+            return Ok(out.unwrap());
+        }
         let mut arms: Vec<TArm> = alts.into_iter().map(|p| TArm { pat: p, guard: None, body: t(true) }).collect();
         arms.push(TArm { pat: TPat { ty: s.ty.clone(), kind: TPK::Wild }, guard: None, body: t(false) });
         Ok(mk(Ty::Bool, TK::Match(Box::new(s), arms), span))

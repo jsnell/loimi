@@ -1,0 +1,9 @@
+vm V {
+    state { pc: *u32, k: *i64 }
+    operand kst = k[it];
+    encoding fixed(u32) { format ABx { op: 8, a: 8, bx: 16 } }
+    op LOADG(name: kst @ b) : ABx { next }
+    entry run(code: *u32, ks: *i64) -> i64 { k = ks; jump code }
+}
+fn main() {}
+// error: `name @ b`: format `ABx` has no operand field `b`

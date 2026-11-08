@@ -135,7 +135,6 @@ pub fn Machine.switch_to(m: *Machine, i: *Inst) {
 }
 
 #[inline(always)]
-fn b2i(c: bool) -> i32 { if c { 1 } else { 0 } }
 
 extern "C" fn realloc(p: *u8, n: u64) -> ?*u8;
 extern "C" fn memset(p: *u8, c: i32, n: u64) -> *u8;
@@ -328,36 +327,36 @@ pub vm W {
         ("I32_SHL", ri, ri, ri, a << b), ("I32_SHR_S", ri, ri, ri, a >> b), ("I32_SHR_U", ru, ru, ru, a >> b),
         ("I32_ROTL", ru, ru, ru, (a << b) | (a >> (32 - (b & 31)))),
         ("I32_ROTR", ru, ru, ru, (a >> b) | (a << (32 - (b & 31)))),
-        ("I32_EQ", ri, ri, ri, b2i(a == b)), ("I32_NE", ri, ri, ri, b2i(a != b)),
-        ("I32_LT_S", ri, ri, ri, b2i(a < b)), ("I32_LT_U", ri, ru, ru, b2i(a < b)),
-        ("I32_GT_S", ri, ri, ri, b2i(a > b)), ("I32_GT_U", ri, ru, ru, b2i(a > b)),
-        ("I32_LE_S", ri, ri, ri, b2i(a <= b)), ("I32_LE_U", ri, ru, ru, b2i(a <= b)),
-        ("I32_GE_S", ri, ri, ri, b2i(a >= b)), ("I32_GE_U", ri, ru, ru, b2i(a >= b)),
+        ("I32_EQ", ri, ri, ri, (a == b) as i32), ("I32_NE", ri, ri, ri, (a != b) as i32),
+        ("I32_LT_S", ri, ri, ri, (a < b) as i32), ("I32_LT_U", ri, ru, ru, (a < b) as i32),
+        ("I32_GT_S", ri, ri, ri, (a > b) as i32), ("I32_GT_U", ri, ru, ru, (a > b) as i32),
+        ("I32_LE_S", ri, ri, ri, (a <= b) as i32), ("I32_LE_U", ri, ru, ru, (a <= b) as i32),
+        ("I32_GE_S", ri, ri, ri, (a >= b) as i32), ("I32_GE_U", ri, ru, ru, (a >= b) as i32),
         ("I64_ADD", rl, rl, rl, a +% b), ("I64_SUB", rl, rl, rl, a -% b), ("I64_MUL", rl, rl, rl, a *% b),
         ("I64_AND", rl, rl, rl, a & b), ("I64_OR", rl, rl, rl, a | b), ("I64_XOR", rl, rl, rl, a ^ b),
         ("I64_SHL", rl, rl, rl, a << b), ("I64_SHR_S", rl, rl, rl, a >> b), ("I64_SHR_U", rq, rq, rq, a >> b),
         ("I64_ROTL", rq, rq, rq, (a << b) | (a >> (64 - (b & 63)))),
         ("I64_ROTR", rq, rq, rq, (a >> b) | (a << (64 - (b & 63)))),
-        ("I64_EQ", ri, rl, rl, b2i(a == b)), ("I64_NE", ri, rl, rl, b2i(a != b)),
-        ("I64_LT_S", ri, rl, rl, b2i(a < b)), ("I64_LT_U", ri, rq, rq, b2i(a < b)),
-        ("I64_GT_S", ri, rl, rl, b2i(a > b)), ("I64_GT_U", ri, rq, rq, b2i(a > b)),
-        ("I64_LE_S", ri, rl, rl, b2i(a <= b)), ("I64_LE_U", ri, rq, rq, b2i(a <= b)),
-        ("I64_GE_S", ri, rl, rl, b2i(a >= b)), ("I64_GE_U", ri, rq, rq, b2i(a >= b)),
+        ("I64_EQ", ri, rl, rl, (a == b) as i32), ("I64_NE", ri, rl, rl, (a != b) as i32),
+        ("I64_LT_S", ri, rl, rl, (a < b) as i32), ("I64_LT_U", ri, rq, rq, (a < b) as i32),
+        ("I64_GT_S", ri, rl, rl, (a > b) as i32), ("I64_GT_U", ri, rq, rq, (a > b) as i32),
+        ("I64_LE_S", ri, rl, rl, (a <= b) as i32), ("I64_LE_U", ri, rq, rq, (a <= b) as i32),
+        ("I64_GE_S", ri, rl, rl, (a >= b) as i32), ("I64_GE_U", ri, rq, rq, (a >= b) as i32),
         // floats
         ("F32_ADD", rf, rf, rf, a + b), ("F32_SUB", rf, rf, rf, a - b),
         ("F32_MUL", rf, rf, rf, a * b), ("F32_DIV", rf, rf, rf, a / b),
         ("F32_MIN", rf, rf, rf, a.minimum(b)), ("F32_MAX", rf, rf, rf, a.maximum(b)),
         ("F32_COPYSIGN", rf, rf, rf, a.copysign(b)),
-        ("F32_EQ", ri, rf, rf, b2i(a == b)), ("F32_NE", ri, rf, rf, b2i(a != b)),
-        ("F32_LT", ri, rf, rf, b2i(a < b)), ("F32_GT", ri, rf, rf, b2i(a > b)),
-        ("F32_LE", ri, rf, rf, b2i(a <= b)), ("F32_GE", ri, rf, rf, b2i(a >= b)),
+        ("F32_EQ", ri, rf, rf, (a == b) as i32), ("F32_NE", ri, rf, rf, (a != b) as i32),
+        ("F32_LT", ri, rf, rf, (a < b) as i32), ("F32_GT", ri, rf, rf, (a > b) as i32),
+        ("F32_LE", ri, rf, rf, (a <= b) as i32), ("F32_GE", ri, rf, rf, (a >= b) as i32),
         ("F64_ADD", rd, rd, rd, a + b), ("F64_SUB", rd, rd, rd, a - b),
         ("F64_MUL", rd, rd, rd, a * b), ("F64_DIV", rd, rd, rd, a / b),
         ("F64_MIN", rd, rd, rd, a.minimum(b)), ("F64_MAX", rd, rd, rd, a.maximum(b)),
         ("F64_COPYSIGN", rd, rd, rd, a.copysign(b)),
-        ("F64_EQ", ri, rd, rd, b2i(a == b)), ("F64_NE", ri, rd, rd, b2i(a != b)),
-        ("F64_LT", ri, rd, rd, b2i(a < b)), ("F64_GT", ri, rd, rd, b2i(a > b)),
-        ("F64_LE", ri, rd, rd, b2i(a <= b)), ("F64_GE", ri, rd, rd, b2i(a >= b)),
+        ("F64_EQ", ri, rd, rd, (a == b) as i32), ("F64_NE", ri, rd, rd, (a != b) as i32),
+        ("F64_LT", ri, rd, rd, (a < b) as i32), ("F64_GT", ri, rd, rd, (a > b) as i32),
+        ("F64_LE", ri, rd, rd, (a <= b) as i32), ("F64_GE", ri, rd, rd, (a >= b) as i32),
     ] {
         op #name(d: dk, a: ak, b: bk) : RRR { d = expr; next }
     }
@@ -371,19 +370,19 @@ pub vm W {
         ("I32_AND", ri, ri, true, a & (k as i32)), ("I32_OR", ri, ri, true, a | (k as i32)),
         ("I32_XOR", ri, ri, true, a ^ (k as i32)),
         ("I32_SHL", ri, ri, false, a << k), ("I32_SHR_S", ri, ri, false, a >> k), ("I32_SHR_U", ru, ru, false, a >> k),
-        ("I32_EQ", ri, ri, true, b2i(a == (k as i32))), ("I32_NE", ri, ri, true, b2i(a != (k as i32))),
-        ("I32_LT_S", ri, ri, false, b2i(a < (k as i32))), ("I32_LT_U", ri, ru, false, b2i(a < (k as u32))),
-        ("I32_GT_S", ri, ri, false, b2i(a > (k as i32))), ("I32_GT_U", ri, ru, false, b2i(a > (k as u32))),
-        ("I32_LE_S", ri, ri, false, b2i(a <= (k as i32))), ("I32_LE_U", ri, ru, false, b2i(a <= (k as u32))),
-        ("I32_GE_S", ri, ri, false, b2i(a >= (k as i32))), ("I32_GE_U", ri, ru, false, b2i(a >= (k as u32))),
+        ("I32_EQ", ri, ri, true, (a == (k as i32)) as i32), ("I32_NE", ri, ri, true, (a != (k as i32)) as i32),
+        ("I32_LT_S", ri, ri, false, (a < (k as i32)) as i32), ("I32_LT_U", ri, ru, false, (a < (k as u32)) as i32),
+        ("I32_GT_S", ri, ri, false, (a > (k as i32)) as i32), ("I32_GT_U", ri, ru, false, (a > (k as u32)) as i32),
+        ("I32_LE_S", ri, ri, false, (a <= (k as i32)) as i32), ("I32_LE_U", ri, ru, false, (a <= (k as u32)) as i32),
+        ("I32_GE_S", ri, ri, false, (a >= (k as i32)) as i32), ("I32_GE_U", ri, ru, false, (a >= (k as u32)) as i32),
         ("I64_ADD", rl, rl, true, a +% k), ("I64_MUL", rl, rl, true, a *% k),
         ("I64_AND", rl, rl, true, a & k), ("I64_OR", rl, rl, true, a | k), ("I64_XOR", rl, rl, true, a ^ k),
         ("I64_SHL", rl, rl, false, a << k), ("I64_SHR_S", rl, rl, false, a >> k), ("I64_SHR_U", rq, rq, false, a >> k),
-        ("I64_EQ", ri, rl, true, b2i(a == k)), ("I64_NE", ri, rl, true, b2i(a != k)),
-        ("I64_LT_S", ri, rl, false, b2i(a < k)), ("I64_LT_U", ri, rq, false, b2i(a < (k as u64))),
-        ("I64_GT_S", ri, rl, false, b2i(a > k)), ("I64_GT_U", ri, rq, false, b2i(a > (k as u64))),
-        ("I64_LE_S", ri, rl, false, b2i(a <= k)), ("I64_LE_U", ri, rq, false, b2i(a <= (k as u64))),
-        ("I64_GE_S", ri, rl, false, b2i(a >= k)), ("I64_GE_U", ri, rq, false, b2i(a >= (k as u64))),
+        ("I64_EQ", ri, rl, true, (a == k) as i32), ("I64_NE", ri, rl, true, (a != k) as i32),
+        ("I64_LT_S", ri, rl, false, (a < k) as i32), ("I64_LT_U", ri, rq, false, (a < (k as u64)) as i32),
+        ("I64_GT_S", ri, rl, false, (a > k) as i32), ("I64_GT_U", ri, rq, false, (a > (k as u64)) as i32),
+        ("I64_LE_S", ri, rl, false, (a <= k) as i32), ("I64_LE_U", ri, rq, false, (a <= (k as u64)) as i32),
+        ("I64_GE_S", ri, rl, false, (a >= k) as i32), ("I64_GE_U", ri, rq, false, (a >= (k as u64)) as i32),
     ] {
         op #(name ++ "K")(d: dk, a: ak, k: imm) : RRK { d = expr; next }
         rel kform(#name) = #(name ++ "K");
@@ -421,7 +420,7 @@ pub vm W {
 
     // ── unary ops and conversions ─────────────────────────────────────
     inline for (name, dk, ak, expr) in [
-        ("I32_EQZ", ri, ri, b2i(a == 0)), ("I64_EQZ", ri, rl, b2i(a == 0)),
+        ("I32_EQZ", ri, ri, (a == 0) as i32), ("I64_EQZ", ri, rl, (a == 0) as i32),
         ("I32_CLZ", ri, ru, a.clz() as i32), ("I32_CTZ", ri, ru, a.ctz() as i32),
         ("I32_POPCNT", ri, ru, a.popcount() as i32),
         ("I64_CLZ", rl, rq, a.clz() as i64), ("I64_CTZ", rl, rq, a.ctz() as i64),
@@ -724,7 +723,7 @@ pub vm W {
     }
 
     // ── reference types and bulk memory ─────────────────────────────
-    op REF_IS_NULL(d: ri, a: rq) : RRR { d = b2i(a == 0); next }
+    op REF_IS_NULL(d: ri, a: rq) : RRR { d = (a == 0) as i32; next }
     op REF_FUNC(d: rq, fi: fidx) : RU { d = ctx.funcs[fi] as u64; next }
     // Rare ops: indices (table, segment) in the cache word, operands in
     // slots; a plain function does the work and checks every bound.
@@ -858,24 +857,24 @@ pub vm W {
 
     inline for (name, dk, ak, expr) in [
         ("V128_NOT", vul, vul, ~a),
-        ("V128_ANY_TRUE", ri, vul, b2i((a == u64x2.splat(0)).bitmask() != 3)),
+        ("V128_ANY_TRUE", ri, vul, ((a == u64x2.splat(0)).bitmask() != 3) as i32),
         ("I8X16_ABS", vb, vb, a.abs()), ("I8X16_NEG", vb, vb, -a), ("I8X16_POPCNT", vub, vub, a.popcount()),
-        ("I8X16_ALL_TRUE", ri, vb, b2i((a == i8x16.splat(0)).bitmask() == 0)),
+        ("I8X16_ALL_TRUE", ri, vb, ((a == i8x16.splat(0)).bitmask() == 0) as i32),
         ("I8X16_BITMASK", ri, vb, a.bitmask() as i32),
         ("I16X8_ABS", vh, vh, a.abs()), ("I16X8_NEG", vh, vh, -a),
-        ("I16X8_ALL_TRUE", ri, vh, b2i((a == i16x8.splat(0)).bitmask() == 0)),
+        ("I16X8_ALL_TRUE", ri, vh, ((a == i16x8.splat(0)).bitmask() == 0) as i32),
         ("I16X8_BITMASK", ri, vh, a.bitmask() as i32),
         ("I16X8_EXTEND_LOW_I8X16_S", vh, vb, a.widen_low()), ("I16X8_EXTEND_HIGH_I8X16_S", vh, vb, a.widen_high()),
         ("I16X8_EXTEND_LOW_I8X16_U", vuh, vub, a.widen_low()), ("I16X8_EXTEND_HIGH_I8X16_U", vuh, vub, a.widen_high()),
         ("I16X8_EXTADD_PAIRWISE_I8X16_S", vh, vb, pairs_i8(a)), ("I16X8_EXTADD_PAIRWISE_I8X16_U", vuh, vub, pairs_u8(a)),
         ("I32X4_ABS", vi, vi, a.abs()), ("I32X4_NEG", vi, vi, -a),
-        ("I32X4_ALL_TRUE", ri, vi, b2i((a == i32x4.splat(0)).bitmask() == 0)),
+        ("I32X4_ALL_TRUE", ri, vi, ((a == i32x4.splat(0)).bitmask() == 0) as i32),
         ("I32X4_BITMASK", ri, vi, a.bitmask() as i32),
         ("I32X4_EXTEND_LOW_I16X8_S", vi, vh, a.widen_low()), ("I32X4_EXTEND_HIGH_I16X8_S", vi, vh, a.widen_high()),
         ("I32X4_EXTEND_LOW_I16X8_U", vui, vuh, a.widen_low()), ("I32X4_EXTEND_HIGH_I16X8_U", vui, vuh, a.widen_high()),
         ("I32X4_EXTADD_PAIRWISE_I16X8_S", vi, vh, pairs_i16(a)), ("I32X4_EXTADD_PAIRWISE_I16X8_U", vui, vuh, pairs_u16(a)),
         ("I64X2_ABS", vl, vl, a.abs()), ("I64X2_NEG", vl, vl, -a),
-        ("I64X2_ALL_TRUE", ri, vl, b2i((a == i64x2.splat(0)).bitmask() == 0)),
+        ("I64X2_ALL_TRUE", ri, vl, ((a == i64x2.splat(0)).bitmask() == 0) as i32),
         ("I64X2_BITMASK", ri, vl, a.bitmask() as i32),
         ("I64X2_EXTEND_LOW_I32X4_S", vl, vi, a.widen_low()), ("I64X2_EXTEND_HIGH_I32X4_S", vl, vi, a.widen_high()),
         ("I64X2_EXTEND_LOW_I32X4_U", vul, vui, a.widen_low()), ("I64X2_EXTEND_HIGH_I32X4_U", vul, vui, a.widen_high()),
@@ -1004,7 +1003,7 @@ pub vm W {
         ("V128_STORE8_LANE", vub, u8, 1), ("V128_STORE16_LANE", vuh, u16, 2),
         ("V128_STORE32_LANE", vui, u32, 4), ("V128_STORE64_LANE", vul, u64, 8),
     ] {
-        op #name(a: ru, v: vk, z: imm) : RRR + Imm64 {
+        op #name(a: ru, v: vk) : RRR + Imm64 {
             let ea = (a as u64) + (cache.v & 0xFFFFFFFF);
             if ea + size > msize { raise Trap.MemOOB }
             ((mem + ea) as *ty).write_unaligned(v.lane_at(cache.v >> 32));

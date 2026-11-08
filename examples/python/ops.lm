@@ -139,7 +139,7 @@ pub fn identity_eq(c: *Ctx, op: u32, a: Value, b: Value) -> u32 {
     }
     if !inst { return 2; }
     let same = a == b;
-    if (op == C_EQ) == same { 1 } else { 0 }
+    ((op == C_EQ) == same) as u32
 }
 
 pub const C_LT: u32 = 0;
@@ -1546,7 +1546,7 @@ pub fn int_arith(c: *Ctx, op: u32, a: Value, b: Value) -> Result<Value, Value> {
 fn small(v: Value) -> ?i64 {
     match v {
         Int(i) => Some(i as i64),
-        Bool(b) => Some(if b { 1 } else { 0 }),
+        Bool(b) => Some(b as i64),
         Long(b) => if b.big.is_none() { Some(b.n) } else { None },
         _ => None,
     }
@@ -2394,7 +2394,7 @@ pub fn contains_fast(container: Value, x: Value) -> u32 {
     match container {
         Dict(d) => {
             let Some(hv) = value.hash_of(x) else { return 2; };
-            if value.dict_find(d, x, hv).is_some() { 1 } else { 0 }
+            value.dict_find(d, x, hv).is_some() as u32
         }
         List(l) => {
             for i in 0..l.len {
@@ -2423,7 +2423,7 @@ pub fn contains_fast(container: Value, x: Value) -> u32 {
         Obj(b) => {
             if b.kind == K_SET or b.kind == K_FROZENSET {
                 let Some(hv) = value.hash_of(x) else { return 2; };
-                return if value.dict_find(b.dict.unwrap(), x, hv).is_some() { 1 } else { 0 };
+                return value.dict_find(b.dict.unwrap(), x, hv).is_some() as u32;
             }
             2
         }

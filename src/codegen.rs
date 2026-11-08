@@ -1,6 +1,6 @@
 //! TIR → textual LLVM IR.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write;
 
 use crate::ast::{BinOp, Linkage, UnOp};
@@ -75,6 +75,10 @@ pub struct Codegen<'p> {
     pub opts: Options,
     pub globals: String,
     pub fns: String,
+    /// Panic sites for `-W handler_frame` (`framelint`): the message
+    /// text (location and message) → what checks it, "the overflow check
+    /// of `/` at vm.lm:512".
+    pub panic_sites: HashMap<String, String>,
     pub decls: Decls,
     pub str_count: u32,
     pub str_count_jc: u32,
@@ -210,6 +214,7 @@ impl<'p> Codegen<'p> {
             opts,
             globals: String::new(),
             fns: String::new(),
+            panic_sites: HashMap::new(),
             decls: Decls::default(),
             str_count: 0,
             str_count_jc: 0,
@@ -379,7 +384,7 @@ impl<'p> Codegen<'p> {
     }
 
     /// The program's IR and, with `--jit-stencils`, the stencil functions.
-    pub fn generate_with_stencils(mut self) -> (String, String) {
+    pub fn generate_with_stencils(mut self) -> (String, String, HashMap<String, String>) {
         let p = self.p;
         if self.opts.jit {
             if let Ok(vi) = crate::jitgen::jit_vm(p) {
@@ -516,7 +521,7 @@ impl<'p> Codegen<'p> {
                 out.insert_str(at, &line);
             }
         }
-        (out, std::mem::take(&mut self.stencils))
+        (out, std::mem::take(&mut self.stencils), std::mem::take(&mut self.panic_sites))
     }
 }
 
@@ -1010,7 +1015,40 @@ impl<'a, 'p> FnGen<'a, 'p> {
     // ── panics ──────────────────────────────────────────────────────
 
     pub fn panic(&mut self, msg: &str, span: Span) {
-        let text = format!("{}: {}\n", self.cg.location(span), msg);
+        self.panic_as(msg, None, span)
+    }
+
+    /// A panic, with what it checks (`what`, "the overflow check of
+    /// `+`") for the panic-site table; by default derived from `msg`.
+    pub fn panic_as(&mut self, msg: &str, what: Option<&str>, span: Span) {
+        let loc = self.cg.location(span);
+        let text = format!("{}: {}\n", loc, msg);
+        let what = match what {
+            Some(w) => w.to_string(),
+            None => match msg {
+                "index out of bounds" => "the bounds check of an index".into(),
+                "slice range out of bounds" => "the bounds check of a slice range".into(),
+                "unwrap of None" => "an `.unwrap()` of `None`".into(),
+                "integer cast to enum is not a valid discriminant" => "the range check of an integer cast to an enum".into(),
+                "trap" => "a `trap()`".into(),
+                _ => format!("a panic (`{}`)", msg),
+            },
+        };
+        let file = loc.rsplit('/').next().unwrap_or(&loc);
+        let mut parts = file.splitn(3, ':');
+        let short = match (parts.next(), parts.next()) {
+            (Some(f), Some(l)) => format!("{}:{}", f, l),
+            _ => file.to_string(),
+        };
+        let desc = format!("{} at {}", what, short);
+        let key = text.trim_end().to_string();
+        match self.cg.panic_sites.get_mut(&key) {
+            Some(d) if !d.contains(&desc) => *d = format!("{} or {}", d, desc),
+            Some(_) => {}
+            None => {
+                self.cg.panic_sites.insert(key, desc);
+            }
+        }
         let g = self.cg.string_const(text.as_bytes());
         self.emit(format!("call void @loimi.panic(ptr {}, i64 {})", g, text.len()));
         self.term("unreachable");
@@ -1018,13 +1056,18 @@ impl<'a, 'p> FnGen<'a, 'p> {
 
     /// Branch to a panic if `cond` (i1) is true.
     pub fn check(&mut self, cond: &str, msg: &str, span: Span) {
+        self.check_as(cond, msg, None, span)
+    }
+
+    /// `check`, with what it checks for the panic-site table.
+    pub fn check_as(&mut self, cond: &str, msg: &str, what: Option<&str>, span: Span) {
         let bad = self.fresh_label("panic");
         let ok = self.fresh_label("ok");
         let c = self.inst(format!("call i1 @llvm.expect.i1(i1 {}, i1 false)", cond));
         self.cg.decls.insert("declare i1 @llvm.expect.i1(i1, i1)");
         self.cond_br(&c, &bad, &ok);
         self.label(&bad);
-        self.panic(msg, span);
+        self.panic_as(msg, what, span);
         self.label(&ok);
     }
 
@@ -2124,7 +2167,12 @@ impl<'a, 'p> FnGen<'a, 'p> {
             };
             let Ty::Int(it) = t else { unreachable!() };
             let (r, ov) = self.overflow_op(*it, name, &x, &y);
-            self.check(&ov, "integer overflow", e.span);
+            let sym = match op {
+                Add => "+",
+                Sub => "-",
+                _ => "*",
+            };
+            self.check_as(&ov, "integer overflow", Some(&format!("the overflow check of `{}`", sym)), e.span);
             return r;
         }
         if matches!(op, Div | Rem) && t.is_int() {
@@ -2140,13 +2188,14 @@ impl<'a, 'p> FnGen<'a, 'p> {
             };
             let k = if odd { 64 - it.bits as u32 } else { 0 };
             let z = self.inst(format!("icmp eq {} {}, 0", ct, yc));
-            self.check(&z, "division by zero", e.span);
+            let sym = if matches!(op, Div) { "/" } else { "%" };
+            self.check_as(&z, "division by zero", Some(&format!("the zero check of `{}`", sym)), e.span);
             if signed {
                 // MIN / -1 overflows (and traps in hardware).
                 let m1 = self.inst(format!("icmp eq {} {}, {}", ct, yc, -1i64 << k));
                 let mn = self.inst(format!("icmp eq {} {}, {}", ct, xc, if odd { i64::MIN as i128 } else { it.min() }));
                 let both = self.inst(format!("and i1 {}, {}", m1, mn));
-                self.check(&both, "integer overflow in division", e.span);
+                self.check_as(&both, "integer overflow in division", Some(&format!("the overflow check of `{}`", sym)), e.span);
             }
         }
         let ins = match op {

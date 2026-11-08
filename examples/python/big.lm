@@ -15,7 +15,7 @@ import value.{Value, Long};
 fn arg(v: Value) -> Arg {
     match v {
         Int(i) => Arg.Small(i as i64),
-        Bool(b) => Arg.Small(if b { 1 } else { 0 }),
+        Bool(b) => Arg.Small(b as i64),
         Long(b) => match b.big { Some(l) => Arg.Ref(l), None => Arg.Small(b.n) },
         _ => Arg.Small(0),
     }

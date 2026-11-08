@@ -2,7 +2,7 @@
 // than fields puts its operand in the first field, and a mismatched
 // encoder argument says which field that is.
 // error: mismatched types: expected `u8`, found `u16`
-// error: operand `name` of `DELGLOBAL` is field `a` of format `ABx` (8 bits): operands take the format's fields in order (`DELGLOBAL` has 1 operand(s) for 2 fields; a placeholder operand such as `z: imm` moves the next ones along)
+// error: operand `name` of `DELGLOBAL` is field `a` of format `ABx` (8 bits): operands take the format's fields in order unless named (`name: kind @ field`) (`DELGLOBAL` has 1 operand(s) for 2 fields; `name: kind @ field` puts an operand in a later field)
 vm V {
     state { pc: *u32, k: *i64 }
     operand kst = k[it];

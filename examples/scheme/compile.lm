@@ -1880,7 +1880,7 @@ fn Gen.effect(g: *Gen, n: *Node) {
     let save = g.top();
     match n.kind {
         Const | Ref | GRef | Lambda => {}
-        GChk => { g.emit(Scheme.CHKGLOBAL(0, n.g as u16)); }
+        GChk => { g.emit(Scheme.CHKGLOBAL(n.g as u16)); }
         Set => {
             let v = n.vr;
             let r = g.any(n.a);
