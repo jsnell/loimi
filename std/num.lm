@@ -574,10 +574,8 @@ pub fn to_i64_exact(x: f64) -> ?i64 {
 
 /// `POW10[2 * (e + 292)]` (high word) and `[.. + 1]` (low word):
 /// floor(10^e * 2^(127 - floor(log2(10^e)))) + 1, for e in [-292, 324],
-/// a 128-bit upper approximation of 10^e with its top bit set. A global
-/// rather than a `const`: indexing a `const` array with a run-time index
-/// builds the whole array on the stack first.
-var POW10: [u64; 1234] = [
+/// a 128-bit upper approximation of 10^e with its top bit set.
+const POW10: [u64; 1234] = [
     0xFF77B1FCBEBCDC4F, 0x25E8E89C13BB0F7B,
     0x9FAACF3DF73609B1, 0x77B191618C54E9AD,
     0xC795830D75038C1D, 0xD59DF5B9EF6A2418,
