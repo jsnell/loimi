@@ -366,7 +366,7 @@ const BRANCH_ALIGN_LLVM_ARGS: &[&str] = &[
 /// Compile to LLVM IR, and the C header if `--header` asked for one.
 /// The options: the LLVM options the program's dispatch modes need
 /// (`GOTO_LLVM_ARGS`, `SWITCH_LLVM_ARGS`).
-fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, Option<JitParts>, Vec<&'static str>, Vec<framelint::Site>), Diags> {
+fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, Option<JitParts>, Vec<&'static str>, framelint::Lint), Diags> {
     let input = opts.input.as_ref().unwrap();
     let mut allows = Vec::new();
     // `--sanitize=address` also sets `#[cfg(sanitize_address)]`: std's
@@ -393,6 +393,7 @@ fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, O
     c.generated_files = sm.files.iter().enumerate().filter(|(_, f)| f.generated.is_some()).map(|(i, _)| i as u32).collect();
     c.dispatch_override = opts.dispatch;
     c.table_in_state = opts.target.as_ref().map_or(codegen::Arch::host(), |t| t.arch) == codegen::Arch::AArch64;
+    c.target_aarch64 = c.table_in_state;
     // Checking goes on past errors in bodies; the passes after it run
     // only on a program that checked.
     c.run_all().map_err(Diags)?;
@@ -534,7 +535,7 @@ fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, O
             cpu: opts.cpu.as_ref().map(|c| c.features).unwrap_or_default(),
         },
     );
-    let (mut ir, stencils) = cg.generate_with_stencils();
+    let (mut ir, stencils, panics) = cg.generate_with_stencils();
     let jit = jit.map(|(ops, nops, table, op_bits, imm, state_names, pc_idx, const_idx)| JitParts { stencils, ops, nops, table, op_bits, imm, state_names, pc_idx, const_idx });
     // Runtime thread-locals are emitted initial-exec: one offset from the
     // thread pointer, fixed at load time. A shared object that may be
@@ -564,7 +565,7 @@ fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, O
     } else {
         ir
     };
-    Ok((ir, header, jit, llvm_args, frame_sites))
+    Ok((ir, header, jit, llvm_args, framelint::Lint { sites: frame_sites, panics }))
 }
 
 /// Hot-handler ordering (`hotorder`): each vm's handler layout from its
@@ -1245,7 +1246,7 @@ fn compiler_main() -> ExitCode {
         }
     }
     // Lint `handler_frame`: the same IR to assembly, with the same options.
-    if !frame_sites.is_empty() {
+    if !frame_sites.sites.is_empty() {
         let s = tmpdir.join(format!("{}.s", stem));
         let mut asm = Command::new(&clang);
         asm.arg(if opts.release { "-O3" } else { "-O1" }).arg("-Wno-override-module").args(&cross);
@@ -1265,7 +1266,7 @@ fn compiler_main() -> ExitCode {
             }
         };
         let arch = opts.target.as_ref().map_or(codegen::Arch::host(), |t| t.arch);
-        let ws = framelint::check(&text, arch, &frame_sites);
+        let ws = framelint::check(&text, arch, &frame_sites.sites, &frame_sites.panics);
         for w in &ws {
             eprint!("{}", sm.render_as(if opts.deny_warnings { "error" } else { "warning" }, w));
         }

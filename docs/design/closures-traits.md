@@ -94,11 +94,17 @@ fn HashMap<K: Hash, V>.get(m: *HashMap<K, V>, key: K) -> ?V { .. key.hash() .. }
   impl's method may have fewer effects than the trait declares, never
   more, so a handler calling `k.hash()` through a bound is checked
   against the trait's declaration and is sound for every instance.
+- **Overlap check** (`register_impls`): two impls of one trait whose
+  (type, trait arguments) unify are an error, a plain impl against a
+  generic one or two generic impls against each other (two-sided
+  unification over both impls' parameters). Bounds are ignored, as in
+  Rust. There is no orphan rule: the whole program is checked at once,
+  and impls carry no code (the methods are the type's), so where an impl
+  sits does not matter. Tests: `tests/fail/trait_impl_overlap{,_generic}.lm`.
 
 Limitations: traits are static (no `dyn`; interpreters use `value` types
 and tagged enums for run-time polymorphism), with no associated types or
-constants and no supertraits. Also absent: an orphan rule or an overlap check between impls (the first matching
-impl wins). Default bodies are checked when an instance uses them, not
+constants and no supertraits. Default bodies are checked when an instance uses them, not
 at the trait.
 
 In std: `std.hash` has `trait Hash { hash, eq }` with impls for the

@@ -434,15 +434,20 @@ fn main() {}
   name is an error. `loimi build -W error` (or `--deny-warnings`) turns
   the warnings that remain into errors. The lints are `match_fallout`,
   `unreachable_arm` (above), `super_overlap` (section 7.3),
-  `value_layout` (section 2) and `next_pc_then` (section 3.5), and the
+  `value_layout` (section 2), `next_pc_then` (section 3.5) and
+  `state_registers` (section 3.1), and the
   opt-in `hot_gc`, turned on with `-W hot_gc`: a call that may collect
   (`uses gc`) on an op handler's fast path, outside `cold`, which syncs
   the vm state and roots the live traced locals on every execution
   (often right, as for an allocation the op exists to make: `#[allow(hot_gc)]`).
   The opt-in `handler_frame` (`-W handler_frame`) reports tail-call op
   handlers whose fast path sets up a stack frame (section 4), naming the
-  calls in the handler that can cause it (with the message of each panic
-  site: `.unwrap()`, bounds checks); it compiles the IR to assembly a
+  calls in the handler that can cause it. A panic is named by what it
+  checks and where ("the overflow check of `/` at vm.lm:512", "the
+  bounds check of an index at value.lm:224", "an `.unwrap()` of `None`
+  at ops.lm:156"), from a table codegen keeps of its panic sites; when
+  LLVM merged several panic calls into one, the warning lists the
+  handler's panic sites as candidates. It compiles the IR to assembly a
   second time, so it roughly doubles the build's clang time.
   `redo_effect` (section 4, "`redo`, polls"), an effect on a path before
   a `redo`, is an error unless an `#[allow(redo_effect)]` covers the
@@ -550,6 +555,16 @@ fn main() { Sym { id: 5 }.show_line(); }
     instance is needed (`Vec<f64>` is not `Show` if `f64` is not). The
     methods are the generic type's (`fn Vec<T>.show`). Each parameter of
     the impl must appear in the type.
+  - **Impls do not overlap.** Two impls of one trait (with the same
+    trait arguments) may not apply to the same type: `impl Show for
+    Vec<i64>;` next to `impl<T: Show> Show for Vec<T>;` is an error
+    ("overlapping impls of `Show`: both apply to `Vec<i64>`"), and so are
+    two generic impls whose types unify (`Pair<T, i64>` and
+    `Pair<str, T>`). Bounds are not consulted, so a new impl of a bound's
+    trait cannot make two existing impls start to overlap. There is no
+    orphan rule: a program is compiled as a whole, so the overlap check
+    sees every impl, and an impl may sit in any module that can name the
+    trait and the type.
   - **Static functions** of a trait (no `Self` parameter needed) are
     called on the type: `T.zero()` for a bounded `T`.
 
@@ -1688,10 +1703,12 @@ live in machine registers for the entire life of the interpreter:
 frame stack, globals, interned strings). Fields accessed through `ctx` cost a
 load, which is the right price for cold-ish data.
 
-The compiler warns when `state` + `context` exceeds the target's argument
-registers under `preserve_none` (about 12 general-purpose registers on x86-64
-and more on AArch64, but fewer is better: 3 to 6 is typical). **Not built:**
-the warning.
+In tail-call mode every handler takes the context, the state and the
+instruction word as `preserve_none` arguments: 12 general-purpose and 8
+floating-point registers on x86-64, 24 and 8 on AArch64 (LLVM 19). A vm
+that needs more gets the warning `state_registers` (the rest would be
+passed on the stack, a store and a load in every handler); 3 to 6 state
+variables is typical.
 
 State variables have plain types (`pc: *u32`, `regs: *Value`). A stack
 VM keeps a plain pointer to its stack top, and its ops declare stack
@@ -1817,7 +1834,28 @@ An op lists its operands and names its format. Operands map to the
 format's non-`op` fields by position, whatever their names; an op may
 have fewer operands than the format has fields, and the rest encode as 0
 and are ignored (`op HALT() : ABC`, `op DUP() : N` with `N` holding a
-24-bit `x`). The compiler type-checks the mapping.
+24-bit `x`). The compiler type-checks the mapping. An operand can name
+its field instead, `name: kind @ field`; the other operands take the
+fields not named, in order:
+
+<!-- snippet: check
+vm V {
+    state { pc: *u32, regs: *i64, k: *i64 }
+    operand reg = regs[it];
+    operand kst = k[it];
+    encoding fixed(u32) { format ABx { op: 8, a: 8, bx: 16 } format ABC { op: 8, a: 8, b: 8, c: 8 } }
+{snippet}
+    op RET(a: reg) : ABC { exit a }
+    entry run(code: *u32, r: *i64, ks: *i64) -> i64 { regs = r; k = ks; jump code }
+}
+-->
+```loimi
+op DELGLOBAL(name: kst @ bx) : ABx { next }   // `a` unused, encodes as 0
+op JLT(a: reg @ b, b: reg @ c) : ABC { next }            // `a` left for the compare it was
+```
+
+The encoder and emitter take the operands in the order written
+(`V.DELGLOBAL(k)`), and the disassembler shows only them.
 
 **Generated API.** Each item is `Vm.NAME` (`Vm__NAME` in the vm's module;
 private to the module unless the vm is `pub vm`). `W` is the code word
@@ -2818,8 +2856,10 @@ time. Only the vm's generated functions can build one: its field is
 private to the vm's expansion (fields whose names start with `__` are
 private to the file declaring their struct), so a struct literal or a
 field write outside it is an error. It offers `v.start() -> *W`,
-`v.len()`, and `v.words() -> []W` for reading (disassembly, line
-tables; writing through it voids the proof). In vm code, `jump v` starts
+`v.len()`, `v.words() -> []W` for reading (disassembly, line
+tables; writing through it voids the proof), and `v.index_of(at: *W) ->
+u64`, the index of the word `at` points at (`(at - start) / (W's size
+in bytes)`, for line tables and exception ranges). In vm code, `jump v` starts
 running the verified code. The escape hatches:
 
 - `unsafe { Mini.assume_verified(code) }`, for code the host built
@@ -3275,6 +3315,46 @@ reached through `become`. `Vm.deopt(v)` maps every member back to
 instruction word to its family's generic op, splits superinstructions
 (the head becomes its first part's generic op) and zeroes inline caches,
 which gives the code the emitters produced.
+
+**`become match`** picks the member from a value, usually the state an
+inline-cache miss handler returns (`std.obj`'s `IcState`):
+
+<!-- snippet: check
+enum IcState { Generic, OwnIn, OwnOut, Proto, Poly, Mega }
+fn miss(k: u64) -> IcState { if k == 0 { IcState.OwnIn } else { IcState.Mega } }
+vm V {
+    state { pc: *u32, regs: *i64 }
+    operand reg = regs[it];
+    operand imm = it;
+    encoding fixed(u32) { format AB { op: 8, a: 8, b: 16 } }
+    family GET(dst: reg, k: imm) : AB {
+        generic {
+            let st = miss(k);
+{snippet}
+            next
+        }
+        GET_IN { next }
+        GET_OUT { next }
+        GET_POLY { next }
+    }
+    entry run(code: *u32, r: *i64) -> i64 { regs = r; jump code }
+}
+-->
+```loimi
+become match st {
+    OwnIn => GET_IN,
+    OwnOut | Proto => GET_OUT,
+    Poly => GET_POLY,
+}
+```
+
+Each arm is a pattern of variants of the scrutinee's enum and an op;
+the scrutinee is evaluated once. It is the ladder `if st ==
+IcState.OwnIn { become GET_IN; } if st == IcState.OwnOut or st ==
+IcState.Proto { become GET_OUT; } ..` and compiles to the same code
+(Lox's and MiniJS's 11 ladders were ported with `loimi ir-diff`
+reporting the same code). A value no arm names keeps the current op, so
+there is no `_` arm.
 
 Rewrites are single-word, non-atomic stores: code is not shared
 between threads that run at the same time (section 10.1, threads).

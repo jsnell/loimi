@@ -70,7 +70,12 @@ pub struct Ctx {
     /// The values that coroutine.yield passed, or that the return that
     /// ended a run returned (RETN; RET1 and RET0 set only `nxfer`).
     xfer: *V,
-    nxfer: u64, #[cfg(gil)] gil: *gil.Gil, #[cfg(debug)] dbg: ?*debugger.Dbg, #[cfg(debug)] pause: u32, // --cfg gil: the lock of threads sharing the state (threads.lm); --cfg debug: the debugger, when running under one (debugger.lm)
+    nxfer: u64,
+    /// --cfg gil: the lock of threads sharing the state (threads.lm).
+    #[cfg(gil)] gil: *gil.Gil,
+    /// --cfg debug: the debugger, when running under one (debugger.lm).
+    #[cfg(debug)] dbg: ?*debugger.Dbg,
+    #[cfg(debug)] pause: u32,
 }
 
 pub const HOST_NATIVE: i32 = 1000;
@@ -168,7 +173,7 @@ fn error(c: *Ctx, msg: str, v: V) -> V {
 /// `e` prefixed with the line of the instruction at `at` in `p`'s code:
 /// "line N: e".
 fn at_line(c: *Ctx, p: Gc<Proto>, at: *u32, e: V) -> V {
-    let i = ((at as u64) - (p.code.start() as u64)) / 4;
+    let i = p.code.index_of(at);
     var line: u32 = 0;
     if i < p.lines.data.len { line = p.lines.data[i]; }
     c.out.clear();
@@ -994,7 +999,7 @@ pub vm Mini {
         rel negate(#("J" ++ cmp)) = #("J" ++ cmp ++ "N");
         rel negate(#("J" ++ cmp ++ "N")) = #("J" ++ cmp);
         inline for (opname, want) in [(#("J" ++ cmp), true), (#("J" ++ cmp ++ "N"), false)] {
-            op #opname(unused: imm, a: reg, b: bkind) : ABC then JMP {
+            op #opname(a: reg @ b, b: bkind @ c) : ABC then JMP {
                 let (x, y) = ((a as u64) ^ value.int_bias(), (b as u64) ^ value.int_bias());
                 if ((x | y) & V.Int.mask) == 0 { branch((isub) == want, then.target) }
                 if let (Num(x), Num(y)) = (a, b) { branch((fsub) == want, then.target) }
@@ -1007,7 +1012,7 @@ pub vm Mini {
         rel negate(#("J" ++ cmp)) = #("J" ++ cmp ++ "N");
         rel negate(#("J" ++ cmp ++ "N")) = #("J" ++ cmp);
         inline for (opname, want) in [(#("J" ++ cmp), true), (#("J" ++ cmp ++ "N"), false)] {
-            op #opname(unused: imm, a: reg, b: bkind) : ABC then JMP {
+            op #opname(a: reg @ b, b: bkind @ c) : ABC then JMP {
                 if let (Int(x), Int(y)) = (a, b) { branch((x == y) == want, then.target) }
                 // Same bits means equal, except for NaN; strings are interned.
                 if a == b {

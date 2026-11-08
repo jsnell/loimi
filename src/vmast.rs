@@ -46,6 +46,9 @@ pub struct CacheDecl {
 pub struct OpParam {
     pub name: Ident,
     pub kind: Ident,
+    /// `name: kind @ field`: the format field the operand is in (by
+    /// default the next field not taken).
+    pub field: Option<Ident>,
 }
 
 /// One value of a stack effect: `a`, or `xs[n]` for a counted run of

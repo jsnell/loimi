@@ -186,7 +186,7 @@ pub fn scan_roots(h: *gc.Heap, c: *Ctx) {
 }
 
 pub fn line_of(p: *Proto, pc: *u32) -> u32 {
-    let off = ((pc as u64) - (p.code.start() as u64)) / 4;
+    let off = p.code.index_of(pc);
     if off < p.lines.len { p.lines[off] } else { 0 }
 }
 
@@ -530,7 +530,7 @@ pub vm Py {
             next
         }
     }
-    op DELGLOBAL(z: imm, name: kst) : ABx {
+    op DELGLOBAL(name: kst @ bx) : ABx {
         let f = fp.func as! Func;
         if !value.dict_del(f.globals, name, value.hash_of(name).unwrap()) {
             raise ops.name_error(ctx, name)
@@ -1410,7 +1410,7 @@ pub vm Py {
         let saved = g.extra.ptr;
         for i in 0..p.nregs as u64 { saved[i] = regs[i]; }
         gc.write_barrier(&ctx.heap, g as *u8);
-        g.n = (((next_pc as u64) - (p.code.start() as u64)) / 4) as i64;
+        g.n = p.code.index_of(next_pc) as i64;
         g.s = dst.raw as i64;
         g.m = GEN_SUSPENDED;
         if (fp.flags & F_BASE) != 0 { exit Ok(v) }
@@ -1477,7 +1477,7 @@ pub vm Py {
             let p = fp.proto;
             if ctx.err_line == 0 { ctx.err_line = line_of(p, pc); }
             let start = p.code.start();
-            let off = (((pc as u64) - (start as u64)) / 4) as u32;
+            let off = p.code.index_of(pc) as u32;
             for i in 0..p.handlers.len {
                 let h = p.handlers[i];
                 if off >= h.start and off < h.end {
@@ -1494,7 +1494,13 @@ pub vm Py {
             regs = fp.base;
             k = fp.k;
         }
-    } #[cfg(debug)] on break { debugger.on_break(ctx, pc, fp); use_variant step; jump pc } #[cfg(debug)] #[unfused] variant step wraps all { before { if !debugger.on_step(ctx, pc, fp) { use_variant default; } } } // --cfg debug: the debugger (see the end of this file)
+    }
+
+    // --cfg debug: the debugger (see the end of this file).
+    #[cfg(debug)] on break { debugger.on_break(ctx, pc, fp); use_variant step; jump pc }
+    #[cfg(debug)] #[unfused] variant step wraps all {
+        before { if !debugger.on_step(ctx, pc, fp) { use_variant default; } }
+    }
 }
 
 /// Number of prototypes, for the verifier (set before verification).

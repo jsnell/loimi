@@ -202,8 +202,13 @@ the vm: Python's 26 `#[cfg(debug)]` all sit on existing lines
 **As built.** `loimi ir-diff A B` compares two builds function by
 function, ignoring source locations and names
 ([status.md](../status.md#comparing-builds-loimi-ir-diff)); every IR
-comparison in this note uses it. The examples' `#[cfg]` lines are not
-unpacked yet.
+comparison in this note uses it. The crammed `#[cfg]` lines were then
+unpacked: Mini's `Ctx` fields (`vm.lm:73`, 233 characters), Python's
+`on break` and `variant step` (`vm.lm:1497`, 268 characters) and the
+two longest debug-only lines of the compilers (Mini's loop back-jump,
+Python's `for` target stores) are now one item per line; `ir-diff
+--release` reports the same code, in the default and `--cfg debug`
+builds.
 
 ### 5. Cache layouts from structs
 
@@ -414,36 +419,44 @@ LOOP, CALL]`. Code and op set the same in all nine (see item 3).
   variable is typed from its range, not from later uses: `for j in
   0..3` used as a `u32` is an error whose note suggests `for j: u32 in
   ..`.
-- **`-W handler_frame` says *that* a frame appeared, not *why* it
-  appeared.** Prolog FRICTION 453 (open): adding a `deref` stopped LLVM
-  proving an `i48` division's overflow panic dead, and only the warning
-  hinted at it.
-  - The lint finds the calls in the assembly (`framelint.rs`). Mapping
-    a panic call back to its source panic, such as "the overflow check
-    of `/` at vm.lm:512", would answer this directly.
-  - `hot_gc` does not see calls inside plain vm functions (Lox FRICTION
-    219, partly fixed). The same mapping would cover them.
-  - Not done: it needs a panic-site table from codegen to the
-    assembly lint, outside the checker.
+- **`-W handler_frame` names the panic behind a frame.** Prolog
+  FRICTION 453: adding a `deref` stopped LLVM proving an `i48`
+  division's overflow panic dead, and the warning only said "a panic".
+  Built: codegen keeps a panic-site table (message text → "the overflow
+  check of `/` at vm.lm:512", "the zero check of `%`", "the bounds check
+  of an index", "an `.unwrap()` of `None`", ...), returned with the IR,
+  and `framelint.rs` names each panic call from it; panic calls LLVM
+  merged into one list the function's panic sites as candidates. The
+  generated code does not change. `hot_gc` still does not see calls
+  inside plain vm functions (Lox FRICTION 219).
 - **Operands map to format fields by position**, so `op DELGLOBAL(z:
-  imm, name: kst) : ABx` needs a dummy operand (Python FRICTION 579; 6
-  sites in 4 vms, e.g. Mini's `unused: imm` at `vm.lm:997`). The message was fixed. A named binding (`name: kst @ bx`)
-  removes the dummy, and is S. Not done: it changes the vm parser and
-  the operand layout in `vmexpand.rs`.
+  imm, name: kst) : ABx` needed a dummy operand (Python FRICTION 579).
+  Built: `name: kst @ bx` names the field (`language.md` §3, formats;
+  `vmexpand::param_fields`), and the encoder-mismatch note mentions it.
+  Ported: Mini's 4 compare-and-jump ops (`a: reg @ b, b: bkind @ c`),
+  Scheme's CHKGLOBAL, Python's DELGLOBAL, MiniJS's THROWREF, and Wasm's
+  trailing `z: imm` on the lane stores (just dropped). Python's
+  SUPERMETHOD `z` is a real flag and stays. `loimi ir-diff --release`:
+  the handlers have the same code; what changes is the disassembler,
+  `operand_name` and verify-error text, which no longer know the dummy
+  operands (and in Mini the name of an accumulator spill slot).
 
 ## 2a. Smaller items
 
-- **`v.index_of(pc)` on `Verified<Vm>`.** It would replace 13 copies of
-  `((pc as u64) - (start as u64)) / 4`, with the word size hard-coded
-  each time (`mini/vm.lm:171`, `mini/debugger.lm:434`, `:508`, `:909`,
-  `scheme/vm.lm:61`, `minijs/vm.lm:364`, `lox/vm.lm:216`,
-  `python/vm.lm:202`, `:1433`, `:1505`, `stack/vm.lm:525`,
-  `python/debugger.lm:373`, `:502`). It is the same arithmetic. S.
-- **`become match st { OwnIn => GETPROP_IN, .. }`.** It would replace
-  48 `if st == obj.IcState.X { become Y; }` ladders: Lox 25
-  (`vm.lm:540`–`:543`, `:567`–`:571`) and MiniJS 23. The ladders map
-  `std.obj`'s cache state to a family member, the same way at each
-  site. The compiled code is the same `if` chain. S.
+- **`v.index_of(pc)` on `Verified<Vm>`.** Built (`language.md` §6,
+  generated with the other `Verified` methods in `vmexpand.rs`): the
+  word index of a pointer into the code, with the vm's word size. It
+  replaced 17 copies of `((pc as u64) - (start as u64)) / 4` in Mini,
+  Mini's debugger, Scheme, MiniJS, Lox, Python, Python's debugger, Stack
+  and tutorial steps 6–9; `loimi ir-diff --release`: same code.
+- **`become match st { OwnIn => GETPROP_IN, .. }`.** Built
+  (`language.md` §7.2): sugar in the parser for the ladder `if st is
+  OwnIn { become GETPROP_IN; } ..`, and `x is A | B` on a local of a
+  payload-less enum is checked as `x == A or x == B`, the comparisons
+  the ladders had (as a `match` it came out as a differently ordered
+  switch in Lox's INVOKE_MISS). Lox's 6 and MiniJS's 5 multi-arm
+  ladders (40 lines) were ported; `loimi ir-diff --release` reports the
+  same code for both. One-arm tests stay plain `if`s.
 
 ## 3. Considered and rejected
 
@@ -464,10 +477,6 @@ LOOP, CALL]`. Code and op set the same in all nine (see item 3).
   item 11 removes the list-keeping.
 - **Trailing arrays in plain structs** (Prolog frames): 4 helpers and one
   operand kind; too few sites.
-- **`bool as i32`** (Wasm FRICTION 1072, still listed as open). It
-  works on master: `true as i64` compiles and prints 1. Wasm's `b2i`
-  helper (`vm.lm:138`) and Python's 21 `if b { 1 } else { 0 }` can just
-  use it. The Wasm log's follow-up table should be updated.
 - **A `sync` shorthand in `state { .. }`**: `sync`/`reload` are one or
   two lines per vm.
 - **Derived state registers** (`regs = fp.base` reloaded whenever `fp`

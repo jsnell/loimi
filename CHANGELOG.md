@@ -8,6 +8,27 @@ implementation; `git log` has the details.
 
 ### `vm` declarations and dispatch
 
+- **Warning `state_registers`**: a tail-call vm whose context, state and
+  instruction word need more `preserve_none` argument registers than the
+  target has (x86-64: 12 general-purpose, 8 floating-point; AArch64: 24
+  and 8) is warned about, since every handler would pass the rest on the
+  stack ([language.md §3.1](docs/language.md#31-state-and-context)).
+- **Named operand fields**: `op DELGLOBAL(name: kst @ bx) : ABx` puts an
+  operand in a named format field (the others take the fields not named,
+  in order), so ops no longer need dummy `unused: imm` operands. Mini,
+  Scheme, Python, MiniJS and Wasm ported; handlers compile to the same
+  code ([language.md §3](docs/language.md#3-the-vm-declaration)).
+- **`v.index_of(at)` on `Verified<Vm>`**: the word index of a pointer
+  into verified code, with the vm's word size, for line tables and
+  exception ranges. It replaces 17 copies of `((pc as u64) - (start as
+  u64)) / 4` in the examples (same code by `loimi ir-diff`)
+  ([language.md §6](docs/language.md#6-verification-unchecked-by-proof)).
+- **`become match st { OwnIn => GETPROP_IN, OwnOut | Proto => .. }`**
+  picks a family member from an enum value, replacing ladders of `if st
+  == obj.IcState.X { become Y; }` (Lox and MiniJS ported, same code by
+  `loimi ir-diff`). `x is A | B` on a local of a payload-less enum now
+  compiles to `x == A or x == B`
+  ([language.md §7.2](docs/language.md#72-families-and-become)).
 - **Side traces, and loops inside loops** (trace tier M2): a trace is
   now a graph in one function: its root path goes through the loops
   inside its loop, and the hot paths from its exits are side traces
@@ -319,6 +340,12 @@ implementation; `git log` has the details.
 
 ### Core language
 
+- **Overlapping impls are an error.** `impl Show for Vec<i64>;` next to
+  `impl<T: Show> Show for Vec<T>;`, or two generic impls whose types
+  unify, no longer let the first matching impl win silently: "overlapping
+  impls of `Show`: both apply to `Vec<i64>`", with a note at the other
+  impl. No orphan rule (the whole program is checked at once)
+  ([language.md §1.2](docs/language.md#generics-and-traits)).
 - **`e is P` and `e as! V`**: a pattern test that binds nothing (`t is
   Ref`, `v is Int | Float`, `!(o is Nil)`; a misspelled variant is an
   error, not a binding), and a checked unwrap of a variant (`let s =
@@ -635,6 +662,11 @@ implementation; `git log` has the details.
 
 ### Tooling
 
+- **`-W handler_frame` names the panic behind a frame**: "the overflow
+  check of `/` at vm.lm:512", "the bounds check of an index at
+  value.lm:224", from a panic-site table codegen keeps (no change to the
+  generated code); merged panic calls list their candidates
+  ([language.md §1.2](docs/language.md#warnings-attributes-and-tests)).
 - **`--vm-stats` counts quickenings**: every `become` per site and per
   transition. A site's later ones (re-quickenings and deopts) are
   reported as a share of dispatches. Across Mini, MiniJS, Lox, Python
@@ -695,6 +727,19 @@ implementation; `git log` has the details.
 
 ### Examples
 
+- **Mini debugger: `next` across `coroutine.resume`** steps over the
+  coroutine: the depth now adds the frames of the threads that resumed
+  the running coroutine (it was the frame index in the coroutine's own
+  stack, so `next` stopped inside the coroutine or skipped the
+  resumer's next line). Test `examples/mini/tests/debug/coro_next`
+  ([design/debugging.md §3.1](docs/design/debugging.md#31-generic-and-specific-parts)).
+- **Crammed `#[cfg]` lines unpacked and `bool as` casts**: Mini's and
+  Python's longest debug-only lines (233 and 268 characters) are one item
+  per line, Wasm's `b2i` helper is gone (`(a < b) as i32`), and 13 of
+  Python's `if b { 1 } else { 0 }` are `b as T`; `loimi ir-diff --release`
+  reports the same code (default and `--cfg debug` builds). The 6 Python
+  sites where the cast changed the optimized code (`bind_args`, `unary`,
+  one builtin) keep the `if`.
 - No `unsafe` left in the example interpreters: `f64.from_bits(a as
   u64)` on a register operand compiles to a `double` load of the slot
   ([language.md](docs/language.md), [lowering.md §2](docs/lowering.md)),
