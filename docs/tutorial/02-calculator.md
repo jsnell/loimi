@@ -25,7 +25,7 @@ comments while counting lines, read identifiers and look them up in a
 keyword table, read numerals exactly (including the overflow cases),
 decode string escapes, match operators longest first. `std.lex` is
 those pieces as a toolkit. It is not a generator (Loimi has no
-compile-time evaluation yet), so a lexer is a short function that tries
+functions run at compile time), so a lexer is a short function that tries
 the scanners in order.
 
 The token kinds are a payload-free enum. The lexer already knows every

@@ -515,15 +515,6 @@ Tried and dropped:
   interp orders its hot opcodes first, so a tree's ~4 compares would
   not beat the chain's average.
 
-Next candidates:
-
-- `SWITCH` straight to the target: done (45).
-- GETINDEX_GETINDEX is now 20% of interp and keeps its stack frame
-  (register pressure from two inlined hash probes).
-- Coroutine resume/yield cold blocks (31% of chameneos; now hot
-  family members, 46), the intern
-  table's probe miss (string_build), LEN and CONCAT frames: as before.
-
 ## Value accumulators (2026-11-06)
 
 43. **A value accumulator** (speed audit item 1, `language.md` §7.4):
@@ -699,17 +690,20 @@ instructions before each store.
 ## Remaining compiler and codegen issues
 
 - Supers of quickened members only form if something re-runs
-  `Vm.optimize` after `become` (Mini now does it by hand). `become`
-  could look up the super for the new neighbour pair itself.
+  `Vm.optimize` after `become` (Mini now does it by hand). Resolved:
+  `refuse CODE;` and `Vm.refuse` fuse supers again over a `become`.
 - `x % y` on `iN` wider than 32 bits keeps the MIN % -1 guard even when
   `y > 0` was tested on the same value (the test is on the shifted
-  payload, the guard on the extended one).
+  payload, the guard on the extended one). Resolved: the division
+  checks now test the shifted operands (`lowering.md`), so the guard
+  folds away.
 - Hot handlers that make a plain call on some path get a stack frame
   (`push %rbp`) on every path; only `cold` keeps it off, reliably only
   for a cold block that ends in a control word (`next`, `redo`, ...):
   one that falls through may stay inline with its call (item 38).
 - `cvtsi2sd` into a register with a stale upper half (no `xorps`
   break): a false dependency in the mixed int/float members.
-- No way to say "this pointer is dereferenceable", so loads cannot be
-  hoisted or speculated; and verify clauses that relate two operands
-  have to decode the word themselves (`Mini.ABC_a(*pc)`).
+- No way to say "this pointer is dereferenceable" (load facts were
+  prototyped 2026-11-06, speed-audit item 4: no handler changed, no
+  gain). Verify clauses that relate two operands decode the word
+  themselves (`Mini.ABC_a(*pc)`).
