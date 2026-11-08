@@ -1,0 +1,58 @@
+// A `const` array indexed at run time is read from a constant global, not
+// built on the stack at each access (tests/golden.rs `const_array_ir`
+// checks the IR): arrays of numbers, of structs, nested arrays, a field
+// of an element, constant indices, the whole value, a method that writes
+// through its receiver (a temporary copy, as before), and the bounds check.
+// expect: 40
+// expect: 11
+// expect: 5
+// expect: 39
+// expect: 50
+// expect: 3
+// expect: 7
+// expect: seven
+// expect: 9
+// expect: nine
+// expect: 103
+// expect: 3
+// expect-exit: 134
+// expect-stderr: const_array_index.lm:31:26: index out of bounds
+import std.io;
+
+struct P { a: u64, b: u32 }
+
+fn P.bump(p: *P) -> u64 { p.a += 100; p.a }
+
+const TAB: [u64; 5] = [10, 20, 30, 40, 50];
+const PS: [P; 3] = [P { a: 1, b: 2 }, P { a: 3, b: 4 }, P { a: 5, b: 6 }];
+const NEST: [[u8; 3]; 2] = [[1, 2, 3], [4, 5, 6]];
+const PAIRS: [(i32, str); 2] = [(7, "seven"), (9, "nine")];
+
+fn elem(i: u64) -> u64 { TAB[i] }
+fn fields(i: u64) -> u64 { PS[i].a + (PS[i].b as u64) }
+fn nested(i: u64, j: u64) -> u64 { NEST[i][j] as u64 }
+fn constant() -> u64 { TAB[2] + PS[1].a + (NEST[1][2] as u64) }
+fn whole() -> [u64; 5] { TAB }
+
+fn main() -> i32 {
+    io.print_int(elem(3) as i64); io.println("");
+    io.print_int(fields(2) as i64); io.println("");
+    io.print_int(nested(1, 1) as i64); io.println("");
+    io.print_int(constant() as i64); io.println("");
+    let w = whole();
+    io.print_int(w[4] as i64); io.println("");
+    // A run-time index into a row of the nested array: a copy of the row.
+    var row = NEST[elem(0) / 10];
+    row[0] = 3;
+    io.print_int(row[0] as i64); io.println("");
+    var k = 0;
+    while k < 2 {
+        io.print_int(PAIRS[k].0 as i64); io.println("");
+        io.println(PAIRS[k].1);
+        k += 1;
+    }
+    io.print_int(PS[elem(0) / 10].bump() as i64); io.println("");
+    io.print_int(PS[elem(0) / 10].a as i64); io.println("");
+    io.print_int(elem(5) as i64); io.println("");
+    0
+}
