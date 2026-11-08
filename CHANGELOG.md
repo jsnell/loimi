@@ -569,6 +569,20 @@ implementation; `git log` has the details.
 
 ### Standard library
 
+- **Shortest float formatting by Schubfach**: `std.num`'s
+  `write_shortest`, `shortest` and `write_js`, the new
+  `write_g_shortest`, and `text.StrBuf.push_f64` no longer try
+  `%.{1..17}e` with snprintf and strtod, one call each per digit count.
+  Their output is unchanged, including C's choice of digits at powers of
+  two (`2^-24` is `5.9604644775390625e-08`). About 80 ns per number
+  instead of 10 us; loops that convert floats to strings run 55 to 80
+  times faster in Python, MiniJS and Scheme, loops that print them 13 to
+  56 times; the benchmark suites are unchanged (geometric means 0.99
+  to 1.02, A/A 0.99 to 1.00).
+  `tests/run/std_num_shortest.lm` compares against the old search
+  (checked once by hand on 20 million doubles)
+  ([stdlib.md](docs/stdlib.md#stdnum)).
+
 - **`std.rt.ValueStack<T>`**: a vm's value stack with a high-water
   mark, so that calls do not clear their registers for the collector.
   `fits` is one compare against the mark, in place of the overflow

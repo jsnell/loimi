@@ -1,0 +1,286 @@
+// std.num's shortest float formatting (Schubfach) against the snprintf
+// search it replaced: for each test double, the fewest `%.{p}e` digits
+// that strtod reads back as the same double. Covers every power of two
+// (where the rounding interval is asymmetric), powers of ten and their
+// neighbours, subnormals, the extremes, signed zeros, infinities, NaNs,
+// integers, short decimals and random bit patterns. `std_num_shortest N
+// SEED` adds N random doubles of each kind (default 3000, seed 1).
+// args: --release
+// expect: 0.1 0.30000000000000004 5.9604644775390625e-08 1e+16 12345678901234568
+// expect: 0.1 1e+02 1e+16 1.7976931348623157e+308 5e-324 -0 -nan -inf
+// expect: 0.000001 1e-7 123456789012345680000 1e+21
+// expect: mismatches 0
+
+import std.io;
+import std.mem;
+import std.num;
+import std.os;
+import std.text;
+
+extern "C" fn snprintf(buf: *u8, n: u64, fmt: *u8, ...) -> i32;
+extern "C" fn strtod(s: *u8, end: **u8) -> f64;
+
+// ── the reference: std.num's former snprintf/strtod implementation ──
+
+fn ref_shortest_g(b: *text.StrBuf, x: f64, widen: bool) {
+    var buf: [u8; 48] = [0; 48];
+    var prec = 1;
+    var n: i32 = 0;
+    while prec <= 17 {
+        n = snprintf(&buf[0], 48, "%.*e\0".ptr, prec - 1, x);
+        if x != x or strtod(&buf[0], 0 as **u8) == x { break; }
+        prec += 1;
+    }
+    let s = buf[0..n as u64];
+    var exp: i64 = 0;
+    if let Some(e) = text.find(s, 'e') {
+        if let Ok(v) = num.parse_i64(s[e + 1..s.len], 10) { exp = v; }
+    }
+    var p = prec as i64;
+    if widen and exp >= -4 and exp < 16 and exp + 1 > p { p = exp + 1; }
+    n = snprintf(&buf[0], 48, "%.*g\0".ptr, p as i32, x);
+    b.push_str(buf[0..n as u64]);
+}
+
+// text.StrBuf.push_f64's former loop.
+fn ref_push_f64(b: *text.StrBuf, x: f64) {
+    var buf: [u8; 40] = [0; 40];
+    var prec = 1;
+    var n: i32 = 0;
+    while prec <= 17 {
+        n = snprintf(&buf[0], 40, "%.*g\0".ptr, prec, x);
+        if strtod(&buf[0], 0 as **u8) == x or x != x { break; }
+        prec += 1;
+    }
+    b.push_str(buf[0..n as u64]);
+}
+
+fn ref_shortest(x: f64) -> num.Shortest {
+    var buf: [u8; 48] = [0; 48];
+    let ax = if x < 0.0 { -x } else { x };
+    var prec = 1;
+    var n: i32 = 0;
+    while prec <= 17 {
+        n = snprintf(&buf[0], 48, "%.*e\0".ptr, prec - 1, ax);
+        if strtod(&buf[0], 0 as **u8) == ax { break; }
+        prec += 1;
+    }
+    let s = buf[0..n as u64];
+    var r = num.Shortest { digits: [0; 17], n: 0, exp: 0 };
+    var i: u64 = 0;
+    while i < s.len and s[i] != 'e' {
+        if s[i] >= '0' and s[i] <= '9' and r.n < 17 { r.digits[r.n] = s[i]; r.n += 1; }
+        i += 1;
+    }
+    while r.n > 1 and r.digits[r.n - 1] == '0' { r.n -= 1; }
+    if i < s.len {
+        if let Ok(v) = num.parse_i64(s[i + 1..s.len], 10) { r.exp = v as i32; }
+    }
+    r
+}
+
+fn ref_js(b: *text.StrBuf, x: f64) {
+    if x != x { b.push_str("NaN"); return; }
+    if x == 0.0 { b.push('0'); return; }
+    if x < 0.0 { b.push('-'); }
+    let ax = if x < 0.0 { -x } else { x };
+    if ax == 1.0 / 0.0 { b.push_str("Infinity"); return; }
+    let s = ref_shortest(ax);
+    let k = s.n as i64;
+    let n = s.exp as i64 + 1;
+    if k <= n and n <= 21 {
+        for i in 0..k { b.push(s.digits[i]); }
+        for _ in k..n { b.push('0'); }
+    } else if 0 < n and n <= 21 {
+        for i in 0..n { b.push(s.digits[i]); }
+        b.push('.');
+        for i in n..k { b.push(s.digits[i]); }
+    } else if -6 < n and n <= 0 {
+        b.push_str("0.");
+        for _ in 0..(0 - n) { b.push('0'); }
+        for i in 0..k { b.push(s.digits[i]); }
+    } else {
+        b.push(s.digits[0]);
+        if k > 1 {
+            b.push('.');
+            for i in 1..k { b.push(s.digits[i]); }
+        }
+        b.push('e');
+        let e = n - 1;
+        if e < 0 { b.push('-'); } else { b.push('+'); }
+        b.push_int(if e < 0 { 0 - e } else { e });
+    }
+}
+
+// ── the comparison ──────────────────────────────────────────────────
+
+struct Check { a: text.StrBuf, b: text.StrBuf, bad: u64, total: u64 }
+
+fn Check.differ(c: *Check, what: str, x: f64) {
+    c.bad += 1;
+    if c.bad <= 20 {
+        var m = text.StrBuf.new();
+        m.push_str(what);
+        m.push_str(" bits=0x");
+        num.write_hex(&m, x.to_bits());
+        m.push_str(" new=");
+        m.push_str(c.a.as_str());
+        m.push_str(" old=");
+        m.push_str(c.b.as_str());
+        io.eprintln(m.as_str());
+        m.free();
+    }
+}
+
+fn Check.compare(c: *Check, what: str, x: f64) {
+    if !mem.equal_bytes(c.a.as_str(), c.b.as_str()) { c.differ(what, x); }
+}
+
+fn Check.one(c: *Check, x: f64) {
+    c.total += 1;
+    c.a.clear(); c.b.clear();
+    num.write_shortest(&c.a, x);
+    ref_shortest_g(&c.b, x, true);
+    c.compare("write_shortest", x);
+    c.a.clear(); c.b.clear();
+    num.write_g_shortest(&c.a, x);
+    ref_shortest_g(&c.b, x, false);
+    c.compare("write_g_shortest", x);
+    c.a.clear(); c.b.clear();
+    c.a.push_f64(x);
+    ref_push_f64(&c.b, x);
+    c.compare("push_f64", x);
+    c.a.clear(); c.b.clear();
+    num.write_js(&c.a, x);
+    ref_js(&c.b, x);
+    c.compare("write_js", x);
+    c.a.clear(); c.b.clear();
+    let s = num.shortest(x);
+    let r = ref_shortest(x);
+    for i in 0..s.n { c.a.push(s.digits[i]); }
+    c.a.push('e');
+    c.a.push_int(s.exp as i64);
+    for i in 0..r.n { c.b.push(r.digits[i]); }
+    c.b.push('e');
+    c.b.push_int(r.exp as i64);
+    c.compare("shortest", x);
+}
+
+fn Check.both(c: *Check, x: f64) { c.one(x); c.one(-x); }
+
+/// x and its neighbours one and two units in the last place away.
+fn Check.around(c: *Check, x: f64) {
+    let u = x.to_bits();
+    c.both(x);
+    if u > 1 { c.both(f64.from_bits(u - 1)); c.both(f64.from_bits(u - 2)); }
+    if u < 0x7FEFFFFFFFFFFFFE { c.both(f64.from_bits(u + 1)); c.both(f64.from_bits(u + 2)); }
+}
+
+struct Rng { s: u64 }
+
+fn Rng.next(r: *Rng) -> u64 {
+    r.s = r.s +% 0x9E3779B97F4A7C15;
+    var z = r.s;
+    z = (z ^ (z >> 30)) *% 0xBF58476D1CE4E5B9;
+    z = (z ^ (z >> 27)) *% 0x94D049BB133111EB;
+    z ^ (z >> 31)
+}
+
+fn main() {
+    var count: u64 = 3000;
+    if let Some(a) = os.arg(1) {
+        if let Ok(v) = num.parse_u64(a, 10) { count = v; }
+    }
+    var seed: u64 = 1;
+    if let Some(a) = os.arg(2) {
+        if let Ok(v) = num.parse_u64(a, 10) { seed = v; }
+    }
+    // A few formats by name (2^-24 is a power of two where the shortest
+    // decimal, 5.960464477539063e-08, is not C's: see std.num).
+    var e = text.StrBuf.new();
+    for x in [0.1, 0.1 + 0.2, 1.0 / 16777216.0, 1e16, 12345678901234567.0] {
+        if e.len() > 0 { e.push(' '); }
+        num.write_shortest(&e, x);
+    }
+    io.println(e.as_str());
+    e.clear();
+    for x in [0.1, 100.0, 1e16, 1.7976931348623157e308, f64.from_bits(1), -0.0,
+              f64.from_bits(0xFFF8000000000000), -1.0 / 0.0] {
+        if e.len() > 0 { e.push(' '); }
+        e.push_f64(x);
+    }
+    io.println(e.as_str());
+    e.clear();
+    for x in [0.000001, 0.0000001, 123456789012345678901.0, 1e21] {
+        if e.len() > 0 { e.push(' '); }
+        num.write_js(&e, x);
+    }
+    io.println(e.as_str());
+    e.free();
+
+    var c = Check { a: text.StrBuf.new(), b: text.StrBuf.new(), bad: 0, total: 0 };
+
+    // Specials and extremes.
+    c.both(0.0);
+    c.both(1.0 / 0.0);
+    c.both(f64.from_bits(0x7FF8000000000000));
+    c.both(f64.from_bits(0x7FF0000000000001));
+    c.around(f64.from_bits(1));                    // the smallest subnormal
+    c.around(f64.from_bits(0x000FFFFFFFFFFFFF));   // the largest subnormal
+    c.around(f64.from_bits(0x0010000000000000));   // the smallest normal
+    c.around(f64.from_bits(0x7FEFFFFFFFFFFFFF));   // the largest finite
+    for bits in [0x0000000000000002 as u64, 0x0000000000000003, 0x00000000000003E8, 0x8000000000000, 0x7FEFFFFFFFFFFFFE] {
+        c.both(f64.from_bits(bits));
+    }
+    // Every power of two, and its neighbours.
+    for e in 0..2047 { c.around(f64.from_bits((e as u64) << 52)); }
+    // Every power of ten in range (as strtod rounds it), and neighbours.
+    var tb = text.StrBuf.new();
+    for e in -324..309 {
+        tb.clear();
+        tb.push_str("1e");
+        tb.push_int(e);
+        if let Ok(x) = num.parse_f64(tb.as_str()) { if x != 0.0 { c.around(x); } }
+        tb.clear();
+        tb.push_str("5e");
+        tb.push_int(e);
+        if let Ok(x) = num.parse_f64(tb.as_str()) { if x != 0.0 { c.around(x); } }
+    }
+    tb.free();
+    // Small integers, short decimals, and integers around 2^53 and 1e16.
+    for i in 0..2000 {
+        c.both(i as f64);
+        c.both(i as f64 / 10.0);
+        c.both(i as f64 / 1000.0);
+        c.both(i as f64 * 0.1);
+        c.both(9007199254740992.0 - 1000.0 + i as f64);
+        c.both(1e16 - 1000.0 + 2.0 * i as f64);
+        c.both(1e17 - 16000.0 + 16.0 * i as f64);
+    }
+
+    var r = Rng { s: seed };
+    for _ in 0..count {
+        // Any bit pattern (NaNs included).
+        c.one(f64.from_bits(r.next()));
+        // Magnitudes around 1, where guest programs live.
+        let m = r.next() & 0x800FFFFFFFFFFFFF;
+        c.one(f64.from_bits(m | ((990 + r.next() % 80) << 52)));
+        // Subnormals.
+        c.one(f64.from_bits(r.next() & 0x800FFFFFFFFFFFFF));
+        // Decimals with few digits: n / 10^j.
+        let n = r.next() % 10000000000;
+        let j = (r.next() % 30) as i64;
+        var p = 1.0;
+        for _ in 0..j { p = p * 10.0; }
+        c.both(n as f64 / p);
+        c.both(n as f64 * p);
+    }
+    c.a.free();
+    c.b.free();
+    io.eprint("checked ");
+    io.eprint_int(c.total as i64);
+    io.eprintln(" doubles");
+    io.print("mismatches ");
+    io.print_int(c.bad as i64);
+    io.println("");
+}

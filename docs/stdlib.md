@@ -422,7 +422,7 @@ Everything here except `HashMap`, `OrderedMap` and `Dict` is design only:
 
 - `StrBuf`, a growable byte string: `StrBuf.new()`, `push(byte)`,
   `push_str(s)`, `push_int(i64)`, `push_f64(f64)` (shortest `%g` that
-  reads back as the same number), `as_str()`
+  reads back as the same number, `num.write_g_shortest`), `as_str()`
   (valid until the next push), `len()`, `clear()`, `free()`,
   `push_u64(u64)`. `std.num` has more float formats.
 - Formatting, for messages: `b.fmt2("expected {} values, got {}", n, m)`
@@ -467,11 +467,28 @@ and validation, and case mapping.
   decimal overflow becomes a float, as in Lua), `decimal_len(s)` (the
   extent of a numeral, for lexers), `digit_value(c)`, `is_hex_digit(c)`.
 - Formatting appends to a `text.StrBuf`: `write_g(b, x, 14)` (Lua's
-  `%.14g`), `write_shortest(b, x)` (shortest round-trip, Python `repr`
-  notation, by trying `%.{1..17}e` with snprintf), `shortest(x)` (the
-  digits and exponent) and `write_js(b, x)` (ECMAScript
-  Number::toString), `mark_float(b, start)` (append `.0` to
+  `%.14g`, by snprintf), `write_shortest(b, x)` (shortest round-trip,
+  Python `repr` notation without the `.0`), `write_g_shortest(b, x)`
+  (`%.{p}g` with the fewest digits p that read back: `1e+02` for 100),
+  `shortest(x)` (the digits and exponent) and `write_js(b, x)`
+  (ECMAScript Number::toString), `mark_float(b, start)` (append `.0` to
   integer-looking output) and `write_hex(b, x)`.
+- The shortest digits come from Schubfach (Giulietti 2020): one
+  64x128-bit multiplication (`mul_wide`) per end of the rounding
+  interval against a table of 617 128-bit powers of ten, no loop over
+  precisions. Among equally short decimals it takes the closest to `x`,
+  as C's correctly rounded `%.{p}e` does; at exact powers of two, where
+  the interval is lopsided, it takes C's `%.{p}e` digits for the fewest p
+  that read back (that need not be the shortest decimal in the interval:
+  `2^-24` is `5.9604644775390625e-08`, not `5.960464477539063e-08`), so
+  the output is the same as a search over `%.{1..17}e` with snprintf and
+  strtod. `tests/run/std_num_shortest.lm` checks that against such a
+  search (every power of two and power of ten with their neighbours,
+  subnormals, extremes, random doubles). `write_shortest` takes about
+  80 ns per number where the search took 10 us (a mix of short and
+  17-digit numbers). Python, MiniJS and Scheme loops that convert
+  floats to strings run 55 to 80 times faster, and loops that print them
+  13 to 56 times.
 - Guest arithmetic: `floor_div`, `floor_mod`, `trunc_div`, `trunc_rem`
   (`?i64`: None on a zero divisor; `MIN / -1` wraps), `floor_div_f64`,
   `floor_mod_f64`, `add_overflow` / `sub_overflow` / `mul_overflow`
@@ -479,9 +496,8 @@ and validation, and case mapping.
 
 ### Design (not built)
 
-Ryu formatting and Eisel-Lemire parsing (snprintf and strtod are used
-instead); binary literals, digit separators and per-language literal
-configuration.
+Binary literals, digit separators and per-language literal
+configuration. Floats are parsed by strtod.
 
 ## `std.bigint`
 
