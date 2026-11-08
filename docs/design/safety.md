@@ -1,7 +1,7 @@
 # Design note: compile-time memory safety for the standard library
 
-Status: **built** (`#![safe]` modules, `#[raw]` functions). Written
-2026-11-03.
+Status: **built** (`#![safe]` modules, `#[raw]` functions, the GC-object
+rules of section 8). Written 2026-11-03.
 
 > Raw pointers (`*T`) need no `unsafe` anywhere (language.md section
 > 1.3), and the standard library is built on them. Can the compiler
@@ -13,20 +13,22 @@ value*: following it is allowed, making it point anywhere else is not.
 Everything that can reach memory outside the one value (indexing,
 arithmetic, `p.slice(n)`, casts to pointers, another module's buffer
 pointers, C calls, functions marked `#[raw]`) needs `unsafe { }`. What
-is not checked is *lifetime*: a `*T` or slice obtained from a container
-dangles once the container grows, shrinks or is freed, and nothing
-stops safe code from keeping it at compile time (section 2); built with
-`--sanitize=address`, std's containers poison the memory they keep but
-no longer use, so most such uses are reported at run time (section 7).
-GC objects have three rules of their own, in every module (section 8):
-a slice of an object's traced trailing array cannot be kept where a
+this rule does not check is *lifetime*: the pointer-stability check
+(`lifetimes.md`) rejects a `*T` or slice used after its container may
+have moved, within a function and through its calls, but a pointer
+stored in memory and loaded elsewhere is unchecked (section 2); built
+with `--sanitize=address`, std's containers poison the memory they keep
+but no longer use, so most such uses are reported at run time (section
+7). GC objects have three rules of their own, in every module (section
+8): a slice of an object's traced trailing array cannot be kept where a
 store through it would skip the write barrier, a trailing array starts
 zero-filled only where zero is a valid element, and the objects of a
 `#![safe]` module are built and written only by that module.
-Nine std modules (`lex`,
-`parse`, `diag`, `text`, `hash`, `io`, `bc`, `map`, `dict`) are now safe
-(section 5). It is a check only: no example's IR changed
-from adding `#![safe]` and `#[raw]`, and the migrations' own IR changes
+Nine std modules (`lex`, `parse`, `diag`, `text`, `hash`, `io`, `bc`,
+`map`, `dict`) are safe (sections 4 and 5); the others (`mem`, `gc`,
+`obj`, `bigint`, `gil`, `num`, `math`, `os`, `rt`, `test`, `prof`,
+`debug`) are not. It is a check only: no example's IR changed from
+adding `#![safe]` and `#[raw]`, and the migrations' own IR changes
 (slices instead of pointer arithmetic, so bounds checks) are measured
 in section 6.
 
@@ -94,7 +96,7 @@ whose type holds a `*T` by value (`*T`, `?*T`, and tuples, arrays and
 options of them, and function types taking or returning one), and "a
 struct with raw-pointer fields" is transitive through struct and enum
 fields (a struct holding a `Vec` is one). Copying a whole value is allowed
-(that is the aliasing part of the lifetime hole, section 3). This holds
+(that is the aliasing part of the lifetime hole, section 2). This holds
 for structs of other *safe* modules too: their `unsafe` blocks rely on
 their invariants.
 
@@ -127,19 +129,18 @@ unsafe { write(fd, s.ptr, s.len) }
    original grows. The rule for std's own APIs is: *a container's
    methods leave the container valid* (`Vec.free` leaves an empty
    `Vec`, `HashMap.free` an empty map), so only references obtained
-   earlier can dangle. Checking this needs ownership or a borrow
-   checker, which Loimi deliberately leaves out (language.md section
-   11); index- and callback-based APIs (`Vec.at(i)`, `OrderedMap`
+   earlier can dangle. Uses within one function, through its calls, are
+   compile errors in every module (pointer stability,
+   `docs/design/lifetimes.md`, which also lists what that check does
+   not cover); a pointer stored in memory and loaded elsewhere is not
+   checked. Index- and callback-based APIs (`Vec.at(i)`, `OrderedMap`
    entry indices with `version`) are the safe alternative where they
    are cheap. Built with `--sanitize=address`, most stale uses are
-   reported at run time (section 7). *Update:* the uses within one
-   function, through calls, are now compile errors in every module (pointer
-   stability, `docs/design/lifetimes.md`); pointers stored in memory
-   and loaded elsewhere remain this hole.
+   reported at run time (section 7).
 2. **GC references in host memory.** A `Gc<T>` kept somewhere the
    collector does not scan (a `Vec<Gc<T>>` that is not a root) dangles
-   after a collection. Unchanged by this work; `gc.Heap` roots and
-   `--gc-check-roots` are the tools.
+   after a collection. `gc.Heap` roots and `--gc-check-roots` are the
+   tools.
 3. **Trusted modules.** A `#![safe]` module is only as safe as the
    functions it calls in modules that are not: those must honor the
    `#[raw]` contract above. std's are audited (section 3); an example
@@ -167,87 +168,40 @@ unsafe { write(fd, s.ptr, s.len) }
    from the safe module. A struct of the safe module that reaches it
    through another module's generic type (`lib.Lookup<Mine>` bound in a
    pattern) is not followed: its pointer fields are its own module's.
+9. **GC objects** (section 8 covers stores through slices, zero-filled
+   trailing arrays and who may write an object). A module that is not
+   `#![safe]` can store through `&o.f` or `o.items.ptr` (raw pointers:
+   `gc.write_barrier` is its job), and a slice of an object's trailing
+   array that is read across a collection dangles if nothing else keeps
+   that object alive (the lifetime hole, item 1, for the GC heap).
 
-9. **GC objects** (closed, section 8, except as listed there). The
-   field rule was about raw pointers, so the fields of another module's
-   `object` holding only `Gc`s, values and trailing arrays could be
-   written (`d.used = 0` on a `dict.Dict`); a GC reference stored
-   through a slice kept in a local (`let s = o.items; s[i] = v;`) got no
-   write barrier; and `new(h, X { }, n)` zero-filled trailing arrays of
-   any element type, `Gc` and `value` types included (item 4). What is
-   left: a module that is not `#![safe]` can still store through
-   `&o.f` or `o.items.ptr` (raw pointers: `gc.write_barrier` is its
-   job), and a slice of an object's trailing array that is read across a
-   collection dangles if nothing else keeps that object alive (the
-   lifetime hole, item 1, for the GC heap).
+Section 3a lists the bypasses the rule closes (Loimi has no struct
+patterns, so `let Vec { ptr, .. } = v` does not parse, but tuple fields,
+arrays of pointers and enum payloads were real bypasses).
 
-Section 3a lists the adversarial pass that closed the other bypasses
-(struct-destructuring was on this list: Loimi has no struct patterns,
-`let Vec { ptr, .. } = v` does not parse, but tuple fields, arrays of
-pointers and enum payloads were real bypasses).
+## 3. Audit of std
 
-## 3. Audit of std (before this work)
+`LOIMI_SAFETY_AUDIT=1 loimi build ..` checks every module as if it were
+`#![safe]` and prints the raw-pointer sites per module and kind
+(`LOIMI_SAFETY_AUDIT=sites` lists each site). Run on std before the
+migration, it split std into a periphery that was already (nearly)
+pointer-free (`lex`, `parse`, `diag`: 0 sites; `hash` 1, `bc` 11,
+`text` 16, `io` 33) and an unsafe core where pointers are the point
+(`mem` 68, `gc` 147, `obj` 48, `bigint` 295, `gil` 34, `map` 27, `dict`
+41). Most `*T` uses everywhere are `p.f` through a pointer to a struct,
+which the rule allows.
 
-Counts are distinct source sites the checker reports when every module
-is checked as if `#![safe]` (`LOIMI_SAFETY_AUDIT=1 loimi build ..`
-prints them per module and kind; `LOIMI_SAFETY_AUDIT=sites` lists each
-site), over the instantiations used by the example interpreters. "Field
-via `*T`" counts the allowed `p.f` uses, for scale.
-
-Columns: `idx` pointer indexing and slicing, `arith` pointer
-arithmetic, `slice` `p.slice(n)`, `cast` casts to pointers (and one
-integer-to-`value` forge in `obj`), `fld` another module's pointer
-fields or a slice's `.ptr` read, `wr` writes to another module's
-invariant fields, `call` extern and `#[raw]` calls, `hint`
-`assume`/`unreachable`; `p.f` the allowed field accesses through a
-`*T`.
-
-| module | lines | idx | arith | slice | cast | fld | wr | call | hint | total | `p.f` | what the raw uses are; safe replacement |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| `lex` | 641 | | | | | | | | | **0** | 156 | already slice-based (`Cursor` over a `str`) |
-| `parse` | 572 | | | | | | | | | **0** | 32 | — |
-| `diag` | 381 | | | | | | | | | **0** | 70 | — (`SourceMap.file`, `Diagnostics.at` return pointers into a `Vec`: lifetime hole) |
-| `hash` | 48 | | | | | 1 | | | | 1 | 0 | `str.eq` by `memcmp` on `.ptr` → `mem.equal_bytes` |
-| `text` | 294 | 6 | 1 | | 1 | 2 | 1 | 5 | | 16 | 35 | `StrBuf.push_str` grew `bytes` by hand (`len +=`, `memcpy`) → `Vec.extend`; `Interner` slot table `*u64` + mask → `Vec<u64>`; `snprintf`/`strtod` → `unsafe` |
-| `io` | 175 | 2 | 2 | 3 | 1 | 12 | | 13 | | 33 | 22 | `write(2)` on `.ptr`/`.len` → one helper over a slice; `Out`'s buffer `*u8`+len+cap → `Vec<u8>`; `read_file` is C stdio (`unsafe`) |
-| `bc` | 780 | 7 | | | | | | 2 | 2 | 11 | 156 | `relax`'s position table `mem.alloc` + `[i]` → `Vec`; `unreachable` → `trap()` |
-| `num` | 402 | 1 | | | 3 | 5 | | 2 | | 11 | 0 | `snprintf`/`strtod` buffers (C interop) |
-| `os` | 21 | 1 | | 1 | | | | 3 | 1 | 6 | 0 | `argv` from C |
-| `rt` | 71 | 1 | | 1 | | 1 | | 5 | 2 | 10 | 0 | C runtime hooks (panic message, setjmp-based protect) |
-| `map` | 470 | 7 | 14 | | 2 | | | 4 | | 27 | 48 | open-addressing tables over `mem.alloc`ed arrays, probing by masked index: section 5 |
-| `dict` | 571 | 8 | 8 | | 11 | 14 | | | | 41 | 163 | the same tables in GC objects (trailing arrays, `Gc` → `*` casts): section 5 |
-| `mem` | 410 | 15 | 6 | 2 | 7 | 11 | | 27 | | 68 | 53 | the allocator and `Vec` themselves: the unsafe core |
-| `prof` | 305 | 4 | | 2 | | | | 5 | | 11 | 47 | counter arrays from `mem.alloc`, clock calls |
-| `test` | 377 | | 1 | | 7 | 4 | | 14 | | 26 | 13 | C stdio, `setjmp`-style panic catching, golden files |
-| `debug` | 468 | | | | | | | 2 | | 2 | 37 | two `mem` calls (not touched: another agent's lane) |
-| `gil` | 285 | | | | 15 | | | 19 | | 34 | 87 | pthreads, atomics on casted words |
-| `obj` | 1592 | 14 | 7 | | 7 | 5 | | 6 | 8 | 48 | 429 | shapes, inline caches over `mem.alloc`ed arrays; `assume` hints in IC paths |
-| `gc` | 1953 | 15 | 46 | | 41 | 5 | 1 | 39 | | 147 | 550 | the collector: headers, free lists, mark stacks, address arithmetic (plus its 3 `unsafe` blocks forging `Gc`s) |
-| `bigint` | 1909 | 116 | 62 | 4 | 2 | 58 | 2 | 51 | | 295 | 13 | limb arrays as `*u64` + length everywhere: a natural slice candidate, but the limb loops are its hot paths |
-
-So the std splits into a safe periphery that was already (nearly)
-pointer-free (the front-end toolkit: `lex`, `parse`, `diag`; `hash`,
-`text`, `io`, `bc` with a handful of sites each), and an unsafe core
-(`mem`, `gc`, `obj`, `bigint`, `gil`, the tables) where pointers are the
-point. Most `*T` uses everywhere are `p.f` through a pointer to a
-struct, which the rule allows.
-
-**Use-after-free hazards found.** `StrBuf.push_str(b.as_str())` (a
-buffer appending its own text) read freed memory when the push grew
-the buffer: `realloc` moved it under the source slice. Fixed by
-`Vec.extend`, which re-derives a source inside the moving buffer.
-`HashMap.free`/`OrderedMap.free` released the table but kept its
-capacity, so a later lookup on the same map read freed memory (section
-5). The rest are the lifetime hole of section 2: pointer-returning
-accessors (`Vec.ptr_at`, `Vec.items`, `map.get_ptr`, `OrderedMap.entry`,
-`next`, `diag.SourceMap.file`, `diag.Diagnostics.at`) valid until the
-next growth, and `Arena.free`.
+Use-after-free bugs it found, all fixed: `StrBuf.push_str(b.as_str())`
+(a buffer appending its own text) read freed memory when the push grew
+the buffer (now `Vec.extend`, section 4); `HashMap.free` and
+`OrderedMap.free` kept the capacity of the table they released (section
+5).
 
 ## 3a. Adversarial pass (closing bypasses)
 
 Programs that try to reach raw memory in a `#![safe]` module without
-`unsafe` (each is a `tests/fail/safe_*.lm` now, or was already
-rejected). "Was" is the compiler before this pass.
+`unsafe`; each is rejected, and each is a `tests/fail/safe_*.lm`. "Was"
+is the compiler before this pass.
 
 | attempt | was | now |
 |---|---|---|
@@ -268,25 +222,25 @@ rejected). "Was" is the compiler before this pass.
 | `c.free(&malloc)` on a `closure fn` (frees through `Malloc.free_bytes`) | rejected | rejected |
 | `x as V` for a `value` type | rejected | rejected |
 
-None of the std safe modules needed a change, and no example's IR
-changed (the checks only reject programs).
+None of the std safe modules needed a change for this pass, and no
+example's IR changed (the checks only reject programs).
 
-## 4. Migration
+## 4. The safe modules and the `#[raw]` contracts
 
-| module | `unsafe` blocks | `#[raw]` | lines changed (+/−) | what changed |
-|---|---:|---|---:|---|
-| `lex` | 0 | | +2 | `#![safe]` only |
-| `parse` | 0 | | +2 | `#![safe]` only |
-| `diag` | 0 | | +2 | `#![safe]` only |
-| `hash` | 0 | | +3 −3 | `str.eq` is `mem.equal_bytes` (also no `memcmp` on a null pointer for empty strings) |
-| `text` | 2 | | +23 −22 | `StrBuf.push_str` is `bytes.extend(s)`; `Interner`'s slot table is a `Vec<u64>` (bounds-checked `at`/`set`); `parse_f64` copies into its buffer by a checked loop; `snprintf`/`strtod` in `unsafe` |
-| `io` | 4 | `free_file` | +67 −48 | one `write_some(fd, s: []u8)` helper and one `format_g14` (the two C calls); `Out` buffers in a `Vec<u8>` (`extend`, `push`); `read_file` (C stdio) is one `unsafe` block; `free_file` frees what `read_file` returned |
-| `bc` | 0 | | +7 −4 | `relax`'s position table is a `Vec<u64>` slice; `unreachable` → `trap()` |
-| `map` | 21 | 7 (`probe_*`) | +266 −126 | section 5 |
-| `mem` | — | 10 functions | +39 | `#[raw]` on `alloc`, `try_alloc`, `grow`, `release`, `copy`, `sort_by`, `try_sort_by`, `Arena.alloc_bytes`, `Malloc.alloc_bytes`, `Malloc.free_bytes`; new `Vec.extend(s)` and `Vec.filled(n, x)` |
-| `obj` | — | 15 functions | +15 | `#[raw]` on the inline-cache API that trusts its cache words (slot refs, validity cells, Poly entry indices, `Hit`s: a safe module can build any `Hit`): `Shapes.valid`, `Poly.add`, `MegaCache.new` (`n` a power of two), `put`, `free` (leaves the cache dangling), `Model.load_ref`, `store_ref`, `load_inline`, `load_out`, `proto_load`, `hit`, `poly_get`, `poly_get_at`, `poly_set`, `add_hit`. The rest of `obj`'s public API checks its indices (slices) or takes only values it made. No IR change. |
+| module | `unsafe` blocks | `#[raw]` | what the migration changed |
+|---|---:|---|---|
+| `lex`, `parse`, `diag` | 0 | | `#![safe]` only |
+| `hash` | 0 | | `str.eq` is `mem.equal_bytes` (also no `memcmp` on a null pointer for empty strings) |
+| `text` | 2 | | `StrBuf.push_str` is `bytes.extend(s)`; `Interner`'s slot table is a `Vec<u64>` (bounds-checked `at`/`set`); `parse_f64` copies into its buffer by a checked loop; `snprintf`/`strtod` in `unsafe` |
+| `io` | 4 | `free_file` | one `write_some(fd, s: []u8)` helper and one `format_g14` (the two C calls); `Out` buffers in a `Vec<u8>`; `read_file` (C stdio) is one `unsafe` block; `free_file` frees what `read_file` returned |
+| `bc` | 0 | | `relax`'s position table is a `Vec<u64>` slice; `unreachable` → `trap()` |
+| `map`, `dict` | section 5 | `map`'s `probe_*` core | section 5 |
+| `mem` (not safe) | — | `alloc`, `try_alloc`, `grow`, `release`, `copy`, `sort_by`, `try_sort_by`, `Arena.alloc_bytes`, `Malloc.alloc_bytes`, `Malloc.free_bytes`, `poison`, `unpoison` | new `Vec.extend(s)` and `Vec.filled(n, x)` |
+| `obj` (not safe) | — | the inline-cache API that trusts its cache words (slot refs, validity cells, Poly entry indices, `Hit`s): `Shapes.valid`, `Poly.add`, `MegaCache.new` (`n` a power of two), `put`, `free`, `Model.load_ref`, `store_ref`, `load_inline`, `load_out`, `proto_load`, `hit`, `poly_get`, `poly_get_at`, `poly_set`, `add_hit` | none: the rest of `obj`'s public API checks its indices (slices) or takes only values it made |
+| `gc` (not safe) | — | `barrier`, `write_barrier` (they read the header before `obj`) | none |
 
-The `unsafe` blocks, each with its one-line justification:
+The `unsafe` blocks of `text` and `io`, each with its one-line
+justification:
 
 ```
 text.lm  // unsafe: C calls on `buf`, whose size snprintf is given and which it NUL-terminates
@@ -297,109 +251,87 @@ io.lm    // unsafe: C stdio on a NUL-terminated copy of `path`; fread fills at m
 io.lm    // unsafe: the caller passes memory read_file malloc'd
 ```
 
-All are C calls: the safe modules have no `unsafe` pointer arithmetic
-of their own. No example call site changed (`io.Out`'s fields changed
-type, but nothing outside `std.io` touched them).
+All are C calls: these modules have no `unsafe` pointer arithmetic of
+their own. No example call site changed.
 
-**`Vec.extend(s)`** is the primitive that `push_str` and `Out.print`
-needed and that was missing: append a slice. It is alias-safe: if `s`
-lies inside the vector's own buffer and the buffer must grow, the cold
-path re-derives `s`'s address in the new buffer before copying, so
+**`Vec.extend(s)`** appends a slice. It is alias-safe: if `s` lies
+inside the vector's own buffer and the buffer must grow, the cold path
+re-derives `s`'s address in the new buffer before copying, so
 `v.extend(v.items())` works. The fast path (room left) is a compare and
-a `memcpy`, as `push_str` was.
+a `memcpy`.
 
-**Not migrated**, and why: `mem`, `gc`, `obj`, `bigint` and `gil` are
-the unsafe core (allocator, collector, inline caches, limb arithmetic,
-threads), where nearly every function is pointer manipulation and the
-public API's contracts are documented, with `#[raw]` on the functions
-that safe callers cannot satisfy; `num`, `os`, `rt`, `test` and `prof` are
-small and mostly C interop (each could be made safe with a few `unsafe`
-blocks; not done for lack of time and of benefit: none is hot or
-complicated); `debug` belongs to another work stream.
+**The modules that are not safe.** `mem`, `gc`, `obj`, `bigint` and
+`gil` are the unsafe core (allocator, collector, inline caches, limb
+arithmetic, threads), where nearly every function is pointer
+manipulation; their public contracts are documented, with `#[raw]` on
+the functions that safe callers cannot satisfy. `num`, `math`, `os`,
+`rt`, `test`, `prof` and `debug` are small modules, mostly C interop.
 
 ## 5. `std.map` and `std.dict`
 
-**`std.map` is `#![safe]`**, with 21 `unsafe` blocks, all of them
-over the tables' own invariants (`slots` holds `cap` slots, `cap` a
+**`std.map` is `#![safe]`**; its `unsafe` blocks all rest on the
+tables' own invariants (`slots` holds `cap` slots, `cap` a
 power of two; an `OrderedMap`'s `idx` holds `mask + 1` slots naming
 entries below `used`, `used <= cap <=` the allocation), which only
 `map`'s own code can break since other modules cannot write the fields
 of a struct with raw pointers. `HashMap` goes through one private
 accessor, `slot(i)`, that masks the index (`m.slots + (i & (m.cap -
 1))`: in bounds by construction; LLVM folds the second mask), plus
-`new`, `grow` and `free`. The CPython-style probing core shared with
-`std.dict` (`probe_find`, `probe_slot_of`, `probe_lookup`, `probe_put`,
+`new`, `grow` and `free`. The CPython-style probing core
+(`probe_find`, `probe_slot_of`, `probe_lookup`, `probe_put`,
 `probe_rebuild`, `probe_kill`, `probe_find_with`) takes a raw index
 pointer, a mask and an entries pointer: it is `#[raw]`, one `unsafe`
-body each, with the contract documented. `OrderedMap` has ten blocks
-(allocation, resize, the probing methods, `clear`, `free`) and a
-bounds-checked entry accessor.
+body each, with the contract documented. `OrderedMap` has its
+allocation, resize, probing methods, `clear` and `free` in `unsafe`
+blocks and a bounds-checked entry accessor.
 
-Two soundness bugs in the API were fixed on the way:
+Two API contracts:
 
-- `OrderedMap.entry(e)`, `set_value(e)` and `remove_at(e)` took any `e`
-  unchecked (out of bounds reads and writes; `remove_at` of a dead
-  entry looped forever). They now panic ("not a live entry index")
-  unless `e` is a live entry. No example uses `OrderedMap` on a hot path
-  (the Python interpreter's entry-index calls are on `dict.Dict`).
-- `HashMap.free` and `OrderedMap.free` released the table but kept its
-  capacity, so a later call on the map used freed memory. `free` now
-  points the map at a shared zeroed sentinel table (a fresh table for
-  slots over 512 bytes), which `grow`, `resize`, `clear` and `free` never
-  write or release, so the map stays usable and the next insert
-  allocates (`tests/run/map_free_reuse.lm`).
+- `OrderedMap.entry(e)`, `set_value(e)` and `remove_at(e)` panic ("not
+  a live entry index") unless `e` is a live entry (unchecked, they read
+  and wrote out of bounds, and `remove_at` of a dead entry looped
+  forever). No example uses `OrderedMap` on a hot path.
+- `HashMap.free` and `OrderedMap.free` point the map at a shared zeroed
+  sentinel table (a fresh table for slots over 512 bytes), which `grow`,
+  `resize`, `clear` and `free` never write or release, so the map stays
+  usable and the next insert allocates (`tests/run/map_free_reuse.lm`).
 
-**`std.dict` is `#![safe]` too** (it was left non-safe at first: 41
-raw-pointer sites, every probe passing `d.index.s.ptr` and `d.ents.e.ptr`
-into the `#[raw]` probe core). The argument used for `map` does not
-carry over: `Dict` and `KeyDict` are GC objects holding `Gc`s and
-trailing arrays, not raw pointers, so any module may write `d.mask`,
-`d.used`, `d.index` or an index slot (`d.index.s[i] = ..`), and Python
-does write some of them. So dict's memory safety no longer rests on its
-fields:
+**`std.dict` is `#![safe]` too**, by a different argument. `Dict` and
+`KeyDict` are GC objects holding `Gc`s and trailing arrays, not raw
+pointers, so the field rule of section 1 does not protect them, and
+dict's memory safety does not rest on its fields (`mask`, `used`, the
+index slots):
 
 - The probes are private safe functions over the trailing arrays as
   slices (`find_in`, `lookup_in`, `put_in`, `slot_of`, `rebuild_in`, and
-  `key_*` ones for `KeyDict`), replacing the calls of map's `#[raw]`
-  `probe_*` (which `OrderedMap` still uses). Each takes its mask from
-  the index's own length (`mask_of(idx)`: panics on an empty index, else
-  length - 1), so LLVM removes the bounds check from the slot reads
-  (the probe loop has no slot compare); entry reads keep one compare
-  per candidate key. `d.mask` is still maintained for the API but not
-  trusted.
-- Two `unsafe` blocks, no `#[raw]` function (a third, a hand-written
-  write barrier after the copies through slices, went away when the
-  compiler started emitting it, section 8):
+  `key_*` ones for `KeyDict`), not map's `#[raw]` `probe_*` (which
+  `OrderedMap` uses). Each takes its mask from the index's own length
+  (`mask_of(idx)`: panics on an empty index, else length - 1), so LLVM
+  removes the bounds check from the slot reads (the probe loop has no
+  slot compare); entry reads keep one compare per candidate key.
+  `d.mask` is maintained for the API but not trusted.
+- Two `unsafe` blocks, no `#[raw]` function:
   `// unsafe: memset writes exactly the s.len * size_of<T>() bytes of \`s\`.`
   (`zero(s: []T)`), and
   `// unsafe: reads only the size_of<K>() bytes of the one K at \`k\` (as u64 words when the size is a multiple of 8).`
-  (`key_live`). `place()` stores a whole entry through `d.ents.e[e]`, so
-  the compiler emits its barrier; the hand-written stores are gone.
-- A bad field can now cause a panic or an endless probe, never an access
-  outside the tables. `remove_at(e)` panics unless `e` is a live entry
-  (it looped forever on a dead one, as `OrderedMap`'s did); `key`,
-  `value`, `hash_at`, `set_value` stay unchecked for liveness (a dead
-  entry reads as zero bytes) but are bounds-checked.
+  (`key_live`). Stores through the trailing arrays passed as slices
+  (`rebuild_in`, `zero`) get their barrier from the compiler after the
+  call (section 8.1); `place()` stores a whole entry through
+  `d.ents.e[e]`, which gets the barrier as any object store does.
+- A bad field can cause a panic or an endless probe, never an access
+  outside the tables. `remove_at(e)` panics unless `e` is a live entry;
+  `key`, `value`, `hash_at`, `set_value` are not checked for liveness (a
+  dead entry reads as zero bytes) but are bounds-checked.
 
 Cost (Python, release, `--align-functions=64`, base and new interleaved,
 best of 10, twice; outliers best of 15, twice): geomean 1.002 and 0.999
 (range 0.978–1.017); reruns of deltablue, hexiom, richards, nqueens
 1.006 and 1.003. `richards` is about 1% slower in every run (+0.3% to
 +1.3%): below the noise threshold but consistent (the per-candidate
-entry bounds check in attribute lookups that miss the inline caches). A
-first version that also bounds-checked slot reads cost `richards` 2.3–3%
-and was replaced. No vm op handler's machine code changed; the IR
-changes are confined to `std.dict` and its callers.
-
-Found on the way (holes, section 2 item 9, closed in section 8): GC
-objects' fields were not protected by the field rule; `gc.barrier(obj:
-*u8)` and `gc.write_barrier` read the header before `obj` and are now
-`#[raw]` (no IR change); a store of a GC reference through a slice held
-in a local (`let s = o.items; s[i] = v;`) got no write barrier. Since
-section 8, other modules cannot write a dict's fields or build one
-(Python's one write, `m.popped = m.ents.e.len`, is now
-`m.use_up_room()`), so `std.dict` could rely on them; it still does
-not, and its probes stay as above.
+entry bounds check in attribute lookups that miss the inline caches).
+Bounds-checking the slot reads as well cost `richards` 2.3–3% and was
+dropped. No vm op handler's machine code changed; the IR changes are
+confined to `std.dict` and its callers.
 
 ## 6. Cost
 
@@ -444,40 +376,18 @@ measurable cost.
 
 ## 7. Catching dangling pointers at run time (ASan builds)
 
-The lifetime hole (section 2, item 1) cannot be closed at compile time
-without ownership. It can be made *detectable*: a pointer or slice
-into a container should fail loudly once the container has moved,
-shrunk or freed the memory it points to.
-
-**Options considered.**
-
-- *Checked handles.* Containers keep a generation counter, bumped on
-  every reallocation, `clear` and `free`; in debug builds `Vec.items`,
-  `ptr_at`, `get_ptr`, `entry`, ... return (pointer, container,
-  generation) and every dereference compares generations. Rejected:
-  `*T` and `[]T` are plain machine values everywhere (struct fields,
-  `vm` state, C interop), so the check would need a second pointer
-  representation that exists only in debug builds, a container pointer
-  that itself dangles when the container is moved or freed, and a
-  validation at every `*p` and `s[i]` in all code, not just std's.
-  Debug and release builds would no longer run the same code.
-- *Pattern-filling* freed and abandoned memory in debug builds (fill
-  the old buffer with `0xdd` before `free`, force growth to move). Cheap
-  and needs no tool, but a stale read gives garbage, not a report, and
-  `malloc` hands the filled block out again soon, so the garbage is
-  often valid data.
-- *AddressSanitizer poisoning* (picked). `--sanitize=address` already
-  reports use of freed memory precisely, with the stacks of the use, the
-  free and the allocation, and it already covers most of the hole: a
-  `Vec` or map that grows calls `realloc`, which under ASan always
-  moves and frees (quarantines) the old buffer; `Vec.free`, map `free`
-  and `Arena.free` call `free`. What ASan cannot see is memory a
-  container *keeps* but no longer uses. ASan's manual poisoning API
-  (`__asan_poison_memory_region`, `__asan_unpoison_memory_region`) marks
-  that memory, so a stale access is reported as `use-after-poison`.
-  The cost is confined to ASan builds: the calls are statements under
-  `#[cfg(sanitize_address)]`, which `--sanitize=address` now sets, and
-  the parser drops them in every other build.
+The pointers the lifetime check does not cover (section 2, item 1) are
+*detectable* in ASan builds. `--sanitize=address` reports use of freed
+memory with the stacks of the use, the free and the allocation, and
+covers most of the hole by itself: a `Vec` or map that grows calls
+`realloc`, which under ASan always moves and frees (quarantines) the
+old buffer; `Vec.free`, map `free` and `Arena.free` call `free`. What
+ASan cannot see is memory a container *keeps* but no longer uses; std
+marks it with ASan's manual poisoning API
+(`__asan_poison_memory_region`, `__asan_unpoison_memory_region`), so a
+stale access is reported as `use-after-poison`. The calls are
+statements under `#[cfg(sanitize_address)]`, which `--sanitize=address`
+sets; the parser drops them in every other build.
 
 **What std poisons** (`std.mem.poison`/`unpoison`, `#[raw]`, ASan
 builds only):
@@ -489,7 +399,7 @@ builds only):
 | `map.OrderedMap` | entries `[used, cap)`: on creation, after `resize`, on `clear` | `entry`, `get_ptr`, `next` pointers kept across `clear` |
 | freed memory (ASan itself) | — | anything kept across growth (`Vec`, `HashMap`, `OrderedMap`, `StrBuf`), `free` of any of them, `Arena.free` |
 
-Not covered: a `HashMap` slot pointer kept across `remove` or `clear`
+Not reported: a `HashMap` slot pointer kept across `remove` or `clear`
 (the slots stay in the table, and probing reads them), an `OrderedMap`
 entry kept across `remove_at` (dead entries stay below `used` until the
 next resize), objects in the GC heap (hole 2: `--gc-check-roots` is the
@@ -502,54 +412,47 @@ raising `len` must unpoison it: `std.bigint` (limbs written through
 
 **Bugs found.** `Arena.free` released its chunks but kept the current
 chunk's pointer, offset and size, so the next `alloc_bytes` on the same
-arena wrote into freed memory, and a second `free` freed it twice
-(`tests/run/arena_free_reuse.lm`; the rule "a container's methods leave
-it valid" now holds for arenas too: the next allocation starts a new
-chunk). The change is the only one in release IR: `Arena.free` gained
-two compares (no hot path calls it). No example interpreter tripped a
-poisoned access or freed memory: every test program of Python (14,
-plus the 11 benchmark programs), Prolog (11), Scheme (26), Lox (6),
-MiniJS (66, with its conformance tests), Stak (13), Mini (46) and the
-Wasm C tests (2), built with `--sanitize=address` as debug builds, and
-Python, Prolog, Scheme, MiniJS and Mini again as release builds, normally
-and with `--gc-stress` (about 600 runs), printed the expected output with
-no report.
+arena wrote into freed memory, and a second `free` freed it twice. It
+resets them, so "a container's methods leave it valid" holds for
+arenas too: the next allocation starts a new chunk
+(`tests/run/arena_free_reuse.lm`). That is the only release IR change:
+two compares in `Arena.free`, which no hot path calls. No example
+interpreter tripped a poisoned access or freed memory: every test
+program of Python (14, plus the 11 benchmark programs), Prolog (11),
+Scheme (26), Lox (6), MiniJS (66, with its conformance tests), Stak
+(13), Mini (46) and the Wasm C tests (2), built with
+`--sanitize=address` as debug builds, and Python, Prolog, Scheme,
+MiniJS and Mini again as release builds, normally and with
+`--gc-stress` (about 600 runs), printed the expected output with no
+report.
 
 **Tests.** `tests/asan/*.lm` (run by `asan_stale_pointers` in
 `tests/golden.rs`, without `ulimit -v`, which ASan cannot run under):
 one program per row above that must be reported, and one that uses
-every poisoned container correctly and must run clean. Release IR of
-every example is unchanged apart from `Arena.free`.
+every poisoned container correctly and must run clean.
+
+**Tried and rejected.** *Checked handles* (a generation counter per
+container, compared at every dereference) need a second, debug-only
+pointer representation and a check at every `*p` and `s[i]` in all
+code. *Pattern-filling* freed memory gives garbage rather than a
+report, and `malloc` soon hands the block out again.
 
 ## 8. GC objects
 
-Three holes of section 2, item 9, closed for every module (not only
-`#![safe]` ones: the first is a collector soundness bug wherever it
-happens). Written 2026-11-04.
+Three rules for GC objects, in every module (not only `#![safe]` ones:
+a missing barrier is a collector soundness bug wherever it happens).
+Written 2026-11-04.
 
 ### 8.1 Stores through slices of an object's trailing array
 
 The compiler emits the write barrier after a store of a reference whose
 place it can see is inside an object: `o.f = v`, `o.items[i] = v`,
 `o.items[a..b][i] = v`. A slice is a plain (pointer, length) pair, so
-`let s = o.items; s[i] = v` (or passing `o.items` to a function that
-stores into it) stored a young object into an old one with no barrier,
-and a minor collection then freed it. Verify mode caught it at run time
-(`tests/run/gc_barrier_slice_arg.lm` aborts with "missing write
-barrier" when built by the previous compiler); now the compiler
-prevents it.
-
-**Options considered.** A slice type that remembers its object
-(`ObjSlice<T>`: three words, every store a barrier) would change every
-signature that takes `[]Value` and make host-memory slices pay;
-read-only slices need a type the language does not have; a barrier that
-finds the object from an interior address (the chunk header) would cost
-every store through any traced slice, register files included. What
-the programs actually do (an audit pass over every example, listing
-each use of such a slice that is not an index, `.len` or `for`) made
-the choice: six places in three interpreters, all reads but one, plus
-`std.dict`, which passes its trailing arrays to its own helpers and
-logged the objects by hand afterwards.
+without a rule `let s = o.items; s[i] = v` (or passing `o.items` to a
+function that stores into it) stores a young object into an old one
+with no barrier, and a minor collection frees it (verify mode reports
+"missing write barrier": `tests/run/gc_barrier_slice_arg.lm`). The
+compiler prevents it.
 
 **The rule** (`src/objref.rs`, after checking, so every function's
 effects are known). An *object slice* is `o.items`, a sub-slice of it,
@@ -589,18 +492,17 @@ A store of a value without references (`Nil`, an integer field of an
 entry) needs no barrier and is not a store for the rule. The same rule
 covers `&o.f` of a traced place in `#![safe]` modules, where taking an
 address is not a raw-pointer operation; elsewhere `&o.f` is a raw
-pointer, as before, except that passing it (also implicitly, as a
-method's receiver) to a call that may collect and store through it is an
-error everywhere, since the compiler's barrier after the call would not
-cover it. `unsafe { }` exempts both.
+pointer, except that passing it (also implicitly, as a method's
+receiver) to a call that may collect and store through it is an error
+everywhere, since the compiler's barrier after the call would not cover
+it. `unsafe { }` exempts both.
 
 **What changed in the programs.** Python's `value.list_items(l)`
 returned `l.arr.items[0..l.len]`; its 11 callers now write the slice
 inline (they pass it to `tuple_of`, `list_of`, `seq_order`, ..., which
 only read). `std.dict`'s `remove_at` zeroes through `d.ents.e[e..e +
 1]` instead of a `let` copy, and its hand-written `barrier(ents)` after
-`rebuild_in`/`key_rebuild_in` is gone with the helper and its `unsafe`
-block: the compiler emits the same barrier. Lox's `let c =
+`rebuild_in`/`key_rebuild_in` is replaced by the compiler's. Lox's `let c =
 fp.cl.upvals` only reads, Mini's coroutine code stores through raw
 `&co.open` pointers and logs the objects with `gc.remember` itself
 (raw pointers in a module without `#![safe]`): both unchanged. No
@@ -613,20 +515,27 @@ barrier): Python's `list.index`, `list.count` and list/tuple ordering
 which may grow the list (moving its items to a new array) and collect.
 The old array was then unreachable and freed, and the scan went on
 reading it: `examples/python/tests/mutating_eq.py` printed "list.index(x):
-x not in list" under `--gc-stress`. They now read the list's current
+x not in list" under `--gc-stress`. They read the list's current
 items at each step, as CPython does (`value.seq_at`). The rule above
 does not catch this (the slice is only read); `LOIMI_OBJREF_AUDIT=1`
 lists object slices passed to, or held in a local across, calls that
-may collect, for review: after the fix, the remaining ones in the
-examples keep their object alive (a rooted tuple, a list that the
-callee only reads before allocating, which does not collect).
+may collect, for review: the remaining ones in the examples keep their
+object alive (a rooted tuple, a list that the callee only reads before
+allocating, which does not collect).
+
+**Tried and rejected.** A slice type that remembers its object
+(`ObjSlice<T>`, three words) changes every signature that takes
+`[]Value` and makes host-memory slices pay; a barrier that finds the
+object from an interior address costs every store through any traced
+slice, register files included. The audit of the examples found six
+such slices in three interpreters, all read-only but one.
 
 ### 8.2 Zero-filled trailing arrays
 
 `new(h, X { .. }, n)` allocates zeroed memory. For `[Gc<T>]` that is n
 null references, which outside `unsafe` cannot be made (`0 as Gc<T>`);
 for a `value` type it is whatever the word 0 encodes. Zero-filling is
-now allowed only where zero is a valid element: numbers, `bool`,
+allowed only where zero is a valid element: numbers, `bool`,
 options (None), slices, raw pointers (outside `#![safe]` modules, as for
 `..zero`), and tuples, arrays and structs of those (no private `__`
 fields); an enum's variant with discriminant 0 if its payload is; a
@@ -643,28 +552,27 @@ reference. Generic objects are checked per instance. Elsewhere:
 
 All value types of the example interpreters zero-fill to their unboxed
 `0.0` (`Value`, `V`, `Term`), and std.dict's entries to all-zero keys
-(dead entries, as before; a dict over `Gc` keys or values would not
-compile, and it would have handed out null references for dead
-entries). Five places allocate `Gc` arrays and fill them right after:
+(dead entries; a dict over `Gc` keys or values does not compile).
+Five places allocate `Gc` arrays and fill them right after:
 Lox's and Mini's `CLOSURE` (upvalue cells) and the three compilers'
 `Protos` tables (Mini, MiniJS, Scheme), plus the two fuzzers' copies.
 They are `unsafe { new(..) }` with a comment, so the example
-interpreters now have five `unsafe` blocks; a fill value would have
-added a loop to `CLOSURE`, and `?Gc` elements a test to every upvalue
-access. The IR of those five is unchanged.
+interpreters have five `unsafe` blocks; a fill value adds a loop to
+`CLOSURE`, and `?Gc` elements a test to every upvalue access. The IR of
+those five is unchanged.
 
 ### 8.3 The objects of a `#![safe]` module
 
 A safe module's code may rely on its own structs' fields only if no
-other module can write them; the field rule (section 1) protected
+other module can write them; the field rule (section 1) protects
 structs with raw pointers, and only from safe modules. Two extensions:
 
 - **In every module**, an `object` declared in a `#![safe]` module is
   built (`new(h, M.X { .. })`) and written (`o.f = v`, `o.items[i] =
   v`, `&o.f`) only by that module's code, or in `unsafe { }`. Reading
   is unrestricted. This is what `std.dict` needed: Python wrote
-  `m.popped = m.ents.e.len` to mark an attribute dict full; it now
-  calls `m.use_up_room()` (new in `KeyDict` and `Dict`).
+  `m.popped = m.ents.e.len` to mark an attribute dict full; it calls
+  `m.use_up_room()` (in `KeyDict` and `Dict`).
 - **In a `#![safe]` module**, another module's `object` is treated as a
   struct with raw pointers: writing its fields or trailing array,
   taking their address and building one with a literal need `unsafe`.
@@ -672,11 +580,9 @@ structs with raw pointers, and only from safe modules. Two extensions:
 Modules without `#![safe]` can still write a safe module's objects
 through raw pointers (`&o.f` there is raw, as is `o.items.ptr`) and
 through slices of their trailing arrays: they are trusted, as for any
-`#[raw]` contract (section 2, item 3). Why not a field visibility
-(`pub(read)`, private by default): Loimi's only field privacy is the
-file-private `__` prefix for generated types, which hides reads too;
-"objects belong to their safe module" needs no new syntax and covers
-the one module that relies on it.
+`#[raw]` contract (section 2, item 3). Rejected: field visibility
+(`pub(read)`); Loimi's only field privacy is the file-private `__`
+prefix, and ownership by the safe module needs no new syntax.
 
 ### 8.4 Cost
 

@@ -19,9 +19,11 @@ Progress (2026-11-02):
   std.diag, its code buffer, labels, constant pool and registers std.bc;
   Scheme's reader is std.lex + std.num and its code generator std.bc;
   MiniJS uses all six. Mini and Scheme emit byte-identical bytecode to
-  their hand-written versions. std.obj is used by MiniJS only: Lua tables
-  and Scheme records have no shape-based objects to replace (see
-  [`design/adoption/README.md`](design/adoption/README.md#stdobj)).
+  their hand-written versions. std.obj is used by MiniJS and Lox; Mini
+  and Scheme do not use it: Lua tables take arbitrary keys and delete
+  with `t.x = nil` (shapes would fall to dictionary mode, and Mini's
+  `GETFIELD` cache already costs about a shape check), and Scheme's
+  records and globals compile to fixed indices.
 - M7 has three proof interpreters: `examples/mini` (a Lua 5.4 subset),
   `examples/scheme` (an R7RS-small subset) and `examples/minijs` (a
   JavaScript subset).

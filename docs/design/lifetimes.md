@@ -1,12 +1,9 @@
 # Design note: lifetimes and pointer stability at compile time
 
 Status: **on by default** (`src/lifetimes.rs`): every module is checked,
-std's included, unless it says `#![lifetimes(off)]` (section 5.5;
-migration step 3 of section 9, question 5 of section 10). Checking
-everything costs under 10% of the front end (section 8).
-**Phase 2, first part done**: questions 1, 2, 5 and 6 of section 10 are
-decided and built (stored pointers into growable memory, exclusivity at
-calls, default on, `#[shrinks]`); 3 and 4 are open. Written 2026-11-04.
+std's included, unless it says `#![lifetimes(off)]` (section 5.5).
+Checking everything costs under 10% of the front end (section 8).
+Written 2026-11-04.
 
 > Where real bugs keep appearing is lifetimes: a pointer or slice into a
 > container used after the container grew, was freed, or was collected.
@@ -20,22 +17,18 @@ move or free memory (it reaches `free`/`realloc`, or may collect) makes
 every pointer into that memory stale; using a stale pointer is an error.
 What each function may move or free, what its result points into, which
 arguments it uses after moving another's memory, and which it may keep
-are *inferred* over the whole call graph, so nothing is declared except
-one attribute on the one std function that handles self-aliasing on
-purpose (`#[may_alias(s)]` on `Vec.extend`). The prototype rejects every
-bug of the corpus below (12 test programs), accepts all nine `#![safe]`
-std modules (`text`, `diag`, `map`, `dict`, `lex`, `parse`, `hash`, `io`,
-`bc`) unchanged, found 3 sites when *every* module of every example
-interpreter was first checked (one a real dangling pointer, since
-fixed), and leaves the release IR of every example byte-identical. It
-is now on for every module (section 7: made the default, it found one
-more dead local outside the examples, in a test). What it does not do is
+are *inferred* over the whole call graph. Nothing is declared except
+`#[may_alias(s)]` on `Vec.extend`, the one std function that handles
+self-aliasing on purpose, and `#[shrinks(v)]` on std's eight functions
+that remove elements. The check rejects every bug of the corpus below,
+accepts the nine `#![safe]` std modules (`text`, `diag`, `map`, `dict`,
+`lex`, `parse`, `hash`, `io`, `bc`) unchanged, found three latent dangling
+pointers in the examples and tests (section 7, all fixed), and
+leaves the release IR of every example byte-identical. It does not
 follow a pointer once it has been stored in memory and loaded again
-somewhere else; since phase 2 it forbids storing a pointer into memory
-that moves (a `Vec`'s buffer, a map's table) where it outlives the
-function, which closes that hole for growable containers (section 5.4,
-error 5). Section 6 lists the remaining holes, and section 10 the
-questions (1, 2 and 6 decided).
+somewhere else, but it forbids storing a pointer into memory that moves
+(a `Vec`'s buffer, a map's table) where it outlives the function
+(section 5.4, error 5). Section 6 lists the remaining holes.
 
 ## 1. The problem
 
@@ -58,7 +51,7 @@ that code alone (or confine it to `unsafe`) and cost nothing at run time.
 
 Real bugs from this repository's history (a search of the 751 commits,
 CHANGELOG, safety.md, COROUTINES.md and the FRICTION files), each with a
-minimized test that the prototype rejects. "Compiler" bugs (missing
+minimized test that the check rejects. "Compiler" bugs (missing
 roots in the generated code: 17ef2e2, 538e067, 334d6cc, cc6b3d2,
 b56a15c, 16bd0a9, 4ab59b0, 63a3b30, 4f232c5, 9b081ae) are bugs in the
 compiler or collector, not in Loimi code a checker could see, and are
@@ -75,161 +68,45 @@ out of scope; so are stale *decoded* state bugs (0456845, 5a77ca9).
 | 7 | Mini's coroutine stacks move on growth: handler and native pointers into the old block (`call_value` switched to indices, `reload`, `VStack.prev`) | examples/mini (20ac4b2..3706bbf, COROUTINES.md item 8) | pointer derived from vm state across a `reenter` call | `lt_vm_reenter_stale` |
 | 8 | objref's remaining hole: a read-only slice of an object held across a call that may collect | safety.md section 8.1 | same as 2 | `lt_gc_slice_across_collect` |
 
-Two more found by the prototype itself (section 7): `minijs`'s
+Two more found by the check itself (section 7): `minijs`'s
 `Gen.top` stored `&fs` (a local) in `g.fs` and returned without
 restoring it (latent: nothing read `g.fs` afterwards; fixed), and a
 false start of this note's own accepted test (`tests/run/lt_accepted.lm`
 used a slice after a loop of pushes).
 
-## 3. Options
+## 3. Options considered
 
-Each option was judged on the corpus, on the annotation burden (counted
-on `std.text`, `std.map`, `std.diag` and the Lox front end:
-`examples/lox/parser.lm`, `compile.lm`), on what it does to interpreter
-cores, on error messages, on its implementation in this compiler, and on
-compile time. Run-time cost is zero for all but E.
+Judged on the corpus, on the annotation burden (counted on `std.text`,
+`std.map`, `std.diag` and the Lox front end), on interpreter cores and
+on run-time cost:
 
-### A. Rust-style borrow checking with lifetime parameters
+- **A. Rust-style borrow checking** (lifetime parameters, exclusive
+  `&mut`): catches the corpus, but needs ≈20 types with lifetime
+  parameters, ≈33 explicit signatures and ≈8 redesigns in those files
+  alone, rejects the clox structure every front end uses (`p.fs = &fs`
+  with parent links, `p.pratt.expr(p)`), cannot express register
+  windows or frames, and is a new dimension of the type system
+  (language.md section 11). Rejected.
+- **B. Second-class references** (Hylo-style: passed down or returned
+  as a projection, never stored): about 60 field positions change type
+  (50 in the Lox front end), and catches 4 of 8 bugs alone. Rejected as
+  the base; its one cheap rule, applied to growable memory only, is
+  error 5.
+- **C. Pointer stability with inferred summaries**: built (section 5).
+  Catches all 8 with no annotations on the std modules counted and no
+  signature changes.
+- **D. Regions** (`*'a Node`, `Expr<'a>`): covers arena pointers stored
+  in nodes, at the cost of a region parameter on every AST and IR type,
+  i.e. option A for the front ends. Rejected; that case is hole 1, and
+  ASan builds catch it at run time.
+- **E. Generational references** (Vale): a word per pointer and a
+  compare per dereference. Rejected by the zero-cost requirement.
 
-Every reference gets a lifetime; structs that store references take
-lifetime parameters; `&mut` is exclusive.
+## 4. Decision
 
-Counted by reading the code (the Lox front end about 85% of
-`parser.lm`, 45% of `compile.lm`, extrapolated), with Rust's elision
-rules applied to `x: *Self` receivers:
-
-| file | types needing `'a` | explicit signatures | exclusivity rejections (redesigns) |
-|---|---:|---:|---:|
-| std.text | 0 | 0 | 1 (1: `Interner.names` points into its own `arena`) |
-| std.map | 0 | 1 | 3 (`HashMap.probe` is NLL problem case #3; `find_with`'s closure captures a map that guest code may change) |
-| std.diag | 4 | 5 (+4 advisable) | 2 (lazy line index mutates in queries; `Diagnostics` is self-referential) |
-| Lox parser + lexer | 13 (≈22 params) | 22 | ≈10 (4) |
-| Lox compile | 2 (+ `Proto` spreads into the vm) | ≈5 | 10 (1) |
-| total | ≈20 types | ≈33 | ≈26 sites, ≈8 redesigns |
-
-- Corpus: all 8, by construction (exclusivity rejects 1 and 3 at the
-  call, lifetimes reject 4, 5 and 6; 2, 7 and 8 need GC and vm state
-  modeled as borrows, which Rust does not do either).
-- The clox structure every front end here uses is rejected outright:
-  stack-local `FnState`/`ClassState` hung off the parser (`p.fs = &fs`)
-  with parent links, arena `Fun` nodes mutated after linking, a Pratt
-  table called with its owner (`p.pratt.expr(p)`). Each becomes an index
-  stack or a `Cell`.
-- Interpreter cores: register windows, frames pointing into the stack
-  of the same machine, open upvalues into the stack, inline-cache words
-  in the code: none expressible; all stay raw.
-- Implementation: a new dimension of the type system (lifetime
-  parameters, variance, inference, two-phase borrows, NLL), which
-  language.md section 11 rules out for good reason.
-
-### B. Second-class references (Hylo/Val-style)
-
-A reference may be passed down to a call, or returned as a projection
-of a parameter, but never stored in a field, global, container or
-closure. No lifetime syntax at all; everything that is stored today must
-become something else.
-
-Counted on the same files: field positions that store a pointer,
-`str` or slice today and would have to change type:
-
-| category | text | map | diag | Lox front end | total | would become |
-|---|---:|---:|---:|---:|---:|---|
-| strings borrowed from the source | | | 2 | 13 | 15 | spans or interned ids |
-| message strings (mostly literals) | | | 3 | 1 | 4 | a `'static` kind |
-| arena-owned strings | 1 | | | | 1 | an arena kind |
-| arena AST/IR links | | | | 31 | 31 | an arena kind, or `NodeId` indices |
-| owners, contexts, parents | | | | 10 | 10 | a program/heap-lifetime kind, or an index stack (`Parser.fs`, `enclosing`) |
-| runtime objects | | | | 2 | 2 | `Gc` |
-| owned buffers | | 3 | | | 3 | an owning kind |
-
-- About 60 field positions in five files, 50 of them in one front end.
-  B is workable only with two or three blessed storable kinds (arena
-  pointers, program-lifetime pointers, spans), at which point it is a
-  coarse region system (option D) without the proof.
-- What B keeps is valuable: every std accessor (`get_ptr`, `next`,
-  `entry`, `as_str`, `items`) is a projection of a parameter and stays
-  as it is. That is the part option C builds on (question 1).
-- Corpus: 3, 5, 6, 7 by forbidding the stores; 1 and 2 still need the
-  "argument into what the callee moves" and GC rules of C.
-- Interpreter cores: as A; nothing on the hot path is a downward-only
-  reference.
-
-### C. Pointer stability ("freeze") with inferred summaries (built)
-
-A pointer or slice is valid until something moves or frees the memory
-it points into; a call that may do so ends it. What a function may move
-or free is a summary inferred over the call graph (generalizing objref's
-"may store / may keep" fixpoint, section 8 of safety.md), and `uses gc`
-counts as "may free any GC object no local holds". Nothing about stored
-pointers changes: the rule is about *uses after a restructure*, and about
-the one thing that never outlives its function, the address of a local.
-
-- Corpus: all 8 (12 tests).
-- Burden: std.text, std.map, std.diag, and every other safe std module:
-  **0 annotations, 0 changes**; std.mem: 1 (`#[may_alias(s)]` on
-  `Vec.extend`). Every example module checked (`LOIMI_LIFETIMES=audit`):
-  3 sites (section 7), since resolved; now on by default. No
-  signature changes anywhere.
-- Interpreter cores: unchanged; vm handlers are checked for pointers
-  derived from the state across `reenter` calls (corpus 7), which is the
-  `reload` contract of language.md section 5.1 made a check.
-- Messages: name the stale variable, the call that may have moved its
-  memory, and the fix (section 5.6).
-- Implementation: one pass over the typed IR after objref, ~1400 lines,
-  no change to the language beyond `#![lifetimes(off)]`, `#[may_alias]`
-  and `#[shrinks]`.
-- Compile time: section 8.
-
-Its limit is the price of no annotations: a pointer stored in a struct
-and loaded elsewhere is tracked only as "the memory at that field", not
-as "a pointer into that container" (section 6). Phase 2 added the one
-cheap rule of section 4 for memory that moves (question 1).
-
-### D. Regions / scoped allocation
-
-Tie pointers to a lexically scoped region (MLKit, Cyclone, Rust's
-`'arena`), so a pointer cannot outlive its arena. This is what Loimi's
-arenas already are informally, and C covers the part that matters at
-the use site: `new(&a, ..)` points into `a`'s chunk, and `a.free()`
-makes it stale (corpus 4). What C leaves open, a node *stored* in
-another structure that outlives the arena, is exactly what region
-*types* would add (`*'a Node`); the cost is a region parameter on every
-AST and IR type (`Expr<'a>`), i.e. option A for the front ends.
-Recommended only as a possible phase-2 refinement for arena pointers
-(question 3), not as the base.
-
-### E. Generational references (Vale) — contrast only
-
-Each allocation carries a generation; each pointer remembers it; each
-dereference compares. Catches everything at run time, but costs a word
-per pointer and a load and compare per access: rejected by the zero-cost
-requirement (and safety.md section 7 already rejected the debug-only
-variant for changing representations).
-
-### Comparison
-
-| | A. borrow checker | B. second-class refs | C. pointer stability (built) | D. regions | E. generations |
-|---|---|---|---|---|---|
-| corpus caught | 8/8 (2, 7, 8 only with GC/vm state as borrows) | 4/8 alone (3, 5, 6, 7) | 8/8 | 4, 6 | 8/8 at run time |
-| annotations, std.text+map+diag | 4 struct params, 6 signatures, 6 rewrites | 0 syntax; 9 fields change type | 0 | region params on stored pointers | 0 |
-| Lox front end | ≈15 struct params, ≈27 signatures, ≈20 sites (5 redesigns) | ≈50 fields change type | 0 (all examples: 3 sites) | `Expr<'a>` everywhere | 0 |
-| interpreter cores | `unsafe`/raw only | `unsafe`/raw only | checked where possible (reenter rule), raw elsewhere as today | raw | slower |
-| stored pointers | checked | forbidden | into growable memory: only in locals; others not followed (hole) | checked for regions | checked |
-| run-time cost | 0 | 0 (but copies/indices) | 0 | 0 | per access |
-| compiler work | a new type system dimension | moderate (new handle types) | one inference pass | new types | runtime + codegen |
-
-## 4. Recommendation
-
-Adopt C as the base (built), keep the language without lifetime syntax,
-and decide in phase 2 how far to go on stored pointers (question 1):
-either accept the hole (ASan builds catch most of it), or add one cheap
-rule: a pointer derived from a container's *growable* interior
-(`ptr_at`, `items`, `get_ptr`, `entry`, `file`, `at`) may not be stored in
-memory that outlives the function, only arena allocations and
-long-lived owners may. That is B restricted to the one kind of pointer
-that dangles on growth, and the audit says it would touch few sites.
-**Decided and built** (error 5 of section 5.4): the audit found 7 sites,
-each safe by a protocol the check cannot see (section 7).
+C, with no lifetime syntax, plus B's rule for growable memory (error 5),
+exclusivity checked only where a callee needs it (error 2), and
+logical staleness through `#[shrinks]`.
 
 ## 5. The rules (as built)
 
@@ -279,7 +156,7 @@ buffer (`v.ptr.*.name.*` lies in another block). Sources:
 - a call that may collect (`uses gc` or `reenter`, also through a
   function value's type) restructures every GC object not held by a
   `let` local or parameter: the compiler roots those while they are in
-  scope, and the collector does not move objects (question 4);
+  scope, and the collector does not move objects;
 - in vm code, a call that may re-enter (`TVm::Synced` with a `reload`)
   restructures what the state variables assigned by `reload` pointed
   into: a pointer computed from `regs` before the call is stale after it;
@@ -294,8 +171,8 @@ buffer (`v.ptr.*.name.*` lies in another block). Sources:
   `Ephemerons.remove`), or of one whose summary has it through its
   callees (`StrBuf.clear`, `OrderedMap.remove`, `pop_last`, `Code.clear`),
   *removes elements*: every pointer into the buffers of the container
-  `v` points to ends, as for a restructure, though the memory stays
-  (question 6). Conservatively all of them, not only those into the
+  `v` points to ends, as for a restructure, though the memory stays.
+  Conservatively all of them, not only those into the
   removed range.
 
 **Growable memory.** A restructure *moves* a block if it reallocates it
@@ -502,7 +379,7 @@ fn Lexer.init(l: *Lexer, src: *text.StrBuf) {
    pointer kept in the function's own memory (a local `Vec<*T>` of
    element pointers) is not followed once stored there; pointers into
    blocks that are only freed (arena nodes used after `a.free()`
-   elsewhere: question 3; a freed list node); a store through `unsafe
+   elsewhere; a freed list node); a store through `unsafe
    { }` (the 7 protocol sites of section 7); a GC object's growable
    field reached as "some GC object" (its type is not known, so it is
    not judged); a growable block of bytes holding typed values through
@@ -511,8 +388,7 @@ fn Lexer.init(l: *Lexer, src: *text.StrBuf) {
    so nothing follows its buffer).
 2. **Parameters are assumed not to alias each other's buffers** inside
    a function body (`fn f(a: *Vec<u8>, b: *Vec<u8>)` taking `a.items()`
-   and pushing to `b`); the caller is checked instead (error 2, question
-   2): `f(&v, &v)` and `f(&c, &c.v)` are rejected when `f` uses what it
+   and pushing to `b`); the caller is checked instead (error 2): `f(&v, &v)` and `f(&c, &c.v)` are rejected when `f` uses what it
    took through one after moving memory through the other. Not checked:
    blocks more than two dereferences below a parameter (reached through
    pointers stored in memory, hole 1), and two different GC objects or
@@ -545,11 +421,9 @@ fn Lexer.init(l: *Lexer, src: *text.StrBuf) {
    owner, so growing it inside the closure does not make it stale
    (Mini's debugger: `tests/run/lt_inference.lm`); what a captured
    slice points into is not related to the captured owner (hole 3).
-5. **The collector is assumed not to move objects.** A slice of an
-   object held by a `let` is accepted across a collection; a moving
-   collector would make every such slice stale (the rule would then be
-   one line: no GC root is exempt).
-6. **Logical staleness**: since phase 2 (question 6) a pointer kept
+5. **The collector does not move objects**, so a slice of an object
+   held by a `let` is accepted across a collection.
+6. **Logical staleness**: a pointer kept
    across `v.clear()`, `truncate`, `pop` or a map's `remove` is an error
    (`#[shrinks]`), though the memory stays allocated. Not covered: a
    container shrunk by assigning its length (`v.len = n` in user code),
@@ -594,7 +468,7 @@ forever) removed the 36 false positives, leaving:
 | `examples/mini/vm.lm` `sort_less`: `&ab[0]` (a local array) passed as `args` to `call_value`, whose summary keeps `args` in the context | no hazard today: the only store, `c.xfer = args` in `coro.call`'s yield, runs only when `from_vm`, and `call_value` passes false (a yield from host code is an error); the summary is path-insensitive (the embedding's `s.args = args` is on another path, not reached from `call_value`). But the store lent a pointer to the context through a native's arguments | fixed in the code: the CALL instruction sets `ctx.xfer` itself (the yield's values are its own arguments, `regs + base + 1`), so `coro.call` no longer stores `args`; IR changes in `coro.call` and the CALL handler's yield branch only |
 | `examples/minijs/compile.lm` `compile`: `&p` (a local parser) passed to `Parser.program`, which "may keep it" | false positive: the Pratt hooks are function values, whose result was taken to point into every pointer argument, so `Parser.primary`'s `*Node` "pointed into" the parser and storing a node in a node kept the parser | inference: a function value's (or extern's) result points into an argument's block only where the types allow it (section 5.1) |
 
-**Opting in** (migration step 2): all 77 modules of Lox, Mini (with its
+**Opting in** (phase 1): all 77 modules of Lox, Mini (with its
 embedding, coroutines, threads and debugger), MiniJS, Prolog, Python
 (with its debugger), the regex library, Scheme, Stack and Wasm are
 `#![lifetimes]` (the tutorial's steps are not: they follow the
@@ -614,8 +488,8 @@ handlers: they already recompute pointers after `reenter` calls. With
 every example module opted in, `LOIMI_LIFETIMES=audit` reports nothing
 on the examples.
 
-**Phase 2 rules** (questions 1, 2 and 6), audited with the same builds
-(every example under `--cfg debug`, `--cfg gil`, `--jit-stencils`,
+**Phase 2 rules** (errors 2 and 5, `#[shrinks]`), audited with the same
+builds (every example under `--cfg debug`, `--cfg gil`, `--jit-stencils`,
 `--shared`, the fuzzers, regex's stats driver, the tutorial; every
 module, std's included):
 
@@ -635,7 +509,7 @@ purpose:
 | `examples/regex/vm.lm` `grow`: `r.bt_end = r.bt_base + ncap` | the end of the block just moved, set by the function that moves it |
 | `examples/wasm/vm.lm` `Machine.switch_to` (3): `m.funcs = i.funcs.ptr`, `globals`, `sigs` | an instance's vectors are complete (`instantiate`) before any switch to it, and the machine takes them again at every switch |
 
-**Default on** (question 5): every module checked, std's unsafe core
+**Default on**: every module checked, std's unsafe core
 (`mem`, `gc`, `obj`, `bigint`, `gil`, `num`, `os`, `rt`, `test`,
 `prof`, `debug`) included, across every example in every configuration
 above plus `--sanitize=address` builds (std has `#[cfg(sanitize_address)]`
@@ -668,7 +542,7 @@ a `push` after a `reserve`).
 Prolog, Python, regex (library and fuzzer), Scheme, Stack (and fuzzer),
 Wasm and the tutorial, base compiler against the new one with the same
 std (the attribute line blanked for the base): byte-identical. After
-step 2 (the attribute takes the place of a blank line, so no line
+phase 1 (the attribute takes the place of a blank line, so no line
 moves), against the tree before it: byte-identical for every example
 (also Mini `--cfg debug`, `--cfg gil` and Python `--cfg debug`) except
 the three intended code fixes: MiniJS (`Gen.top`), Mini and its
@@ -749,7 +623,7 @@ calculator, the ASan tests that build without an opt-out).
   pointee and the buffers it owns (two dereferences, section 6 item 2),
   brought it to 7.
 
-  **Default on** (question 5): the pass's time before (master: the
+  **Default on**: the pass's time before (master: the
   examples' modules and std's `#![safe]` ones checked) and after (every
   module), and its share of the front end without it (`LOIMI_LIFETIMES=off`,
   `--emit-llvm`, best of 3; the machine was busier than for the tables
@@ -778,28 +652,13 @@ calculator, the ASan tests that build without an opt-out).
   on codegen), `#![lifetimes]`, `#[may_alias]` and `#[shrinks]` in the
   parser and checker, a summary map in `tir::Program`.
 
-## 9. Migration plan
+## 9. History, and what stays raw
 
-1. **std** (done): every `#![safe]` module is checked; `Vec.extend` is
-   `#[may_alias(s)]`. Since step 3 every other std module is checked
-   too, the unsafe core (`mem`, `gc`, `obj`, `bigint`, `gil`, `map`'s
-   probes) included, which is also what the summaries are inferred
-   from: no change was needed.
-2. **Examples** (done): every module of the example interpreters is
-   `#![lifetimes]`, front ends and vm modules alike (77 modules; the
-   tutorial's steps excepted). The 3 audit sites and the 4 new findings
-   are resolved (section 7): three code fixes, four inference
-   refinements, no `unsafe { }`.
-3. **Default** (done): every module is checked, std's included;
-   `#![lifetimes(off)]` opts out, `unsafe { }`, `#[may_alias]` and
-   `#[shrinks]` stay (section 5.5). It found one latent dangling
-   pointer in a test, fixed, and 8 ASan tests opt out (section 7); the
-   examples' 77 `#![lifetimes]` lines went.
-4. **Phase 2 rules** (done): errors 2 (exclusivity) and 5 (stored
-   pointers into growable memory) and `#[shrinks]` (questions 1, 2, 6);
-   std gained eight `#[shrinks]` lines, the examples 7 `unsafe { }` at
-   stores safe by protocol (section 7). Questions 3 and 4 stay open
-   (5 is step 3).
+Built in three steps: phase 1 (errors 1, 3 and 4, opt-in per module;
+all 77 example modules opted in, after the fixes of section 7), phase 2
+(errors 2 and 5, `#[shrinks]`), then the default (every module checked,
+`#![lifetimes(off)]` to opt out; the examples' `#![lifetimes]` lines
+went).
 
 **What stays raw (`unsafe` or unchecked) and why**: the allocator, the
 collector, inline caches and limb arithmetic (`mem`, `gc`, `obj`,
@@ -811,42 +670,3 @@ context (`ctx.stack + base`) are hole 1; interpreter natives that take
 `args: *V` into the value stack rely on the stack not being freed during
 the call (Mini's `VStack.prev`), which the rule treats as the caller's
 promise for every pointer parameter.
-
-## 10. Open questions for the user
-
-1. **Stored pointers** (hole 1) — **decided: forbid, for growable
-   memory** (error 5; growable inferred from what moves, section 5.2).
-   The question was: accept the hole, or forbid storing a
-   pointer into a *growable* container's interior in memory that
-   outlives the function (a second-class rule for `ptr_at`, `items`,
-   `get_ptr`, `entry`, `SourceMap.file`, `Diagnostics.at` results), with
-   arena allocations and owner pointers still storable? It needs a way
-   to tell growable from stable memory: inferred (some function other
-   than the owner's `free` restructures it) or declared on the field.
-2. **Aliasing of pointer parameters** (hole 2) — **decided: check at
-   call sites** (error 2), only where the callee uses what it took
-   through one argument after moving memory through the other, so
-   `f(&v, &v)` stays legal when the callee re-derives; `#[may_alias]` is
-   the escape hatch. The question was: add an exclusivity
-   check at call sites (two arguments pointing to the same container,
-   one restructured), at the cost of rejecting `f(&v, &v)`-style calls
-   that are fine today?
-3. **Arena pointers stored in nodes** and `Arena.free`: region types
-   (option D) for arenas only, or keep "free the arena last" a
-   convention checked by ASan?
-4. **A moving collector** (planned in language.md section 5): then no
-   `let` exempts a slice of an object across a collection. Should the
-   rule already be the strict one, to keep that option open?
-5. **Default on** — **decided: yes**, for every module, std's
-   included, with `#![lifetimes(off)]` as the per-module opt-out
-   (section 5.5; migration step 3). The question was: make
-   `#![lifetimes]` the default for every module (after the examples opt
-   in), or keep it opt-in like `#![safe]`? Unlike `#![safe]`, the check
-   asks nothing of code that is right (no annotation, no `unsafe` for
-   raw pointers), so opting in only hid bugs: the default found one.
-6. **Logical staleness** — **decided: yes**, conservatively for every
-   pointer into the container, seeded by `#[shrinks(v)]` on std's
-   shrinking functions (section 5.2). The question was: should
-   `clear`/`truncate`/`pop` also end pointers into the dropped elements
-   (memory-safe today, but always a bug)? It is one more seed in the
-   summaries.
