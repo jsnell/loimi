@@ -81,6 +81,8 @@ pub struct VmInfo {
 pub struct CacheInfo {
     pub name: String,
     pub fields: Vec<(String, Ty, u32)>,
+    /// Per field: `const` (set by the emitter; handlers only read it).
+    pub konst: Vec<bool>,
     /// `cache X = S;`: the struct, and why `&cache` cannot be a `*S` if
     /// the words do not hold an `S` as it is laid out in memory.
     pub from: Option<(Ty, Option<String>)>,
@@ -411,13 +413,8 @@ fn cache_infos(c: &mut Checker, m: usize, d: &VmDecl, l: &mut crate::vmexpand::V
     for (ci, cd) in d.caches.iter().enumerate() {
         let mut fields = Vec::new();
         let mut off = 0u32;
-        for (f, t, weak) in &cd.fields {
-            if *weak {
-                return Err(Diag::new(
-                    t.span,
-                    "`weak` cache fields are not supported: inline caches cannot hold GC references (see language.md §7.1)",
-                ));
-            }
+        let mut konst = Vec::new();
+        for (f, t, k) in &cd.fields {
             if fields.iter().any(|(n, _, _): &(String, Ty, u32)| *n == f.name) {
                 return Err(Diag::new(f.span, format!("duplicate field `{}` in cache `{}`", f.name, cd.name.name)));
             }
@@ -432,8 +429,15 @@ fn cache_infos(c: &mut Checker, m: usize, d: &VmDecl, l: &mut crate::vmexpand::V
             if Some(&ft) != resume.as_ref() && let Some(why) = bad_cache_type(&ft) {
                 return Err(Diag::new(t.span, format!("cache field `{}` has type `{}`: {}", f.name, c.ty_name(&ft), why)));
             }
+            if *k && Some(&ft) == resume.as_ref() {
+                return Err(Diag::new(
+                    f.span,
+                    format!("cache field `{}` is a `{}.Resume` and cannot be `const`: the verifier resets resume fields, and vm code and `fill_resumes` set them (language.md §7.1)", f.name, d.name.name),
+                ));
+            }
             let words = crate::layout::size_of(&c.prog, &ft).max(1).div_ceil(wb) as u32;
             fields.push((f.name.clone(), ft, off));
+            konst.push(*k);
             off += words;
         }
         l.cache_words[ci] = off;
@@ -445,10 +449,14 @@ fn cache_infos(c: &mut Checker, m: usize, d: &VmDecl, l: &mut crate::vmexpand::V
                     return Err(Diag::new(t.span, format!("a cache layout `cache X = S;` names a struct, not `{}`", c.ty_name(&st))));
                 };
                 let why = whole_cache_mismatch(c, sid, &fields, off as u64 * wb, wb);
+                // `cache X = const S verify e;`: `it` is `&cache`, a `*S`.
+                if let (Some((_, e)), Some(why)) = (cd.verify.iter().find(|(f, _)| f.is_none()), &why) {
+                    return Err(Diag::new(e.span, format!("this `verify` clause sees the cache as a `*{}`, which its words cannot be: {}", c.ty_name(&st), why)));
+                }
                 Some((st, why))
             }
         };
-        caches.push(CacheInfo { name: cd.name.name.clone(), fields, from });
+        caches.push(CacheInfo { name: cd.name.name.clone(), fields, konst, from });
     }
     Ok(caches)
 }
@@ -1952,6 +1960,49 @@ pub fn cache_addr(c: &mut Checker, cx: &mut FnCx, n: &str, span: Span) -> Res<Op
         )),
         Some((st, Some(why))) => Err(Diag::new(span, format!("`&{}` cannot be a `*{}`: {}", n, c.ty_name(st), why))),
         Some((st, None)) => Ok(Some(mk(Ty::Ptr(Box::new(st.clone())), TK::Cast(Box::new(base)), span))),
+    }
+}
+
+/// `const` cache fields are set by the emitter and only read by vm code:
+/// an error if `place` (assigned, or with its address taken if `addr`) is
+/// one, `cache.f` in an op or `c.f` through a cache handle (or part of
+/// one, `cache.f.x`).
+pub fn const_cache_write(c: &Checker, cx: &FnCx, place: &Expr, addr: bool) -> Res<()> {
+    let Some(h) = &cx.vm else { return Ok(()) };
+    let mut e = place;
+    loop {
+        match &e.kind {
+            ExprKind::Field(b, name) => {
+                if let ExprKind::Ident(bn) = &b.kind {
+                    if cx.lookup(bn).is_some() {
+                        return Ok(());
+                    }
+                    let info = &c.vms[h.vm as usize];
+                    let ci = if let Some((_, _, ci)) = h.cache_params.iter().find(|(x, _, _)| x == bn) {
+                        *ci
+                    } else if bn == "cache" && !h.in_fn && let Some(op) = h.op && let Some(ci) = info.ops[op].cache {
+                        ci
+                    } else {
+                        return Ok(());
+                    };
+                    let cache = &info.caches[ci];
+                    if let Some(i) = cache.fields.iter().position(|f| f.0 == name.name) && cache.konst[i] {
+                        let what = if addr { "take the address of" } else { "assign" };
+                        return Err(Diag::new(
+                            e.span,
+                            format!(
+                                "cannot {} `{}.{}`: it is a `const` field of cache `{}`, which the emitter sets and vm code only reads (language.md §7.1)",
+                                what, bn, name.name, cache.name
+                            ),
+                        ));
+                    }
+                    return Ok(());
+                }
+                e = b;
+            }
+            ExprKind::Index(b, _) => e = b,
+            _ => return Ok(()),
+        }
     }
 }
 

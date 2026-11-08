@@ -26,6 +26,7 @@ cache layout in a vm.
 | `math.Divisor.new(d: i64) -> ?Divisor` | prepare `d`; None unless 1 <= d < 2^32. Costs two 64-bit divisions (no call): do it when emitting the op, or once when it first runs, not every time |
 | `dv.set(d: i64) -> bool` | the same, in place (a cache filled when its op first runs) |
 | `dv.store(w: []u32)` | write the 4 words to `w[0..4]` (an emitter filling the op's cache words) |
+| `dv.is_valid() -> bool` | whether the words are what `Divisor.new(dv.divisor())` prepares (a `verify` clause of a `const` cache); costs what `new` does |
 | `dv.divisor() -> i64` | `d` |
 | `dv.udiv(n: u64)`, `dv.urem(n: u64)` | floor(n / d) and n mod d, for n < 2^63 |
 | `dv.udiv31(n: u64)`, `dv.urem31(n: u64)` | the same for n < 2^31 (non-negative i32 values) with a 64-bit `imul` instead of the 128-bit product |
@@ -62,8 +63,10 @@ cache is filled.
 
 ### A constant-divisor op
 
-The emitter prepares the divisor and stores it in the op's cache words;
-the op is one line:
+The emitter prepares the divisor and stores it in the op's cache words.
+The cache is `const` (language.md §7.1): handlers only read it,
+`Vm.deopt` keeps it, and the verifier checks it with `is_valid`. The op
+is one line:
 
 <!-- snippet: run "7 -14"
 import std.io;
@@ -90,7 +93,7 @@ fn main() {
 }
 -->
 ```loimi
-cache DivK = math.Divisor;
+cache DivK = const math.Divisor verify it.is_valid();
 op MODK(dst: reg, a: reg) : AB + DivK { dst = (&cache).rem_floor(a); next }
 op IDIVK(dst: reg, a: reg) : AB + DivK { dst = (&cache).div_trunc(a); next }
 ```
@@ -102,8 +105,8 @@ With `std.bc`, `let at = code.op(w);` then
 
 - **Prolog** (`examples/prolog`): `X // K`, `X mod K`, `X div K` and
   `X rem K` with an integer constant 1 <= K < 2^31 compile to `IDIVK`,
-  `MODK`, `DIVK` and `REMK`, whose `DivK` cache the clause compiler
-  fills. The four ops are one `inline for` row each:
+  `MODK`, `DIVK` and `REMK`, whose `const` `DivK` cache the clause
+  compiler fills and the verifier checks. The four ops are one `inline for` row each:
   `d = Term.Int((&cache).#method(x as i64) as i48)`. Every i48
   dividend, negative ones included, takes the fast path; bignums and
   errors go to the evaluator. Before, these were `R3` ops dividing by a
@@ -117,7 +120,8 @@ With `std.bc`, `let at = code.op(w);` then
   hand-written `mod_magic` (a 31-bit magic and shift packed in a
   `u64`).
 - **MiniJS** (`examples/minijs`): `MODK` with an Int constant gets its
-  `ModK` cache from the emitter. Its fast path checks
+  `const` `ModK` cache from the emitter (zero words for other constants;
+  the verify clause accepts those too). Its fast path checks
   `y > 0 and (y as u32) == cache.d`, so an unfilled cache (or a
   constant <= 0) goes to the `idiv` and float paths as before; integral
   floats below 2^53 use `rem_trunc` too.
@@ -126,12 +130,6 @@ With `std.bc`, `let at = code.op(w);` then
 
 ## Limitations
 
-- **`const` cache fields** (`roadmap.md` Q10): fields that the emitter
-  sets, that `Vm.deopt` keeps and the verifier may read. Today a
-  divisor cache is an ordinary cache: `Vm.deopt` zeroes it, so an op
-  whose cache an emitter fills must not be deoptimized (none of the
-  examples deoptimizes these ops), or must test `cache.d` and refill as
-  Mini does.
 - `Divisor` does not handle negative divisors, divisors of 2^32 and
   more, or i64.min / u64 dividends of 2^63 and more (libdivide's 65-bit
   "add" form would cover them at two more instructions).

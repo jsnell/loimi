@@ -139,7 +139,7 @@ stores a SlotRef: the index, or the overflow index with bit 31
   these). An id therefore names a transition path, which fixes the
   layout, so a cache entry holding it can be stale but never wrong; no
   id is ever given to a different path, and caches need no reset after a
-  collection (the weak-cache machinery of gc.md §8 is not needed). Ids
+  collection. Ids
   come from a u32 counter (0 is an empty cache, `DICT_ID` =
   `0xFFFFFFFF` the dictionary shape); 4 billion distinct paths abort the
   process.

@@ -1,0 +1,10 @@
+fn set(p: *u32) { *p = 1; }
+vm V {
+    state { pc: *u32 }
+    encoding fixed(u32) { format A { op: 8 } }
+    cache IC { const k: u32 }
+    op NOP() : A + IC { set(&cache.k); next }
+    entry run(c: *u32) -> i64 { pc = c; jump pc }
+}
+fn main() {}
+// error: cannot take the address of `cache.k`: it is a `const` field

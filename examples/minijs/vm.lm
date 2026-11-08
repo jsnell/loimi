@@ -891,8 +891,10 @@ pub vm JS {
     /// `%` with a positive Int divisor is exact in integers when the
     /// dividend is integral (an Int, or a Num below 2^53).
     /// MODK's constant divisor is also a std.math.Divisor in its cache,
-    /// filled by the emitter (compile.lm): a multiply, not an `idiv`.
-    cache ModK = math.Divisor;
+    /// filled by the emitter (compile.lm): a multiply, not an `idiv`. A
+    /// `const` cache: `deopt` keeps it, and the verifier checks it (zero
+    /// words when the constant is not a positive Int).
+    cache ModK = const math.Divisor verify it.d == 0 or it.is_valid();
     op MODK(dst: reg, a: reg, b: kst) : ABC + ModK {
         if let Int(y) = b and y > 0 and (y as u32) == cache.d {
             if let Int(x) = a and x >= 0 { dst = Int((&cache).urem(x as u64) as i32); next }

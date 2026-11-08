@@ -1,0 +1,11 @@
+struct S { a: u32, b: u64 }
+fn S.ok(s: *S) -> bool { s.a < 4 }
+vm V {
+    state { pc: *u32 }
+    encoding fixed(u32) { format A { op: 8 } }
+    cache IC = const S verify it.ok();
+    op NOP() : A + IC { next }
+    entry run(c: *u32) -> i64 { pc = c; jump pc }
+}
+fn main() {}
+// error: this `verify` clause sees the cache as a `*S`, which its words cannot be

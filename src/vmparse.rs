@@ -301,25 +301,43 @@ impl Parser {
                     let n = self.ident()?;
                     if self.eat("=") {
                         // `cache X = S;`: the fields of struct `S`
-                        // (vmexpand::cache_structs fills them in).
+                        // (vmexpand::cache_structs fills them in);
+                        // `cache X = const S verify e;`: all of them const.
+                        let konst = self.eat_kw("const");
                         let t = self.parse_type()?;
+                        let mut verify = vec![];
+                        if self.is_kw("verify") {
+                            let at = self.bump().span;
+                            if !konst {
+                                return Err(Diag::new(at, "only `const` cache fields have `verify` clauses: write `cache X = const S verify ..;`"));
+                            }
+                            verify.push((None, self.parse_expr()?));
+                        }
                         self.expect(";")?;
-                        vm.caches.push(CacheDecl { name: n, fields: vec![], from: Some(t) });
+                        vm.caches.push(CacheDecl { name: n, fields: vec![], from: Some(t), konst, verify });
                     } else {
                         self.expect("{")?;
                         let mut fields = Vec::new();
+                        let mut verify = vec![];
                         while !self.is("}") {
+                            let konst = self.eat_kw("const");
                             let f = self.ident()?;
                             self.expect(":")?;
-                            let weak = self.eat_kw("weak");
                             let t = self.parse_type()?;
-                            fields.push((f, t, weak));
+                            if self.is_kw("verify") {
+                                let at = self.bump().span;
+                                if !konst {
+                                    return Err(Diag::new(at, format!("only `const` cache fields have `verify` clauses: write `const {}: ..`", f.name)));
+                                }
+                                verify.push((Some(f.clone()), self.parse_expr()?));
+                            }
+                            fields.push((f, t, konst));
                             if !self.eat(",") {
                                 break;
                             }
                         }
                         self.expect("}")?;
-                        vm.caches.push(CacheDecl { name: n, fields, from: None });
+                        vm.caches.push(CacheDecl { name: n, fields, from: None, konst: false, verify });
                     }
                 }
                 "poll" => {

@@ -1,0 +1,9 @@
+vm V {
+    state { pc: *u32 }
+    encoding fixed(u32) { format A { op: 8 } }
+    cache IC { const to: V.Resume }
+    op GO() : A + IC { jump cache.to }
+    entry run(c: *u32) -> i64 { pc = c; jump pc }
+}
+fn main() {}
+// error: cache field `to` is a `V.Resume` and cannot be `const`

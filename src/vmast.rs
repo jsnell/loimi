@@ -36,10 +36,19 @@ pub struct CacheDecl {
     /// Each field starts a code word (and takes as many as its type
     /// needs). For `cache X = S;` these are `S`'s fields, filled in by
     /// `vmexpand::cache_structs` before the vm is expanded.
+    /// The flag: a `const` field (`const v: u64`, or every field of
+    /// `cache X = const S;`), which the emitter sets, handlers only read,
+    /// `deopt` keeps and the verifier may check.
     pub fields: Vec<(Ident, TypeExpr, bool)>,
     /// `cache X = S;`: the layout is struct `S`'s fields, and `&cache`
     /// is a `*S` (language.md §7.1).
     pub from: Option<TypeExpr>,
+    /// `cache X = const S;`: every field is `const`.
+    pub konst: bool,
+    /// `verify` clauses of const fields: the field's name and the clause,
+    /// with `it` the field's value; for `cache X = const S verify e;` no
+    /// name, and `it` is a `*S` pointing at the cache words.
+    pub verify: Vec<(Option<Ident>, Expr)>,
 }
 
 #[derive(Clone, Debug)]

@@ -789,7 +789,7 @@ Built as the trace tier: [`trace-tier.md`](trace-tier.md).
 | NaN tagging, dual int/double | LuaJIT | N: `nanbox`, merged tuple tests (`language.md` §2); `nanbox(int_high)` (item 7) |
 | Top of stack in a register | wasm3 `_r0`/`_fp0` (`m3_exec.h:119-146`) | N: accumulators (item 1) |
 | Stack caching with several states (Ertl) | Forth systems | H: Stak's `tos` state variable (10–15%, Stak FRICTION) |
-| Inline caches in the code stream | CPython `_Py*Cache` | N: `cache`, `cache X = S` (`language.md` §7.1) |
+| Inline caches in the code stream | CPython `_Py*Cache` | N: `cache`, `cache X = S`, `const` fields (`language.md` §7.1) |
 | Quickening, families, deopt | CPython PEP 659 | N: `family`, `become`, `Vm.deopt`, `refuse` (`language.md` §7.2–7.3) |
 | Warmup and backoff counters | CPython `pycore_backoff.h` | H: a cache field (item 10: not needed) |
 | Static superinstructions | CPython (LOAD_FAST_LOAD_FAST), QuickJS | N, beyond the references: `supers`, DP `optimize`, `#[forward]`, suggestions, `supers from` (`language.md` §7.3) |

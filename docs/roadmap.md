@@ -60,12 +60,11 @@ numbers are in [`results.md`](results.md).
    through nested entries (`uses reenter`). The header is
    `extern "C"`-guarded, usable from C++.
 
-10. **Immediates wider than a format's word.** The wasm interpreter
-    keeps 64-bit constants and table and segment indices in inline cache
-    words (`cache Imm64 { v: u64 }`), written after `emit`; the verifier
-    cannot see cache words, so such indices are bounds-checked at each
-    execution. The chosen fix is `const` cache fields: set by the
-    emitter, readable by the verifier, kept by `deopt`.
+10. **Immediates wider than a format's word.** *Decided and built
+    (2026-11-08):* `const` inline cache fields (`cache Imm64 { const v:
+    u64 }`, `language.md` §7.1), set by the emitter, kept by `deopt` and
+    checked once by `verify` clauses; wasm's `call_indirect` table index
+    is one.
 
 11. **The cost of a three-operand op.** `F64_MUL d, a, b` is 14
     instructions (6 to decode three 16-bit fields, 3 to load, multiply

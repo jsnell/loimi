@@ -508,13 +508,9 @@ prefixes nor the double mapping (which rules out transparent huge
 pages) is measurable on Mini: 0.997 without prefixes, 1.001 with a
 private mapping.
 
-**Hot and cold stencil parts.** `LOIMI_JIT_SPLIT=1` at build time gives
-stencils a profile entry count, so that clang's
-`-fsplit-machine-functions` moves blocks it thinks never run to
-`.text.split`; `elf.rs` joins the parts and the runtime lays out each
-code object's cold parts after its fast paths, so that fast paths fall
-through. Only 36 of Mini's 112 stencils split. It is off by default: 1.01×
-the JIT time without it on Mini and MiniJS, and Mini's nbody 13% slower.
+**Hot and cold stencil parts** (`-fsplit-machine-functions`, cold parts
+laid out after all fast paths) were measured and rejected: 1.01× the JIT
+time on Mini and MiniJS, Mini's nbody 13% slower.
 
 ## 11. Environment variables
 
@@ -528,9 +524,8 @@ after n compiles (section 10; for testing).
 
 At build time: `LOIMI_JIT_REPORT=1` reports the stencils (and any
 rejected ones), `LOIMI_KEEP_STENCILS=dir` keeps the stencil module and
-object, `LOIMI_JIT_VARIANTS=0` turns off type variants (section 12),
-`LOIMI_JIT_SPLIT=1` splits stencils into hot and cold parts (section
-10), and `LOIMI_JIT_REGDELAY=n` is a latency probe (section 13).
+object, `LOIMI_JIT_VARIANTS=0` turns off type variants (section 12), and
+`LOIMI_JIT_REGDELAY=n` is a latency probe (section 13).
 
 ```sh
 loimi build examples/mini/main.lm --release --jit-stencils -o mini-jit

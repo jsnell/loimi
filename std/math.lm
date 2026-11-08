@@ -7,9 +7,10 @@
 // number wide enough that one form covers every dividend magnitude
 // below 2^63: every i32 and i48 value, every i64 but i64.min.
 //
-// Its fields are four u32 words, so `cache DivK = math.Divisor;` is an
-// inline cache layout in a u32 (or wider) vm, and `&cache` is a
-// `*Divisor` (language.md §7.1). docs/stdlib/math.md has the details.
+// Its fields are four u32 words, so `cache DivK = const math.Divisor;`
+// is an inline cache layout in a u32 (or wider) vm that the emitter
+// fills and `deopt` keeps, and `&cache` is a `*Divisor` (language.md
+// §7.1). docs/stdlib/math.md has the details.
 
 /// A prepared positive divisor. Zeroed words (an unfilled cache) are not
 /// a divisor: `d` is 0 there, and the methods give 0 quotients.
@@ -52,6 +53,15 @@ pub fn Divisor.set(dv: *Divisor, d: i64) -> bool {
     let Some(v) = Divisor.new(d) else { return false; };
     *dv = v;
     true
+}
+
+/// Whether `*dv` is what `Divisor.new(dv.d)` prepares: a `verify` clause
+/// of a `const` cache (`cache DivK = const math.Divisor verify
+/// it.is_valid();`) checks the words an emitter stored. Costs what `new`
+/// does.
+pub fn Divisor.is_valid(dv: *Divisor) -> bool {
+    let Some(v) = Divisor.new(dv.d as i64) else { return false; };
+    v.m_lo == dv.m_lo and v.m_hi == dv.m_hi and v.l == dv.l
 }
 
 /// The divisor itself.
