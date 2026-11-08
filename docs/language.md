@@ -434,7 +434,8 @@ fn main() {}
   name is an error. `loimi build -W error` (or `--deny-warnings`) turns
   the warnings that remain into errors. The lints are `match_fallout`,
   `unreachable_arm` (above), `super_overlap` (section 7.3),
-  `value_layout` (section 2) and `next_pc_then` (section 3.5), and the
+  `value_layout` (section 2), `next_pc_then` (section 3.5) and
+  `state_registers` (section 3.1), and the
   opt-in `hot_gc`, turned on with `-W hot_gc`: a call that may collect
   (`uses gc`) on an op handler's fast path, outside `cold`, which syncs
   the vm state and roots the live traced locals on every execution
@@ -1702,10 +1703,12 @@ live in machine registers for the entire life of the interpreter:
 frame stack, globals, interned strings). Fields accessed through `ctx` cost a
 load, which is the right price for cold-ish data.
 
-The compiler warns when `state` + `context` exceeds the target's argument
-registers under `preserve_none` (about 12 general-purpose registers on x86-64
-and more on AArch64, but fewer is better: 3 to 6 is typical). **Not built:**
-the warning.
+In tail-call mode every handler takes the context, the state and the
+instruction word as `preserve_none` arguments: 12 general-purpose and 8
+floating-point registers on x86-64, 24 and 8 on AArch64 (LLVM 19). A vm
+that needs more gets the warning `state_registers` (the rest would be
+passed on the stack, a store and a load in every handler); 3 to 6 state
+variables is typical.
 
 State variables have plain types (`pc: *u32`, `regs: *Value`). A stack
 VM keeps a plain pointer to its stack top, and its ops declare stack

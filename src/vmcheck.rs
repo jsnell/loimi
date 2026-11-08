@@ -600,6 +600,9 @@ pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
         None => None,
     };
     let state_tys: Vec<Ty> = state.iter().map(|(_, t)| t.clone()).collect();
+    if dispatch == Dispatch::TailCall {
+        state_registers(c, &d, &state);
+    }
 
     // Ops.
     let mut ops = Vec::new();
@@ -2260,4 +2263,40 @@ pub fn wrap_effects(c: &mut Checker, cx: &mut FnCx, call: TExpr) -> Res<TExpr> {
         span,
         format!("{} uses {}, but {} does not declare it; add `uses {}` to its signature", callee, eff, caller, eff),
     ))
+}
+
+/// Lint `state_registers`: a tail-call vm passes its state (context and
+/// hidden registers included) and the instruction word to every handler
+/// in `preserve_none` argument registers. Past the target's count (x86-64:
+/// 12 general-purpose and 8 SSE registers; AArch64: 24 and 8, LLVM 19)
+/// the rest are passed on the stack, a store and a load in every handler.
+fn state_registers(c: &mut Checker, d: &VmDecl, state: &[(String, Ty)]) {
+    let (gpr_max, fpr_max, target) = if c.target_aarch64 { (24, 8, "AArch64") } else { (12, 8, "x86-64") };
+    let fp = |t: &Ty| matches!(t, Ty::F32 | Ty::F64 | Ty::Vector(..));
+    let fprs = state.iter().filter(|(_, t)| fp(t)).count();
+    // The instruction word is the last argument.
+    let gprs = state.iter().filter(|(_, t)| !fp(t)).count() + 1;
+    let mut msgs = Vec::new();
+    if gprs > gpr_max {
+        msgs.push(format!(
+            "{} integer or pointer values (state and context, plus the instruction word) for {} general-purpose argument registers",
+            gprs, gpr_max
+        ));
+    }
+    if fprs > fpr_max {
+        msgs.push(format!("{} floating-point state variables for {} floating-point argument registers", fprs, fpr_max));
+    }
+    if msgs.is_empty() {
+        return;
+    }
+    c.warnings.push(Diag::warning(
+        "state_registers",
+        d.name.span,
+        format!(
+            "vm `{}` passes {} under `preserve_none` on {}: the rest go through the stack, a store and a load in every handler; keep rarely used values behind `context`",
+            d.name.name,
+            msgs.join(", and "),
+            target
+        ),
+    ));
 }

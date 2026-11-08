@@ -8,6 +8,11 @@ implementation; `git log` has the details.
 
 ### `vm` declarations and dispatch
 
+- **Warning `state_registers`**: a tail-call vm whose context, state and
+  instruction word need more `preserve_none` argument registers than the
+  target has (x86-64: 12 general-purpose, 8 floating-point; AArch64: 24
+  and 8) is warned about, since every handler would pass the rest on the
+  stack ([language.md §3.1](docs/language.md#31-state-and-context)).
 - **Named operand fields**: `op DELGLOBAL(name: kst @ bx) : ABx` puts an
   operand in a named format field (the others take the fields not named,
   in order), so ops no longer need dummy `unused: imm` operands. Mini,

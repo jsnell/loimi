@@ -393,6 +393,7 @@ fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, O
     c.generated_files = sm.files.iter().enumerate().filter(|(_, f)| f.generated.is_some()).map(|(i, _)| i as u32).collect();
     c.dispatch_override = opts.dispatch;
     c.table_in_state = opts.target.as_ref().map_or(codegen::Arch::host(), |t| t.arch) == codegen::Arch::AArch64;
+    c.target_aarch64 = c.table_in_state;
     // Checking goes on past errors in bodies; the passes after it run
     // only on a program that checked.
     c.run_all().map_err(Diags)?;

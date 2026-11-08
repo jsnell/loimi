@@ -170,6 +170,9 @@ pub struct Checker<'a> {
     /// Tail-call vms keep their dispatch table's address in a state
     /// register (AArch64: saves the `adrp`+`add` of every dispatch).
     pub table_in_state: bool,
+    /// The target is AArch64 (for `state_registers`: how many argument
+    /// registers `preserve_none` has).
+    pub target_aarch64: bool,
     pub vms: Vec<crate::vmcheck::VmInfo>,
     pub traits: crate::traits::Traits,
     pub aliases: Vec<AliasInfo>,
@@ -312,6 +315,7 @@ impl<'a> Checker<'a> {
             vm_decls: vec![],
             dispatch_override: None,
             table_in_state: false,
+            target_aarch64: false,
             vms: vec![],
             generics: Default::default(),
             traits: Default::default(),
