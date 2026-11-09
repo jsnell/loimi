@@ -42,8 +42,8 @@ numbers are in [`results.md`](results.md).
    no extra source: 0.76–0.83 of the interpreters' time by geometric
    mean (Mini, MiniJS, Scheme; Prolog 0.94). Re-patching on quickening,
    patched constant operands and a one-register cache (1.5% slower) each gained nothing; what remains
-   needs register allocation across instructions, which the
-   ahead-of-time traces do (`design/trace-tier.md`).
+   needs register allocation across instructions; ahead-of-time traces
+   did it and were removed (`design/speed-audit.md`, item 14).
 
 7. **A checked register window: no** (2026-11-03). The verifier is the
    trusted-index mechanism (an operand kind's `verify` clause states the

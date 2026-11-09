@@ -3635,8 +3635,8 @@ refuse p.code;                      // the code a `become` rewrites
   did.
 - **`redo`.** `become X; redo` runs the word as it is after the
   re-fusion: the super `X` now heads, if one formed, else `X` alone.
-- **The JIT and traces.** `Vm.optimize` invalidates compiled code and
-  uninstalls traces over the words it rewrites, as when called by hand.
+- **The JIT.** `Vm.optimize` invalidates compiled code over the words
+  it rewrites, as when called by hand.
 - **Cost.** The pass is over the whole code, once per `become`. A
   site that flips between two members that supers name repeats the
   pass each time.
@@ -4930,9 +4930,8 @@ compile to the same IR as without the catches.
 - **No optimizing JIT.** Each handler is a separate LLVM function with a known
   register interface, which is exactly the input a copy-and-patch baseline JIT
   needs (CPython 3.13 builds its JIT from LLVM-compiled templates); Loimi
-  has one (`--jit-stencils`, `design/copy-and-patch.md`),
-  with traces built ahead of time from a recorded profile on top of it
-  (`design/trace-tier.md`); there is no run-time trace compiler.
+  has one (`--jit-stencils`, `design/copy-and-patch.md`); there is no
+  trace compiler.
 - **No borrow checker or ownership types.** Arenas and the GC cover
   interpreter workloads. The complexity budget goes to the hot loop.
 - **No exceptions or unwinding in host code.** Guest exceptions are a VM

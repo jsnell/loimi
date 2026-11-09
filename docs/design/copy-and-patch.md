@@ -14,8 +14,8 @@ It takes 0.76–0.83 of the interpreter's time on Mini, MiniJS and Scheme
 (current numbers in [results.md](../results.md)), and about 0.98 on
 Prolog (section 14). It removes dispatch and operand decoding. It does
 not remove the loads and stores through the register file, the type
-checks, or the call overhead (section 7); the trace tier
-([trace-tier.md](trace-tier.md)) builds on these stencils for that.
+checks, or the call overhead (section 7); traces built ahead of time
+from these stencils did, and were removed ([speed-audit.md](speed-audit.md), item 14).
 Sections 1–5 describe the design, 6–7 its results, 8 its limitations,
 10 and 12 rewrites of compiled code and constant operands, 13 an
 experiment with guest registers in machine registers, 14 Prolog, and 15
@@ -394,8 +394,8 @@ code of an already tuned interpreter, and copy-and-patch removes most
 of that. The next layer (memory traffic through the register file,
 repeated type checks, call overhead) needs register allocation and
 type specialization across instructions. Sections 10, 12 and 13 attacked
-it with template techniques and gained nothing; the trace tier
-([trace-tier.md](trace-tier.md)) does it over loops.
+it with template techniques and gained nothing; ahead-of-time traces
+over loops did it and were removed ([speed-audit.md](speed-audit.md), item 14).
 
 ## 8. Limitations
 
@@ -567,14 +567,13 @@ Measured (2026-11-02): within noise. JIT with constants and variants
 against without: Mini 0.996, MiniJS 0.998, Scheme 1.003 (only `LOADK`
 is const). A constant load is an L1 hit off a live register, a type
 check of a constant is a well-predicted branch, and neither is on the
-critical path; variants grow Mini's stencils from 22 KB to 29 KB. The
-trace tier uses the same holes to fold constants.
+critical path; variants grow Mini's stencils from 22 KB to 29 KB.
 
 ## 13. Guest registers in machine registers (experiment)
 
 How much keeping register-file values in machine registers across
 instructions could buy, measured 2026-11-02; nothing of it is in the
-JIT, which led to the trace tier.
+JIT.
 
 - **Upper bound, by hand.** Mandelbrot's inner loop (97% of its
   samples), copied from the JIT and run in a harness: 0.42 s as

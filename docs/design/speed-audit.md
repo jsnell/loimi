@@ -25,8 +25,8 @@ float op, against wasm3's 5), memory traffic through the register file
 (calls and frames, object size, the collector, division, hashing). None
 of the features in these layers is worth more than a few percent
 suite-wide alone. The JIT removes most of the first layer (0.76–0.83 of
-the interpreter's time), and the trace tier (item 14) goes after the
-second.
+the interpreter's time); an ahead-of-time optimizing tier for the second
+was built and removed (item 14).
 
 **Method of every timing below**, unless an item says otherwise: user+sys
 CPU, the minimum of interleaved runs (order rotated each round), an A/A
@@ -52,7 +52,7 @@ interleave, `--align-functions=64` with suspects rechecked at 128
 | 11 | Coroutine switching | quickened call sites kept in Mini; the vm primitive is a no-go | chameneos 0.925 |
 | 12 | Trailing immediate words | no-go | the checked cache-word ops run 0 times on the wasm suite |
 | 13 | JIT stencils: computed jumps to a target | built | Mini interp 0.977 (interpreter) |
-| 14 | An optimizing tier | built as the trace tier | `trace-tier.md` |
+| 14 | An optimizing tier | built as ahead-of-time traces, then removed | Mini 0.76 of the JIT, on its training programs |
 
 ---
 
@@ -479,8 +479,7 @@ ops cheaper (ADD 279 → 189 samples, FORITER2 302 → 201) and the float ones d
   `#[scan_raw_words]` is refused: a raw pointer's low 16 bits can be any
   tag. The all-zero word is `Int(0)`.
 - **JIT.** Stencil variants per constant tag rotate their mask and tag;
-  the float gets none (its test is not a mask test of the stored word),
-  and traces load float constants instead of baking them in
+  the float gets none (its test is not a mask test of the stored word)
   (`tests/run/vm_jit_values_int_high.lm`, JIT on and off).
 - **`--explain-values`** prints `repr nanbox(int_high)`, the rotation,
   the rotated masks and tags and the float's costs
@@ -593,9 +592,9 @@ running.
   `NEG_F_RET`), else `X` alone. A `become` inside a super first
   re-targets or splits the head as before; the pass then sees the
   result.
-- **JIT and traces.** `optimize_words` calls
-  `loimi_jit_invalidate`/`loimi_jit_rewritten`, which uninstall traces
-  and re-patch the stencils; the test runs under the JIT matrix.
+- **JIT.** `optimize_words` calls
+  `loimi_jit_invalidate`/`loimi_jit_rewritten`, which re-patch the
+  stencils; the test runs under the JIT matrix.
 - **Cost.** One pass over the function per `become` (three `calloc`s
   and a DP over its words), as Mini's hand `refuse` paid.
 
@@ -709,7 +708,7 @@ runs):
 chameneos is now 0.91 of LuaJIT `-joff` (0.357 s against 0.391 s),
 coroutine_ring 0.89 and sieve 0.88. The switch stays ordinary vm control
 flow (`jump` to a `Mini.Resume`, which compiled code takes as a resume
-jump), so the JIT and traces need nothing new.
+jump), so the JIT needs nothing new.
 
 **Rejected: a `switch_state` vm primitive** (2026-11-06). A state
 snapshot saves only Mini's two dependent loads `fp.base` and `fp.k`,
@@ -774,7 +773,10 @@ dispatch to save. Wasm's BR_TABLE to its target measured 1.796 against
 
 ### 14. An optimizing tier
 
-Built as the trace tier: [`trace-tier.md`](trace-tier.md).
+Built as ahead-of-time traces (2026-11-06 to 11-09) and removed: hot loops of
+profiled programs, compiled at build time from the JIT's stencils, took 0.76–0.87 of
+the JIT's time only on the programs trained on (an interpreter's builder does not
+know its scripts), at four interpreter builds per test.
 
 ## 2. Reference techniques, against what Loimi offers
 
@@ -801,7 +803,7 @@ Built as the trace tier: [`trace-tier.md`](trace-tier.md).
 | Hot counters, tier-up | LuaJIT `hotloop`, Guile `instrument-entry` | N inside `--jit-stencils` |
 | Zero-cost hooks when off | Lua `trap`, Guile `NEXT_HOOK` | N, better: instrumentation variants swap tables (`language.md` §9) |
 | Clause indexing | SWI-Prolog | interpreter runtime work (Prolog's first-argument CALL indexing) |
-| Trace JIT | LuaJIT | N: the trace tier (item 14) |
+| Trace JIT | LuaJIT | not built (item 14 tried traces ahead of time) |
 
 ## 3. Tried and rejected
 
@@ -815,8 +817,7 @@ are above. The rest:
   dispatches, 20% in seidel-2d) rotate values live at once; MOV2 merging
   measured 0.997 and 0.998.
 - **Guest registers in machine registers, in the JIT.** One cached
-  register measured 1.015 (`copy-and-patch.md` §13); the trace tier
-  does this instead.
+  register measured 1.015 (`copy-and-patch.md` §13).
 - **Stencil hot/cold splitting, constant patching in the JIT.** No gain
   (`copy-and-patch.md` §10, §12).
 - **Frame-free slow paths through inline-asm `preserve_all` stubs.**
@@ -830,8 +831,7 @@ are above. The rest:
   jump; what remains is placement, which `#[profile]` ordering
   addresses.
 - **Type-check elimination across ops.** Within a super LLVM merges
-  repeated tag tests; across ops it needs types per slot, which traces
-  have.
+  repeated tag tests; across ops it needs types per slot (item 14).
 - **Interner layouts.** MiniJS's records with inline key bytes and
   Mini's shrink thresholds measured noise or worse.
 - **A moving or bump-pointer nursery.** Python's generational mode

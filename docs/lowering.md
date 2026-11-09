@@ -262,8 +262,7 @@ before the `umax`. In Python's `ADD` the float path still went only from
 The GC marks through the same payload extraction; the JIT's stencil
 variants per constant tag (`--jit-stencils`) use the rotated mask and
 tag, and the float, whose test is no mask test of the stored word, gets
-no stencil variant (traces load float constants from the pool instead
-of baking them in). `#[scan_raw_words]` is refused: a raw pointer's low
+no stencil variant. `#[scan_raw_words]` is refused: a raw pointer's low
 16 bits can be any variant's tag. The all-zero word is `Int(0)`, not
 `0.0`, which is what zero-filled trailing arrays hold.
 
@@ -1047,7 +1046,7 @@ emitted only when this mode references them (`is_lazy` in
 src/codegen.rs), so a default build's IR does not change. The checks
 assume that the shadow stack holds only objects of the heap being
 collected: with several heaps on one thread, a frame of a nested run
-into another heap is reported. With `--jit-stencils` (and traces) the
+into another heap is reported. With `--jit-stencils` the
 stencils are generated in this mode too.
 The rooting fuzzer (`fuzz_gc_roots` in tests/fuzz.rs, generator in
 tests/fuzz/rootgen.rs) builds its programs in this mode.

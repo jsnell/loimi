@@ -125,10 +125,7 @@ Lox, regex, stack, wasm, python and prolog were written by agents that read only
 the docs, as usability studies; each has a `FRICTION.md` report.
 `loimi build --jit-stencils` turns the same `vm` source into a
 copy-and-patch JIT: 0.76–0.83 of the interpreter's time for Mini, MiniJS
-and Scheme ([design](docs/design/copy-and-patch.md)); with ahead-of-time
-traces from a profile on top, Mini takes 0.76 of the JIT's time and
-MiniJS 0.87 ([design](docs/design/trace-tier.md); trained on the
-benchmarks' own inputs).
+and Scheme ([design](docs/design/copy-and-patch.md)).
 
 ## What is in it
 
@@ -242,16 +239,15 @@ The tests come in three tiers (`RUST_TEST_THREADS=2` on an 8-core machine):
   tests), Lox, Mini's scripts and conformance tests, the fuzz smoke runs
   and the doc snippets. Tests that build the other interpreters skip,
   saying so on stderr. Use it while iterating.
-- **Default** (about 10 minutes): every example in its dispatch modes,
-  GC modes, JIT and debugger builds, the trace tier, the C hosts.
+- **Default** (about 5 minutes): every example in its dispatch modes,
+  GC modes, JIT and debugger builds, the C hosts.
   Run it before every merge.
 - **Heavy** (`-- --include-ignored`): the `#[ignore = "heavy ..."]` tests
   as well: AArch64 under qemu (`aarch64_qemu`, `vm_prof_stress_aarch64`),
-  the trace fuzzer (`mini_traces_fuzz`), the DAP session and the Mini
-  and Python debuggers in the goto and switch builds, the Mini C hosts
-  against every library build, ThreadSanitizer, two minutes of GC
-  rooting fuzzing. Run it before merging
-  changes to code generation, dispatch, the JIT or traces, the GC or the
+  the DAP session and the Mini and Python debuggers in the goto and
+  switch builds, the Mini C hosts against every library build,
+  ThreadSanitizer, two minutes of GC rooting fuzzing. Run it before
+  merging changes to code generation, dispatch, the JIT, the GC or the
   C ABI, or anything target-specific. (ASan and TSan tests run only
   without `ulimit -v`.)
 
@@ -262,7 +258,7 @@ conformance tests and `tests/run` keep it; `LOIMI_TEST_BRANCH_ALIGN=1`
 keeps it everywhere. Builds are shared between tests within a run, and
 `LOIMI_TEST_JOBS` (default 3) bounds the builds and programs a test
 runs at once. To see where the time goes, `LOIMI_TEST_TIMES=FILE` logs
-each build and the trace tests' phases, and libtest times each test:
+each build, and libtest times each test:
 `RUSTC_BOOTSTRAP=1 cargo test --release --test golden -- -Z
 unstable-options --report-time NAME`.
 

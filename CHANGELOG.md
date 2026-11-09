@@ -22,8 +22,10 @@ implementation; `git log` has the details.
   sets the part count (`1` compiles whole); `LOIMI_SPLIT_REPORT=1`
   times the parts. With `-W handler_frame`, the parts' assembly is
   linted and assembled, not compiled a second time.
-- Trace-region generation (`--trace-regions`) runs on every core: a
-  profiling build of Mini, 57 s to 23 s.
+- The ahead-of-time trace tier (`--trace-regions`, `--traces`,
+  `LOIMI_TRACE_*`) is removed: it specialized the interpreter to the
+  programs it was trained on at build time, and took four builds per
+  test ([speed-audit.md](docs/design/speed-audit.md), item 14).
 
 ### `vm` declarations and dispatch
 
@@ -41,14 +43,6 @@ implementation; `git log` has the details.
   question 10). The `weak` cache field qualifier, which was parsed and
   rejected, is gone.
 
-- **Traces for Scheme**: the trace tier's workflow runs on the Scheme
-  example; a dispatch into the same code object is a path edge only if
-  it keeps the frame's register file or goes to the next instruction
-  (recursive procedures no longer get traces that leave at every
-  iteration). Scheme's 43 benchmarks: 0.773 of the JIT by geometric mean
-  (0.767 at `--align-functions=128`; sum 0.24, mbrot 0.39, nqueens 0.57).
-  Prolog gets none: its loops are recursion
-  ([design/trace-tier.md §13.7](docs/design/trace-tier.md#137-scheme-and-prolog)).
 - **Warning `state_registers`**: a tail-call vm whose context, state and
   instruction word need more `preserve_none` argument registers than the
   target has (x86-64: 12 general-purpose, 8 floating-point; AArch64: 24
@@ -70,20 +64,6 @@ implementation; `git log` has the details.
   `loimi ir-diff`). `x is A | B` on a local of a payload-less enum now
   compiles to `x == A or x == B`
   ([language.md §7.2](docs/language.md#72-families-and-become)).
-- **Side traces, and loops inside loops** (trace tier M2): a trace is
-  now a graph in one function: its root path goes through the loops
-  inside its loop, and the hot paths from its exits are side traces
-  that rejoin it, under a size budget (`LOIMI_TRACE_SIDES`,
-  `LOIMI_TRACE_SIDE_MIN`, `LOIMI_TRACE_SIDE_FRAC`,
-  `LOIMI_TRACE_SIDE_LINES`; `LOIMI_TRACE_NEST=0`). A side trace counts its
-  own guard failures and is dropped alone. Jump tables (Mini's SWITCH)
-  and superinstruction resumes are path edges, step branches carry the
-  profile's weights, and profiling regions no longer grow with the square
-  of their size (`interp`'s dispatch loop: 542,000 → 50,000 lines). Mini:
-  0.759 of the JIT by geometric mean (0.773 at `--align-functions=128`;
-  M4 0.858): `interp` 0.72, fannkuch 0.35, mandelbrot 0.53, nbody 0.68,
-  sort 0.67; side traces alone are 0.812 → 0.763
-  ([design/trace-tier.md §13](docs/design/trace-tier.md#13-side-traces-and-loops-inside-loops-m2)).
 - **JIT: handlers may read other instructions' words; computed jumps
   enter compiled code.** `Vm.real_word` maps a JIT enter word through
   an inline load from the runtime's table (`loimi_jit_words`) instead
@@ -108,7 +88,7 @@ implementation; `git log` has the details.
   `Vm.refuse(code)` (value accumulator selection, then `Vm.optimize`
   over the code), so supers of two quickened members form, which no
   single `become` could. `redo` runs the super the word heads after
-  the pass; the JIT and traces see the rewrite as for `optimize`.
+  the pass; the JIT sees the rewrite as for `optimize`.
   Lox uses it with six supers of quickened members (`GETGLOBAL_C;
   INVOKE_P`: zoo 0.88, suite 0.973); Mini uses it in place of its
   hand-written `refuse` (the same code). MiniJS keeps its own, which
@@ -302,34 +282,8 @@ implementation; `git log` has the details.
   the code (a 256-byte stack array up to 2048 words, else calloc'd)
   instead of zeroing 64 KiB per call: Prolog's `assertz`, which verifies
   each new clause, spent half its time there.
-- **Ahead-of-time traces** (trace tier M1): `LOIMI_TRACE_RECORD=file`
-  on a `--jit-stencils` run, a profiling build `--trace-regions=REC`
-  run with `LOIMI_TRACE_PROFILE=file`, and `--traces=PROF` stitch the
-  hot loops' stencils into one LLVM function each (the generator is in
-  the compiler, `src/tracegen.rs`); the JIT enters them at the loop
-  header. Guards re-run an instruction in the interpreter where the
-  `redo_effect` rules allow; traces uninstall on word changes and
-  blacklist themselves when more than 1 iteration in 8 fails. Mini:
-  0.932 of the JIT by geometric mean (mandelbrot 0.66, fannkuch 0.73;
-  nbody 1.11; loops through calls get none), under the milestone's 10%
-  stop rule. `--jit-stencils` builds also take `--sanitize=address`
-  and `--gc-check-roots` now
-  ([design/trace-tier.md §11](docs/design/trace-tier.md#11-m1-as-built-ahead-of-time-traces-from-a-profile)).
-- **Traces through calls, and cheaper exits** (trace tier, M4 in
-  part): exits write back only the window slots that may differ from
-  memory, guards restore only what their step stored, reloads load only
-  live slots (nbody 1.11 → 0.76 of the JIT). Profiling regions record
-  where calls and returns go and have an entry at every instruction;
-  small functions get entry regions; a trace's path goes into a call
-  whose site called one function (90%), which is inlined with its frame
-  pushed and popped as the JIT does (exits inside it need nothing
-  reconstructed), its registers in the trace's window and its code
-  address bound at run time by its words and constants. Recursion stays
-  an exit; traces whose inlined callees call functions that may write
-  are declined (`LOIMI_TRACE_INLINE_WRITERS=1` keeps them). Mini: 0.858
-  of the JIT by geometric mean (M1 0.932; spectral_norm 0.64), no
-  program slower
-  ([design/trace-tier.md §12](docs/design/trace-tier.md#12-cheaper-exits-and-traces-through-calls-m4-in-part)).
+- **`--jit-stencils` builds take `--sanitize=address` and
+  `--gc-check-roots`.**
 - **JIT (`--jit-stencils`)**: jumps to a `Vm.Resume` count toward
   compiling like calls (Prolog enters clauses from its try chains that
   way, and their code was never compiled), and the registry of code
@@ -729,8 +683,8 @@ implementation; `git log` has the details.
 ### Tooling
 
 - **Test tiers**: `LOIMI_TEST_FAST=1 cargo test --release` (about 2
-  minutes), `cargo test --release` (about 10, before every merge) and
-  `-- --include-ignored` (qemu, the trace fuzzer and more, before risky
+  minutes), `cargo test --release` (about 5, before every merge) and
+  `-- --include-ignored` (qemu, the DAP session and more, before risky
   merges). Tests share interpreter builds and run their programs side by
   side; test builds drop the x86-64 branch padding (`LOIMI_BRANCH_ALIGN=0`,
   new, the same as `--no-branch-align`), which took most of clang's time
