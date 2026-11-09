@@ -1,13 +1,30 @@
 # The Mini language
 
-Mini is a subset of Lua 5.4. Every valid Mini program is a valid Lua 5.4
-program, and running it under Lua 5.4 produces the same output, except
-where this document says otherwise. This document defines the subset. For
-anything it does not say, the Lua 5.4 reference manual applies.
+Mini is a subset of Lua 5.4. This document defines the subset, for people
+who write Mini programs or implement Mini.
+
+Every valid Mini program is a valid Lua 5.4 program, and running it under
+Lua 5.4 produces the same output, except where this document says
+otherwise. For anything it does not say, the Lua 5.4 reference manual
+applies.
 
 A program that uses a feature outside the subset is not a Mini program.
 An implementation may reject it, or it may run it with different
 behaviour.
+
+## Running Mini
+
+```sh
+./target/release/loimi build examples/mini/main.lm --release -o mini
+./mini script.mini
+```
+
+| Command line | What it does |
+|---|---|
+| `mini SCRIPT` | Runs the script. |
+| `mini SCRIPT stress` | Runs it with a garbage collection at every safepoint (for testing). |
+| `mini SCRIPT verify` | As `stress`, with a generational heap whose write barriers are checked at each collection. |
+| `mini --debug SCRIPT` | Runs it under the debugger. Only in a debug build (§8). |
 
 ## 1. Lexical structure
 
@@ -24,14 +41,15 @@ behaviour.
   - Decimal floats: `3.0`, `.5`, `1e10`, `2.5e-3`.
   - A numeral with a fraction or an exponent is a float. Otherwise it is
     an integer, and must fit the integer range (§2.1).
+  - More forms are in §3.3.
 - **Strings:**
   - Delimited by `"` or `'`.
   - Escapes: `\n \t \r \\ \" \' \0`, `\ddd` (decimal, up to 3 digits),
     and `\` followed by a newline.
   - Long brackets (`[[ ... ]]`) are **not** supported.
 - **Operators and punctuation.** `+ - * / % ^ # == ~= <= >= < > = ( ) { }
-  [ ] ; : , . .. `.
-  Not in Mini: `//`, the bitwise operators `& | ~ << >>`, and `...`.
+  [ ] ; : , . ..`
+- **Not in Mini:** `//`, the bitwise operators `& | ~ << >>`, and `...`.
 
 ## 2. Values and types
 
@@ -117,7 +135,8 @@ as in Lua 5.4.
     trailing separator.
   - Positional fields are numbered from 1.
 - **Calls.**
-  - Calls take the forms `f(args)`, `f{...}`, `f"str"` and `obj:m(args)`.
+  - Calls take the forms `f(args)`, `f{...}`, `f"str"`, `obj:m(args)`,
+    `obj:m{...}` and `obj:m"str"`.
   - `obj:m(args)` means `obj.m(obj, args)`, with `obj` evaluated once.
   - Missing arguments are nil, and extra arguments are discarded.
 
@@ -140,8 +159,8 @@ as in Lua 5.4.
 ### 3.2 Evaluation order
 
 Function arguments, table constructor fields and operands of binary
-operators are evaluated left to right. (Lua leaves this unspecified;
-Mini programs should not depend on it.)
+operators are evaluated left to right. Lua leaves this unspecified, so
+Mini programs should not depend on it.
 
 ### 3.3 Numerals and negative literals
 
@@ -166,9 +185,11 @@ for i, v in ipairs(e) do block end
 function name(params) block end
 function name.field.field(params) block end
 function name:method(params) block end
+function name.field:method(params) block end
 local function name(params) block end
 return [e1, e2, ...]               -- must be the last statement in its block
 break                              -- must be the last statement in its block
+;                                  -- empty statement, allowed anywhere
 ```
 
 - **Names and scope.**
@@ -191,108 +212,139 @@ break                              -- must be the last statement in its block
   - During traversal a program may assign to existing fields, including
     assigning nil. It must not add new keys.
   - With one variable, `for k in pairs(t)`, the value is dropped.
-- **`;`** is an empty statement and may appear anywhere a statement can.
-- **Method declarations.** `function a.b:m()` is allowed, as are the
-  call forms `obj:m{...}` and `obj:m"str"`.
 
 ## 5. Standard library
 
-Only the following globals exist. Every other Lua library function is not
+Only the globals below exist. Every other Lua library function is not
 part of Mini.
 
-**Basic functions:**
-- `print(...)`: writes its arguments converted with `tostring`, separated
-  by tabs and followed by a newline.
-- `tostring(v)`:
-  - An integer becomes its decimal form.
-  - A float is formatted with `%.14g`. If the result looks like an
-    integer, `.0` is appended, so `3.0` gives `"3.0"`, `1e15` gives
-    `"1e+15"` and `0.1` gives `"0.1"`. Infinities become `"inf"` and
-    `"-inf"`.
-  - Tables and functions become an unspecified string that starts with
-    `"table: "` or `"function: "`.
-- `tonumber(v)`:
-  - A number is returned unchanged.
-  - A string holding a decimal or hex integer numeral, or a decimal float
-    numeral, is converted. An optional leading `-` or `+` and surrounding
-    whitespace (space, tab, newline, CR) are allowed. An integer numeral
-    outside the integer range gives a float.
-  - Anything else gives nil.
-- `type(v)`: the type name as a string.
-- `pairs(t)` and `ipairs(t)`: only in generic `for` (§4).
-- `assert(v [, msg])`: an error if `v` is false or nil. Otherwise it
-  returns `v`.
-- `error(msg)`: raises an error. `msg` should be a string.
+### Basic functions
 
-**`math`:**
-- Functions: `math.floor(x)`, `math.ceil(x)`, `math.abs(x)`,
-  `math.sqrt(x)`, `math.sin(x)`, `math.cos(x)`, `math.exp(x)`,
-  `math.log(x)` (natural log, one argument), `math.max(x, ...)` and
-  `math.min(x, ...)`.
-- Constants: `math.huge` and `math.pi`.
-- Results:
-  - `floor` and `ceil` return an integer when the result fits the
-    integer range, as in Lua 5.4.
-  - `abs`, `max` and `min` keep the integer or float subtype of their
-    result. On ties, `max` and `min` return the first argument.
-  - The others return floats.
+| Function | Behaviour |
+|---|---|
+| `print(...)` | Writes its arguments converted with `tostring`, separated by tabs and followed by a newline. |
+| `tostring(v)` | See below. |
+| `tonumber(v)` | See below. |
+| `type(v)` | The type name as a string. |
+| `pairs(t)`, `ipairs(t)` | Only in a generic `for` (§4). |
+| `assert(v [, msg])` | An error if `v` is false or nil. Otherwise returns `v`. |
+| `error(msg)` | Raises an error. `msg` should be a string. |
 
-**`string`:** functions are called as `string.f(s, ...)`. Method syntax on
-strings, such as `s:sub(1, 2)`, is not part of Mini.
-- `string.len(s)`.
-- `string.sub(s, i [, j])`: negative indices count from the end, as in Lua.
-- `string.byte(s [, i])`: one result only. The default for `i` is 1.
-- `string.char(...)`.
-- `string.rep(s, n)`.
-- `string.format(fmt, ...)`. A negative argument to `%x` is out of the
-  subset:
-  - Directives: `%d`, `%s`, `%f`, `%g`, `%x`, `%c` and `%%`.
-  - Optional flag `-`, optional width, optional `.precision`.
-  - `%d`, `%x` and `%c` need integer arguments, or floats with an
-    integral value. `%s` converts its argument with `tostring`.
+`tostring(v)`:
 
-**`table`:**
-- `table.insert(t, v)`: appends at `#t + 1`. The 3-argument form is not
-  in Mini.
-- `table.remove(t)`: removes and returns `t[#t]`. The 2-argument form is
-  not in Mini.
-- `table.concat(t [, sep])`: elements 1..#t, each a string or number.
-- `table.sort(t [, comp])`: sorts elements 1..#t in place, with
-  `comp(a, b)` (true when `a` must come before `b`) or `<`. As in Lua
-  5.4, the sort is not stable, `comp` must define a strict order (an
-  inconsistent one may raise "invalid order function for sorting"), and
-  errors raised by `comp` propagate unchanged. `comp` must be nil or a
-  function (checked when `#t > 1`). Mini uses Lua 5.4's algorithm, so
-  `comp` is called with the same arguments in the same order as in Lua
-  for arrays of up to 100 elements (Lua randomizes some pivots in larger
-  ones). Calling Mini functions from `comp` nests the interpreter: more
-  than 200 nested calls through natives fail with "C stack overflow".
+- An integer becomes its decimal form.
+- A float is formatted with `%.14g`. If the result looks like an
+  integer, `.0` is appended. So `3.0` gives `"3.0"`, `1e15` gives
+  `"1e+15"` and `0.1` gives `"0.1"`.
+- Infinities become `"inf"` and `"-inf"`.
+- Tables, functions and threads become an unspecified string that
+  starts with `"table: "`, `"function: "` or `"thread: "`.
 
-**`coroutine`:** as in Lua 5.4: `coroutine.create(f)`, `resume(co, ...)`,
-`yield(...)`, `status(co)`, `isyieldable([co])`, `running()`, `wrap(f)`
-and `close(co)`. Values pass both ways through resume and yield, an error
-inside a coroutine makes `resume` return false and the message (and the
-coroutine dead), and a `wrap` function raises it. Yield works from any
-depth of Mini calls inside the coroutine.
+`tonumber(v)`:
+
+- A number is returned unchanged.
+- A string holding a decimal or hex integer numeral, or a decimal float
+  numeral, is converted. An optional leading `-` or `+` and surrounding
+  whitespace (space, tab, newline, CR) are allowed. An integer numeral
+  outside the integer range gives a float.
+- Anything else gives nil.
+
+### `math`
+
+| Name | Result |
+|---|---|
+| `math.floor(x)`, `math.ceil(x)` | An integer when the result fits the integer range, as in Lua 5.4. |
+| `math.abs(x)` | Keeps the integer or float subtype. |
+| `math.max(x, ...)`, `math.min(x, ...)` | Keep the subtype of the result. On ties they return the first argument. |
+| `math.sqrt(x)`, `math.sin(x)`, `math.cos(x)`, `math.exp(x)` | A float. |
+| `math.log(x)` | The natural log, as a float. One argument only. |
+| `math.huge`, `math.pi` | Constants. |
+
+### `string`
+
+Call these as `string.f(s, ...)`. Method syntax on strings, such as
+`s:sub(1, 2)`, is not part of Mini.
+
+| Function | Notes |
+|---|---|
+| `string.len(s)` | |
+| `string.sub(s, i [, j])` | Negative indices count from the end, as in Lua. |
+| `string.byte(s [, i])` | One result only. `i` defaults to 1. |
+| `string.char(...)` | |
+| `string.rep(s, n)` | |
+| `string.format(fmt, ...)` | See below. |
+
+`string.format` accepts:
+
+- the directives `%d`, `%s`, `%f`, `%g`, `%x`, `%c` and `%%`;
+- an optional `-` flag, an optional width and an optional `.precision`.
+
+`%d`, `%x` and `%c` need integer arguments, or floats with an integral
+value. A negative argument to `%x` is out of the subset. `%s` converts
+its argument with `tostring`.
+
+### `table`
+
+| Function | Notes |
+|---|---|
+| `table.insert(t, v)` | Appends at `#t + 1`. The 3-argument form is not in Mini. |
+| `table.remove(t)` | Removes and returns `t[#t]`, or nil if `t` is empty. The 2-argument form is not in Mini. |
+| `table.concat(t [, sep])` | Joins elements 1..#t. Each must be a string or a number. |
+| `table.sort(t [, comp])` | Sorts elements 1..#t in place. See below. |
+
+`table.sort` orders with `comp(a, b)`, which returns true when `a` must
+come before `b`, or with `<` if there is no `comp`. As in Lua 5.4:
+
+- The sort is not stable.
+- `comp` must define a strict order. An inconsistent one may raise
+  "invalid order function for sorting".
+- Errors raised by `comp` propagate unchanged.
+- `comp` must be nil or a function. This is checked when `#t > 1`.
+- Mini uses Lua 5.4's algorithm, so `comp` is called with the same
+  arguments in the same order as in Lua, for arrays of up to 100
+  elements. (Lua picks some pivots at random in larger arrays.)
+
+Each call of a Mini function from `comp` nests the interpreter. More than
+200 nested calls through library functions fail with "C stack overflow".
+
+### `coroutine`
+
+As in Lua 5.4:
+
+- `coroutine.create(f)`
+- `coroutine.resume(co, ...)`
+- `coroutine.yield(...)`
+- `coroutine.status(co)`
+- `coroutine.isyieldable([co])`
+- `coroutine.running()`
+- `coroutine.wrap(f)`
+- `coroutine.close(co)`
+
+Behaviour:
+
+- Values pass both ways through `resume` and `yield`.
 - `resume` returns `true` followed by the values, so keep them with
   `local ok, a, b = coroutine.resume(co)` (§3.1).
+- Yield works from any depth of Mini calls inside the coroutine.
+- An error inside a coroutine makes `resume` return false and the
+  message, and the coroutine is dead. A `wrap` function raises the error
+  instead.
 - Yielding while a library function is between the yield and the
-  coroutine, as from inside a `table.sort` comparator, is an error
-  ("attempt to yield across a C-call boundary"), as in Lua for C
-  functions without continuations. A coroutine may still resume others
-  from a comparator.
-- More than 200 coroutines resuming each other at once (nested resumes,
-  together with nested comparator calls) fail with "C stack overflow".
-- `tostring(co)` starts with `"thread: "`. Error messages are unspecified
-  (Mini prefixes `line N: `; Lua's position looks different).
+  coroutine, as from inside a `table.sort` comparator, is an error:
+  "attempt to yield across a C-call boundary". Lua does the same for C
+  functions without continuations. A comparator may still resume other
+  coroutines.
+- More than 200 coroutines resuming each other at once fail with "C
+  stack overflow". Nested comparator calls count towards the same limit.
+- Error messages are unspecified. Mini prefixes `line N: `; Lua shows the
+  position differently.
 
-**`io`:**
-- `io.write(...)`: writes strings and numbers, with nothing added
-  between or after the arguments. Integers are written in decimal, and
-  floats with `%.14g` and **no** `.0` suffix, as in Lua 5.4: `io.write(1.0)`
-  writes `1`.
+### `io`
 
-- `table.remove` on an empty table returns nil.
+`io.write(...)` writes strings and numbers, with nothing added between or
+after the arguments. Integers are written in decimal. Floats are written
+with `%.14g` and **no** `.0` suffix, as in Lua 5.4: `io.write(1.0)`
+writes `1`.
 
 ## 6. Errors
 
@@ -310,44 +362,69 @@ like, and unreachable objects are reclaimed.
 
 ## 8. Debugger (`--cfg debug`)
 
-Not part of the language: what the debug build of this implementation
-adds (`examples/mini/debugger.lm`; design in
-`docs/design/debugging.md`, sections 1 to 7 and 9).
+This section is not part of the language. It describes what the debug
+build of this implementation adds (`examples/mini/debugger.lm`).
 
-**Command line.**
+### Command line
 
 ```sh
 ./target/release/loimi build examples/mini/main.lm --release --cfg debug -o mini-dbg
 ./mini-dbg --debug script.mini < commands      # or interactively
 ```
 
-It stops before the first line and reads gdb-like commands:
-`break [FILE:]LINE` (`b`), `break LINE if COND` (stop only when the Mini
-expression COND holds there), `tbreak`, `delete ID` (`d`), `info`,
-`continue` (`c`), `step` (`s`), `next` (`n`), `finish` (`fin`), `bt`,
-`locals`, `print NAME` (a local) or `print EXPR` (any expression in the
-current frame), `op` (the current instruction, disassembled), `quit`,
-`help`. An error that nothing catches stops before it unwinds, with
-its message, so `bt` and `locals` show where it happened.
+The debugger stops before the first line and reads gdb-like commands:
 
-**Editors (DAP).** `examples/mini/dap/mini_dap.c` is a Debug Adapter
-Protocol server over the C debugging API (section 9 of the design note;
-the `mini_debug_*` functions at the end of `embed.lm`):
+| Command | Short | What it does |
+|---|---|---|
+| `break [FILE:]LINE` | `b` | Sets a breakpoint. |
+| `break [FILE:]LINE if COND` | | Stops only when the Mini expression `COND` holds there. |
+| `tbreak [FILE:]LINE` | | A breakpoint that is deleted after its first stop. |
+| `delete ID` | `d` | Deletes a breakpoint. |
+| `info` | `i` | Lists the breakpoints. |
+| `continue` | `c` | Runs to the next stop. |
+| `step` | `s` | Runs to the next line, entering calls. |
+| `next` | `n` | Runs to the next line in this function. |
+| `finish` | `fin` | Runs until the current function returns. |
+| `bt` | | Prints the call stack. |
+| `locals` | `l` | Prints the current frame's locals. |
+| `print NAME`, `print EXPR` | `p` | Prints a local, or any expression evaluated in the current frame. |
+| `op` | | Disassembles the current instruction. |
+| `quit` | `q` | Ends the program. |
+| `help` | | Lists the commands. |
+
+An error that nothing catches stops the program before it unwinds and
+prints its message, so `bt` and `locals` show where it happened.
+
+### Editors (DAP)
+
+`examples/mini/dap/mini_dap.c` is a Debug Adapter Protocol server, built
+on the C debugging API (the `mini_debug_*` functions at the end of
+`embed.lm`):
 
 ```sh
 ./target/release/loimi build --cfg debug examples/mini/embed.lm --lib -o libmini.a --header mini.h
 clang-19 -I. examples/mini/dap/mini_dap.c libmini.a -lm -pthread -o mini-dap
 ```
 
-An editor runs `mini-dap` as the debug adapter for `.mini` files, with
-a launch configuration such as `{"type": "mini", "request": "launch",
-"program": "${file}", "stopOnEntry": false}` (in VS Code, a
-`debuggers` contribution whose `program` is `mini-dap`). It supports
-breakpoints with conditions and hit counts (`N`, `>= N`, `% N`, ...),
-stopping on uncaught errors (the "Uncaught errors" exception filter),
-step in, over and out, pause, the call stack, locals (with upvalues)
-and globals (without the standard library) with tables expanded on
-demand, and evaluating expressions in a frame (watches, hovers, and
-statements such as `done = true` in the debug console). Locals are
-copies there: assigning to one in the console does not change the
-program's. Set `MINI_DAP_LOG=file` to log the protocol.
+An editor runs `mini-dap` as the debug adapter for `.mini` files. A
+launch configuration looks like this:
+
+```json
+{"type": "mini", "request": "launch", "program": "${file}", "stopOnEntry": false}
+```
+
+In VS Code, register it with a `debuggers` contribution whose `program`
+is `mini-dap`. The adapter supports:
+
+- breakpoints with conditions and hit counts (`N`, `>= N`, `% N`, ...);
+- stopping on uncaught errors (the "Uncaught errors" exception filter);
+- step in, step over, step out and pause;
+- the call stack;
+- locals (with upvalues) and globals (without the standard library),
+  with tables expanded on demand;
+- evaluating expressions in a frame: watches, hovers, and statements
+  such as `done = true` in the debug console.
+
+Locals shown in the editor are copies: assigning to one in the console
+does not change the program's variable. Set `MINI_DAP_LOG=file` to log
+the protocol.

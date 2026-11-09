@@ -1,149 +1,152 @@
 # A small Scheme in Loimi
 
-The second proof interpreter: a subset of R7RS-small, compiled to register
-bytecode and run on a Loimi `vm`. It follows the architecture of
-[`examples/mini`](../mini): a NaN-boxed `value`, GC `object`s, a `vm` with
-cold paths, a `sync` block, an `on raise` handler, a quickened family and
-superinstructions, and a compiler written in Loimi that emits code through
-the generated `Scheme.X` encoders and checks it with the generated verifier.
+This example is an interpreter for a subset of R7RS-small Scheme, written
+in Loimi. This README describes what it supports and how it is built.
+
+Programs are compiled to register bytecode and run on a Loimi `vm`. The
+design follows [`examples/mini`](../mini):
+
+- a NaN-boxed `value` type and GC `object`s;
+- a `vm` with cold paths, a `sync` block and an `on raise` handler;
+- a quickened instruction family and superinstructions;
+- a compiler written in Loimi that emits code through the generated
+  `Scheme.X` encoders and checks it with the generated verifier.
+
+## Build, run and test
 
 ```sh
 cargo build --release
 ./target/release/loimi build examples/scheme/main.lm --release -o scheme
-./scheme program.scm            # a second argument turns on GC stress
-./scheme program.scm disasm     # print the compiled bytecode instead
+./scheme program.scm
 cargo test --release --test golden scheme_programs
-bench/scheme/compare.py         # benchmarks vs chibi-scheme (see bench/scheme/README.md)
+bench/scheme/compare.py         # benchmarks against other Schemes
 ```
+
+| Command line | What it does |
+|---|---|
+| `scheme PROGRAM` | Runs the program. |
+| `scheme PROGRAM disasm` | Prints the compiled bytecode instead of running. |
+| `scheme PROGRAM stress` | Runs with a garbage collection at every safepoint (for testing). |
+| `scheme PROGRAM verify` | As `stress`, with a generational heap whose write barriers are checked at each collection. |
 
 ## Files
 
 | File | Contents |
 |---|---|
-| `bignum.lm` | exact integers beyond the fixnums, on `std.bigint`: promotion, normalization back to fixnums, exact comparison with flonums, radix I/O |
-| `value.lm` | the `V` value type, heap objects (pairs, strings, symbols, vectors, closures, prototypes), printing, `eqv?`/`equal?`, the symbol table |
-| `read.lm` | the reader, on `std.lex` (cursor, comments) and `std.num` (numerals) |
-| `compile.lm` | s-expressions → AST (derived forms expanded, variables resolved) → inlining, contification → bytecode |
-| `vm.lm` | the `vm Scheme` declaration: ops, calls and tail calls, error handler |
-| `rt.lm` | the interpreter context (stacks, globals) and the GC root scanner |
-| `builtins.lm` | the builtin procedures (natives) and numeric helpers |
-| `prelude.lm` | builtins written in Scheme (`map`, `for-each`, `vector-map`, ...) |
-| `main.lm` | driver |
-| `tests/*.scm` | test programs with `; expect:` lines, run by `tests/golden.rs` normally and under GC stress |
+| `bignum.lm` | Exact integers beyond the fixnums, on `std.bigint`: promotion, normalization back to fixnums, exact comparison with flonums, radix I/O. |
+| `value.lm` | The `V` value type; heap objects (pairs, strings, symbols, vectors, closures, prototypes); printing; `eqv?` and `equal?`; the symbol table. |
+| `read.lm` | The reader, on `std.lex` (cursor, comments) and `std.num` (numerals). |
+| `compile.lm` | S-expressions to AST (derived forms expanded, variables resolved), then inlining and contification, then bytecode. |
+| `vm.lm` | The `vm Scheme` declaration: ops, calls and tail calls, the error handler. |
+| `rt.lm` | The interpreter context (stacks, globals) and the GC root scanner. |
+| `builtins.lm` | The builtin procedures (natives) and numeric helpers. |
+| `prelude.lm` | Builtins written in Scheme (`map`, `for-each`, `vector-map`, ...). |
+| `main.lm` | The driver. |
+| `tests/*.scm` | Test programs with `; expect:` lines, run by `tests/golden.rs` normally and under GC stress. |
 
-Benchmarks live in [`bench/scheme`](../../bench/scheme/README.md): the
-public r7rs-benchmarks suite, run unmodified against chibi-scheme.
+## The language
 
-## What is supported
+### Data types
 
-- **Data.** Exact integers (32-bit fixnums, and bignums beyond them),
-  flonums, booleans, characters, strings,
-  interned symbols, pairs and lists, vectors, records, procedures,
-  unspecified.
-- **Reader.** Lists with `()` or `[]`, dotted pairs, `'` `` ` `` `,` `,@`,
-  `#t`/`#f`/`#true`/`#false`, `#\a` `#\space` `#\x41` characters, strings
-  with `\n \t \r \a \0 \\ \" \x41;` escapes and line continuations,
-  vectors `#(...)`, `;` comments, nested `#| |#` and `#;` datum comments.
-- **Special forms.** `define` (variables, procedure shorthand, internal
-  defines with `letrec*` semantics), `lambda` (fixed, rest and variadic
-  parameters), `if`, `set!`, `let`, `let*`, `letrec`, `letrec*`, named
-  `let`, `begin` (splicing at top level and in bodies), `cond` (with `else`
-  and `=>`), `case` (with `else` and `=>`), `and`, `or`, `when`, `unless`,
-  `do`, `quote`, `quasiquote`/`unquote`/`unquote-splicing` (nested, and in
-  vectors), `define-record-type` (top level and in bodies). Keywords can be
-  shadowed by local variables. A top-level `(import ...)` is accepted and
-  ignored: every procedure the program can name is built in.
-- **Builtins** (149 natives plus the prelude): numbers (`+ - * / quotient
-  remainder modulo floor/ truncate/ floor-quotient floor-remainder
-  truncate-quotient truncate-remainder exact-integer-sqrt = < > <= >= zero?
-  positive? negative? even? odd? number? integer? exact? inexact?
-  exact-integer? abs min max gcd lcm sqrt expt exp log sin cos tan asin acos
-  atan floor ceiling round truncate exact->inexact inexact->exact exact
-  inexact square number->string string->number`), pairs and lists (`cons car
-  cdr` and `c[ad]{2,4}r`, `set-car! set-cdr! list length append reverse
-  list-tail list-ref list-copy last-pair memq memv member assq assv assoc
-  map for-each apply`), predicates (`null? pair? list? eq? eqv? equal? not
-  symbol? string? procedure? vector? boolean? char?`), vectors (`make-vector
-  vector vector-ref vector-set! vector-length vector->list list->vector
-  vector-fill! vector-map vector-for-each`), strings and chars
-  (`string-length string-ref substring string-append string=? string<?` and
-  friends, `string-copy string->list list->string make-string string
-  string-set! symbol->string string->symbol char->integer integer->char
-  char=? char<? char-upcase char-alphabetic?` ...), output (`display write
-  newline write-string write-char flush-output-port current-output-port`;
-  the port arguments are accepted and ignored), `read` (from standard
-  input), `eof-object eof-object?`, `current-second current-jiffy
-  jiffies-per-second`, `values call-with-values`,
-  `call-with-current-continuation`/`call/cc` (escaping only, see below),
-  `error`, `exit`.
-- **Proper tail calls** everywhere (`if`, `cond`, `case`, `and`, `or`,
-  `when`, `let`..., `apply`, calls to builtins and to procedures with rest
-  parameters). The frame stack holds 131072 frames, so non-tail recursion
-  100000 deep works; deeper recursion stops with `stack overflow`.
+- exact integers: 32-bit fixnums, and bignums beyond them;
+- flonums;
+- booleans, characters, strings, interned symbols;
+- pairs and lists, vectors, records;
+- procedures;
+- the unspecified value.
+
+### Reader
+
+- lists with `()` or `[]`, and dotted pairs;
+- `'`, `` ` ``, `,` and `,@`;
+- `#t`, `#f`, `#true`, `#false`;
+- characters: `#\a`, `#\space`, `#\x41`;
+- strings with `\n \t \r \a \0 \\ \" \x41;` escapes and line
+  continuations;
+- vectors `#(...)`;
+- `;` comments, nested `#| |#` comments and `#;` datum comments;
+- number prefixes `#x #o #b #d #e #i`, and `+inf.0`, `-inf.0`, `+nan.0`.
+
+### Special forms
+
+- `define`: variables, the procedure shorthand, and internal defines
+  with `letrec*` semantics;
+- `lambda`, with fixed, rest and variadic parameters;
+- `if`, `set!`, `quote`;
+- `let`, `let*`, `letrec`, `letrec*`, named `let`;
+- `begin`, splicing at top level and in bodies;
+- `cond` and `case`, both with `else` and `=>`;
+- `and`, `or`, `when`, `unless`, `do`;
+- `quasiquote`, `unquote` and `unquote-splicing`, nested and in vectors;
+- `define-record-type`, at top level and in bodies.
+
+Local variables can shadow keywords. A top-level `(import ...)` is
+accepted and ignored: every procedure a program can name is built in.
+
+### Builtins
+
+There are 149 natives, plus the procedures in the prelude.
+
+| Group | Procedures |
+|---|---|
+| Numbers | `+ - * / quotient remainder modulo floor/ truncate/ floor-quotient floor-remainder truncate-quotient truncate-remainder exact-integer-sqrt = < > <= >= zero? positive? negative? even? odd? number? integer? exact? inexact? exact-integer? abs min max gcd lcm sqrt expt exp log sin cos tan asin acos atan floor ceiling round truncate exact->inexact inexact->exact exact inexact square number->string string->number` |
+| Pairs and lists | `cons car cdr`, `c[ad]{2,4}r`, `set-car! set-cdr! list length append reverse list-tail list-ref list-copy last-pair memq memv member assq assv assoc map for-each apply` |
+| Predicates | `null? pair? list? eq? eqv? equal? not symbol? string? procedure? vector? boolean? char?` |
+| Vectors | `make-vector vector vector-ref vector-set! vector-length vector->list list->vector vector-fill! vector-map vector-for-each` |
+| Strings and characters | `string-length string-ref substring string-append string=? string<?` and the other comparisons, `string-copy string->list list->string make-string string string-set! symbol->string string->symbol char->integer integer->char char=? char<? char-upcase char-alphabetic?`, ... |
+| Output | `display write newline write-string write-char flush-output-port current-output-port` (port arguments are accepted and ignored) |
+| Input | `read` (from standard input), `eof-object eof-object?` |
+| Time | `current-second current-jiffy jiffies-per-second` (`current-jiffy` counts microseconds of wall-clock time from its first call) |
+| Control | `values call-with-values`, `call-with-current-continuation` and `call/cc` (escape only), `error`, `exit` |
+
+### Tail calls and errors
+
+- **Proper tail calls** everywhere: `if`, `cond`, `case`, `and`, `or`,
+  `when`, `let` and the other binding forms, `apply`, calls to builtins
+  and to procedures with rest parameters.
+- **Recursion depth.** The frame stack holds 131072 frames, so non-tail
+  recursion 100000 deep works. Deeper recursion stops with
+  `stack overflow`.
 - **Errors.** Run-time errors print `error: line N: <message>` on stderr
-  and exit with status 1. The line is that of the failing expression, or,
-  for errors inside prelude code such as `map`, of the nearest caller in the
-  program. Syntax errors are reported the same way.
+  and exit with status 1. The line is that of the failing expression. For
+  errors inside prelude code such as `map`, it is the line of the nearest
+  caller in the program. Syntax errors are reported the same way.
 
-### Deviations and choices
+### Differences from R7RS
 
-- **Exact integers are fixnums or bignums.** Fixnums are 32-bit (`Int`
-  in the nanbox); a result that overflows becomes a bignum (`Big`, a
-  `std.bigint` GC object), and a bignum result that fits a fixnum is a
-  fixnum again, so `eqv?` on small integers stays a word compare and the
-  fixnum fast paths never see a small bignum. The fast paths are
-  unchanged: overflow, like mixed operands, goes to the op's cold path,
-  which is also a safepoint (a loop of bignum arithmetic with no call
-  still collects). Comparisons between bignums and flonums are exact
-  (`(< (+ (expt 2 53) 1) 9007199254740992.0)` is `#f`), `exact->inexact`
-  rounds correctly, `number->string` and `string->number` take radix 2,
-  8, 10 or 16, and the reader takes `#x #o #b #d #e #i` prefixes,
-  `+inf.0`, `-inf.0` and `+nan.0`. There are no rationals: `(/ 1 3)` is
-  `0.3333333333333333`, while `(/ 6 3)` and `(/ (expt 10 30) (expt 10
-  28))` stay exact; an exact negative exponent in `expt` gives a flonum.
+- **Exact integers are fixnums or bignums.** A fixnum result that
+  overflows becomes a bignum, and a bignum result that fits a fixnum
+  becomes a fixnum again.
+  - Comparisons between bignums and flonums are exact:
+    `(< (+ (expt 2 53) 1) 9007199254740992.0)` is `#f`.
+  - `exact->inexact` rounds correctly.
+  - `number->string` and `string->number` take radix 2, 8, 10 or 16.
+- **No rationals.** `(/ 1 3)` is `0.3333333333333333`. `(/ 6 3)` and
+  `(/ (expt 10 30) (expt 10 28))` stay exact. An exact negative exponent
+  in `expt` gives a flonum.
 - **Strings are byte strings.** `string-length` and `string-ref` count
-  bytes; characters are code points, and `#\λ` or `\x3bb;` are encoded as
+  bytes. Characters are code points, and `#\λ` or `\x3bb;` are encoded as
   UTF-8 when put into a string.
-- **Inline builtins.** Calls to `+ - * / quotient remainder modulo = < > <=
-  >= zero? eq? eqv? not null? pair? car cdr cons set-car! set-cdr!
-  vector-ref vector-set! symbol? number? exact-integer? string? vector?
-  memq assq list vector length odd? even? positive? negative?
-  vector-length reverse string-ref`, two-list `append`, `call/cc`, record
-  constructors, accessors, modifiers and predicates, and `cXr` are compiled
-  to ops (`list` to a chain of `CONS`; `vector` and record constructors to
-  `VECTOR`/`RECORD`; the others have a fast path and leave every other
-  case to the native), and calls to the other builtins (except `apply`)
-  call the native directly (`PRIMCALL`), unless the
-  program defines or `set!`s that name somewhere (then every call goes
-  through the global). The prelude always uses the inline versions.
-- **Inlined procedures.** A top-level procedure that is defined once and
-  never `set!` (and not named like a builtin) is a known procedure, and so
-  is an unassigned `let`/`letrec` lambda: small ones are inlined at their
-  calls (see "Compiler"). A call of an inlined top-level procedure that
-  could run before its definition is guarded, so it still fails with
-  `unbound variable`. Other calls of a known top-level procedure without
-  free variables whose definition has certainly run are `CALLK`: the
-  compiler makes the procedure's closure (the definition stores that
-  object), so the call takes it from the constant pool, with no global
-  load and no arity check (the caller makes a rest list). Whether a
-  definition has run: it is in an earlier form, or no earlier form can
-  reach the body the call is in (`Comp.reachability`).
-- Symbols are never collected. `eq?` on flonums compares bits.
 - **Continuations are escape-only.** A continuation can be invoked while
-  the `call/cc` that made it is still active (early exit from loops,
+  the `call/cc` that made it is still active: early exit from loops,
   searches and recursions, as in the `ctak`, `fibc` and `puzzle`
-  benchmarks). Invoking it after that `call/cc` has returned is an error
-  (`continuation invoked after its extent ended`), not a re-entry.
-- **Multiple values** are a list tagged with a private marker unless
-  there is exactly one value; only `call-with-values` takes them apart.
-- **Records** are vectors with a hidden type field: `vector?` is false for
-  them and `equal?` compares them by identity, but the inline
+  benchmarks. Invoking it after that `call/cc` has returned is an error
+  (`continuation invoked after its extent ended`).
+- **Multiple values** are a list tagged with a private marker, unless
+  there is exactly one value. Only `call-with-values` takes them apart.
+- **Records** are vectors with a hidden type field. `vector?` is false
+  for them and `equal?` compares them by identity, but the inline
   `vector-ref` op does not check the type.
-- `current-jiffy` counts microseconds of wall-clock time from its first
-  call.
-- Not supported: `dynamic-wind`, `syntax-rules`/`define-syntax` (they are
-  reported as unsupported), re-entrant continuations, file and string
-  ports, `delay`, bytevectors, rationals, complex numbers.
+- Symbols are never collected. `eq?` on flonums compares bits.
+
+### Not supported
+
+- `dynamic-wind`;
+- `syntax-rules` and `define-syntax` (reported as unsupported);
+- re-entrant continuations;
+- file and string ports;
+- `delay`;
+- bytevectors, rationals, complex numbers.
 
 ## Architecture
 
@@ -158,220 +161,246 @@ pub value V repr nanbox {
 }
 ```
 
-A nanbox has room for seven tagged variants, which is two fewer than the
-natural Scheme set, so the payload-free immediates share `Imm(i32)` and are
-told apart by the payload (`#f` is `Imm(1)`, the character `a` is
-`Imm(CHAR_BASE + 97)`, builtin number 39 (`car`) is `Imm(PRIM_BASE + 39)`).
-Truthiness is a single compare against the bits of `Imm(1)`, and `null?`
-against those of `Imm(0)`. Boxes for assigned captured variables reuse the
-vector object (one slot), since they are never visible to programs.
+The NaN box has room for seven tagged variants, two fewer than the
+natural Scheme set. So the immediates share `Imm(i32)` and are told apart
+by the payload: `#f` is `Imm(1)`, the character `a` is
+`Imm(CHAR_BASE + 97)`, and builtin number 39 (`car`) is
+`Imm(PRIM_BASE + 39)`. A truth test is a single compare against the bits
+of `Imm(1)`, and `null?` against those of `Imm(0)`.
+
+Boxes for assigned captured variables reuse the vector object with one
+slot, since programs never see them.
+
+Bignums (`Big`) are `std.bigint` GC objects. Keeping small results as
+fixnums means `eqv?` on small integers stays a word compare, and the
+fixnum fast paths never see a small bignum. Overflow, like mixed
+operands, goes to the op's cold path, which is also a safepoint, so a
+loop of bignum arithmetic with no call still collects.
 
 ### Why a register VM
 
-The compiler is a two-pass compiler over an AST, so it knows every
-variable's lifetime and can assign registers directly: parameters are
-R0..Rn, `let` variables get the next registers, and temporaries go above.
-Compared with a stack machine that saves most of the loads and stores that
-move locals to the top of the stack and back (`(+ n 1)` is one `ADDI` that
-reads `n`'s register), so each source operation is usually one dispatch.
+The compiler works on an AST, so it knows every variable's lifetime and
+can assign registers directly:
+
+- parameters are R0..Rn;
+- `let` variables get the next registers;
+- temporaries go above them.
+
+Compared with a stack machine, this saves most of the loads and stores
+that move locals to the top of the stack and back. `(+ n 1)` is one
+`ADDI` that reads `n`'s register, so each source operation is usually one
+dispatch.
+
 Calls need no copying: the caller evaluates the procedure and its
 arguments into consecutive registers at the top of its window, and the
 callee's window starts right there, so the arguments arrive as R0..Rn-1.
-Mini made the same choice and its idioms carry over directly, which was
-part of the point of the exercise.
 
 ### Compiler
 
-`compile.lm` works in passes:
+`compile.lm` works in five passes.
 
-1. **Build** (s-expressions → AST): expands derived forms (`let*`, named
+1. **Build** (s-expressions to AST). Expands derived forms (`let*`, named
    `let`, `do`, `cond`, `case`, `when`, `unless`, quasiquote, internal
-   defines) into a small core (`Const Ref GRef Set GSet GDef If Lambda Seq
-   Call Prim Let Letrec And Or`). It resolves every variable to a `Var`,
-   records which ones are assigned, and notes the top-level definitions
-   and `set!`s of each global.
-2. **Inline** (`Comp.inl`): a call of a known procedure (see above) is
-   replaced by a copy of its body, with the parameters bound by a `let` or
-   replaced by the argument when that is a constant, an unassigned local or
-   a known procedure. Bodies of up to 12 nodes are inlined, or up to 40
-   when an argument is a lambda or a known procedure: then calls of that
-   parameter in the copy are known too and are inlined in turn, so
-   `(map (lambda (x) ...) l)` becomes a loop with the lambda's body in it
-   (`map` and `for-each` with one list use the prelude's one-list versions).
-   Recursive bodies are not inlined, and nesting stops at depth 3.
-   A global defined once, never `set!`, as another name for a builtin or a
-   known procedure (`(define make-node vector)`) is an alias: its calls
-   are calls of the builtin (an op, where it has one) or of the procedure.
-3. **Contify** (`contify`): a `letrec` lambda whose every use is a tail call
-   from the letrec body or from another contified lambda of the same letrec
-   (every named-let loop, mutually tail-recursive local procedures) is
-   compiled inline in the enclosing procedure: its parameters become
-   registers, its calls become moves and jumps, and its "returns" go to the
-   letrec's continuation. No closure is made and its free variables are
-   the enclosing procedure's registers.
-4. **Resolve** (`reown`): gives every variable its real owner (the
+   defines) into a small core: `Const Ref GRef Set GSet GDef If Lambda
+   Seq Call Prim Let Letrec And Or`. Resolves every variable, records
+   which ones are assigned, and notes the top-level definitions and
+   `set!`s of each global.
+2. **Inline** (`Comp.inl`). Replaces a call of a *known procedure* with a
+   copy of its body (see below).
+3. **Contify** (`contify`). A `letrec` lambda whose every use is a tail
+   call from the letrec body, or from another contified lambda of the
+   same letrec, is compiled inline in the enclosing procedure. This
+   covers every named-let loop and mutually tail-recursive local
+   procedures. Its parameters become registers, its calls become moves
+   and jumps, and its returns go to the letrec's continuation. No closure
+   is made, and its free variables are the enclosing procedure's
+   registers.
+4. **Resolve** (`reown`). Gives every variable its real owner (the
    procedure whose frame holds it) and recomputes which variables are
    captured and each lambda's free variables, as in Lua's upvalue
-   resolution. A variable that is assigned and used only by contified code
-   is no longer boxed.
-5. **Generate** (AST → bytecode): allocates registers and emits code with
-   the generated encoders (`Scheme.ADD(dst, a, b)`), in value-into-register
-   and effect-only contexts and in tail position with a continuation
-   (return, or a register or nothing followed by a jump to a join point,
-   for contified bodies). Conditions compile to branches through `not`,
-   `and` and `or`; in tail position `and`/`or` of predicates jump to a
-   `#t`/`#f` exit. Each finished prototype is checked with the generated
-   `Scheme.verify` and peephole-fused with `Scheme.optimize`.
+   resolution. A variable that is assigned and used only by contified
+   code is no longer boxed.
+5. **Generate** (AST to bytecode). Allocates registers and emits code
+   with the generated encoders (`Scheme.ADD(dst, a, b)`). Conditions
+   compile to branches through `not`, `and` and `or`. Each finished
+   prototype is checked with the generated `Scheme.verify` and fused into
+   superinstructions with `Scheme.optimize`.
+
+**Known procedures.** A top-level procedure that is defined once, never
+`set!` and not named like a builtin is known, and so is an unassigned
+`let` or `letrec` lambda.
+
+- Bodies of up to 12 nodes are inlined at their calls, or up to 40 nodes
+  when an argument is a lambda or a known procedure. Then calls of that
+  parameter in the copy are known too and are inlined in turn, so
+  `(map (lambda (x) ...) l)` becomes a loop with the lambda's body in it.
+- Recursive bodies are not inlined, and nesting stops at depth 3.
+- A call of an inlined top-level procedure that could run before its
+  definition is guarded, so it still fails with `unbound variable`.
+- Other calls of a known top-level procedure without free variables,
+  whose definition has certainly run, compile to `CALLK`: the call takes
+  the closure from the constant pool, with no global load and no arity
+  check. A definition has certainly run if it is in an earlier form, or
+  no earlier form can reach the body the call is in
+  (`Comp.reachability`).
+- A global defined once, never `set!`, as another name for a builtin or
+  a known procedure (`(define make-node vector)`) is an alias: its calls
+  compile as calls of the original.
+
+**Inline builtins.** Calls to these builtins compile to ops:
+
+```
++ - * / quotient remainder modulo = < > <= >= zero? eq? eqv? not null?
+pair? car cdr cons set-car! set-cdr! vector-ref vector-set! symbol?
+number? exact-integer? string? vector? memq assq list vector length odd?
+even? positive? negative? vector-length reverse string-ref cXr call/cc
+```
+
+Two-list `append` and record constructors, accessors, modifiers and
+predicates do too. `list` becomes a chain of `CONS`, and `vector` and
+record constructors become `VECTOR` and `RECORD`. The other ops have a
+fast path and leave every other case to the native. Calls to the
+remaining builtins, except `apply`, call the native directly
+(`PRIMCALL`).
+
+If the program defines or `set!`s a builtin's name anywhere, every call
+of that name goes through the global instead. The prelude always uses
+the inline versions.
 
 ### Closures
 
-Closures are **flat**: `CLOSURE` copies the values of the free variables
-into the new closure, following capture descriptors stored in the
-prototype ("register r of the parent" or "free slot i of the parent").
-Variables that are both captured and `set!` are **assignment-converted**:
-they live in a box (`MKBOX`, `BOXGET`, `BOXSET`). Free variables are read
-with `GETFREE`; those a contified loop uses are read once into registers
-before the loop (a closure's slots never change: an assigned variable's
-slot holds its box).
+Closures are flat. `CLOSURE` copies the values of the free variables into
+the new closure, following capture descriptors stored in the prototype
+("register r of the parent" or "free slot i of the parent").
 
-`letrec` (and internal defines) of lambdas, the common case for recursive
-local procedures and named `let`, are not boxed: the closures are created
-in order and their slots for variables initialized later are patched with
-`SETFREE` once those have values. A `letrec` variable is boxed only if a
-closure created by a non-lambda initializer could capture it before it is
-initialized.
+- Variables that are both captured and `set!` live in a box (`MKBOX`,
+  `BOXGET`, `BOXSET`).
+- Free variables are read with `GETFREE`. Those that a contified loop
+  uses are read once into registers before the loop.
+- `letrec` and internal defines of lambdas are not boxed. The closures
+  are created in order, and their slots for variables initialized later
+  are patched with `SETFREE` once those have values. A `letrec` variable
+  is boxed only if a closure created by a non-lambda initializer could
+  capture it before it is initialized.
 
 ### Calls and tail calls
 
-Frames live on a separate frame stack (`rt.Frame`: closure, register base,
-return address, constants). `CALL base nargs` handles the common case in
-its hot path (a closure with exactly that many fixed parameters): check
-the stack, push a frame, and jump. The callee's registers are not
-cleared (see GC). Everything else
-(rest parameters, arity errors, builtins, `apply`, non-procedures) goes
-through a cold path, the vm function `call_slow`, which sets up the state
-and returns where to continue.
+Frames live on a separate frame stack (`rt.Frame`: closure, register
+base, return address, constants).
 
-`TAILCALL` moves the arguments down to R0.. and replaces the current
-frame's closure, so tail calls never grow either stack. A tail call of a
-procedure to itself, through its own `letrec` variable or the global of a
-known top-level procedure, compiles to moves into the parameter registers
-and a `JMP` to the start, with arguments that are single ops computed
-straight into their parameter when no other argument reads it. A non-tail
-call of a procedure to itself with its number of parameters is
-`CALLSELF`, which calls the running closure with no checks.
+- **`CALL base nargs`** handles the common case in its hot path: a
+  closure with exactly that many fixed parameters. It checks the stack,
+  pushes a frame and jumps. Everything else (rest parameters, arity
+  errors, builtins, `apply`, non-procedures) goes through a cold path,
+  the vm function `call_slow`.
+- **`TAILCALL`** moves the arguments down to R0 and replaces the current
+  frame's closure, so tail calls never grow either stack.
+- **Self tail calls** (through the procedure's own `letrec` variable or
+  the global of a known top-level procedure) compile to moves into the
+  parameter registers and a `JMP` to the start.
+- **`CALLSELF`** is a non-tail call of a procedure to itself with its
+  number of parameters. It calls the running closure with no checks.
+- **`apply`** is handled in `call_slow` by spreading the list into
+  registers and dispatching again, so it is properly tail-recursive too.
 
-`apply` is handled in `call_slow` by spreading the list into registers and
-dispatching again, so it is properly tail-recursive too. Builtins that take
-procedures (`map`, `for-each`, ...) are written in Scheme in the prelude,
-so natives never call back into the VM.
+Builtins that take procedures (`map`, `for-each`, ...) are written in
+Scheme in the prelude, so natives never call back into the VM.
 
 ### Globals
 
 Each symbol used as a global gets a slot in `ctx.gvals` when the compiler
-first sees it. The compiler resolves names to slots, so a global read is
-`GETGLOBAL dst, slot`: a load and an "unbound" check. That is what an inline
-cache would converge to, and there is nothing to miss, so there is no IC.
-`GETGLOBAL` is a `family` instead: once a slot is seen bound it stays bound
-(there is no undefine), so the first successful read quickens the
+first sees it, so a global read is `GETGLOBAL dst, slot`: a load and an
+"unbound" check. An inline cache would give nothing more.
+
+Once a slot is bound it stays bound, since there is no undefine. So
+`GETGLOBAL` is a family: the first successful read quickens the
 instruction into `GETGLOBAL_B`, which skips the check.
 
 ### GC
 
-Mark-sweep from `std.gc` (16-byte object headers, so a pair takes 32
-bytes). A collection runs after allocating 4 times the live data (at
-least 2 MiB, at most 256 MiB; `Heap.set_growth`, `set_max_budget`).
-Roots come from `rt.scan_roots`: symbols,
-globals, the pending error, and every active frame's closure and whole
-register window. Every op that allocates (`CONS`, `CLOSURE`, `MKBOX`, and
-the call path, which covers builtins and rest lists) runs the collector,
-if due, *before* allocating, in a `cold` block, with the `sync` block
-publishing the frame pointer; the ops allocate with `try_new` (refill in
-a cold block), so they have no stack frame. Allocation never collects, so
-natives and the compiler allocate freely.
+The collector is mark-sweep from `std.gc`, with 16-byte object headers,
+so a pair takes 32 bytes. A collection runs after allocating 4 times the
+live data, at least 2 MiB and at most 256 MiB.
 
-Registers are not cleared on entry to a frame, so the scanner sees stale
-values of dead frames in registers not yet written. That is safe because
-every stack slot below a high-water mark (`ctx.vs`, a
-`std.rt.ValueStack`) holds a value that is safe to mark: a stale value
-inside a live window is marked (so its object stays allocated), and the
-scanner clears the slots above the top window and lowers the mark to it
-(`vs.lower`); a call whose window passes the mark raises it (`vs.raise`,
-on the cold path that also checks for stack overflow).
+- **Roots** come from `rt.scan_roots`: symbols, globals, the pending
+  error, and every active frame's closure and whole register window.
+- **When it runs.** Every op that allocates (`CONS`, `CLOSURE`, `MKBOX`,
+  and the call path, which covers builtins and rest lists) runs the
+  collector if due, *before* allocating, in a `cold` block, with the
+  `sync` block publishing the frame pointer. The ops have no stack frame.
+- Allocation itself never collects, so natives and the compiler allocate
+  freely.
+- **Stale registers.** Registers are not cleared on entry to a frame. The
+  stack is a `std.rt.ValueStack` with a high-water mark: every slot below
+  it holds a value that is safe to mark, and the scanner clears the slots
+  above the top window and lowers the mark. A call whose window passes
+  the mark raises it, on the cold path that also checks for stack
+  overflow.
 
 ### Ops
 
-`LOADK LOADI MOVE`, `GETGLOBAL`(+`_B`) `CHKGLOBAL`(+`_B`) `SETGLOBAL
-DEFGLOBAL`, `GETFREE SETFREE MKBOX BOXGET BOXSET CLOSURE`, `JMP TEST
-TESTT`, `ADD SUB MUL ADDI DIV QUO REM MOD` (fixnum fast paths with
-overflow checks, flonum fast paths, everything else cold), `NUMEQ LT GT
-LE GE` and their compare-with-constant forms `NUMEQI LTI GTI LEI GEI`,
-`ZEROP EQ EQV NOT NULLP PAIRP SYMBOLP NUMBERP FIXNUMP STRINGP VECTORP CAR
-CDR CONS SETCAR SETCDR VREF VSET VREFI VSETI VECTOR RECORD MEMQ ASSQ`,
-`LENGTH ODDP EVENP POSP NEGP VLEN REVERSE APPEND2 SREF`, `RREF RSET RECP`
-(records, the type and field as a constant operand), `CALL CALLSELF CALLK
-TAILCALLK CALLCC PRIMCALL TAILCALL RET`,
-and 35 superinstructions picked from `--vm-stats` over the benchmarks
-(compare-and-branch pairs, `MOVE_MOVE`, `MOVE_JMP`, `CDR_CDR`, `ADDI_CALL`,
-...).
+| Group | Ops |
+|---|---|
+| Moves and constants | `LOADK LOADI MOVE` |
+| Globals | `GETGLOBAL` (and `_B`), `CHKGLOBAL` (and `_B`), `SETGLOBAL DEFGLOBAL` |
+| Closures and boxes | `GETFREE SETFREE MKBOX BOXGET BOXSET CLOSURE` |
+| Jumps | `JMP TEST TESTT` |
+| Arithmetic | `ADD SUB MUL ADDI DIV QUO REM MOD` (fixnum fast paths with overflow checks, flonum fast paths, everything else cold) |
+| Comparisons | `NUMEQ LT GT LE GE`, and with a constant `NUMEQI LTI GTI LEI GEI` |
+| Inline builtins | `ZEROP EQ EQV NOT NULLP PAIRP SYMBOLP NUMBERP FIXNUMP STRINGP VECTORP CAR CDR CONS SETCAR SETCDR VREF VSET VREFI VSETI VECTOR RECORD MEMQ ASSQ LENGTH ODDP EVENP POSP NEGP VLEN REVERSE APPEND2 SREF` |
+| Records | `RREF RSET RECP` (type and field as a constant operand) |
+| Calls | `CALL CALLSELF CALLK TAILCALLK CALLCC PRIMCALL TAILCALL RET` |
 
-## Escape continuations; why no full call/cc, dynamic-wind or syntax-rules
+There are also 35 superinstructions picked with `--vm-stats` over the
+benchmarks: compare-and-branch pairs, `MOVE_MOVE`, `MOVE_JMP`, `CDR_CDR`,
+`ADDI_CALL`, and others.
 
-`call/cc` is the `CALLCC` op (or, called as a value, handled in
-`call_slow`, like `apply`). It allocates a
-continuation, a closure of a fixed prototype (`vm.cont_proto`) whose one
-free slot is a frame depth, and pushes a frame of that prototype (or, for
-a tail call, replaces the current frame) with R0 = the procedure and R1 =
-the continuation. The prototype's code is `CALL R0 1; RET R0`: a non-tail
-call, so the frame stays where it is while the procedure runs, and a normal
-return passes the result straight through. Invoking the continuation
-(its `fixed` arity never matches, so it always reaches `call_slow`) checks
-that the frame at its depth still holds this very continuation as its
-closure, which is true exactly while that `call/cc` is active, and then
-returns the argument from that frame, dropping everything above it. Both
-the capture and the escape are O(1), and ordinary calls pay nothing.
+### Escape continuations
 
-The rest is left out to keep the core small; none of it is blocked by the
-language.
+`call/cc` is the `CALLCC` op. (Called as a value, it is handled in
+`call_slow`, like `apply`.)
 
-- **Re-entrant `call/cc`.** Frames live on an explicit frame stack and
-  registers in an explicit value stack, never on the C stack (natives do
-  not call back into the VM), so a full continuation can be captured by
-  copying both stacks into a heap object, and invoking it would copy them
-  back and `jump` to the saved `resume` address. That is the simple "stack
-  copying" strategy; a segmented stack (as in Chez) would make capture
-  O(1).
-- **`dynamic-wind`** needs a wind list in the context, and continuation
-  invocation would run the `after`/`before` thunks between the current and
-  target wind lists. Running a thunk from the middle of a continuation
-  switch means re-entering the VM from a native (`uses reenter`) or
-  writing the switch as a small Scheme procedure in the prelude.
+1. It allocates a continuation: a closure of a fixed prototype
+   (`vm.cont_proto`) whose one free slot is a frame depth.
+2. It pushes a frame of that prototype (or, for a tail call, replaces the
+   current frame) with R0 = the procedure and R1 = the continuation.
+3. The prototype's code is `CALL R0 1; RET R0`. That is a non-tail call,
+   so the frame stays where it is while the procedure runs, and a normal
+   return passes the result through.
+
+Invoking the continuation always reaches `call_slow`, because its arity
+never matches. It checks that the frame at its depth still holds this
+continuation as its closure, which is true exactly while that `call/cc`
+is active. Then it returns the argument from that frame, dropping
+everything above it. Both capture and escape take constant time, and
+ordinary calls pay nothing.
+
+Full continuations, `dynamic-wind` and `syntax-rules` were left out to
+keep the core small; the language does not block any of them:
+
+- **Re-entrant `call/cc`.** Frames and registers live on explicit
+  stacks, never on the C stack, so a full continuation could copy both
+  stacks into a heap object, and invoking it would copy them back and
+  `jump` to the saved return address.
+- **`dynamic-wind`** needs a wind list in the context. Invoking a
+  continuation would run the `after` and `before` thunks, either by
+  re-entering the VM from a native (`uses reenter`) or with a small
+  Scheme procedure in the prelude.
 - **`syntax-rules`** is a front-end feature: a pattern matcher and
-  template expander running on s-expressions before the build pass, plus
-  hygiene (renaming introduced bindings, which the `gensym` helper used by
-  `do` and `case` already does in a limited way). It does not touch the VM.
+  template expander on s-expressions before the build pass, plus hygiene.
+  It does not touch the VM.
 
-## Benchmarks
+## Performance
 
-The benchmarks are the public
+The benchmarks are 43 programs from the public
 [r7rs-benchmarks](https://github.com/ecraven/r7rs-benchmarks) suite, used
-unmodified and downloaded at a pinned commit, and the reference is
-chibi-scheme 0.12 (a bytecode VM) built from source; see
-[`bench/scheme/README.md`](../../bench/scheme/README.md) for how they are
-run, the inputs, all results and the skipped programs. 43 of the 57
-programs the suite's `bench` script runs are included (pi and chudnovsky,
-which need bignums, since 2026-11-03); of the other 14, equal, mbrotZ and
-bv2string would need a sharing-aware `equal?`, complex numbers or
-bytevectors, and 11 need file ports.
+unmodified. Of the other 14 programs in the suite, 11 need file ports,
+and `equal`, `mbrotZ` and `bv2string` need a sharing-aware `equal?`,
+complex numbers or bytevectors.
 
-Geometric mean of ours / reference over the 41 programs (wall time,
-whole process; Intel i7-6700, 2026-11-02): Gauche 0.29, Guile 3 without
-its JIT 0.47, Guile 3 with its JIT 1.02 (chibi: 0.10 before the compiler
-passes). Ours is faster than Gauche and than Guile's bytecode VM on every
-program; the per-program tables, the timed-loop times and the changelog
-of the optimizations are in the benchmark README. On the two bignum
-programs (2026-11-03) ours is 4-11x faster than Gauche, level with
-Guile's VM on chudnovsky and 2.3-2.7x slower than Guile (GMP) on pi.
-
-The programs this directory used before were reproduced from memory by
-the interpreter's author; they were removed in favour of the public suite.
+In the latest run the interpreter was faster than Gauche on every
+program, and faster than Guile 3's bytecode VM on all but `pi` (whose
+bignum arithmetic Guile does with GMP). It took 0.22 of Gauche's time, 0.38 of
+Guile's without its JIT, and 0.80 of Guile's with its JIT, by geometric
+mean. The numbers are in [`docs/results.md`](../../docs/results.md), and
+how the benchmarks are run is in `bench/scheme/README.md`.

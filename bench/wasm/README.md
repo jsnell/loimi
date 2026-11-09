@@ -1,10 +1,14 @@
 # WebAssembly reference tools, spec tests and benchmarks
 
-External pieces for the WebAssembly MVP interpreter in `examples/wasm/`.
-Everything is downloaded from the URLs pinned (with sha256) in `MANIFEST`
-and built from source; only the scripts, `MANIFEST` and `ports/` are
-committed. Generated directories (`src/`, `install/`, `spec-json/`,
-`programs-out/`) are gitignored.
+External tools, spec tests and benchmark programs for the WebAssembly
+MVP interpreter in `examples/wasm/`. The latest results are in
+[`docs/results.md`](../../docs/results.md) as the `wasm`, `wasm-simd` and
+`wasm-polybench` suites.
+
+Everything is downloaded from the URLs pinned (with sha256) in
+`MANIFEST` and built from source. Only the scripts, `MANIFEST` and
+`ports/` are committed; the generated directories (`src/`, `install/`,
+`spec-json/`, `programs-out/`) are not.
 
 | piece | pinned | used for |
 |---|---|---|
@@ -34,21 +38,27 @@ bench/wasm/bench.py --dir bench/wasm/polybench-out --interp loimi='path/to/inter
 ```
 
 `spec-json/STATUS` lists every top-level `.wast` and how it converted
-(`ok` = wabt default features). The proposals/ subdirectories are skipped.
-The top-level files include the post-MVP features of Wasm 2.0 (bulk memory,
-reference types, multi-value, sign-ext, sat-trunc, SIMD); picking the MVP
-subset is up to the interpreter's test runner.
+(`ok` means with wabt's default features). The `proposals/`
+subdirectories are skipped. The top-level files include the post-MVP
+features of Wasm 2.0 (bulk memory, reference types, multi-value,
+sign-ext, sat-trunc, SIMD); the interpreter's test runner picks the MVP
+subset.
 
 ## Benchmarks
 
-Every module is compiled with `clang-19 --target=wasm32-wasi -O2 -mcpu=mvp`
-against `install/wasi-sysroot-mvp`, needs no command-line arguments (problem
-size fixed at compile time via `ports/argv_main.c`), and is checked by
-`programs.sh` to validate with every post-MVP feature disabled (see
-`programs-out/REPORT`). The prebuilt wasi-sdk sysroot is not used because it
-is compiled for clang's "generic" CPU: `memory.copy`/`memory.fill` in
-memcpy/memset, and `call_indirect` with a 5-byte padded table index (from
-reference-types) that MVP decoders, including wasm3 0.5.0, reject.
+Every module:
+
+- is compiled with `clang-19 --target=wasm32-wasi -O2 -mcpu=mvp` against
+  `install/wasi-sysroot-mvp`;
+- needs no command-line arguments (the problem size is fixed at compile
+  time through `ports/argv_main.c`);
+- is checked by `programs.sh` to validate with every post-MVP feature
+  disabled (see `programs-out/REPORT`).
+
+The prebuilt wasi-sdk sysroot is not used because it is compiled for
+clang's "generic" CPU. Its memcpy/memset use `memory.copy`/`memory.fill`,
+and its `call_indirect` has a 5-byte padded table index (from
+reference-types), which MVP decoders, including wasm3 0.5.0, reject.
 
 | name | source | size |
 |---|---|---|
@@ -67,41 +77,52 @@ nbody (about 50 SIMD instructions), fannkuchredux (12) and spectralnorm
 `.expected` is a copy of the MVP build's; `bench/run_all.py` times them
 as the `wasm-simd` suite against the MVP builds.
 
-The Benchmarks Game programs are unmodified single-threaded C versions (no
-pthreads/OpenMP/SIMD intrinsics); their wasm outputs match native gcc builds.
-CoreMark validates its CRCs itself (`crclist 0xe714`, `crcmatrix 0x1fd7`,
-`crcstate 0x8e3a` are the reference values for the 2K performance run); it
-still ends with "Errors detected" because a run shorter than 10 s counts as
-an error under CoreMark's reporting rules. `bench.py` ignores CoreMark's
-timing lines when comparing outputs.
+- The Benchmarks Game programs are unmodified single-threaded C versions
+  (no pthreads, OpenMP or SIMD intrinsics). Their wasm outputs match
+  native gcc builds.
+- CoreMark checks its own CRCs (`crclist 0xe714`, `crcmatrix 0x1fd7`,
+  `crcstate 0x8e3a` are the reference values for the 2K performance
+  run). It still ends with "Errors detected", because CoreMark's
+  reporting rules count a run shorter than 10 s as an error. `bench.py`
+  ignores CoreMark's timing lines when comparing outputs.
 
 Imports (all `wasi_snapshot_preview1`): `fd_write`, `fd_seek`, `fd_close`,
 `fd_fdstat_get`, `proc_exit`, plus `clock_time_get` for CoreMark.
 
 ## Held-out set: PolyBench/C
 
-The interpreter's optimizations were measured on the seven programs
-above, so `polybench.sh` builds a second, independent set: the 30
-PolyBench/C 4.2.1 kernels (linear algebra, solvers, stencils, data
-mining, dynamic programming), unmodified, with the same toolchain and
-flags, problem size fixed per kernel (`MEDIUM`, `LARGE` or `EXTRALARGE`:
-the largest that runs in at most about 2 s under wasm3; 0.05 to 1.7 s).
-The timed builds print nothing; `check/NAME.wasm` are `SMALL_DATASET`
-builds with `POLYBENCH_DUMP_ARRAYS`, whose stderr `--check` compares
-with wasm3's. Results are in `examples/wasm/FRICTION.md`.
+The interpreter was tuned on the seven programs above. To check that the
+gains are not specific to them, `polybench.sh` builds a second,
+independent set that was not used for tuning: the 30 PolyBench/C 4.2.1
+kernels (linear algebra, solvers, stencils, data mining, dynamic
+programming).
+
+- The kernels are unmodified and built with the same toolchain and
+  flags.
+- Each kernel uses the largest standard dataset (`MEDIUM`, `LARGE` or
+  `EXTRALARGE`) that runs in at most about 2 s under wasm3; they take
+  0.05 to 1.7 s.
+- The timed builds print nothing. `check/NAME.wasm` are `SMALL_DATASET`
+  builds with `POLYBENCH_DUMP_ARRAYS`; `--check` compares their stderr
+  with wasm3's.
 
 ## Measuring
 
-Changes to the interpreter are measured on both sets, interleaved
-(each benchmark runs once under every build in turn, best of 5 to 7),
-with `--align-functions=64` so that unrelated edits do not move the
-handlers, and on user+sys CPU time when the machine is shared. Even so,
-any change to a handler moves the ones after it, and on the i7-6700
-(Skylake) used for these numbers placement alone moved single programs
-by 3-4% either way, and before round three by 40%: a dispatch jump
-that ended on a 32-byte boundary (Intel's JCC erratum) made cholesky, lu
-and ludcmp take 1.4 times as long. `loimi build` now pads x86-64 vm
-branches off those boundaries (`--no-branch-align` to compare;
-`docs/lowering.md` §12). A change that moves a whole set's geometric
-mean by less than 1% is within this placement noise.
+Changes to the interpreter are measured on both sets:
+
+- interleaved: each benchmark runs once under every build in turn, best
+  of 5 to 7;
+- built with `--align-functions=64`, so that unrelated edits do not move
+  the handlers;
+- on user+sys CPU time when the machine is shared.
+
+Even so, any change to a handler moves the ones after it. On the
+i7-6700 (Skylake) used for these numbers, code placement alone moves
+single programs by 3–4% either way. A change that moves a whole set's
+geometric mean by less than 1% is within this noise.
+
+Placement once cost much more: a dispatch jump that ended on a 32-byte
+boundary (Intel's JCC erratum) made cholesky, lu and ludcmp take 1.4
+times as long. `loimi build --release` now pads x86-64 vm branches off
+those boundaries; `--no-branch-align` turns this off for comparison.
 

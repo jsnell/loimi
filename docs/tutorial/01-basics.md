@@ -1,19 +1,27 @@
 # 1. Loimi in ten minutes
 
-Loimi's core is a small statically typed language at roughly C's level:
-structs, tagged unions, pointers, slices, no garbage collector for host
-data and no hidden allocation. Everything interpreter-specific (the `vm`
-block, `value` types, `object`s, effects) builds on it. This chapter is
-the core, by example. The full program is
+Loimi's core is a small statically typed language at about the level of
+C: structs, tagged unions, pointers and slices, with no garbage
+collector for your own data and no hidden allocation. The interpreter
+features in later chapters are built on top of it. This chapter shows
+the core by example.
+
+The full program is
 [`examples/tutorial/step1/main.lm`](../../examples/tutorial/step1/main.lm).
+Run it with:
 
 ```sh
 ./target/release/loimi run examples/tutorial/step1/main.lm
 ```
 
-`loimi run` compiles to LLVM IR, hands it to clang, and runs the result.
-`loimi build FILE -o OUT` keeps the executable; add `--release` for
-`-O3` without overflow checks. Arguments after `--` go to the program.
+The commands you will use:
+
+| Command | What it does |
+|---|---|
+| `loimi run FILE` | Compiles to LLVM IR, builds it with clang, and runs the result |
+| `loimi build FILE -o OUT` | Builds an executable and keeps it |
+| `--release` | Builds with `-O3` and without overflow checks |
+| `-- ARGS` | Passes the arguments after `--` to the program |
 
 ## Functions and bindings
 
@@ -23,9 +31,11 @@ fn fib(n: i64) -> i64 {
 }
 ```
 
-Blocks are expressions, so `if` returns a value and the last expression
-of a function body is its result. Parameter and return types are
-written out; local types are inferred:
+Blocks are expressions. So `if` returns a value, and the last
+expression of a function body is its result.
+
+You write out the types of parameters and return values. The types of
+local variables are inferred:
 
 ```loimi
     let n = 20;
@@ -34,9 +44,15 @@ written out; local types are inferred:
     while i < 10 { total += i; i += 1; }
 ```
 
-`let` is immutable and `var` mutable. Integer arithmetic traps on
-overflow in debug builds and wraps in release builds; the explicit forms
-are `a +% b` (wrapping) and `a.add_checked(b)`, which returns an option:
+`let` makes an immutable binding, and `var` a mutable one.
+
+## Integer overflow
+
+Integer arithmetic traps on overflow in debug builds and wraps in
+release builds. When you want a specific behavior, say so:
+
+- `a +% b` always wraps.
+- `a.add_checked(b)` returns an option, which is `None` on overflow.
 
 ```loimi
     let big: i32 = 2147483647;
@@ -46,14 +62,14 @@ are `a +% b` (wrapping) and `a.add_checked(b)`, which returns an option:
     }
 ```
 
-Checked arithmetic lowers to LLVM's `*.with.overflow` intrinsics, an add
-and a `jo`. You will see it again in every arithmetic handler of the
-interpreter, where it is how a 32-bit integer overflows into a float.
+A checked add compiles to an add followed by a jump on overflow, so it
+is cheap. You will use it in every arithmetic op of the interpreter:
+it is how a 32-bit integer overflows into a float.
 
 ## Structs, methods and modules
 
-Step 1 has a second file, `shapes.lm`. A file is a module; `pub` items
-are visible to files that import it:
+Step 1 has a second file, `shapes.lm`. Each file is a module, and items
+marked `pub` are visible to files that import it:
 
 ```loimi
 /// A plain struct. Fields are laid out like a C struct.
@@ -64,6 +80,8 @@ pub struct Point { x: f64, y: f64 }
 pub fn Point.norm2(p: *Point) -> f64 { p.x * p.x + p.y * p.y }
 ```
 
+`main.lm` imports it:
+
 ```loimi
 import std.io;
 import std.mem;
@@ -72,14 +90,18 @@ import shapes;
 import shapes.{Point, Shape};
 ```
 
-`import shapes;` makes `shapes.area` available; `import
-shapes.{Point, Shape}` brings names in unqualified. Modules are found
-next to the importing file, and `std.*` in the standard library.
+- `import shapes;` lets you write `shapes.area`.
+- `import shapes.{Point, Shape}` lets you write `Point` and `Shape`
+  without the module name.
 
-Pointers are `*T`. Field access goes through them without `->`, and
-there is no borrow checker: host memory is managed by hand (`mem.alloc`,
-`mem.release`) or, much more often in an interpreter, by an arena that
-frees a whole phase's data at once.
+The compiler looks for modules next to the importing file, and for
+`std.*` in the standard library.
+
+Pointers are written `*T`. You access fields through a pointer with `.`,
+as with a struct (there is no `->`). There is no borrow checker. You
+manage memory by hand with `mem.alloc` and `mem.release`, or, much more
+often in an interpreter, with an arena that frees all of one phase's
+data at once.
 
 ## Enums and `match`
 
@@ -101,14 +123,18 @@ pub fn area(s: Shape) -> f64 {
 }
 ```
 
-Variants are written `Shape.Rect(2.0, 3.5)`, or `.Circle(1.0)` where the
-type is known. Patterns nest, and work on tuples, which is how an
-interpreter matches two operands at once (chapter 4).
+You write a variant as `Shape.Rect(2.0, 3.5)`, or as `.Circle(1.0)`
+where the type is already known. Patterns can be nested, and can match
+tuples. Matching a tuple is how the interpreter will look at two
+operands at once (chapter 4).
 
-## Options, results and slices
+## Options and slices
 
-`?T` is an option (a `?*T` is a nullable pointer, one word). `[]T` is a
-slice: a pointer and a length, bounds-checked.
+`?T` is an option: either `Some(value)` or `None`. A `?*T` is a pointer
+that may be null, and takes one word.
+
+`[]T` is a slice: a pointer and a length. Indexing a slice is
+bounds-checked.
 
 ```loimi
 fn find(xs: []i64, want: i64) -> ?u64 {
@@ -119,10 +145,23 @@ fn find(xs: []i64, want: i64) -> ?u64 {
 }
 ```
 
-`for i in a..b` counts; when the index is not needed, `for x in xs`
-runs over the elements of an array or slice (`for x in xs { s += x; }`).
+`for i in a..b` counts from `a` up to `b - 1`. When you don't need the
+index, `for x in xs` loops over the elements of an array or slice:
+`for x in xs { s += x; }`.
 
-Errors are values. `Result<T, E>` with `?` returns early on `Err`:
+`if let`, `let ... else` and `while let` take apart options and enums:
+
+```loimi
+    let xs = [5, 7, 9, 11];
+    if let Some(at) = find(xs[..], 9) { io.print("9 is at "); io.print_int(at as i64); io.println(""); }
+    if find(xs[..], 4).is_none() { io.println("4 is missing"); }
+```
+
+## Errors
+
+Errors are ordinary values. A function that can fail returns
+`Result<T, E>`, which is `Ok(value)` or `Err(error)`. Writing `?` after
+a call returns early if the call returned `Err`:
 
 ```loimi
 fn digit(c: u8) -> Result<i64, str> {
@@ -138,24 +177,19 @@ fn parse_number(s: str) -> Result<i64, str> {
 }
 ```
 
-There are no exceptions in host code. The interpreter's guest exceptions
-are a vm feature (`raise`, chapter 4).
-
-`if let`, `let ... else` and `while let` destructure options and enums:
-
-```loimi
-    let xs = [5, 7, 9, 11];
-    if let Some(at) = find(xs[..], 9) { io.print("9 is at "); io.print_int(at as i64); io.println(""); }
-    if find(xs[..], 4).is_none() { io.println("4 is missing"); }
-```
+Loimi has no exceptions. Errors in the guest language, the one your
+interpreter runs, are handled by a separate feature (chapter 4).
 
 ## The standard library
 
-`std.io` prints (`print`, `println`, `print_int`, `print_f64`, and the
-`eprint` forms for stderr: `eprint`, `eprintln`, `eprint_int`,
-`eprint_f64`) and reads files; `std.os` has the command
-line; `std.mem` has `Vec<T>` and `Arena`; `std.text` has `StrBuf` and an
-`Interner`:
+The modules this chapter uses:
+
+| Module | What it has |
+|---|---|
+| `std.io` | Printing to stdout (`print`, `println`, `print_int`, `print_f64`) and stderr (`eprint`, `eprintln`, `eprint_int`, `eprint_f64`), and reading files |
+| `std.os` | The command line |
+| `std.mem` | `Vec<T>` (a growable array) and `Arena` |
+| `std.text` | `StrBuf` (a growable string) and `Interner` |
 
 ```loimi
     var v: mem.Vec<i64> = mem.Vec.new();
@@ -168,24 +202,33 @@ line; `std.mem` has `Vec<T>` and `Arena`; `std.text` has `StrBuf` and an
     v.free();
 ```
 
-Generic types are monomorphized, like C++ templates or Rust generics.
-There are no destructors; `defer x.free();` runs at the end of the scope
-if you want the cleanup next to the allocation.
+Generic types are compiled separately for each type they are used with,
+like C++ templates or Rust generics.
 
-The rest of the standard library is aimed at interpreters: `std.lex`,
-`std.parse`, `std.diag`, `std.num`, `std.bc`, `std.gc`, `std.obj`. The
-next chapters use most of them. [`docs/stdlib.md`](../stdlib.md)
-describes each one.
+There are no destructors, so you free things yourself. To keep the
+cleanup next to the allocation, write `defer x.free();`: it runs at the
+end of the scope.
 
-## What you get, and what you don't
+The rest of the standard library is aimed at interpreters, and the
+next chapters use most of it. [`docs/stdlib.md`](../stdlib.md)
+describes every module.
 
-The core language has generics, static traits (bounds checked when a
-generic is instantiated), function pointers, `defer`, `inline for`
-(chapter 4), module-level `var`s and closures (`|x| x + 1`, passed as a
-`block fn` argument, or kept as a `closure fn` allocated in an arena or
-the GC heap; the tutorial does not need them). It does not have
-destructors, exceptions or a borrow checker. That is deliberate: the
-complexity budget goes to the parts of an interpreter that C makes hard,
-which start in chapter 3.
+## What else is in the core
+
+The core also has these, which this chapter doesn't show:
+
+- generics, with static traits as bounds (checked when the generic is
+  used with a type)
+- function pointers
+- `inline for`, which repeats code once per item at compile time
+  (chapter 4)
+- module-level `var`s
+- closures (`|x| x + 1`), passed as a `block fn` argument, or kept as a
+  `closure fn` allocated in an arena or the GC heap (the tutorial does
+  not need them)
+
+The core has no destructors, exceptions or borrow checker. That is on
+purpose: the complexity goes into the parts of an interpreter that C
+makes hard. Those start in chapter 3.
 
 Next: [a calculator](02-calculator.md).

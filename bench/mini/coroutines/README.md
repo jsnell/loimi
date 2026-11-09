@@ -1,18 +1,23 @@
 # Coroutine benchmarks for Mini
 
-Existing public Lua benchmark programs that exercise coroutines, adapted to
-the Mini subset (examples/mini/SPEC.md plus the `coroutine` library) with
-mechanical edits only. Each `NAME.lua` prints exactly `NAME.expected`, which
-is the output of PUC-Lua 5.4.9; LuaJIT 2.1 (with and without `-joff`) prints
-the same.
+Three public Lua benchmark programs that use coroutines, adapted to
+Mini (`examples/mini/SPEC.md` plus the `coroutine` library) with
+mechanical edits only. The latest results are in
+[`docs/results.md`](../../../docs/results.md) as the `mini-coro` suite.
 
-    bench/mini/coroutines/run.py --mini PATH [-n RUNS] [--lua-dir DIR] [NAME ...]
+- Each `NAME.lua` prints exactly `NAME.expected`, which is PUC-Lua
+  5.4.9's output. LuaJIT 2.1, with and without `-joff`, prints the same.
+- Sizes were chosen so that PUC-Lua 5.4.9 takes about 1–2 s.
 
-times a Mini binary against `lua` and `luajit -joff` (best of 3 by default).
-From a git worktree, pass `--lua-dir` pointing at the main checkout's
-`bench/lua/install/bin`.
+## Running
 
-Sizes were chosen so PUC-Lua 5.4.9 takes about 1–2 s.
+```sh
+bench/mini/coroutines/run.py [--mini PATH] [-n RUNS] [--lua-dir DIR] [NAME ...]
+```
+
+This times the Mini binary given with `--mini` against `lua` and
+`luajit -joff`, best of 3 by default. From a git worktree, pass
+`--lua-dir` pointing at the main checkout's `bench/lua/install/bin`.
 
 ## coroutine_ring.lua
 

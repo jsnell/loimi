@@ -1,160 +1,620 @@
 # Implementation status
 
-What exists today, and where the implementation differs from the design
-in [`language.md`](language.md). Updated 2026-11-08. What changed
-recently, by topic: [`CHANGELOG.md`](../CHANGELOG.md).
+What exists today, what its limits are, and where the implementation
+differs from the design in [`language.md`](language.md). It is for
+contributors and for anyone checking whether a feature is built.
+Updated 2026-11-08; recent changes by topic are in
+[`CHANGELOG.md`](../CHANGELOG.md).
 
-## Built
+## At a glance
 
-| Area | Status |
+| Area | State | Main limits |
+|---|---|---|
+| [Compiler](#compiler) | Rust, no dependencies; emits LLVM IR and drives `clang-19` | — |
+| [Targets](#targets) | x86-64 Linux, AArch64 Linux | AArch64 tested under qemu only |
+| [Language](#language) | As described in `language.md` | No `dyn` traits, no effect inference |
+| [`vm` declarations](#vm-declarations) | All features, in all three dispatch modes | — |
+| [Instrumentation](#instrumentation) | Variants, op counts, a sampling profiler | — |
+| [Debugging guest programs](#debugging-guest-programs-prototype) | Prototype: breakpoints, stepping, a DAP server for Mini | Not under the JIT or in stack vms |
+| [GC](#gc) | Mark-sweep in Loimi, optional generational mode | Non-moving; no card marking |
+| [Threads](#threads) | Independent states on any thread; a shared heap one thread at a time | No free threading |
+| [Libraries and embedding](#libraries-and-embedding) | Static and shared libraries with a generated C header | `Gc` and `value` types don't cross into C |
+| [JIT](#jit) | Copy-and-patch, generated from the handlers | x86-64 executables, tail-call mode, one vm |
+| [Standard library](#standard-library) | Modules from I/O and collections to lexers, bytecode builders and big integers | — |
+| [Examples](#examples) | Nine interpreters | — |
+
+## Compiler
+
+- Written in Rust with no dependencies. It emits textual LLVM IR and
+  drives `clang-19` to build it.
+- A large module is split into parts that clang compiles in parallel
+  (`src/splitir.rs`).
+- `LOIMI_DUMP_VM_EXPANSION=1` prints the Loimi source generated for
+  each `vm` (its expansion) to stderr.
+- Errors and panic locations in user text copied into the expansion
+  (`verify` and `const` clauses, `verify_context` types, `verify`
+  blocks, stack effect counts, `stack_entry`) point at the vm
+  declaration, with a note naming the generated context. An error in
+  the rest of the expansion says `internal: generated code`.
+
+### Commands and options
+
+| Command or option | What it does |
 |---|---|
-| Compiler | Rust, no dependencies. Emits textual LLVM IR and drives `clang-19` (`loimi build`, `loimi run`, `--emit-llvm`, `--release`, `--dispatch=`, `--sanitize=address`, `--sanitize=thread`, `--align-functions=N` to start every function on an N-byte boundary so that unrelated code changes do not move vm handlers, which makes A/B benchmarks steadier, `--no-branch-align` to drop the default x86-64 padding that keeps every branch of a vm program, dispatch jumps included, off 32-byte boundaries (Intel's JCC erratum; `lowering.md` §12; `LOIMI_BRANCH_ALIGN=0` does the same, for test suites), `--keep-ll` to keep the IR next to the output, and `loimi ir-diff` to compare the code of two builds function by function, ignoring source locations and names: "Comparing builds" below). The standard library is found through `LOIMI_STD` (else a `std/` directory next to the executable or up to three directories above it, else in the current directory); `LOIMI_CLANG` and `LOIMI_AR` override `clang-19` and `llvm-ar-19` (and `LOIMI_LD`, `LOIMI_OBJCOPY` override `ld.lld` and `llvm-objcopy`, which merge a static library's parts); a large module is split into parts compiled in parallel (`src/splitir.rs`; `LOIMI_SPLIT=N` sets the number of parts, `1` compiles it whole, `LOIMI_SPLIT_REPORT=1` times them), and `LOIMI_ASAN_RUNTIME`/`LOIMI_TSAN_RUNTIME` name a sanitizer runtime to link when clang has none; `LOIMI_DUMP_VM_EXPANSION=1` prints the Loimi source generated for each `vm` (its expansion) to stderr. Errors (and panic locations) in user text copied into the expansion (`verify`/`const` clauses, `verify_context` types, `verify` blocks, stack effect counts, `stack_entry`) point at the vm declaration, with a note naming the generated context; an error in the rest of the expansion says `internal: generated code`. A build reports every independent error it finds, not only the first: in source order, each place once, at most `--max-errors N` of them (default 20, `0` for all), then `error: N errors`. Which passes go on past an error: the checking of function bodies (each body, each generic instance, which reports its first error only, and each statement of a body: type errors, name resolution inside bodies, effects, unsafe operations), and in a `vm` each op handler, super, `-> never` and plain vm function, entry, `on raise` and variant `before` block; the write-barrier (`objref`) and lifetimes checks, which run only on a program that type-checked, report the first error of each function. A statement that fails is left out and what it binds is poisoned (type `never`; an error in a later statement that reads it is not reported, nor one in an enclosing statement), so one bad expression gives one error; an error in the condition of an `if` or `while` or the scrutinee of a `match` does not keep its branches from being checked. Which stop at their first error: parsing, `vm` expansion, and the passes later ones depend on: imports, type definitions, signatures, impls, module-level `var` initializers, a `vm`'s declarations (state, operands, formats, caches); and the checks of a vm as a whole (constant operands written, `pc` writes, `collects`, shared continuations) are skipped in a vm with an error in a body. An `if`, `match` or block whose results are all literals takes its type from the other operand of a binary operator, as a literal does: `(if c { 1 } else { 0 }) == y` with `y: i32`. Named warnings (`match_fallout`, `super_overlap`, `unreachable_arm`, `value_layout`, `next_pc_then`, `state_registers` (a tail-call vm whose state needs more `preserve_none` argument registers than the target has); the retired `state_root` is still accepted by `#[allow]`; `hot_gc`, a call that may collect on a handler's hot path, is opt-in with `-W hot_gc`; so is `handler_frame`, `-W handler_frame`, tail-call handlers whose fast path sets up a stack frame, found in the assembly with the calls that cause it; `redo_effect`, an effect before a `redo`, is an error unless allowed: `language.md` §4), silenced with `#[allow(name)]` on an item, vm item or match arm or `#![allow(name)]` per file; `-W error` / `--deny-warnings` makes them errors. |
-| Libraries and embedding | `loimi build --lib` (static archive of `-fPIC` code) and `--shared` (shared object), with no `main`; `export "C"` functions are the API. `--header out.h` writes a C header for them (integers, floats, `bool`, pointers, opaque struct pointers, nullable `?*T`, C function pointers, `str` as `loimi_str { const char *ptr; size_t len; }`, payload-less enums as a typedef plus `E_Variant` constants; other types are rejected with the reason). No init function. `--tls=` overrides the model of the runtime's thread-locals (see Threads). `std.rt.protect`/`throw` recover from errors deep in code without an error path, and `#[catch_panic(v)]` on an export (or `rt.catch_panic`) turns panics into an error return instead of aborting the host (an `rt.panic` message is copied, up to 512 bytes). The header also carries `export "C" const`s, `///` comments (on functions, constants, structs and enums), `#[c_const]` parameters and `#[c_name]`/`--header-prefix` names. `--sanitize=address` and `--vm-stats` work for libraries (several `--vm-stats` libraries link into one host). `examples/mini/embed.lm` makes Mini a library (`mini_new`, `mini_dostring`, `mini_error`, globals, C natives, a rooted value stack, `mini_call`); `examples/embed/host.c` uses it. C natives may call back into Mini (`mini_call`, `mini_dostring`), as nested runs. An internal error (a panic) returns `MiniStatus_Internal` and poisons that state only. See `language.md` §10.1. |
-| Threads | Independent states on different threads run concurrently with no locks: the runtime's per-thread state (shadow-stack top, `Vm.depth`, vm scratch slots, `std.rt` handler chain and panic message, `#[track_caller]` location) is initial-exec TLS (local-dynamic in `--shared` builds), and `std.gc` keeps everything in its `Heap` (no globals). A state may move between threads with a synchronized hand-over. TLS instead of plain globals costs nothing measurable (geometric means 0.99–1.01 on Mini, MiniJS, Scheme; `lowering.md` §4). Several states on one thread may nest (a native of B runs A): the collector's shadow-stack walk marks only its own heap's objects (fixed 2026-11-03; it used to mark the other heap's objects, which that heap's next collection then took as marked, freeing what they referenced). `--sanitize=thread` builds with ThreadSanitizer (host links GCC's `libtsan`). `examples/embed/threads.c`: four Mini states on four threads, GC stress, nested runs, caught panics on every thread, states handed between threads; clean under TSan. Not thread-safe: plain module-level `var`s, `--vm-stats` counters, the `--jit-stencils` JIT (executables). **Several threads sharing one heap and state, one at a time** (opt-in): `std.gil`, a lock per heap with first-come-first-served hand-over, attach/detach, `unlock`/`lock` around blocking code, a poll (`waiting()`, a relaxed atomic load) and `yield_now()`, hooks that move the interpreter's per-thread state in and out of its shared state, and a scanner that marks the other threads' saved shadow stacks and states. Mini built with `--cfg gil` (`examples/mini/threads.lm`): each OS thread runs its own Mini thread (stacks, main coroutine, API value stack) over shared globals and code, polls at every taken jump and Lua call, `mini_thread_attach`/`detach`, `mini_unlock`/`lock`; `examples/embed/shared.c` (a hand-over at a back-edge of a loop that only another thread can end; four threads on shared tables under GC stress, natives releasing the lock two runs deep) is clean under TSan. Cost single-threaded: 1.2–1.4% geomean on Mini (worst 4–5%); default builds unchanged (IR byte-identical). Free threading (several threads running vm code in one heap at once) is not supported (roadmap Q4). See `language.md` §10.1. |
-| Core language | names and constant data on enum variants (`#[name("..")]`, `#[names]`, `#[data(key: T = default)]` on the enum and `#[data(..)]` on variants; generated `E.name`, `E.from_name` and one accessor per key, compiled only where called; language.md §1.2, "Variant names and data"), raw string literals (`r"..."`, `r#"..."#`, no escapes), type aliases (`type Name = T;`, `pub type`, generic `type Map<V> = HashMap<str, V>;`; transparent), `inline for` (module level, in `vm` blocks, and as a statement in any block), structs (literals may be module-qualified: `diag.Span { .. }`, and end in `..zero` to zero the fields not given, where zero is valid: numbers, `bool`, options (`?*T`, `?Gc<T>`, `?fn` start as None), slices, raw pointers `*T` (null); not `Gc<T>`, functions, structs, enums or values), `[]` as the empty slice, enums with payloads, `?T`, `Result` with `?`, tuples, arrays, slices, pointers and pointer arithmetic, methods (`fn Type.name`), modules and imports, `match` with exhaustiveness checking (integer literal and range patterns; a `const` in scope, imported or `mod.C`/`Vm.OP_X`, matches its value; arms after one that matches everything warn), string literal patterns on `str` (a length switch, then word-sized compares) (through nested patterns and tuples) and guards (`pat if cond =>`; in vm code, a warning for an arm whose body is an `if` without `else` when a later arm could match), `let ... else`, `if let` chains, loops with `break` values, `for i in 0..n` ranges typed by the non-literal bound or an annotation (`for i: u8 in 0..10`), `for x in e` over an array or slice, `defer`, consts, module-level `var`s (see below), casts (including integer to fieldless enum, checked in debug builds; `Kind.COUNT` gives the number of variants; `x as u64 < y` parses as a comparison), local inference across `if`/`match` branches (`if c { Ok(e) } else { Err(m) }` needs no annotation), checked/wrapping arithmetic, float built-ins on `f32` and `f64` (`to_bits`/`from_bits`, `sqrt`, `floor`, `ceil`, `trunc`, `nearest`, `abs`, `copysign`, `is_nan`, C-style `min`/`max` and IEEE 754-2019 `minimum`/`maximum`, each an LLVM intrinsic), unaligned loads and stores (`p.read_unaligned()`, `p.write_unaligned(v)`), `~x` (bitwise not; `!x` also works on integers), `a ?? b` with `b: T` or `b: ?T`, hints for operators Loimi lacks (`++`, `**`, `?:`, `===`), arbitrary-width integers `iN`/`uN` (1..=64), overflow and bounds checks (overflow traps in debug builds). |
-| Vectors | 128-bit SIMD types `i8x16`, `u8x16`, `i16x8`, `u16x8`, `i32x4`, `u32x4`, `i64x2`, `u64x2`, `f32x4`, `f64x2` (LLVM `<N x T>`; language.md §1.2, "Vectors"): lane-wise operators (integer lanes wrap; shifts by a scalar modulo the lane width; comparisons give signed masks), `splat`, `new`, `from_bits`, `lane`/`with_lane` with constant lanes, `lane_at`/`with_lane_at` with a run-time lane (masked to the lane count), `shuffle` with constant indices, `swizzle`, `select`, `bitmask`, `widen_low`/`widen_high`, `narrow_sat`, saturating `add_sat`/`sub_sat`, `avgr`, integer and float `min`/`max`, `minimum`/`maximum`, rounding, `abs`, `popcount`/`clz`/`ctz`, `as` lane by lane (float to integer saturating). Values everywhere a scalar goes (fields, objects, enum payloads, arrays, `?T`, state registers in vector registers across tail calls); vector loads and stores assume no alignment. Baseline SSE2 and NEON; where the IR differs by target: `swizzle` (`tbl` on AArch64), signed `narrow_sat` (`sqxtn`/`sqxtun`), `f32x4` to integer conversions (`cvttps2dq` on x86-64) and float rounding (inline SSE2 on x86-64, no libm calls). `--cpu=NAME` (clang's `-march`/`-mcpu`; `x86-64-v2`, `x86-64-v3`, `native`, ..) builds for a newer CPU: `swizzle` becomes `pshufb` (SSSE3) and the rounding methods `roundps`/`roundpd` (SSE4.1); the default is the portable baseline (lowering.md §12 has instruction counts per level). `--header` signatures do not take vector types. |
-| Conditional compilation and atomics | `--cfg NAME` with `#[cfg(NAME)]`/`#[cfg(not(NAME))]` on items (imports included), struct fields and statements, dropped by the parser (a build without the name has the same IR as without the code). Pointer atomics: `atomic_load` (acquire), `atomic_load_relaxed`, `atomic_store` (release), `atomic_swap`, `atomic_cas`, `atomic_add` on 8–64-bit integers (and pointers, but `add`). `language.md` §1.4 and §1.3. |
-| Globals | `var NAME: T = init;` at module level (with `pub`, readable and assignable from other modules as `mod.NAME` or after `import mod.{NAME}`). Plain LLVM globals; `#[thread_local]` makes one copy per thread (`thread_local(initialexec)`). The initializer must be a constant expression: literals, consts, `[x; N]`, struct/tuple/array literals, enum variants without payload, `None`/`Some(..)`/`Ok(..)`/`Err(..)` of constants, and functions (for hooks). Globals are not GC roots: a global holding `Gc`/`Value` must be marked by a root scanner (`heap.add_scanner`). |
-| Generics | Monomorphized generic structs, enums, functions and methods; type arguments inferred from arguments and the expected type. Qualified variants of generic enums (`Lookup.Missing`, `Lookup.Own(i)`, also in patterns) take the instance from the expected type or the payload. Methods resolve per instance. Static traits (`trait Hash { fn hash(k: Self) -> u64; .. }`, `impl Hash for Sym;`) with default methods, type parameters (`trait Conv<T>`, bounds `P: Hooks<K, E>`), generic methods (`fn fold<U>(..)`), static functions (`T.zero()`) and generic impls (`impl<T: Show> Show for Vec<T>;`). Bounds (`HashMap<K: hash.Hash, V>`, `fn f<T: A + B>`; methods of a generic type inherit the type's) are checked at instantiation, with the error at the use site, and generic bodies are checked against them: a bounded parameter has only its bounds' methods (opaque in a second check of the body, once per combination of the unbounded parameters' arguments); unbounded parameters stay duck-typed. Static dispatch only. A generic function can be used as a function pointer where a function type is expected (`Pratt.new(peek, ...)` with `fn peek<E>(p: *P<E>) -> T`), or with explicit type arguments anywhere (`scan<Gc<Box>>`); passed to another generic function, its type arguments can come from the parameter types alone (`apply(double, 21)` with `fn apply<T, U>(f: fn(T) -> U, x: T)`). Methods can have their own type parameters after the method name, on plain receivers (`fn Cursor.op<K>(c: *Cursor, ops: *OpTable<K>) -> ?K`) and generic ones (`fn Box<T>.map<U>(b: *Box<T>, f: fn(T) -> U) -> Box<U>`); the receiver's arguments come from the receiver, the method's are inferred from the arguments and the expected type. Type arguments can also be given explicitly on calls: `mem.alloc<u8>(n)`, `id<i64>(x)`, `c.op<K>(&ops)`, `Cursor.cast<u8>(&c)` (a method's own parameters only; not on a generic type's static functions such as `Vec.new`). `f<T>(` is recognized when `<` directly follows the name and a balanced, type-shaped `<...>` is followed by `(`; otherwise `<` is a comparison. |
-| `value` types | `nanbox`, `lowtag`, `boxed` representations; `nanbox(int_high)` (the layout's words rotated left by 16, so the integer variant is `payload << 16`: checked `+`/`-` are `add; jo` on the words, floats decode with `xor; ror`; examples/python uses it, suite 0.93–0.94 of the plain nanbox's time; `design/speed-audit.md` item 7); NaN canonicalization; tuple patterns merged into one test (xor/or/mask, umax). Integer payloads up to 48 bits (nanbox) or 61 bits (lowtag); more than 7 (nanbox) or 8 (lowtag) tagged variants when payloads are narrow, with tags sized to the payloads; in a nanbox, more pointer variants than 48-bit blocks: `Gc` variants share a block, up to 8, told apart by the pointer's low 3 bits (the shared layout, `block 45`; tests are `(v & mask) == tag`, the payload is the usual `and` with the low tag folded into load displacements). The layout is visible and can be pinned: `loimi build --explain-values` prints every value type's encoding and which tuple tests merge; `Int(i32) block 48` pins a variant's block width; the `value_layout` warning names every unpinned variant that a non-classic layout narrows (so a new variant cannot silently change the others' encoding; an error under `-W error`); `V.X.mask`, `V.X.tag`, `V.X.block` and `V.Num.limit` are the encoding as constants, for code that tests raw words. Lowtag uses 3-bit primary tags. |
-| `vm` declarations | state, context, operand kinds (`const` kinds: what they read cannot change after verification, checked within the vm), fixed-width formats, inline caches (fields of any integer, float, `bool` or pointer type, wider ones spanning several code words with unaligned access; no GC references; `Vm.Resume` fields for verified code addresses, reset by the verifier and set with `fill_resumes`; `const` fields that the emitter sets, handlers only read, `deopt` keeps and `verify` clauses check once; `emit.OP_cached` emitters with initial contents), `then OP` (typed operands of the following instruction), `family` + `become`, `rel`/`data` (host lookups between ops and per-op constants, `Vm.kform(op)`), `super` and `supers { .. }` groups (any number of parts, including family members; `become` in a part re-targets the super; `refuse CODE;` names the code an instruction is in, and a `become` of an op some super names then fuses supers again over it (`Vm.refuse`: accumulator selection and `optimize`), so supers of two quickened members form; `supers from "file";` adds the supers a `--vm-stats` report suggests; `#[forward]` adds opcodes, forwarding variants, in which a part reads the previous part's result from a machine register instead of the register file; `optimize` picks them where the operand fields match; kinds that are views of one slot, differing only in the types they cast to, link like one kind; on every super of the three interpreters: 0.97–0.99 of their time by geometric mean, up to 0.92 on float loops, see `bench/mini/RESULTS.md` item 28), accumulators (`accumulator acc: T for kinds;` state registers and `#[accumulate]` variants of ops (or of the ops an `accumulate` list selects: names, `A..B`, globs, `with KIND`) that keep a temporary in one between adjacent ops, picked by `Vm.accumulate`; the wasm interpreter: 0.91 of its time), vm functions (including `-> never` ones with control words and `next_pc`, the address `next` continues at (in an op with `then`, the `then` word's address, with a warning; `then_next_pc` is past it), and `c: cache Name` parameters that receive the calling op's cache), entries, `on raise`/`raise`, `cold`, `sync`, `reload` (run after each `reenter` call in vm code), nested entries (`entry call(..) uses reenter`: a run above an active one, for natives calling guest code; callers need the effect; a generated thread-local `Vm.depth` counts them), in all three dispatch modes. |
-| Dispatch | `tailcall` (`preserve_none` + `musttail`, instruction word passed in a register; handlers are compiled without memset/memcpy/memmove formation, and loops in tail-call vm code are not vectorized or unrolled, so no loop gives them a stack frame), `goto` (one function; a shared `indirectbr` block that LLVM copies into every handler after register allocation, so compile time stays near linear in the op count: `lowering.md` §5), `switch`. |
-| Targets | x86-64 Linux (native) and AArch64 Linux (`--target=aarch64-linux-gnu [--sysroot=DIR]`: clang `--target`, linked with `ld.lld`; `LOIMI_RUNNER` runs `loimi run`/`test` programs under an emulator). The IR is target-independent except a few vector operations ("Vectors" row) and `std.rt`'s handlers (LLVM's builtin setjmp on x86-64, glibc's `_setjmp` on AArch64) and tail-call vms, which on AArch64 keep the dispatch table's address in a state register instead of an `adrp`+`add` per dispatch (lowering.md §3; x86-64 indexes the table as an absolute address). AArch64 is validated under qemu user-mode (`bench/cross/install.sh`: qemu and a Debian arm64 sysroot from pinned sources): the whole golden suite passes cross-compiled (`LOIMI_TARGET`, all dispatch modes, GC stress and verify, C hosts, `rt` panics), and the heavy test tier (`cargo test --release -- --include-ignored`) runs a subset under qemu (`aarch64_qemu`, `vm_prof_stress_aarch64`) when the toolchain is installed. It has not been run on AArch64 hardware or with 16K/64K pages. The JIT (x86-64 only) and `--sanitize` do not combine with `--target`. Code is for each target's baseline (x86-64: SSE2) unless `--cpu=NAME` (or `LOIMI_CPU`) names a CPU: clang's `-march` (x86-64) or `-mcpu` (AArch64) for every clang run of the build (stencils and C runtimes included), and the CPU's extensions, read from clang's predefined macros (so `native` and any name clang knows work; an unknown name is an error), choose Loimi's own vector lowering. Interpreters gain nothing measurable from `x86-64-v3` (run_all on Stak, Lox, Scheme, Mini and the wasm benchmarks: within noise; lowering.md §12). |
-| Generated per vm | encoders (`Vm.OP(..)`), emitters (`Vm.emit.OP(..)`), opcode constants, `op_size`, `op_name`, `Vm.Op` and `Vm.op_of(w)` (an enum of the ops for exhaustive `match`es in host tools), the superinstruction peephole (`Vm.optimize`), deoptimization (`Vm.deopt`: every word back to its family's generic op, supers split, caches zeroed), the verifier (`Vm.verify -> Result<Verified<Vm>, Vm.VerifyError>`, with any number of `verify_context` parameters; the error says which word and which check, `e.write(&out)`), the proof type `Verified<Vm>` (opaque; `jump v`, `v.start()`, `v.words()`; `#[require_verified]` vms start entries only from one, or from a resume point `Vm.Resume` (an instruction boundary of verified code: `next_resume` in vm code, `v.resume_at(i) -> ?Vm.Resume`, `Vm.Resume.placeholder()` (traps), `unsafe { Vm.assume_resume(p) }`; generated only for programs that name them); `unsafe { Vm.assume_verified(code) }`, `Vm.placeholder()`), `Vm.build_verified(heap, Obj { .. }, words, ctx..)` for objects with a `code: verified [W] by Vm` trailing array (`owner` verify contexts; `unsafe { Vm.build_assume_verified(..) }`), `verify NAME { .. }` side-table checks (over the base view of the code; `reject(at, msg)` reports a word and a message), stack effects for stack VMs (`op X() : N stack(a b -- c)`, `stack_entry`: depth checks in the verifier, `v.max_stack()`, `Vm.stack_effect(w)`, `Vm.stack_effect_text(w)`), label helpers (`Vm.set_label(w, off) -> ?W`, range-checked; `Vm.label(w) -> ?i64`), per-format field readers (`Vm.ABC_a(w)`), setters (`Vm.set_ABC_a(w, v) -> ?W`, range-checked) and encoders (`Vm.encode.ABC(op, a, b, c)`; setters and encoders are compiled only where called) and per-op operand metadata (`Vm.operand_count(w)`, `Vm.operand_kind(w, i)`, `operand_bits`, `operand_signed`, `kind_name`, `kind_is_label`, `NUM_KINDS`), the disassembler (`Vm.disasm(code, &out)`, `Vm.disasm_insn(code, i, &out) -> size`, generic over the output buffer; operand kinds can declare `display "r{}"`). The items are named `Vm__X` in the vm's module: an op named like one of them (`label`, `verify`) is an error, as is a module item named `Vm__..`; item names starting with `__` (generated C declarations) and operand names starting with `__` are reserved. |
-| Instrumentation | `variant NAME wraps all|[OPS] { before { .. } }`, switched with `use_variant`; `#[unfused]` variants run supers as their parts (every instruction is wrapped). `#[cfg(..)]` on vm items. |
-| Debugging guest programs (prototype) | `on break { .. }`: generated breakpoint ops (one per inline cache layout, so a breakpoint has the size of the instruction it replaces), `Vm.set_break(v, i) -> ?Vm.Break` on verified code (splits a super spanning the word), `Vm.clear_break`, `b.rearm()`, `Vm.is_break`; code with breakpoints does not verify, `deopt` keeps them. `std.debug`: breakpoint sites with the step-over protocol, line stepping (`step`/`next`/`finish`), a command reader. `std.debug` also has `Stepper.left` (a nested run's frame left to its native), `line_sites` (line starts with loop heads), `unpatched` (code without breakpoints, for label walks) and line 0 as "no line". Mini built with `--cfg debug`: `mini --debug script < commands` (break, tbreak, delete, info, continue, step, next, finish, bt, locals, print, op, quit); the Python subset built with `--cfg debug`: `python-loimi --debug prog.py`, pdb-like (generators, exceptions, comprehensions, `sorted` keys); golden transcripts of both in all three dispatch modes; default builds unchanged (IR byte-identical), the debug builds not debugging within noise. **For editors** (Mini, `--cfg debug`): a stop-callback C API (`mini_debug_*` in `embed.lm`: breakpoints by file and line, pending until code loads; conditions, a Mini expression evaluated in the stopped frame by a nested run with the breakpoints suspended; hit conditions; break on uncaught errors before they unwind; a pause from any thread, a flag polled at back-edges and calls; frames, locals with upvalues, globals, tables expanded through handles; evaluation of expressions and statements), and a Debug Adapter Protocol server in C (`examples/mini/dap/mini_dap.c`, no dependencies: initialize, launch, setBreakpoints with conditions and hit conditions, setExceptionBreakpoints, configurationDone, threads, stackTrace, scopes, variables, evaluate, continue, next, stepIn, stepOut, pause, disconnect, terminate; events initialized, stopped, output, exited, terminated); a scripted DAP session's transcript is golden in all three dispatch modes, and a C host tests the API under GC stress. `std.debug` gained conditions, hit conditions, `suspend`, `Refs`, pause requests; the command line gained `break LINE if COND`, `print EXPR`, the error stop. `#[cfg(..)]` on struct literal field initializers. Breakpoints work in interpreted code, not under `--jit-stencils` or in stack vms. See `design/debugging.md`. |
-| Instrumentation (counts) | `loimi build --vm-stats` counts executed ops, adjacent op pairs and sequences of 3 and 4, entries into each `cold` block (per op, with its source location), and every `become` per site and transition (later ones: re-quickenings and deopts, as a share of dispatches), and prints the counts and frequent pairs and dominant longer sequences at exit as `super` declarations. `Vm.optimize` picks fusions by dynamic programming (the most dispatches saved; greedy on ties). |
-| Instrumentation (time) | `loimi build --vm-prof` links a sampling profiler (`src/prof_rt.c`, a `SIGPROF` timer at 1000 Hz, `LOIMI_PROF_*` settings): at exit it prints the samples per op handler and cold block (the `--vm-stats` names), per program function and shared-library function (with its caller), by the innermost vm location on the stack, and by guest `pc`. All three dispatch modes (tail-call handlers and outlined cold blocks by address; inline cold blocks by marks; goto and switch: the running op stored at each op), `--jit-stencils` (JIT code by stencil and instruction), libraries, x86-64 and AArch64. Named in the process: no external tools. Cost at the default rate: 3% on Mini and Python in tail-call mode, 8% for Mini in goto mode. See `language.md` §7.3. |
-| JIT | `loimi build --jit-stencils`: a copy-and-patch JIT generated from the vm's handlers (stencils with holes, read back from clang's object file by `src/elf.rs`, a C runtime in `src/jit_rt.c`), turned on at run time with `LOIMI_JIT=1`. Runs Mini, MiniJS, Scheme and Prolog (0.76, 0.83, 0.78 and 0.94 of their interpreters' time by geometric mean in `results.md`'s 2026-11-07 run; Prolog 0.93 without `sieve` and 1.35 on it, since clauses entered through resume points count as calls and the code-object registry is a treap, `design/copy-and-patch.md` §14); with the JIT off, a JIT build runs as fast as a default one. Quickening re-patches compiled code instead of dropping it. Handlers may read other instructions' words (`Vm.real_word` maps an enter word through an inline table load), and a `jump` to a computed pc that is not a label enters the target's compiled code, or the interpreter there (Mini's SWITCH jumps straight to its arm's target: interp 0.95–0.98 in the interpreter, 1.00 under the JIT; `design/speed-audit.md` item 13). Operand kinds marked `const` (all three interpreters) have their constants patched into compiled code, with stencil variants per constant tag; no measurable gain. Keeping guest registers in machine registers was measured too (a third at best on mandelbrot, at most 12% over the suite; a one-register cache, kept on branch `jit-regcache-experiment`, is 1.5% slower): the template-JIT line stops here (ahead-of-time traces went further and were removed: `design/speed-audit.md` item 14). `--jit-stencils` builds also take `--sanitize=address` and `--gc-check-roots`. x86-64 Linux executables, tail-call dispatch, one vm, no variants. See `design/copy-and-patch.md`. |
-| GC | `object` types (with trailing arrays), generic `object` types (`object Obj<V> { .., inline: [V] }`; one type id and trace function per instance), `Gc<T>` (also over a type parameter, checked per instance), `new(heap, ..)`, `try_new(heap, ..)` (no refill call: `None` where `new` would refill, for frameless handlers, with `gc.make_room` in a cold block), `new_uninit(heap, .., n)` (the trailing array not zeroed; untraced elements of which every bit pattern is valid, any untraced ones in `unsafe`), `gc_mark`; `std.gc` mark-sweep written in Loimi, without a sweep: marking sets per-chunk mark bitmaps (a bit per 16-byte granule) and each size class bump-allocates through the runs of clear bits, so dead objects are never read; chunks with nothing marked go to a pool any class takes (2026-11-04: new/old time Prolog 0.885, Scheme 0.955, Python 0.94, Mini 0.98, MiniJS 0.975 by geometric mean, the same peak memory; `results.md`); compiler-generated tracing (including pointers inside values); shadow-stack frames for traced locals, and for vm state variables of traced types (a cached top of stack), copied into the frame at each call that may collect, so `sync` and root scanners need not know them; an optional generational mode (`heap.set_generational`, on in Mini, MiniJS and Scheme: non-moving, sticky mark bits with an epoch flip per major collection, aging for large objects, an object-logging write barrier the compiler emits after every store of a reference into an object (none for values statically free of references; its slow path makes no call, so it gives handlers no stack frame), `gc.write_barrier` for raw-pointer stores, a barrier after calls that may store through a slice of an object's trailing array, verify mode); weak references (`heap.new_weak`), ephemeron tables (`gc.Ephemerons`) and weak intern tables for GC strings (`gc.WeakInterner`, with pinned keys); `#[trace(f)]` hooks on objects (trace the live part of a trailing array, or references in memory the object owns), free hooks for host memory an object owns (`heap.on_free`, typed `heap.on_free_gc`, run when it is found dead and by `Heap.free`; no allocation, no resurrection) and dirty pinning for objects written without barriers (`heap.pin_dirty`: a root traced by every collection, minor ones included; `stdlib/gc.md`); `unsafe { p as Gc<T> }` from a pointer or address; collection only in calls marked `uses gc` (effects: Differences below); `loimi build --gc-check-roots` checks every root (below). |
-| Closures | Non-escaping `block fn(A) -> R uses E` parameters and `|a, b| expr` literals, capturing by reference; only as call arguments, never stored or returned (checked). Effects of the body are checked against the type. Lowered to a separate function with an environment of slot pointers in the enclosing frame (small `let`s copied in); code and environment passed as two arguments, so LLVM specializes callees for a closure literal; plain functions convert through a trampoline. Not allowed in vm code. Escaping closures: `closure fn(A) -> R uses E` (`{ code, env }`, untraced) and `Gc<closure fn(..)>` (a traced closure object), created with `new(a, \|..\| ..)` where `a` is an allocator with `alloc_bytes` (`*mem.Arena`) or a `*gc.Heap`; captures copied in (assigning one, capturing a `block fn`, or a traced value in an arena environment are errors); generated trace function per GC closure literal, environment rooted by the body; plain `fn` converts to `closure fn`, `closure fn` to `block fn`; callable (not creatable) in vm code; not across C. State of a closure's own in a state list, `new(a, [var i = lo, var n] \|..\| ..)` (environment fields, assignable in the body, kept between calls; in a GC closure traced state is traced through the environment and assigned with the write barrier, not from a nested `block fn`); shared state in a cell from `new(a, v)` (a `*T` in allocator memory; untraced values only). `c.free(a)` frees one `closure fn`'s environment with `a.free_bytes(p)`, and nothing for closures that own no memory (no captures, converted plain functions: the code is compared with the signature's trampoline); `std.mem.Malloc` frees one by one, `Arena.free_bytes` does nothing. Use after free is not detected (ASan does); freeing does not free what captures point to. |
-| Standard library | `std.io` (with `Out`, buffered output), `std.os`, `std.mem` (`Vec` with `sort_by` and `try_sort_by` (stable, with a fallible, re-entrant comparator), non-allocating when empty; `memchr`/`memmem`/`memcmp`-backed byte search and compare on slices; allocators `Arena` and `Malloc` (frees one by one)), `std.hash`, `std.map` (`HashMap`, with `clear`; `OrderedMap`, below), `std.text` (`StrBuf` with `fmt`/`add` and `{}` placeholders over the `Fmt` trait, `Interner`, number parsing/printing), `std.gc` (GC row), `std.gil` (Threads row), `std.rt` (`protect`/`throw`, `catch_panic`, `panic`, `panic_message`, `ValueStack`: a value stack with a high-water mark, so calls need not clear registers; Lox, Scheme and MiniJS use it), and the modules below. Every module is described in [`stdlib.md`](stdlib.md). |
-| `std.num` | Exact numeral parsing with overflow reporting (`parse_int`, `parse_i64`/`parse_u64` in radix 2 to 36, `parse_u64_wrapping`, `parse_f64` via strtod with strict syntax, `parse_number` for literals, `decimal_len`), float formatting (`write_g` for `%.14g`, `write_shortest` and `write_g_shortest` for shortest round-trip by Schubfach, with C's digits at powers of two, `shortest` digits and `write_js` for ECMAScript's Number::toString, `mark_float` for Lua's `3.0`, `write_hex`), `add/sub/mul_overflow`, `floor_div`/`floor_mod`/`trunc_div`/`trunc_rem` with the `MIN / -1` case defined, float `floor_div_f64`/`floor_mod_f64`, `to_i64_exact`. |
-| `std.map.OrderedMap`, `std.dict.Dict` | Insertion-ordered maps in CPython's compact layout (index table plus dense entries with stored hashes, tombstones, compaction): `OrderedMap` in host memory, `Dict` in the GC heap. Entry indices stay stable until a compaction and a `version` counter changes with the key set or layout (for inline caches); `find_with` is a lookup whose equality may fail and run guest code (`uses reenter`) and starts over when the map changed during it, as CPython's does. examples/python's dict is `std.dict.Dict<Value, Value>` (benchmarks 0.97x of its own dict's time). `std.dict.KeyDict` is the same without stored hashes, for keys that cache their own (CPython's str-keys layout; 16-byte entries for `Value` keys); examples/python used it for instance attributes (an instance with 7 attributes 0.84-0.90x of `Dict`'s time) until they moved to inline slots behind shapes (examples/python/FRICTION.md, "Instance layout"). |
-| `std.bigint` | Arbitrary-precision integers with Python's semantics: 64-bit limbs (on the `u64` intrinsics `mul_wide` and `div_wide`), schoolbook (rows two at a time, on the carry-chain intrinsics `add_carry`, `sub_borrow`, `mul_add_wide`), Karatsuba and Toom-3 multiplication and squaring, Knuth and divide-and-conquer (Burnikel-Ziegler) division (floor and truncating), Zimmermann's Karatsuba square root, binary powering, shifts and two's-complement bit operations, correctly rounded `to_f64`, `from_f64`, CPython's int `hash`, parsing and formatting in radix 2 to 36 (divide and conquer above 16 and 512 limbs). Three layers: caller-buffer functions over `Num` views, an owned `BigInt`, and a GC object `Big` (`gc_add(h, Arg, Arg)`, ...). Differential test against CPython in `cargo test`; 2.8-6.4x faster than CPython 3.13 on the stdlib.md benchmarks, 1.3-10x on million-digit conversions and division. Used by examples/python and examples/scheme. No FFT multiplication or subquadratic gcd. |
-| `std.test`, `std.prof` | `loimi test FILE.lm [FILTER..]` runs the file's `#[test]` functions, each under a panic catch, with `#[track_caller]` assertions (`test.eq`, `ok`, `some`, `has`, `panics`, ..) that report the test's line and both values, stdout/stderr capture and golden files (`--update`); `examples/regex/verify_test.lm` and the tutorial's step 9 `unit_test.lm` use it. `std.prof`: monotonic clock and `Timer`, `Bench` (warmup, interleaved rounds, min/median), `Counters`, and the `--vm-stats` op counts read in-program (`prof.op_counts`, with `reset`). |
-| `std.diag` | `Span`, `SourceMap` (borrowed files, lazily built line-start table, binary-searched `line_col`, `line_text`, `write_location`), `Diag` (severity, message, primary span with label, notes and help lines, built with `with_label`/`with_note`/`with_note_at`/`with_help`), `line_span` (for errors that only know a line), rendering with a snippet and carets in the compiler's format (lines over 160 bytes cut to a window around the span), and a `Diagnostics` sink that copies messages into an arena, counts errors and warnings, and prints a summary. |
-| `std.lex` | A scanner toolkit rather than a generator: `Cursor` (peek, bump, line tracking, marks, spans, errors), `Syntax` presets (`lua()`, `c_like()`, `js()`, `none()`) for line, block, nested and Lua long-bracket comments, escape and overflow rules; `skip_trivia`, `ident`, `number` (via std.num), `quoted` (escapes into a `StrBuf`, including `\ddd`, `\xHH`, `\u{..}`, `\z`, line continuation), `long_string`, `OpTable<K>` (maximal munch), `Keywords<K>`. Errors are `lex.Error` (span and message), convertible to a `diag.Diag`. A complete lexer for Mini's token set is about 50 lines (`tests/run/lex_toy.lm`). |
-| `std.parse` | `Pratt<P, K, E, X>`: binding-power table indexed by token kind (`infix_left`, `infix_right`, `infix`, `prefix`) and a driver that calls the user's `peek`, `advance`, `atom`, `unary`, `binary` and optional `before_rhs` hooks through function pointers. `Parser<P: Hooks<K, E, X>, K, E, X>`: the same table and driver with the hooks as methods of the parser state (trait `Hooks`, with defaults for `before_rhs` and `led`). `Ops`: operator definitions changed at run time (Prolog `op/3`: `u64` names, priorities, the seven types, prefix/infix/postfix per name) and a Prolog-style operator-precedence driver (`OpHooks`, `op_parse`, `op_parse_arg`); the Prolog reader uses it. |
-| `std.bc` | Bytecode construction over any vm's generated encoders: `Code<W>` (given `Vm.op_size` and a jump-patch function: `op` reserves inline-cache words, labels with fixups, jump lists, range-checked patching with sticky errors, a run-length position table with per-word expansion and a delta-encoded form, `last`/`truncate` for peepholes, jump threading, branch relaxation into a long-jump form), `Field` (encoded bit fields), `Pool<K: hash.Hash>` (deduplicating constant pool with a limit) and `Regs` (Lua-style locals/temporaries register allocator with maximum tracking). |
-| `std.obj` | Hidden-class objects over a generic `obj.Obj<V>` or the interpreter's own object type: shapes in a transition tree with weak edges (cleared by a sweeper) and never-reused ids, inline and overflow slots, dictionary mode, prototype chains with validity cells, monomorphic cache fill helpers (shape id + SlotRef in two cache words; a hit is two loads, a compare and the slot load), `Poly`, a global `MegaCache` (hits inlined into handlers, and reporting whether the value was own or inherited), allocation templates, per-property attribute bits (`define`, `set_attrs`, `attrs`, `keys_where`; `ic.readonly` keeps write caches off read-only properties). No elements, global property cells or `SetError`. |
-| Examples | Eight interpreters, each tested by `cargo test` (see the README for one line each; [`results.md`](results.md) for benchmarks). `examples/mini/`: a Lua 5.4 subset (single-pass compiler on std.lex, std.parse, std.diag and std.bc; GC'd strings and tables; `table.sort` with Lua comparators through re-entry; coroutines with their own stacks in host memory, switched inside the running vm run (call sites that switched quicken to CALL_RESUME, CALL_WRAP and CALL_YIELD: the switch on the hot path), resumed from natives through a nested run and a `Mini.Resume`, `examples/mini/COROUTINES.md`; threads sharing one heap with `--cfg gil`), embeddable in C (`embed.lm`, natives that call back). `examples/scheme/`: an R7RS-small subset (reader on std.lex and std.num, code generator on std.bc, generational heap). `examples/minijs/`: a JavaScript subset on std.obj (shapes, mono/poly/mega inline caches, prototype validity cells). Written from the docs as usability studies, each with a `FRICTION.md`: `examples/lox/` (all 246 of the book's clox tests), `examples/regex/` (a backtracking regex engine as a C library), `examples/stack/` (Stak, a Forth with declared stack effects), `examples/wasm/` (MVP plus sign extension, saturating conversions, multi-value, reference types, bulk memory and fixed-width SIMD on Loimi's vector types; every spec test file passes, SIMD's 57 included; accumulators, `#[forward]` float supers, constant slots, calls that zero only locals read before written, `p + k` loads and stores, bit-test and load-and-branch fusion, min/max selects as one op; benchmarked also on a held-out set, the 30 PolyBench/C kernels), `examples/python/` (a Python 3 subset: classes, generators, exceptions, ints on `std.bigint`, dicts on `std.dict`; the 11 pyperformance programs in `bench/python` print CPython's output). |
-| Tests | Three tiers (README, "Testing and benchmarking"): `LOIMI_TEST_FAST=1 cargo test --release` (fast, while iterating), `cargo test --release` (default, before every merge), `cargo test --release -- --include-ignored` (heavy, before merging risky changes: `#[ignore = "heavy ..."]` tests). `cargo test`: golden programs (`tests/run/`, every vm test in all three dispatch modes), expected compile errors (`tests/fail/`), `loimi test` (`tests/test/`), every example's tests (Mini, Scheme, MiniJS, Lox, Stak, wasm, Python, the regex library; Mini's, Scheme's and MiniJS's normally, with GC stress, and in verify mode, i.e. generational heap under stress, checking the write barriers at every collection; Lox's and Python's also with GC stress), the tutorial's steps against their chapters (`tutorial_steps`), the README's and `docs/`'s code blocks (`tests/docs.rs`: each compiles, runs or fails as its annotation says), `std.bigint` against CPython, a few seconds of bytecode fuzzing and of GC rooting fuzzing (below), and C hosts built against `--lib` and `--shared` libraries and their generated headers (`tests/embed/`: the C ABI, caught panics of every kind, also through nested vm runs and host callbacks, ASan builds, two `--vm-stats` libraries in one host; embedded Mini with two states, natives calling back, and GC stress; Mini on four threads and with a shared heap, also under TSan when GCC's `libtsan` is installed). Re-entry: `tests/run/vm_reenter.lm` (all three modes, a stack that moves on every callback), Mini's sort and coroutine scripts in all three modes. AArch64: `aarch64_qemu` (above, Targets). |
+| `loimi build`, `loimi run`, `loimi test` | Build; build and run; run `#[test]` functions |
+| `loimi ir-diff A B` | Compare the code of two builds ([below](#comparing-builds-loimi-ir-diff)) |
+| `--release` | Optimized build |
+| `--emit-llvm`, `--keep-ll` | Write the IR instead of an executable; keep the IR next to the output |
+| `--dispatch=tailcall\|goto\|switch` | Dispatch mode |
+| `--sanitize=address`, `--sanitize=thread` | AddressSanitizer, ThreadSanitizer |
+| `--align-functions=N` | Start every function on an N-byte boundary, so unrelated changes don't move vm handlers (steadier A/B benchmarks) |
+| `--no-branch-align` | Drop the default x86-64 padding that keeps every branch of a vm program off 32-byte boundaries (Intel's JCC erratum; [lowering.md §12](lowering.md#12-driver-settings)) |
+| `--max-errors N` | Report at most N errors (default 20, `0` for all) |
+| `-W error`, `--deny-warnings` | Make warnings errors |
+| `--target=`, `--sysroot=`, `--cpu=` | See [Targets](#targets) |
+| `--lib`, `--shared`, `--header`, `--tls=` | See [Libraries and embedding](#libraries-and-embedding) |
+| `--vm-stats`, `--vm-prof` | See [Instrumentation](#instrumentation) |
+| `--explain-values` | Print every `value` type's encoding, then stop |
+| `--gc-check-roots` | Check every GC root ([below](#gc-rooting-fuzzing)) |
+| `--jit-stencils` | See [JIT](#jit) |
+
+### Environment variables
+
+| Variable | What it does |
+|---|---|
+| `LOIMI_STD` | Where the standard library is. Default: a `std/` directory next to the executable or up to three directories above it, else in the current directory |
+| `LOIMI_CLANG`, `LOIMI_AR` | Override `clang-19` and `llvm-ar-19` |
+| `LOIMI_LD`, `LOIMI_OBJCOPY` | Override `ld.lld` and `llvm-objcopy` (used to merge a static library's parts) |
+| `LOIMI_SPLIT=N` | Number of parts a large module is split into; `1` compiles it whole |
+| `LOIMI_SPLIT_REPORT=1` | Time the parts |
+| `LOIMI_ASAN_RUNTIME`, `LOIMI_TSAN_RUNTIME` | A sanitizer runtime to link when clang has none |
+| `LOIMI_BRANCH_ALIGN=0` | Same as `--no-branch-align` (for test suites) |
+| `LOIMI_TARGET`, `LOIMI_SYSROOT` | Defaults for `--target` and `--sysroot` |
+| `LOIMI_CPU` | Default for `--cpu` |
+| `LOIMI_RUNNER` | Run `loimi run` and `loimi test` programs under this command (an emulator) |
+| `LOIMI_LIFETIMES=off` | Turn off the pointer stability check for a build |
+| `LOIMI_DUMP_VM_EXPANSION=1` | Print each vm's expansion |
+
+### Errors
+
+A build reports every independent error it finds, not only the first:
+in source order, each place once, at most `--max-errors N`, then
+`error: N errors`.
+
+These passes go on past an error:
+
+- Checking function bodies: each body, each generic instance (which
+  reports only its first error) and each statement. This covers type
+  errors, name resolution inside bodies, effects and unsafe operations.
+- In a `vm`: each op handler, super, `-> never` and plain vm function,
+  entry, `on raise` and variant `before` block.
+- The write-barrier (`objref`) and lifetimes checks. They run only on a
+  program that type-checked, and report the first error of each
+  function.
+
+A statement that fails is left out, and what it binds is *poisoned*
+(type `never`). Errors in later statements that read it, or in an
+enclosing statement, are not reported, so one bad expression gives one
+error. An error in the condition of an `if` or `while`, or in the
+scrutinee of a `match`, doesn't stop its branches from being checked.
+
+These stop at their first error, because later passes depend on them:
+
+- parsing and `vm` expansion;
+- imports, type definitions, signatures, impls, module-level `var`
+  initializers;
+- a vm's declarations (state, operands, formats, caches).
+
+The checks of a vm as a whole (constant operands written, `pc` writes,
+`collects`, shared continuations) are skipped in a vm with an error in
+a body.
+
+### Warnings
+
+Silence a warning with `#[allow(name)]` on an item, vm item or match
+arm, or with `#![allow(name)]` for a file.
+
+| Warning | On by default | Reports |
+|---|---|---|
+| `match_fallout` | yes | in vm code, an arm whose body is an `if` without `else` when a later arm could match |
+| `super_overlap` | yes | declared supers where a proper suffix of one is a proper prefix of another |
+| `unreachable_arm` | yes | a `match` arm after one that matches everything |
+| `value_layout` | yes | an unpinned `value` variant that a non-classic layout narrows |
+| `next_pc_then` | yes | `next_pc` in an op with `then` |
+| `state_registers` | yes | a tail-call vm whose state needs more `preserve_none` argument registers than the target has |
+| `hot_gc` | no (`-W hot_gc`) | a call that may collect on a handler's hot path |
+| `handler_frame` | no (`-W handler_frame`) | a tail-call handler whose fast path sets up a stack frame, with the calls that cause it (read from the assembly) |
+| `redo_effect` | an error unless allowed | an effect before a `redo` (`language.md` §4) |
+
+The retired `state_root` is still accepted by `#[allow]`.
+
+## Targets
+
+- **x86-64 Linux**, native.
+- **AArch64 Linux** with `--target=aarch64-linux-gnu [--sysroot=DIR]`:
+  clang's `--target`, linked with `ld.lld`.
+
+The IR is the same for both targets except for:
+
+- a few vector operations (see [Vectors](#vectors));
+- `std.rt`'s handlers: LLVM's builtin setjmp on x86-64, glibc's
+  `_setjmp` on AArch64;
+- tail-call vms: AArch64 keeps the dispatch table's address in a state
+  register instead of an `adrp`+`add` per dispatch; x86-64 indexes the
+  table as an absolute address ([lowering.md §3](lowering.md#3-handlers-in-tailcall-mode)).
+
+**CPU level.** Code is for the target's baseline (x86-64: SSE2) unless
+`--cpu=NAME` (or `LOIMI_CPU`) names a CPU. The name goes to clang as
+`-march` (x86-64) or `-mcpu` (AArch64) for every clang run of the
+build, stencils and C runtimes included. The CPU's extensions, read
+from clang's predefined macros, choose Loimi's own vector lowering, so
+`native` and any name clang knows work; an unknown name is an error.
+Interpreters gain nothing measurable from `x86-64-v3` (within noise on
+Stak, Lox, Scheme, Mini and the wasm benchmarks).
+
+**Testing AArch64.** It runs under qemu user mode
+(`bench/cross/install.sh` installs qemu and a Debian arm64 sysroot from
+pinned sources):
+
+- The whole golden suite passes cross-compiled (`LOIMI_TARGET`): all
+  dispatch modes, GC stress and verify, C hosts, `rt` panics.
+- The heavy test tier runs a subset under qemu (`aarch64_qemu`,
+  `vm_prof_stress_aarch64`) when the toolchain is installed.
+
+**Limits.**
+
+- AArch64 has not been run on hardware or with 16K/64K pages.
+- The JIT (x86-64 only) and `--sanitize` don't combine with `--target`.
+
+## Language
+
+`language.md` §1 describes the language as built; where it departs from
+the original design is listed in
+[Differences from the design](#differences-from-the-design). The notes
+below are limits and implementation details that the reference doesn't
+spell out.
+
+### Core language
+
+- Arbitrary-width integers `iN`/`uN` for N from 1 to 64. Overflow traps
+  in debug builds; casts from integers to fieldless enums are checked in
+  debug builds.
+- `match` checks exhaustiveness. String literal patterns compile to a
+  length switch, then word-sized compares.
+- Float built-ins (`sqrt`, `floor`, `minimum`, ...) are each an LLVM
+  intrinsic.
+- `..zero` in a struct literal works only for fields where zero is
+  valid: numbers, `bool`, options, slices and raw pointers. Not for
+  `Gc<T>`, functions, structs, enums or values.
+- The compiler gives hints for operators Loimi lacks (`++`, `**`, `?:`,
+  `===`).
+
+### Globals
+
+- Module-level `var`s are plain LLVM globals. `#[thread_local]` gives
+  one copy per thread (`thread_local(initialexec)`).
+- The initializer must be a constant expression: literals, consts,
+  `[x; N]`, struct, tuple and array literals, payload-less enum
+  variants, `None`/`Some`/`Ok`/`Err` of constants, and functions.
+- Globals are not GC roots. A global holding a `Gc` or `value` must be
+  marked by a root scanner (`heap.add_scanner`).
+
+### Generics and traits
+
+- Generics are monomorphized; dispatch is static only.
+- Bounds are checked at instantiation, with the error at the use site.
+  Generic bodies are checked against their bounds; unbounded parameters
+  stay duck-typed.
+- Explicit type arguments on calls (`mem.alloc<u8>(n)`, `c.op<K>(&ops)`)
+  can give only a method's own type parameters, not a generic type's:
+  `Vec.new<T>` doesn't work.
+- `f<T>(` is read as type arguments only when `<` directly follows the
+  name and a balanced, type-shaped `<...>` is followed by `(`.
+  Otherwise `<` is a comparison.
+
+### Closures
+
+- `block fn` closures are lowered to a separate function plus an
+  environment of pointers to slots in the enclosing frame (small `let`s
+  are copied in). Code and environment are passed as two arguments, so
+  LLVM can specialize a callee for a closure literal. Plain functions
+  convert through a trampoline.
+- `block fn` closures can't be created in vm code. Escaping closures
+  (`closure fn`, `Gc<closure fn>`) can be called in vm code but not
+  created, and don't cross into C.
+- `c.free(a)` frees nothing for closures that own no memory (it compares
+  the code with the signature's trampoline). Use after free is not
+  detected (ASan does detect it), and freeing doesn't free what captures
+  point to.
+
+### Vectors
+
+- The 128-bit types are LLVM `<N x T>` vectors. Vector loads and stores
+  assume no alignment.
+- The baseline is SSE2 and NEON. The IR differs by target for
+  `swizzle` (`tbl` on AArch64), signed `narrow_sat` (`sqxtn`/`sqxtun`),
+  `f32x4` to integer conversions (`cvttps2dq` on x86-64) and float
+  rounding (inline SSE2 on x86-64, no libm calls).
+- With `--cpu`, `swizzle` becomes `pshufb` (SSSE3) and the rounding
+  methods `roundps`/`roundpd` (SSE4.1). [lowering.md §12](lowering.md#12-driver-settings)
+  has instruction counts per level.
+- `--header` signatures don't take vector types.
+
+### `value` types
+
+- `nanbox`, `lowtag` and `boxed` representations, and `nanbox(int_high)`
+  (words rotated left by 16; examples/python uses it, 0.93–0.94 of the
+  plain nanbox's time).
+- Integer payloads up to 48 bits (nanbox) or 61 bits (lowtag). Lowtag
+  uses 3-bit primary tags.
+- Tuple patterns over values merge into one test (xor/or/mask, `umax`).
+- The layout is described in [lowering.md §2](lowering.md#2-values-nanbox-lowtag-boxed);
+  `loimi build --explain-values` prints it for a program.
+
+### Conditional compilation and atomics
+
+- `#[cfg]` items are dropped by the parser: a build without the name
+  has the same IR as one without the code.
+- Atomics work on 8- to 64-bit integers and pointers (`atomic_add` not
+  on pointers).
+
+## `vm` declarations
+
+`language.md` §3–§9 describes the vm features as built; all of them
+work in all three dispatch modes. Some details:
+
+- Operand fields decode to `u64` / `i64` in handlers and verify
+  clauses, whatever their width.
+- Inline cache fields wider than a code word span several words, with
+  unaligned access. Caches can't hold GC references.
+- `#[forward]` supers on all three larger interpreters: 0.97–0.99 of
+  their time by geometric mean, up to 0.92 on float loops.
+  Accumulators: the wasm interpreter runs in 0.91 of its time.
+- Nested entries (`uses reenter`) keep a generated thread-local
+  `Vm.depth` count.
+
+### Dispatch
+
+- **`tailcall`**: `preserve_none` and `musttail`, with the instruction
+  word passed in a register. Handlers are compiled without
+  memset/memcpy/memmove formation, and loops in tail-call vm code are
+  not vectorized or unrolled, so no loop gives a handler a stack frame.
+- **`goto`**: one function. A shared `indirectbr` block that LLVM copies
+  into every handler after register allocation keeps compile time near
+  linear in the op count ([lowering.md §5](lowering.md#5-goto-mode)).
+- **`switch`**: one function with a `switch`.
+
+### Generated per vm
+
+The compiler generates these items for each vm:
+
+- encoders (`Vm.OP(..)`), emitters (`Vm.emit.OP(..)`), opcode
+  constants, `op_size`, `op_name`, `Vm.Op` and `Vm.op_of(w)`;
+- the superinstruction peephole (`Vm.optimize`) and deoptimization
+  (`Vm.deopt`);
+- the verifier (`Vm.verify`), the proof type `Verified<Vm>`,
+  `Vm.build_verified` and resume points (`Vm.Resume`);
+- stack effect queries for stack vms (`v.max_stack()`,
+  `Vm.stack_effect(w)`);
+- label helpers, per-format field readers, setters and encoders, and
+  per-op operand metadata;
+- the disassembler (`Vm.disasm`, `Vm.disasm_insn`).
+
+Setters and encoders are compiled only where called, and resume points
+only for programs that name them.
+
+The items are named `Vm__X` in the vm's module, so an op named like one
+of them (`label`, `verify`) is an error, as is a module item named
+`Vm__..`. Item and operand names starting with `__` are reserved.
+
+## Instrumentation
+
+- **Variants**: `variant NAME wraps all|[OPS] { before { .. } }`,
+  switched from vm code with `use_variant`. `#[unfused]` variants run
+  supers as their parts, so every instruction is wrapped.
+- **Counts**: `loimi build --vm-stats` counts executed ops, adjacent op
+  pairs, sequences of 3 and 4, entries into each `cold` block and every
+  `become` per site. At exit it prints the counts, with frequent pairs
+  and sequences as `super` declarations. `Vm.optimize` picks fusions by
+  dynamic programming (most dispatches saved).
+- **Time**: `loimi build --vm-prof` links a sampling profiler
+  (`src/prof_rt.c`, a `SIGPROF` timer at 1000 Hz, `LOIMI_PROF_*`
+  settings). At exit it prints samples per op handler and cold block,
+  per function, by vm location on the stack and by guest `pc`. It
+  works in all dispatch modes, under `--jit-stencils`, in libraries
+  and on both targets, without external tools. Cost: 3% on Mini and
+  Python in tail-call mode, 8% for Mini in goto mode
+  (`language.md` §7.3).
+
+## Debugging guest programs (prototype)
+
+- **Breakpoints**: `on break { .. }` generates breakpoint ops, one per
+  inline cache layout, so a breakpoint has the size of the instruction
+  it replaces. `Vm.set_break` works on verified code and splits a super
+  spanning the word. Code with breakpoints doesn't verify; `deopt` keeps
+  them.
+- **`std.debug`**: breakpoint sites with step-over, line stepping
+  (`step`/`next`/`finish`), conditions, hit conditions, pause requests
+  and a command reader.
+- **Mini** built with `--cfg debug`: `mini --debug script < commands`,
+  with break, step, next, finish, bt, locals, print and more.
+- **Python subset** built with `--cfg debug`: `python-loimi --debug
+  prog.py`, pdb-like.
+- **For editors** (Mini, `--cfg debug`): a stop-callback C API
+  (`mini_debug_*` in `embed.lm`) and a Debug Adapter Protocol server in
+  C with no dependencies (`examples/mini/dap/mini_dap.c`).
+- Default builds are unchanged (byte-identical IR). Debug builds run
+  within noise of default ones when not debugging.
+- Tests: golden transcripts of both debuggers and of a scripted DAP
+  session, in all three dispatch modes; a C host tests the API under GC
+  stress.
+
+**Limits**: breakpoints work in interpreted code, not under
+`--jit-stencils` or in stack vms. Design and protocol details are in
+[`design/debugging.md`](design/debugging.md).
+
+## GC
+
+- `std.gc` is a mark-sweep collector written in Loimi, without a sweep:
+  marking sets per-chunk bitmaps (a bit per 16-byte granule), and each
+  size class bump-allocates through the runs of clear bits, so dead
+  objects are never read. Chunks with nothing marked go to a shared
+  pool.
+- The compiler generates tracing, including pointers inside values.
+- Roots are shadow-stack frames for traced locals, and for vm state
+  variables of traced types, copied into the frame at each call that
+  may collect. `sync` blocks and root scanners don't need to know them.
+- Collection happens only in calls marked `uses gc` (see
+  [Differences](#differences-from-the-design)).
+- **Generational mode** (`heap.set_generational`, on in Mini, MiniJS
+  and Scheme): non-moving, sticky mark bits with an epoch flip per major
+  collection, aging for large objects. The compiler emits an
+  object-logging write barrier after every store of a reference into an
+  object (none for values statically free of references). Its slow
+  path makes no call, so it gives handlers no stack frame.
+- Also built: weak references, ephemeron tables, weak intern tables,
+  `#[trace(f)]` hooks, free hooks, dirty pinning, and verify mode
+  (checks the write barriers at every collection). See
+  [`stdlib/gc.md`](stdlib/gc.md).
+
+**Limits**: the heap never moves objects ([roadmap, question 2](roadmap.md)).
+There is no card marking: a large array that is stored into is retraced
+whole by each minor collection. Small objects are promoted at their
+first survival. Free hooks can't run guest code or allocate.
+
+## Threads
+
+**Independent states** on different threads run concurrently with no
+locks:
+
+- The runtime's per-thread state (shadow-stack top, `Vm.depth`, vm
+  scratch slots, `std.rt`'s handler chain and panic message, the
+  `#[track_caller]` location) is initial-exec TLS (local-dynamic in
+  `--shared` builds). This costs nothing measurable over plain globals.
+- `std.gc` keeps everything in its `Heap`; it has no globals.
+- A state may move between threads with a synchronized hand-over.
+- Several states on one thread may nest (a native of B runs A). Each
+  collector's shadow-stack walk marks only its own heap's objects.
+
+**A shared heap, one thread at a time** (opt-in): `std.gil` is a lock
+per heap, handed over first-come-first-served at points the interpreter
+polls. Mini built with `--cfg gil` (`examples/mini/threads.lm`) runs one
+Mini thread per OS thread over shared globals and code. Cost
+single-threaded: 1.2–1.4% geometric mean on Mini (worst 4–5%); default
+builds are unchanged.
+
+**Tests**: `examples/embed/threads.c` (four states on four threads) and
+`examples/embed/shared.c` (four threads on one heap) under GC stress,
+both clean under ThreadSanitizer (`--sanitize=thread`, which links
+GCC's `libtsan`).
+
+**Limits**:
+
+- No free threading (several threads running vm code in one heap at
+  once; [roadmap, question 4](roadmap.md)).
+- Not thread-safe: plain module-level `var`s, `--vm-stats` counters,
+  the `--jit-stencils` JIT.
+
+## Libraries and embedding
+
+- `loimi build --lib` builds a static archive of `-fPIC` code;
+  `--shared` builds a shared object. Neither has a `main`, and there is
+  no init function. `export "C"` functions are the API.
+- `--header out.h` writes a C header for them, `extern "C"`-guarded for
+  C++. Types that don't map to C are rejected with the reason.
+- `--tls=initial-exec|local-dynamic|global-dynamic` overrides the model
+  of the runtime's thread-locals.
+- `#[catch_panic(v)]` on an export turns panics into an error return
+  instead of aborting the host. An `rt.panic` message is copied, up to
+  512 bytes.
+- `--sanitize=address` and `--vm-stats` work for libraries; several
+  `--vm-stats` libraries can link into one host.
+- `examples/mini/embed.lm` makes Mini a library and
+  `examples/embed/host.c` uses it. C natives can call back into Mini as
+  nested runs. A panic returns `MiniStatus_Internal` and poisons only
+  that state.
+
+Details are in `language.md` §10.1.
+
+## JIT
+
+`loimi build --jit-stencils` adds a copy-and-patch JIT generated from
+the vm's handlers. It is turned on at run time with `LOIMI_JIT=1`.
+
+- Stencils are read back from clang's object file (`src/elf.rs`); the
+  runtime is `src/jit_rt.c`.
+- It runs Mini, MiniJS, Scheme and Prolog, in 0.76, 0.83, 0.78 and 0.94
+  of their interpreters' time by geometric mean (2026-11-07,
+  [`results.md`](results.md)). With the JIT off, a JIT build runs as
+  fast as a default one.
+- Quickening re-patches compiled code instead of dropping it.
+- A `jump` to a computed pc that is not a label enters the target's
+  compiled code, or the interpreter there.
+- `const` operands are patched into the code, with stencil variants per
+  constant tag.
+- Builds also take `--sanitize=address` and `--gc-check-roots`.
+
+**Limits**: x86-64 Linux executables only, tail-call dispatch, one vm,
+no variants, no breakpoints. There is no trace compiler; why the
+template JIT stops here is in [roadmap, question 6](roadmap.md). Design:
+[`design/copy-and-patch.md`](design/copy-and-patch.md).
+
+## Standard library
+
+Every module is described in [`stdlib.md`](stdlib.md).
+
+| Module | Contents |
+|---|---|
+| `std.io`, `std.os` | Printing, buffered output (`Out`), reading files, program arguments |
+| `std.mem` | `Vec` (with stable `sort_by`), byte search on slices, allocators `Arena` and `Malloc` |
+| `std.hash`, `std.map` | Hashing; `HashMap` and the insertion-ordered `OrderedMap` |
+| `std.dict` | Insertion-ordered maps in the GC heap, in CPython's compact layout (`Dict`, `KeyDict`) |
+| `std.text` | `StrBuf` with `{}` formatting, `Interner`, number parsing and printing |
+| `std.math` | `Divisor`: division by a prepared constant |
+| `std.num` | Exact number parsing, shortest round-trip float formatting (Schubfach), checked and floor division |
+| `std.bigint` | Arbitrary-precision integers with Python's semantics; 2.8–6.4x faster than CPython 3.13 on the stdlib.md benchmarks |
+| `std.gc` | The collector ([GC](#gc)) |
+| `std.gil` | A lock per heap ([Threads](#threads)) |
+| `std.rt` | `protect`/`throw`, `catch_panic`, panics, `ValueStack` |
+| `std.test`, `std.prof` | `loimi test` assertions and golden files; clock, benchmarking, in-program op counts |
+| `std.diag` | Source maps and diagnostics rendered in the compiler's format |
+| `std.lex` | A scanner toolkit (cursor, comment and escape presets, maximal-munch operators) |
+| `std.parse` | Pratt parsers, and run-time operator tables for Prolog |
+| `std.bc` | Bytecode construction over a vm's encoders: labels, fixups, constant pools, a register allocator |
+| `std.obj` | Hidden-class objects with shapes, inline caches and prototype chains |
+| `std.debug` | Breakpoints and stepping ([Debugging](#debugging-guest-programs-prototype)) |
+
+Limits:
+
+- `std.num` parses floats with strtod and formats `%.14g` with
+  snprintf.
+- `std.bigint` has no FFT multiplication or subquadratic gcd.
+- `std.obj` has no elements, global property cells or `SetError`. Keys
+  are u64 symbol ids. Shape ids are never reused, so inline caches need
+  no reset after a collection ([`stdlib/obj.md`](stdlib/obj.md#as-implemented)).
+
+## Examples
+
+Nine interpreters, each tested by `cargo test`. The README has one
+line on each; benchmarks are in [`results.md`](results.md).
+
+| Directory | Language | Notes |
+|---|---|---|
+| `examples/mini/` | A Lua 5.4 subset | Coroutines switched inside the running vm (`COROUTINES.md`), threads with `--cfg gil`, embeddable in C, a debugger |
+| `examples/scheme/` | An R7RS-small subset | Generational heap |
+| `examples/minijs/` | A JavaScript subset | Built on `std.obj`: shapes, mono/poly/mega inline caches |
+| `examples/lox/` | Lox | All 246 of the book's clox tests |
+| `examples/regex/` | A backtracking regex engine | A C library |
+| `examples/stack/` | Stak, a Forth | Declared stack effects |
+| `examples/wasm/` | WebAssembly MVP plus SIMD and other extensions | Every spec test file passes; also benchmarked on PolyBench/C |
+| `examples/python/` | A Python 3 subset | Ints on `std.bigint`, dicts on `std.dict`; the 11 pyperformance programs in `bench/python` print CPython's output |
+| `examples/prolog/` | An ISO Prolog subset on a WAM | |
+
+Lox, regex, Stak, wasm, Python and Prolog were written from the docs as
+usability studies; each has a `FRICTION.md`.
+
+## Tests
+
+The three test tiers and how to run them are in the README
+("Testing and benchmarking"). `cargo test` covers:
+
+- golden programs (`tests/run/`, every vm test in all three dispatch
+  modes), expected compile errors (`tests/fail/`) and `loimi test`
+  files (`tests/test/`);
+- every example's tests. Mini, Scheme and MiniJS also run with GC
+  stress and in verify mode; Lox and Python with GC stress;
+- the tutorial's steps against their chapters, and the code blocks in
+  the README and `docs/` (`tests/docs.rs`);
+- `std.bigint` against CPython;
+- a few seconds each of [bytecode fuzzing](#bytecode-fuzzing) and
+  [GC rooting fuzzing](#gc-rooting-fuzzing);
+- C hosts against `--lib` and `--shared` builds and their headers
+  (`tests/embed/`): caught panics, nested runs, ASan, threads and
+  TSan;
+- re-entry: `tests/run/vm_reenter.lm` (a stack that moves on every
+  callback) and Mini's sort and coroutine scripts, in all three modes.
 
 ## Bytecode fuzzing
 
-`tests/fuzz/run.sh` builds bytecode fuzzers, which check that verified code does not crash, with `--sanitize=address`
-and runs them for a time or seed budget, saving failing seeds:
+`tests/fuzz/run.sh` builds fuzzers that check that verified code
+doesn't crash. It builds them with `--sanitize=address`, runs them for a
+time or seed budget, and saves failing seeds. There are two:
 
-- `tests/fuzz/fuzzvm.lm`: a test vm using every verifier feature
-  (register, constant and context-indexed operands, labels of three
-  widths, a call operand checked with `is_insn_boundary`, two verify
-  contexts, inline caches, families with `become`/`redo`, supers with up to
-  four parts and family-member parts, `then JMP`, `-> never` vm functions,
-  cold blocks, variants), declared once per dispatch mode. Random programs
-  (mostly well-formed, some mutated, some random words) are verified and,
-  if they pass, run in all three modes with exactly-sized heap buffers and
-  a step budget. Besides crashes it checks that the modes agree and that
-  code still verifies after running (quickening) and after `Vm.optimize`.
-- `tests/fuzz/minifuzz.lm`: random code against Mini's own `verify`
+- **`tests/fuzz/fuzzvm.lm`**: a test vm that uses every verifier feature
+  (operand kinds of every sort, labels of three widths, verify contexts,
+  inline caches, families, supers, `then`, `-> never` functions, cold
+  blocks, variants), declared once per dispatch mode. Random programs
+  (mostly well-formed, some mutated, some random words) are verified
+  and, if they pass, run in all three modes with exactly-sized heap
+  buffers and a step budget. The fuzzer checks that the modes agree,
+  and that code still verifies after running (quickening) and after
+  `Vm.optimize`.
+- **`tests/fuzz/minifuzz.lm`**: random code against Mini's own `verify`
   clauses and `Mini.run`, on a stack exactly as large as the frame.
 
-ASan works in all three dispatch modes. `--sanitize=address` turns off
-use-after-return detection: its fake-stack fallback is a dynamic alloca,
-which LLVM cannot combine with stack realignment in `preserve_none`
-functions, so tail-call builds would not compile. `musttail` survives the
-instrumentation. ASan executables do not report leaks (programs leave their heaps
-to the OS); `ASAN_OPTIONS=detect_leaks=1` turns leak checking on.
+`cargo test` runs a few seconds of both without ASan. The longest run
+so far was 2 h 10 min under ASan (2026-11-02): 149M test-vm programs
+and 11.6M Mini programs. The bugs it found have regression tests in
+`tests/run/vm_verify_*.lm`; the holes it found in Mini's verify clauses
+are checked by `tests/fuzz/mini_holes.lm`.
 
-**Run so far: 2 h 10 min** under ASan (2026-11-02), before and after the
-n-ary supers / `then` changes, 20 minutes of it on the final verifier:
-149M test-vm programs (55M verified and run in all three modes) and 11.6M
-Mini programs (3.0M run), in debug and `--release` builds. `cargo test` runs a few seconds of both
-without ASan.
+**ASan notes.** ASan works in all three dispatch modes.
 
-Bugs found and fixed (regression tests in `tests/run/vm_verify_*.lm`):
-
-- Verified code could run off its end: a last instruction using `next`
-  read past the buffer, and empty code verified. The verifier now rejects
-  both (see `language.md` §6). It also missed ops that save `next_pc`
-  without naming `pc` or `next` (Lox's calls): code ending in one passed,
-  and the callee's return would run past the end. Found while adding
-  resume points (2026-11-03; `tests/run/vm_resume_point.lm`).
-- Before the n-ary super rewrite: a super's later words were checked only
-  as the declared part's operands, so after the first part quickened they
-  ran as unverified instructions; and `Vm.optimize` produced overlapping
-  supers that failed verification.
-- Found by review while fuzzing: `verify` clauses are pasted into the
-  generated verifier, whose locals shadowed verify contexts of the same
-  name (`verify_context w: u32` compared with the instruction word).
-
-Holes in Mini's verify clauses (`examples/mini/vm.lm`), now fixed:
-CALL's `nres` let the callee's return write past the stack; SETLIST's,
-RETN's and CONCAT's counts (and CALL's argument count) read past the
-frame; CONCAT with fewer than 2 values and GETINDEXI with index 0
-underflowed; SELF wrote `R[a+1]` with only `a < nregs` checked. Each
-count now has its own operand kind whose `verify` clause reads the base
-register from the instruction word (`Mini.ABC_a(*pc) + it <= nregs`);
-the kinds decode to the plain field, so handlers are unchanged.
-`tests/fuzz/mini_holes.lm` checks that all nine reproducers are
-rejected (run by `cargo test`).
+- `--sanitize=address` turns off use-after-return detection. Its
+  fake-stack fallback is a dynamic alloca, which LLVM can't combine with
+  stack realignment in `preserve_none` functions, so tail-call builds
+  wouldn't compile.
+- ASan executables don't report leaks, since programs leave their heaps
+  to the OS. `ASAN_OPTIONS=detect_leaks=1` turns leak checking on.
 
 ## Comparing builds: `loimi ir-diff`
 
-A refactor of an interpreter should not change its code, but moving a
-line changes the release IR: panic messages carry `file:line:col`.
-`loimi ir-diff A B` says whether two builds have the same code,
-function by function:
+A refactor of an interpreter shouldn't change its code, but moving a
+line changes the release IR, because panic messages carry
+`file:line:col`. `loimi ir-diff A B` says whether two builds have the
+same code, function by function:
 
     loimi ir-diff old/examples/scheme/main.lm examples/scheme/main.lm --release --asm
     loimi build main.lm --release --emit-llvm -o a.ll    # or two .ll files, from any compiler
     loimi ir-diff a.ll b.ll --release
 
-- **Inputs.** Each of A and B is a program (`.lm`, built here with the
-  build options given: `--release`, `--dispatch=`, `--cfg`, `--cpu`,
-  ...) or a `.ll` file from `loimi build --emit-llvm`. Both go through
-  clang with the options `loimi build` uses (`-O3` with `--release`,
-  the vm's LLVM options), to optimized IR and, with `--asm`, to
-  assembly. A `.ll` file from `loimi build --emit-llvm` names the LLVM
-  options of its build on its first line (`; loimi-llvm-args: ..`), so
-  the outputs of two compilers compare exactly in every dispatch mode
-  (and the interpreter of a `--jit-stencils` build, which `.lm` inputs
-  do not support);
-  a `.ll` without that line (an older compiler's) gets the goto
-  options if it has an `indirectbr`, and no others.
-- **What it ignores.** Source locations in string constants
-  (`dir/vm.lm:120:7: index out of bounds` becomes `vm.lm:L:C`, so the
-  same file in two trees compares equal) and the message lengths passed
-  next to them (`@loimi.panic(ptr @s, i64 141)`; in assembly the `$141`
-  next to the string's address); the names of private and internal
-  constants (`@.str.12`, LLVM's switch tables, an unchanged table under
-  a new name: each is renamed after its normalized contents); local
-  value and label names (numbered in order of appearance; in assembly
-  `.LBB3_7`, `.Ltmp2`); comments, `!dbg` attachments and the numbering
-  of attribute groups and metadata (resolved to their contents);
-  constant pools (`.LCPI0_1`, inlined); the program-wide numbering of
-  outlined cold blocks (`vm.Py.op.BOR.cold132`, and the capture slots
-  named after them, become `vm.Py.op.BOR.cold#0`, numbered per
-  handler, so a cold block added to one op does not rename every later
-  one); and the order of functions.
-  Functions on one side only are paired when their normalized bodies
-  are equal (a renamed function), and calls to them compare equal.
-- **Output.** A summary per form (`IR: 511 functions in A, 511 in B:
-  509 same, 0 renamed, 2 differ, 0 only in A, 0 only in B`), the names
-  of the functions that differ, and a unified diff of each
-  (`--context=N`, `--max-lines=N`, 0 for all). `--keep=DIR` keeps the
-  optimized IR, the assembly and their normalized forms. The exit status
-  is 0 when every function has the same code, 1 otherwise, 2 on
-  errors.
-- **Limits.** A location string merged by LLVM into a `phi` or a
-  switch table of lengths is not recognized, and shows as a
-  difference. Global data other than constants (initialized `var`s
-  that are written) is compared by name only, through the code that
-  uses it.
+**Inputs.** A and B are each a program (`.lm`, built with the build
+options given) or a `.ll` file from `loimi build --emit-llvm`. Both go
+through clang with the options `loimi build` uses, to optimized IR and,
+with `--asm`, to assembly.
 
-An excerpt of a real diff (Scheme's `enum Prim` port, language.md
-section 1.2, "Variant names and data"): every vm handler is the same,
-and the arity lookup in `call_native` has a different `phi` layout:
+A `.ll` file names the LLVM options of its build on its first line
+(`; loimi-llvm-args: ..`), so the outputs of two compilers compare
+exactly in every dispatch mode. This also covers the interpreter of a
+`--jit-stencils` build, which `.lm` inputs don't support. A `.ll`
+without that line gets the goto options if it has an `indirectbr`, and
+no others.
+
+**What it ignores:**
+
+- source locations in string constants (`dir/vm.lm:120:7:` becomes
+  `vm.lm:L:C`, so the same file in two trees compares equal), and the
+  message lengths passed next to them;
+- names of private and internal constants (`@.str.12`, switch tables),
+  which are renamed after their contents;
+- local value and label names, which are renumbered in order of
+  appearance;
+- comments, `!dbg` attachments, and the numbering of attribute groups
+  and metadata;
+- constant pools (`.LCPI0_1`), which are inlined;
+- the program-wide numbering of outlined cold blocks
+  (`vm.Py.op.BOR.cold132` becomes `vm.Py.op.BOR.cold#0`, numbered per
+  handler, so a cold block added to one op doesn't rename every later
+  one);
+- the order of functions.
+
+Functions on one side only are paired when their normalized bodies are
+equal (a rename), and calls to them compare equal.
+
+**Output.** A summary per form, the names of the functions that
+differ, and a unified diff of each. The exit status is 0 when every
+function has the same code, 1 otherwise, 2 on errors. For example
+(Scheme's `enum Prim` port: every vm handler is the same):
 
     IR: 511 functions in A, 510 in B: 507 same, 0 renamed, 3 differ, 1 only in A, 0 only in B
       only in A: compile.inline_prim (198 lines)
@@ -162,211 +622,154 @@ and the arity lookup in `call_native` has a different `phi` layout:
       differs: compile.Comp.build_inner (2455 lines in A, 2791 in B)
       differs: compile.Comp.inl (607 lines in A, 809 in B)
 
+| Option | What it does |
+|---|---|
+| `--asm` | Compare the assembly too |
+| `--context=N` | Lines of context in each diff |
+| `--max-lines=N` | Lines per diff, `0` for all |
+| `--keep=DIR` | Keep the optimized IR, the assembly and their normalized forms |
+
+**Limits.**
+
+- A location string that LLVM merges into a `phi` or a switch table of
+  lengths is not recognized, and shows as a difference.
+- Global data other than constants (initialized `var`s that are
+  written) is compared by name only, through the code that uses it.
+
 ## GC rooting fuzzing
 
 `loimi build --gc-check-roots` makes the collector check every
-reference it marks (shadow-stack roots, copies of vm state, `gc_mark`
-in scanners, traced fields) before reading its header, fills unassigned
-traced slots and freed objects with 0x01 bytes, and reports a bad root
-with its frame, function, call site and slot (lowering.md §9).
+reference it marks before reading its header: shadow-stack roots,
+copies of vm state, `gc_mark` in scanners and traced fields. It also
+fills unassigned traced slots and freed objects with 0x01 bytes. A bad
+root is reported with its frame, function, call site and slot
+(lowering.md §9).
+
 `tests/fuzz/rootgen.rs` generates random programs that mix traced
-locals (`Gc`, options, a struct, a tuple, an enum, a nanbox `value`, an
-array) with every binding form (`let`/`var`, `let .. else` (also `else
-cold`), `if let` chains, `while let`, `match` with guards that collect
-and fail, or-patterns and tuple patterns, `for`, `loop` with `break`
-values, `defer`, closures), early exits, stores, and calls that collect,
-in plain functions and in a vm's handlers, `cold` blocks, vm functions
-and `on raise`. Each is built in this mode and run without collections,
-under GC stress, and under generational stress with verify; the outputs
-(digests that read through every reference) must agree across runs and
-dispatch modes, and objects only out-of-scope locals reached must be
-gone after a full collection (`Weak` probes). It keeps to what the
-language promises: no traced temporary is held across a call that may
-collect.
+locals with every binding form, early exits, stores and calls that
+collect, in plain functions and in vm code. Each program is built in
+this mode and run three ways: without collections, under GC stress, and
+under generational stress with verify. The fuzzer checks that:
+
+- the outputs (digests that read through every reference) agree across
+  runs and dispatch modes;
+- objects reached only by out-of-scope locals are gone after a full
+  collection.
+
+It keeps to what the language promises: no traced temporary is held
+across a call that may collect.
 
     cargo test --release --test fuzz fuzz_gc_roots       # smoke: 18 fixed seeds, ~20 s
     ROOTFUZZ_SECS=300 ROOTFUZZ_JOBS=2 ROOTFUZZ_FIRST=1000 \
       cargo test --release --test fuzz fuzz_gc_roots_long -- --ignored --nocapture
     ROOTFUZZ_SEEDS=17,42 ROOTFUZZ_KEEP=1 ...              # rerun seeds, keep target/rootfuzz/roots-SEED.lm
 
-(`ROOTFUZZ_PLAIN=1` builds without `--gc-check-roots`.) Seeded bugs,
-detected by the 18 smoke seeds with the checks (without):
-let-else bindings rooted in the else block (the bug of commit 334d6cc)
-18 (16); a match arm's bindings not rooted 10 (2); a block's locals
-rooted after their scope 18 (18, as leaks); `if let` bindings rooted
-in the else branch 14 (13); a match scrutinee not rooted during guards
-(the bug below) 5 (0).
-
-**Run so far: 14 minutes** (2026-11-03), 535 programs, each in
-three dispatch modes and three GC settings. Found and fixed: a `match`
-guard that collects ran with a temporary scrutinee (`match f() {..}`)
-unrooted, so arms after a failing guard bound freed objects; in vm
-code also with the earlier fix, since a call there is a vm node
-(`tests/run/gc_roots_match_guard.lm`). Found: LLVM 19
-crashed in `LoopSimplifyCFG` (at `-O1` and `-O3`) on the goto-mode run
-loop of about 1% of the generated programs (the IR verified); gone since
-goto mode emits one shared dispatch block (`lowering.md` §5,
-`tests/run/goto_loop_simplifycfg.lm`), and the fuzzer no longer skips
-those builds.
+`ROOTFUZZ_PLAIN=1` builds without `--gc-check-roots`. The 18 smoke
+seeds detect each of five seeded rooting bugs (let-else, match arms,
+block scopes, `if let`, match guards).
 
 ## Differences from the design
 
 - **Collection happens only at safepoints.** Allocation never collects;
-  only functions with `uses gc` (such as `gc.collect`) do. The effect rules
-  are as designed, but "may collect" is now explicit and rare. As a result,
-  the only roots the compiler has to provide are traced locals that are in
-  scope at those calls, and in vm code the traced state variables (copied
-  at the call), registered in shadow-stack frames. Traced
-  *temporaries* are not roots: bind a value to a local before a call that
-  may collect. (The exception: a value computed before defers run, such
-  as a block's tail value or `return v`, is rooted while they run.)
-- **`sync { ... }`** is a new vm item. It holds the code the compiler runs
-  before an effectful call from a handler, for example publishing `fp` or
-  the stack top for the GC's root scanner.
-- **Cold blocks are outlined with `musttail`.** In tail-call mode, a `cold` block in an op handler that ends in
-  control words moves to its own function with the handler's signature,
-  and the handler reaches it with `musttail`. The hot path makes no call,
-  so it needs no stack frame. The instruction word travels in its
-  register, and the cold function decodes the operand fields it uses
-  again; other handler locals it uses travel through thread-local slots
-  (`initialexec`), written only on the cold path.
-  `if c { cold { .. } }` followed by code ending in a control word gets that
-  continuation copied into the cold block, so it can be outlined too. This
-  includes superinstruction parts: an outlined `next` from a part other
-  than the last dispatches the next part's word on its own. Other
-  cold blocks, and all cold blocks in goto/switch mode, stay inline and are
-  marked unlikely.
-- **State variables** are plain types (stack and frame pointers
-  included). Stack VMs declare per-op stack effects (`op ADD() : N stack(a b
-  -- c)`, `language.md` §3.4a): the verifier checks depths and records
-  the maximum (`v.max_stack()`), but the names are not bound in the
-  handler, which moves its own stack pointer.
+  only functions with `uses gc` (such as `gc.collect`) do. So the only
+  roots the compiler provides are traced locals in scope at those
+  calls, and in vm code the traced state variables (copied at the
+  call). Traced *temporaries* are not roots: bind a value to a local
+  before a call that may collect. The exception is a value computed
+  before defers run (a block's tail value, `return v`), which is rooted
+  while they run.
+- **`sync { ... }`** is a vm item not in the original design. It holds
+  the code the compiler runs before an effectful call from a handler,
+  for example publishing `fp` or the stack top for the GC's root
+  scanner.
+- **Cold blocks.** In tail-call mode, a `cold` block in an op handler
+  that ends in control words moves to its own function with the
+  handler's signature, reached with `musttail`. The hot path makes no
+  call, so it needs no stack frame. Code after `if c { cold { .. } }`
+  that ends in a control word is copied into the cold block so it can
+  be outlined too. Other cold blocks, and all cold blocks in goto and
+  switch mode, stay inline and are marked unlikely. How the outlined
+  block gets the handler's values is in
+  [lowering.md §3](lowering.md#3-handlers-in-tailcall-mode).
+- **State variables** are plain types, stack and frame pointers
+  included. Stack vms declare per-op stack effects (`language.md`
+  §3.4a): the verifier checks depths and records the maximum, but the
+  names are not bound in the handler, which moves its own stack
+  pointer.
 - **`unsafe`** is required for `p as Gc<T>` and `#[unsafe]` functions
   everywhere. Raw pointer dereference, indexing and arithmetic are
-  allowed in modules without `#![safe]`; see `language.md` §1.3 for why. A
-  module marked `#![safe]` is checked: there a `*T` is a reference to
-  one value, and indexing, arithmetic, pointer casts, other modules'
-  buffer pointers and invariant fields, `extern` and `#[raw]` calls need
-  `unsafe { }`; so do reading pointers held in another module's
-  tuple/array/function fields or enum payloads, zero-initialized
-  pointers, `new` with an allocator whose `alloc_bytes` is not `#[raw]`,
-  and declaring a `vm`. Pointer stability is checked in every module,
-  std's included (`design/lifetimes.md`; `#![lifetimes(off)]` opts a
-  non-`#![safe]` module out, as the ASan tests of stale pointers do;
-  `LOIMI_LIFETIMES=off` turns it off for a build): a pointer
-  into a container used after a call that may move or free it or
-  remove its elements (`#[shrinks]`), Vec copy aliasing, arguments
-  aliasing what the callee moves, escaping local addresses, and a
-  pointer into growable memory stored where it outlives the function
-  are errors; other pointers stored in memory are not followed. No
-  module of std, the examples, the tutorial or the benchmarks opts
-  out. Under
-  `--sanitize=address`, `Vec` and `Arena` poison memory they keep but no
-  longer use, so stale pointers into it are reported at run time.
-  `std.lex`, `parse`, `diag`, `text`, `hash`,
-  `io`, `bc`, `map` and `dict` are safe (`design/safety.md`).
-  GC objects are checked in every module (`design/safety.md` section
-  8): slices of traced trailing arrays cannot be kept where a store
-  through them would skip the write barrier (a call that may store
-  through one gets the barrier after it), trailing arrays start
-  zero-filled only where zero is a valid element (`new(h, X { .. }, n,
-  v)` fills them otherwise), and a `#![safe]` module's objects are built
-  and written only by that module.
+  allowed in modules without `#![safe]`. Pointer stability is checked in
+  every module, std's included ([`design/lifetimes.md`](design/lifetimes.md));
+  `#![lifetimes(off)]` opts a non-`#![safe]` module out, and no module
+  in std, the examples, the tutorial or the benchmarks does. The full
+  rules are in `language.md` §1.3.
+- **Safe modules.** `std.lex`, `parse`, `diag`, `text`, `hash`, `io`,
+  `bc`, `map` and `dict` are `#![safe]` ([`design/safety.md`](design/safety.md)).
   The example interpreters' only `unsafe` blocks are five zero-filled
-  `Gc` arrays that are filled right after allocation (Lox's and Mini's
-  closure upvalues, three `Protos` tables): float reads of a
-  register use `f64.from_bits(a as u64)` (compiled to a `double` load
-  of the slot), and Mini's coroutine free hook uses `heap.on_free_gc`.
-  A checked register window was measured and not adopted (roadmap open
-  question 7).
-- **Operand fields** decode to `u64` / `i64` in handlers and verify
-  clauses, whatever their width.
-- **`-> never` vm functions** are inlined into each call site, except
-  that in tail-call mode, calls from `cold` blocks (and recursive calls)
+  `Gc` arrays filled right after allocation. A checked register window
+  was considered and not adopted ([roadmap, question 7](roadmap.md)).
+- **`-> never` vm functions** are inlined into each call site. In
+  tail-call mode, calls from `cold` blocks (and recursive calls)
   `musttail` to one shared copy that receives its arguments through
-  thread-local slots. They cannot use `become` or the caller's operands;
-  the op's inline cache can be passed as a `c: cache Name` parameter (also
-  to plain vm functions), which a shared copy receives as an address.
+  thread-local slots. They can't use `become` or the caller's operands;
+  the op's inline cache can be passed as a `c: cache Name` parameter.
 - **Re-entry** (`language.md` §10): no whole `Vm.call` is generated.
-  The compiler provides the nested entry (an entry
-  declared `uses reenter`, which callers must be allowed to make), the
-  `reload` block after `reenter` calls in vm code, and `Vm.depth`; the
-  interpreter writes where the new frame goes, the sentinel that makes
-  the callee's return leave the run, the depth limit (Mini: 200, "C
-  stack overflow"), and restoring its frame registers after the call
-  (Mini's `vm.call_value`), because only it knows its frame layout.
-  Derived pointers held across a `reenter` call (`let p = regs + a`)
-  are not checked. Measured on Mini, a nested run per callback costs
-  about 20 ns over a native comparison and makes a native `table.sort`
-  with a Lua comparator 1.2x slower than the same sort written in Lua
-  (`bench/reenter/`, `lowering.md` §4), so the Scheme and MiniJS
-  preludes keep their higher-order builtins.
-- **Effects** must be declared; they are not inferred for private functions.
-  Handlers and plain vm functions are the exception: their effectful calls
-  are synced in place (in a vm function, through the state pointers it
-  sees), and callers of such a vm function root their traced locals there.
-  Function types carry them (`fn(*Heap) uses gc`), so calls through function
-  pointers are checked, synced and rooted like direct calls. Entries
-  declare what their vm code reaches: `uses gc` once any op, vm function
-  or `on raise` may collect, so an entry's function type says it may
-  collect and cannot be converted to one that does not. There are no
-  effect variables: a generic function cannot take "a callback with any
+  - The compiler provides the nested entry (declared `uses reenter`),
+    the `reload` block after `reenter` calls in vm code, and `Vm.depth`.
+  - The interpreter writes where the new frame goes, the sentinel that
+    makes the callee's return leave the run, the depth limit (Mini:
+    200, "C stack overflow"), and restoring its frame registers after
+    the call, because only it knows its frame layout.
+  - Derived pointers held across a `reenter` call (`let p = regs + a`)
+    are not checked.
+  - A nested run per callback costs about 20 ns on Mini. A native
+    `table.sort` with a Lua comparator is 1.2x slower than the same sort
+    written in Lua (`bench/reenter/`), so the Scheme and MiniJS preludes
+    keep their higher-order builtins.
+- **Effects** must be declared; they are not inferred for private
+  functions. Handlers and plain vm functions are the exception: their
+  effectful calls are synced in place. Entries declare what their vm
+  code reaches (`uses gc` once any op may collect). There are no effect
+  variables: a generic function can't take "a callback with any
   effects" and inherit them.
-- **Verifier**: opcodes, extents, operand `verify` clauses, superinstruction
-  part words, and "cannot fall off the end" (an op may continue if its
-  handler uses `next` or reads `pc`; the scan is over tokens, so it errs
-  toward "may continue"), and stack depths for vms that declare stack
-  effects. `Verified<V>` (`language.md` §6) ties the code that runs
-  to a verification: `#[require_verified]` entries start only from one,
-  and Mini, Scheme and MiniJS keep their code as a verified trailing
-  array of the prototype (`code: verified [u32] by Mini`, created only
-  by `Vm.build_verified`, which verifies the words in the object with
-  the object as the `owner` verify context), so CALL reaches only
-  verified code at no cost over raw code (`lowering.md` §11). `verify
-  NAME { .. }` blocks check side tables: MiniJS's exception handler
-  targets. Not covered: the interpreter must not change the context
-  fields after verification (they are ordinary fields), and return
-  addresses (`jump fp.resume`) are trusted to land on boundaries of
-  verified code.
-- **Instrumentation**: tables are switched from vm code (`use_variant`).
-  A debugger turns its variant on
-  in the entries and `reload` (Mini's `--cfg debug`, `design/debugging.md`).
-- **Float parsing** in `std.num` uses strtod, and `write_g` (`%.14g`)
-  snprintf; shortest round-trip formatting is Loimi code (Schubfach).
-- **`std.obj`** offers a generic `Obj<V>` (or the interpreter declares
-  its own object and slot-array types) and a generic `Model` over them;
-  keys are u64 symbol ids, attributes are bits per property, and there
-  are no elements or global property cells. Shape ids are never reused,
-  so inline caches need no reset after a collection. See
-  [`stdlib/obj.md`](stdlib/obj.md#as-implemented).
-- **`inline for`** is token-level expansion: values are token sequences
-  (so operators like `+` work), and `#var` makes an identifier from a
-  string or identifier value; `#(a ++ "_X" ++ 2)` joins loop variables
-  and literals into one. In statement position the copies are
-  statements of the enclosing block, with no scope of their own (see
-  `language.md` §1.4). Inside a `vm`, a loop variable named like a state
-  variable is an error. Errors in expanded code point at the body or the
-  element in the source, but do not say which copy they come from.
-- **Traits and closures** (see [`design/closures-traits.md`](design/closures-traits.md)):
-  no `dyn`, associated types or constants, supertraits or orphan rule
-  (overlapping impls are an error); default bodies are checked when an
-  instance uses them, not at the trait. Closures differ from the design
-  as listed in the Closures row above: not creatable in vm code, and
-  escaping closures copy their captures (assignable state goes in a
-  state list).
+- **Verifier.** It checks opcodes, extents, operand `verify` clauses,
+  superinstruction part words, stack depths for stack vms, and that code
+  can't fall off its end. The fall-off scan is over tokens: an op may
+  continue if its handler uses `next` or reads `pc`, so it errs toward
+  "may continue". Mini, Scheme and MiniJS keep their code as a verified
+  trailing array, so CALL reaches only verified code at no cost over
+  raw code ([lowering.md §11](lowering.md#11-bounds-checks-and-verification)).
+  Not covered:
+  - the interpreter changing context fields after verification (they
+    are ordinary fields);
+  - return addresses (`jump fp.resume`), which are trusted to land on
+    boundaries of verified code.
+- **Instrumentation** tables are switched from vm code (`use_variant`).
+  A debugger turns its variant on in the entries and `reload`.
+- **`inline for`** is token-level expansion: values are token sequences,
+  so operators like `+` work. In statement position the copies have no
+  scope of their own. Inside a `vm`, a loop variable named like a state
+  variable is an error. Errors in expanded code point at the source,
+  but don't say which copy they come from.
+- **Traits and closures** ([`design/closures-traits.md`](design/closures-traits.md)):
+  - no `dyn`, associated types or constants, supertraits or orphan rule
+    (overlapping impls are an error);
+  - default bodies are checked when an instance uses them, not at the
+    trait;
+  - closures can't be created in vm code, and escaping closures copy
+    their captures (assignable state goes in a state list).
 
 ## Limitations
 
-- **Threads** share a heap one at a time (`std.gil`); free threading is
-  not supported.
-- **The heap never moves objects** (roadmap Q2). The generational mode
-  has no card marking: a large array that is stored into is retraced
-  whole by each minor collection, and small objects are promoted at
-  their first survival. Free hooks cannot run guest code.
+- **Threads** share a heap one at a time (`std.gil`); there is no free
+  threading.
+- **The heap never moves objects** ([roadmap, question 2](roadmap.md)).
+  There is no card marking, and small objects are promoted at their
+  first survival.
 - **The JIT** is x86-64 Linux only, for executables with one vm,
-  tail-call dispatch and no variants; there is no trace compiler.
+  tail-call dispatch and no variants. There is no trace compiler.
 - **AArch64** is tested under qemu only, not on hardware.
 - **Effects** are declared on every function, not inferred, and there
   is no effect polymorphism.
-- **The verifier** does not cover context-field mutation after
-  verification or `jump fp.resume` targets (Verifier, above).
+- **The verifier** doesn't cover context-field changes after
+  verification or `jump fp.resume` targets.

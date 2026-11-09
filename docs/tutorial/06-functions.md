@@ -8,14 +8,16 @@ fn fib(n) {
 print fib(20);
 ```
 
-Functions are values: `fn fib` compiles to a **prototype** and stores
-it in the global `fib`. Calls stay inside the interpreter loop: a call
-pushes a frame and jumps to the callee's first instruction, and a return
-pops it and jumps back. Nothing recurses on the C stack, so deep guest
-recursion is limited by the vm's own stacks, which report overflow as an
+Functions are values: `fn fib` compiles to a **prototype**, which is
+stored in the global `fib`.
+
+Calls stay inside the interpreter. A call pushes a frame and jumps to
+the callee's first instruction, and a return pops the frame and jumps
+back. Nothing recurses on the C stack. So deep recursion in a Pip
+program is limited by the vm's own stacks, which report overflow as an
 ordinary error.
 
-Code: [`examples/tutorial/step6/`](../../examples/tutorial/step6).
+The code is in [`examples/tutorial/step6/`](../../examples/tutorial/step6).
 
 ## Prototypes and frames
 
@@ -41,16 +43,17 @@ pub struct Proto {
 }
 ```
 
-`code` is the `Verified<Pip>` from chapter 3, and it cannot be made
-when the prototype is: the verifier checks global numbers against the
-number of names in the whole program, which is known only once
-everything is compiled. So the compiler fills `code` with
-`Pip.placeholder()`, a proof over one static word whose opcode no op
-has (it traps if it ever runs), and `main` replaces it with the real
-proof later.
+`code` is the `Verified<Pip>` from chapter 3. It can't be made at the
+same time as the prototype. The verifier checks global numbers against
+the number of names in the whole program, which is known only once
+everything is compiled.
 
-A function value is a pointer to its prototype. A nanbox payload can be
-any pointer:
+So the compiler fills `code` with `Pip.placeholder()`, and `main`
+replaces it with the real proof later. The placeholder wraps a single
+word whose opcode belongs to no op, so it traps if it ever runs.
+
+A function value is a pointer to its prototype. A nanbox variant can
+hold any pointer:
 
 ```loimi
 pub value Value repr nanbox {
@@ -62,8 +65,8 @@ pub value Value repr nanbox {
 }
 ```
 
-The machine gets a value stack, which holds every active call's
-registers, and a frame stack:
+The machine gets two stacks: a value stack, which holds the registers
+of every active call, and a frame stack:
 
 ```loimi
 /// One activation record. `ret` is where the caller continues when this
@@ -71,8 +74,8 @@ registers, and a frame stack:
 pub struct Frame { proto: *Proto, base: *Value, ret: *u32 }
 ```
 
-and the current frame becomes part of the vm state, next to `pc`,
-`regs` and `k`:
+The current frame becomes part of the vm state, next to `pc`, `regs`
+and `k`:
 
 ```loimi
     state { pc: *u32, regs: *Value, k: *Value, fp: *Frame }
@@ -80,13 +83,17 @@ and the current frame becomes part of the vm state, next to `pc`,
 
 ## Register windows
 
-Like Lua, Pip passes arguments by placing them in consecutive registers
-of the caller and making those the first registers of the callee. To
-call `f(x, y)` the compiler puts `f` in some register `base`, `x` in
-`base+1`, `y` in `base+2`, and emits `CALL base, 2`. The callee's
-register window starts at `base+1`, so its parameters are already in
-`r0` and `r1`: no copying. Its result goes to `regs[-1]` of its window,
-which is the caller's `base`.
+Like Lua, Pip passes arguments without copying them. The caller puts
+them in consecutive registers, and those become the callee's first
+registers. To call `f(x, y)`, the compiler:
+
+1. puts `f` in some register `base`, `x` in `base+1` and `y` in
+   `base+2`
+2. emits `CALL base, 2`
+
+The callee's registers start at `base+1`, so its parameters are already
+in its `r0` and `r1`. Its result goes to the register just below its
+own, `regs[-1]`, which is the caller's `base`.
 
 ```loimi
     /// R[base] = R[base](R[base+1], ..., R[base+n]). The callee's
@@ -112,16 +119,18 @@ which is the caller's `base`.
     }
 ```
 
-`base` is a `reg` operand, so reading it gives the register's value;
-`base.raw` is the field itself, the register number. The handler
-assigns all four state variables and jumps: the callee runs with its
-own `regs` and `k` in the same machine registers. `jump p.code` jumps
-to the start of the callee's verified code. `fp.ret = pc + 1` is the
-return address because CALL is one word; for an op with cache words, or
-a call helper shared by several ops, write `fp.ret = next_pc`, the
-address `next` would continue at (language.md section 3.5). The vm is
-`#[require_verified]` and its entry, too, jumps to `main.code`, so every
-function that runs was verified.
+Some details:
+
+- `base` is a `reg` operand, so reading it gives the register's value.
+  `base.raw` is the field itself: the register number.
+- The op sets all four state variables and jumps. The callee runs with
+  its own `regs` and `k`, in the same machine registers.
+- `jump p.code` jumps to the start of the callee's verified code. The
+  vm is `#[require_verified]`, and its entry also jumps to verified
+  code (`main.code`), so every function that runs has been verified.
+- `fp.ret = pc + 1` is the return address, because CALL is one word.
+  For an op with cache words, write `fp.ret = next_pc` instead: the
+  address where `next` would continue.
 
 ```loimi
     /// Return R[src] to the caller.
@@ -138,10 +147,10 @@ function that runs was verified.
 
 The `fp == ctx.frames` test is never true for code from Pip's compiler,
 which does not allow `return` at the top level. It is there because the
-verifier cannot know that, and chapter 9's fuzzer will happily try.
+verifier can't know that, and chapter 9's fuzzer will try it.
 
-`on raise` now finds the line through the current frame's prototype,
-so an error inside a function reports the line inside the function:
+`on raise` now finds the line through the current frame's prototype. So
+an error inside a function reports the line inside that function:
 
 ```loimi
     on raise(msg: str) {
@@ -158,7 +167,7 @@ in words of the vm's encoding (`(pc - start) / 4` here).
 ## Verifying a function
 
 The verifier now checks one prototype at a time, against that
-prototype. A vm can have several verify contexts; they become
+prototype. A vm can have several verify contexts, which become
 parameters of `Pip.verify` in order:
 
 ```loimi
@@ -169,22 +178,22 @@ parameters of `Pip.verify` in order:
     operand kst = k[it] verify it < proto.consts.len display "k{}";
 ```
 
-CALL's argument count needs more than a range: `base + n` must be in
-the frame too. A verify clause can read the instruction word through
-`pc`, and the generated field readers decode it:
+Checking CALL's argument count needs more than a range: `base + n` must
+also be inside the frame. A verify clause can read the instruction word
+through `pc`, and decode other fields with the generated field readers:
 
 ```loimi
     /// CALL's argument count: R[base+1 .. base+n] must be in the frame.
     operand nargs = it verify Pip.ABC_a(*pc) + it < proto.nregs as u64;
 ```
 
-`nargs` decodes to the plain field in the handler, so the clause costs
-nothing at run time. Mini found nine holes like this with its fuzzer
-(counts whose range was never checked); each became an operand kind
-with a clause of this shape.
+In the op, `nargs` is just the field's value, so the check costs
+nothing at run time. Counts like this are easy to forget to check: in
+Mini, the fuzzer found nine of them, and each was fixed with a clause
+like this one.
 
-`main` verifies every prototype before running any of them, and
-stores each proof in its prototype:
+`main` verifies every prototype before running any of them, and stores
+each proof in its prototype:
 
 ```loimi
     // Verify every function before running anything.
@@ -203,10 +212,12 @@ stores each proof in its prototype:
     }
 ```
 
-What the verifier cannot check is still up to the embedder: that
-`nparams <= nregs`, that the stack has room for the main function's
-frame, and that a prototype's `nregs` and constants do not change after
-it was verified.
+Some things the verifier can't check, so they are up to you:
+
+- that `nparams <= nregs`
+- that the stack has room for the main function's frame
+- that a prototype's `nregs` and constants don't change after it was
+  verified
 
 ## Compiling calls
 
@@ -225,11 +236,13 @@ it was verified.
         }
 ```
 
-The base is allocated at the top of the caller's registers, so
-everything above it is a dead temporary that the callee may overwrite.
+The base is allocated at the top of the caller's registers. So every
+register above it is an unused temporary, which the callee may
+overwrite.
 
-A function body compiles with its own `bc.Code`, pool and registers.
-Parameters are the first locals; falling off the end returns `nil`:
+A function body compiles with its own `bc.Code`, constant pool and
+registers. Parameters are the first locals, and falling off the end
+returns `nil`:
 
 ```loimi
 fn function(unit: *Unit, f: *FnDecl) -> *Proto {
@@ -265,12 +278,13 @@ fn main:
     9  HALT
 ```
 
-The `MOVE` after the call is avoidable; chapter 8 removes it.
+The `MOVE` after the call can be avoided; chapter 8 removes it.
 
-The inline caches from chapter 5 now earn their keep: `fib` reads the
-global `fib` twice per call. `tests/recache.pip` defines globals after a
-function has cached a slot, so that the table grows under the cache and
-a cached slot may no longer hold the name; GETGLOBAL_C then falls back
-to GETGLOBAL, which refills the cache.
+The inline caches from chapter 5 now pay off, because `fib` reads the
+global `fib` twice per call. The test `tests/recache.pip` checks the
+case where the cache goes stale. It defines globals after a function
+has cached a slot, so the table grows and the slot may no longer hold
+the name. GETGLOBAL_C then falls back to GETGLOBAL, which fills the
+cache again.
 
 Next: [heap objects and the GC](07-gc.md).

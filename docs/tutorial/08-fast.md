@@ -1,31 +1,38 @@
 # 8. Making it fast
 
-Step 7 is a complete interpreter. This chapter is about measuring it and
-making it faster, with the tools Loimi provides and the lessons from
-Mini's performance log ([`bench/mini/RESULTS.md`](../../bench/mini/RESULTS.md)),
-where these techniques were tried on a Lua subset that ended up faster
-than PUC-Lua on every benchmark.
+Step 7 is a complete interpreter. This chapter measures it and makes it
+faster, using Loimi's tools and the lessons from Mini, the Lua-like
+example interpreter. Mini's performance log,
+[`bench/mini/RESULTS.md`](../../bench/mini/RESULTS.md), records each
+technique tried and what it gained.
 
-Code: [`examples/tutorial/step8/`](../../examples/tutorial/step8), and
-benchmarks in [`step8/bench/`](../../examples/tutorial/step8/bench).
+The code is in [`examples/tutorial/step8/`](../../examples/tutorial/step8),
+and the benchmarks in [`step8/bench/`](../../examples/tutorial/step8/bench).
 
 ## Measure first
 
 `step8/bench/run.py` builds steps with `--release` and times four
-programs: `fib` (calls), `loop` (integer and float arithmetic on
-locals), `sieve` (arrays), `strings` (allocation). It runs the
-executables interleaved and keeps the best of N runs, because a shared
-machine's load changes during a run and affects whichever binary
-happens to run then.
+programs:
+
+| Program | What it exercises |
+|---|---|
+| `fib` | calls |
+| `loop` | integer and float arithmetic on locals |
+| `sieve` | arrays |
+| `strings` | allocation |
+
+It takes turns running each executable, and keeps the best of N runs.
+That is because the load on a shared machine changes during a run, and
+slows down whichever program happens to be running at the time.
 
 ```sh
 examples/tutorial/step8/bench/run.py -n 5 step7 step8
 examples/tutorial/step8/bench/run.py -n 5 step8 -- --dispatch=goto
 ```
 
-Treat differences under about 5% as noise unless they repeat. Mini's log
-reports many changes that seemed to help in one run and were within
-noise in an interleaved A/B; it is the rule rather than the exception.
+Treat differences under about 5% as noise unless they repeat. In Mini,
+many changes seemed to help in one run, but were within noise when
+measured side by side. That is the rule, not the exception.
 
 All numbers below are seconds, best of 5, on a shared 8-core x86-64
 machine.
@@ -41,50 +48,57 @@ The same source, three ways:
 | sieve | 0.749 | 0.790 | 0.865 |
 | strings | 0.146 | 0.144 | 0.148 |
 
-Tail calls are the default for a reason, but the differences are
-smaller than folklore suggests on a modern branch predictor, and Mini
-saw `goto` win on some benchmarks. Since it costs one flag to find out,
-find out.
+Tail calls are the default for a reason. But on a CPU with a modern
+branch predictor the differences are smaller than often claimed, and in
+Mini `goto` won on some benchmarks. Trying another mode costs one
+flag, so try it.
 
 ## Reading the generated code
 
-Every handler is its own function, named `vm.Pip.op.NAME`, so
+Every op is its own function, named `vm.Pip.op.NAME`. So
 `objdump -d --disassemble=vm.Pip.op.ADDK pip` shows one op, and any
-sampling profiler attributes time per op. `loimi build --emit-llvm -o
-pip.ll` writes the LLVM IR, where a handler looks like this:
+sampling profiler reports time per op.
+
+`loimi build --emit-llvm -o pip.ll` writes the LLVM IR, where an op
+looks like this:
 
 ```text
 define internal preserve_nonecc void @"vm.Pip.op.ADDK"(ptr %p0, ptr %p1, ptr %p2, ptr %p3, ptr %p4, i32 %insn)
 ```
 
 The parameters are the context, the four state variables and the
-instruction word. The entry's result, a `Result<(), str>`, does not
-come back in registers: `exit` stores it to a thread-local slot that
-the entry reads, so handlers return `void` (an entry returning a
-scalar such as an `i64` returns it directly). Things to look for in
-a hot handler's assembly:
+instruction word. The op returns `void`: the entry's result, a
+`Result<(), str>`, is passed back through memory. (An entry that
+returns a single number, such as an `i64`, returns it directly.)
 
-- **no stack frame** (`push`, `sub $..., %rsp`): a plain call on any
-  path gives the handler a frame on *every* path. Mini found this in
-  GETINDEX and SETINDEX; the cure is `cold`. Calls LLVM would add
-  itself are not a worry in tail-call handlers: they are compiled so
-  that a zeroing or copying loop stays a loop instead of becoming a
-  `memset`/`memcpy` call (a call to a C function you declared, such as
-  `memset` itself, is still a call: put it in `cold` or use a loop).
-  `loimi build --release -W handler_frame` finds these for you: it
-  warns about every handler whose fast path sets up a frame and names
-  the calls that may have caused it. On step 8 it lists five handlers:
-  DEFGLOBAL, NEWLIST, NEWARRAY and PRINT, which run rarely, and
-  SETINDEX, where the frame is a `push`/`pop` pair around the call to
-  `std.gc.remember` in the compiler's write barrier (chapter 7);
-- **no reloads of state** from memory;
-- **one dispatch sequence per exit**: load the next word, advance `pc`,
+In the assembly of a hot op, check for three things:
+
+- **No stack frame** (`push`, `sub $..., %rsp`). A plain call on any
+  path gives the op a frame on *every* path. The fix is to move the
+  call into `cold`.
+- **No reloads of state** from memory.
+- **One dispatch sequence per exit**: load the next word, advance `pc`,
   index the table, jump.
+
+`loimi build --release -W handler_frame` finds stack frames for you. It
+warns about every op whose fast path sets up a frame, and names the
+calls that may have caused it. On step 8 it lists five ops:
+
+- DEFGLOBAL, NEWLIST, NEWARRAY and PRINT, which run rarely
+- SETINDEX, where the frame is a `push`/`pop` pair around the call to
+  `std.gc.remember` in the write barrier (chapter 7)
+
+You don't need to worry about calls that LLVM would add on its own.
+In tail-call mode, ops are compiled so that a loop that zeroes or
+copies memory stays a loop, instead of becoming a call to `memset` or
+`memcpy`. A call to a C function you declared yourself, such as
+`memset`, is still a call: put it in `cold`, or use a loop.
 
 ## Constant operands
 
-`--vm-stats` builds an interpreter that counts every op executed and
-every adjacent pair, and prints them at exit:
+`--vm-stats` builds an interpreter that counts every op it runs, and
+every pair of ops that run one after the other. It prints the counts
+when it exits:
 
 ```sh
 loimi build examples/tutorial/step7/main.lm --release --vm-stats -o pip-stats
@@ -108,11 +122,11 @@ existing super, so they can all be added together):
     ...
 ```
 
-A quarter of all instructions load a small constant into a register for
-the next instruction to use (`n < 2`, `n - 1`). Lua's answer is
-instructions that take a constant operand directly. In Loimi that is an
-op whose second operand has kind `kst` instead of `reg`, and with
-`inline for` the K forms come from the same template:
+A quarter of all instructions load a small constant into a register,
+for the next instruction to use (`n < 2`, `n - 1`). Lua's answer is
+instructions that take a constant operand directly. In Loimi, that is
+an op whose second operand has kind `kst` instead of `reg`. With
+`inline for`, these "K" forms come from the same template:
 
 ```loimi
     inline for (name, fname, checked, sym, kind, bkind) in [
@@ -125,8 +139,8 @@ op whose second operand has kind `kst` instead of `reg`, and with
     ] {
 ```
 
-The compiler uses them when the right operand is a number literal whose
-constant index fits the 8-bit field:
+The compiler uses them when the right operand is a number literal, and
+its index in the constant pool fits the 8-bit field:
 
 ```loimi
 /// If `n` is a number literal whose constant index fits an 8-bit
@@ -142,9 +156,9 @@ fn C.small_const(c: *C, n: *Node) -> ?u8 {
 }
 ```
 
-Compare-and-branch gets K forms too. With a constant on the right, `x >
-k` cannot be flipped into `k < x` without a register for `k`, so there
-are four orders:
+Compare-and-branch gets K forms too. With a constant on the right,
+`x > k` can't be flipped into `k < x` without a register for `k`. So
+there are four K forms, one per comparison:
 
 ```loimi
     inline for (name, bkind, test, slow) in [
@@ -158,7 +172,7 @@ are four orders:
 ```
 
 The MOVE after every call (chapter 6) goes too. When the call's
-destination is the topmost temporary, it can be the call's base:
+destination is the topmost temporary, it can serve as the call's base:
 
 ```loimi
             // If `dst` is the topmost temporary, it can be the base
@@ -168,16 +182,19 @@ destination is the topmost temporary, it can be the call's base:
             let base = if in_place { c.regs.alloc(args.len as u32); dst } else { c.regs.alloc(1 + args.len as u32) };
 ```
 
-Together: fib 0.466 → 0.369 s, loop 0.494 → 0.407 s.
+Together, these take fib from 0.466 to 0.369 s, and loop from 0.494 to
+0.407 s.
 
 ## Float-first quickening
 
-`loop` does `x = x * 0.5 + 1.0`. The arithmetic handlers test
-`(Int, Int)` first, so every float operation pays for a failed integer
-test. Testing floats first would slow down integer code instead. Mini's
-answer (RESULTS.md, item 10) is to let each *site* decide: the arithmetic
-ops become families whose generic member is integer-first and turns
-itself into a float-first member the first time it sees two floats.
+`loop` does `x = x * 0.5 + 1.0`. The arithmetic ops test `(Int, Int)`
+first, so every float operation pays for a failed integer test. Testing
+floats first would slow down integer code instead.
+
+The answer, taken from Mini, is to let each instruction decide for
+itself. The arithmetic ops become families. The generic member tests
+integers first, and turns itself into a float-first member the first
+time it sees two floats:
 
 ```loimi
         family #name(dst: reg, a: reg, b: bkind) : ABC {
@@ -200,10 +217,10 @@ itself into a float-first member the first time it sees two floats.
         }
 ```
 
-Both members handle every case, so a site never needs to switch back
-(a site that flip-flops would be worse than either). In the generated
-code, `become` is a single byte store into the code stream, on the
-float path of the generic member:
+Both members handle every case, so an instruction never needs to switch
+back. (One that kept switching back and forth would be slower than
+either.) In the generated code, `become` is a single byte store into the
+code, on the float path of the generic member:
 
 ```text
 <vm.Pip.op.ADDK>:
@@ -217,7 +234,8 @@ float path of the generic member:
   ...
 ```
 
-loop 0.407 → 0.372 s; the integer benchmarks do not change.
+This takes loop from 0.407 to 0.372 s. The integer benchmarks don't
+change.
 
 `--disasm-after` shows the quickened code:
 
@@ -230,10 +248,12 @@ fn step:
 
 ## Superinstructions
 
-`--vm-stats` ends with suggested superinstructions, already written as
-declarations, and, commented out, frequent ones that overlap them (only
-one of two overlapping supers can fuse where they meet). On step 8
-without its supers:
+A **superinstruction** ("super") runs several ops with one dispatch.
+
+`--vm-stats` ends with suggested supers, already written as
+declarations. After them, commented out, it lists frequent supers that
+overlap the suggested ones. Only one of two overlapping supers can be
+used where they meet. Here is the output for step 8 without its supers:
 
 ```text
     super GETGLOBAL_C_SUBK_CALL = GETGLOBAL_C; SUBK; CALL;    // 29860700, 18.2%, saves 59721400 dispatches
@@ -243,10 +263,8 @@ without its supers:
 //  super GETGLOBAL_C_SUBK = GETGLOBAL_C; SUBK;    // 29860700, 18.2%, saves 29860700 dispatches; overlaps GETGLOBAL_C_SUBK_CALL
 ```
 
-Step 8 takes the pairs, which are simpler to read; the three-op super
-works the same way.
-
-A **superinstruction** runs several ops with one dispatch:
+Step 8 uses pairs, which are simpler to read. The three-op super works
+the same way:
 
 ```loimi
     super GETGLOBAL_SUBK = GETGLOBAL; SUBK;
@@ -256,14 +274,14 @@ A **superinstruction** runs several ops with one dispatch:
     super ADD_JMP = ADD; JMP;
 ```
 
-The compiler builds each super's handler by inlining the parts. The
-generated peephole pass `Pip.optimize(v)` fuses matching sequences
-in place: the first word's opcode becomes the super, and the following
-words stay as they are, so a jump into the middle still runs the
-original instruction, and fusion needs no control-flow analysis.
+The compiler builds each super by inlining its parts. The generated
+function `Pip.optimize(v)` finds matching sequences and fuses them in
+place. The first word's opcode becomes the super, and the following
+words stay as they are. So a jump into the middle of the sequence still
+runs the original instruction, and fusing needs no analysis of jumps.
 
-It takes the proof from `Pip.verify` and returns it: fusing keeps the
-code valid, so it stays verified. (The verifier accepts supers too, and
+`Pip.optimize` takes the proof from `Pip.verify` and returns it, since
+fused code is still valid. (The verifier accepts supers too, and
 chapter 9's fuzzer checks that optimized code still verifies.)
 `Pip.optimize_words(words)` does the same on a plain slice.
 
@@ -276,19 +294,20 @@ chapter 9's fuzzer checks that optimized code still verifies.)
             Ok(v) => p.code = Pip.optimize(v),
 ```
 
-`Pip.optimize` goes left to right and fuses, at each instruction, the
-longest super that starts there, then moves on. That is why the
-suggested `SUBK_CALL` is not declared: it shares the `SUBK` with
-`GETGLOBAL_SUBK`, and in fib every `SUBK; CALL` is part of
-`GETGLOBAL; SUBK; CALL` (the call `fib(n - 1)`), where `GETGLOBAL_SUBK`
-takes the `SUBK` first, so `SUBK_CALL` would never run. Declaring both
-gets a `super_overlap` warning from the compiler.
+`Pip.optimize` goes from left to right. At each instruction it fuses
+the longest super that starts there, then moves on.
 
-Quickening and supers interact: `Pip.optimize` runs on generic code, so
-it sees `GETGLOBAL; SUBK`. When the GETGLOBAL part quickens, the super's
-head is rewritten to the super with that part replaced
-(`GETGLOBAL_C_SUBK`) if one is declared, and otherwise split back into
-its parts. Hence the two declarations.
+That is why the suggested `SUBK_CALL` is not declared. In fib, every
+`SUBK; CALL` is part of `GETGLOBAL; SUBK; CALL` (the call
+`fib(n - 1)`). `GETGLOBAL_SUBK` takes the `SUBK` first, so `SUBK_CALL`
+would never run. Declaring both gets a `super_overlap` warning from the
+compiler.
+
+Quickening and supers work together. `Pip.optimize` runs on code that
+has not been quickened yet, so it sees `GETGLOBAL; SUBK`. When the
+GETGLOBAL part quickens, the super becomes the matching super with that
+part replaced, `GETGLOBAL_C_SUBK`. If there is no such super, it is
+split back into its parts. That is why both are declared.
 
 And the result:
 
@@ -299,12 +318,11 @@ And the result:
 | sieve | 0.770 | 0.749 |
 | strings | 0.147 | 0.146 |
 
-Within noise. This matches Mini's experience: ten supers taken from
-`--vm-stats` "changed nothing beyond noise" because dispatch on a modern
-core is well predicted; later, supers helped only together with other
-changes (12% on one benchmark, after compare-and-branch ops got their
-polarity in the opcode). Supers are cheap to try in Loimi, which is the
-point: try them, measure, keep what pays.
+The difference is within noise. Mini had the same experience: ten
+supers taken from `--vm-stats` made no difference beyond noise, because
+a modern CPU predicts dispatch well. Supers helped Mini only together
+with other changes (12% on one benchmark). Supers are cheap to try in
+Loimi, which is the point: try them, measure, and keep what pays.
 
 ## Overall
 
@@ -315,12 +333,12 @@ point: try them, measure, keep what pays.
 | sieve | 0.783 | 0.749 |
 | strings | 0.142 | 0.146 |
 
-`fib` and `loop` are 23-26% faster. `sieve` is bounded by array
-accesses and `strings` by allocation and copying, which none of these
+`fib` and `loop` are 23–26% faster. `sieve` is limited by array
+accesses, and `strings` by allocation and copying, which none of these
 changes touched.
 
-`--vm-stats` also counts how often each `cold` block is entered, which
-shows a fast path that misses a common case. On `sieve`:
+`--vm-stats` also counts how often each `cold` block runs. This shows
+when a fast path misses a common case. On `sieve`:
 
 ```text
 cold blocks entered:
@@ -329,45 +347,46 @@ cold blocks entered:
             29  NEWARRAY (cold block at examples/tutorial/step8/vm.lm:397:68)
 ```
 
-`i * i` overflows `Int(i32)` for every prime above 46340, so MUL goes
-cold and returns a float, and the comparison `j <= n` that follows
-mixes a float with an integer, which neither of JNLE's fast cases
-covers. Each is about 0.5% of the ops executed, so not worth a
-fast case here; on `strings`, every `+` is ADD's cold block (string
-joining), which is expected. Step 6 (no GC) runs `fib` in 0.404 s against step 7's
-0.466: the price of clearing a callee's registers in CALL (chapter 7)
-and of the larger value type.
+`i * i` overflows `Int(i32)` for every prime above 46340. So MUL takes
+its cold path and returns a float. The comparison `j <= n` that follows
+then compares a float with an integer, which neither of JNLE's fast
+cases covers. Each is about 0.5% of the ops run, so it is not worth a
+fast case here.
+
+On `strings`, every `+` runs ADD's cold block (joining strings), which
+is expected.
+
+The GC has a cost too. Step 6, which has no GC, runs `fib` in 0.404 s,
+against step 7's 0.466 s. The difference comes from clearing the
+callee's registers in CALL (chapter 7) and from the larger value type.
 
 ## A checklist
 
-From Mini's log, roughly in order of payoff for a Lua-like interpreter:
+What paid off in Mini, roughly from most to least, for a Lua-like
+interpreter:
 
-1. **A size-class allocator** for small objects (Mini: 2x on
-   allocation-heavy benchmarks). `std.gc` has one.
-2. **Inline caches** on property and global access (Mini: up to 40% on
-   object-heavy code). Chapter 5.
-3. **Interned strings**, so string equality and table-key comparison
-   are one compare (Mini: hash_strings 1.7x).
-4. **Constant operands** (`ADDK`, `x < 2`), and **compare-and-branch**
-   instead of compare-then-test (Mini: 4-13%; Pip: above).
-5. **Conditions compiled to jump chains**: `a and b` in an `if` jumps
-   straight to the exit, without building a boolean (Mini: queens -18%).
-   Pip has no `and`/`or` yet; this is how to add them.
-6. **Per-site quickening** for float-heavy code (Mini: mandelbrot -15%,
-   nbody -12%), with every member complete so sites never flip-flop.
-7. **Counted integer `for` loops**, as in Lua 5.4: compute the
-   iteration count once, so the loop op has no overflow or direction
-   test (Mini: 4-9%).
-8. **One allocation per object**: trailing arrays in the object instead
-   of a separate buffer (Mini: binary_trees 15-25%).
-9. **Polarity in the opcode** (JLT and JLTN rather than a polarity
-   operand), and **supers**, measured.
-10. Things that did not pay in Mini: lazy register clearing, float-first
-    compares, forwarding on every super (`#[forward]` helps only on
-    latency-bound chains), mixed-type cases in hot handlers.
+| Technique | Gain in Mini |
+|---|---|
+| **A size-class allocator** for small objects. `std.gc` has one. | 2× on allocation-heavy benchmarks |
+| **Inline caches** on property and global access (chapter 5) | up to 40% on object-heavy code |
+| **Interned strings**, so comparing strings or table keys is one compare | 1.7× on hash_strings |
+| **Constant operands** (`ADDK`, `x < 2`), and **compare-and-branch** instead of compare then test | 4–13% |
+| **Conditions compiled to jumps**: `a and b` in an `if` jumps straight past the body, without building a boolean. Pip has no `and`/`or` yet; this is how to add them. | 18% on queens |
+| **Per-instruction quickening** for float-heavy code, with every family member handling every case | 15% on mandelbrot, 12% on nbody |
+| **Counted integer `for` loops**, as in Lua 5.4: compute the number of iterations once, so the loop op needs no overflow or direction test | 4–9% |
+| **One allocation per object**: arrays at the end of the object instead of in a separate buffer | 15–25% on binary_trees |
+| **Separate opcodes for "jump if true" and "jump if false"** (JLT and JLTN) instead of an operand that says which, and **supers**, measured | |
+
+Things that did not pay off in Mini:
+
+- clearing registers lazily, in the root scanner
+- comparisons that test floats first
+- register forwarding (`#[forward]`) on every super; it helps only on
+  chains where each op waits for the previous one's result
+- mixed-type cases in hot ops
 
 Through all of it: keep the hot path to the one or two common cases,
-put everything else in `cold`, and look at the assembly of the handlers
-that `--vm-stats` says matter.
+put everything else in `cold`, and look at the assembly of the ops that
+`--vm-stats` says matter.
 
 Next: [testing an interpreter](09-testing.md).

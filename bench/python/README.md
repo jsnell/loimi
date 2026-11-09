@@ -1,22 +1,30 @@
 # Python benchmarks
 
 Reference interpreters and benchmark programs for the Python-subset
-interpreter (`examples/python`).
+interpreter (`examples/python`). The latest results are in
+[`docs/results.md`](../../docs/results.md): on 2026-11-07 the tail-call
+build took 0.31 of CPython 3.13.18's time and 0.11 of MicroPython's, by
+geometric mean, and printed CPython's output on every program.
 
-- `MANIFEST`, `install.sh` — pinned sources; `install.sh` builds CPython 3.13.18
-  (plain `./configure`, CPython's default `-O3`, **no PGO, no LTO**, `make -j2`)
-  and MicroPython 1.29.0 (stock unix port, standard variant) into
-  `install/bin/{python3,micropython}`, and unpacks pyperformance 1.14.0 into
-  `src/pyperformance/` (gitignored). About 3 minutes at `-j2`.
-- `programs/<name>.py` — standalone copies of pyperformance benchmarks
-  (mechanical edits only, listed below); `programs/<name>.expected` — CPython
-  3.13.18's stdout.
-- `compare.py` — runs every program under loimi, CPython and MicroPython,
-  best of N (default 3), interleaved, checks output, prints a markdown table
-  with ratios and geometric means.
-  `bench/python/compare.py [--loimi CMD] [-n N] [--only a,b]`.
-  MicroPython is run with `-X heapsize=256M` (its default fixed GC heap is
-  too small for `float.py`).
+## Running
+
+```sh
+bench/python/install.sh       # once, about 3 minutes
+bench/python/compare.py [--loimi CMD] [-n N] [--only a,b]
+```
+
+- `install.sh` downloads the sources pinned in `MANIFEST` and builds
+  CPython 3.13.18 and MicroPython 1.29.0 into
+  `install/bin/{python3,micropython}`. It also unpacks pyperformance
+  1.14.0 into `src/pyperformance/` (not committed).
+- CPython is built with plain `./configure`: its default `-O3`, **no PGO
+  and no LTO**. MicroPython is the stock unix port, standard variant.
+- `compare.py` runs every program under Loimi's interpreter, CPython and
+  MicroPython, interleaved, and takes the best of N (default 3). It checks
+  each output against `programs/<name>.expected` (CPython 3.13.18's
+  output) and prints a markdown table with ratios and geometric means.
+- MicroPython runs with `-X heapsize=256M`. With its default fixed heap,
+  `float.py` fails with MemoryError.
 
 ## Provenance
 
@@ -25,7 +33,8 @@ All programs come from pyperformance 1.14.0
 sha256 `2eb90812…40ed`, see MANIFEST), file
 `pyperformance/data-files/benchmarks/bm_<name>/run_benchmark.py`.
 
-Edits common to all files:
+Each program is a standalone copy, with mechanical edits only. Edits
+common to all files:
 
 - removed `import pyperf`, the `pyperf.Runner` / `runner.metadata` /
   `argparser` / `add_cmdline_args` / `bench_func` / `bench_time_func` harness
@@ -54,7 +63,7 @@ Per-file edits beyond that:
 
 ## Reference timings
 
-Dev machine, best of 3, `compare.py`:
+Best of 3 with `compare.py`, on the development machine:
 
 | benchmark | CPython 3.13.18 (s) | MicroPython 1.29.0 (s) |
 |---|---|---|
@@ -70,49 +79,41 @@ Dev machine, best of 3, `compare.py`:
 | richards | 0.904 | 3.473 |
 | spectral_norm | 0.711 | 1.385 |
 
-MicroPython runs all programs (none needed changes), but three outputs differ
-from CPython's: chaos and go use `random` (MicroPython has a different
-generator, so different seeds → different games), and nbody differs in the
-last digits of the energies (float rounding differences). Its times are still
-reported, flagged MISMATCH. Without `-X heapsize=…` `float.py` fails with
-MemoryError.
+MicroPython runs every program unchanged, but three outputs differ from
+CPython's:
+
+- chaos and go use `random`, and MicroPython has a different generator.
+- nbody differs in the last digits of the energies (float rounding).
+
+`compare.py` still reports their times, flagged MISMATCH.
 
 ## Library use per program
 
-The loimi interpreter needs these (beyond builtins such as `range`, `len`,
-`print`, `list`, `tuple`, `set`, `int`, `float`, `str`, `abs`, `min`, `max`,
-`sum`, `isinstance`):
+Beyond builtins such as `range`, `len`, `print`, `list`, `tuple`, `set`,
+`int`, `float`, `str`, `abs`, `min`, `max`, `sum` and `isinstance`, the
+programs use:
 
-- chaos: `math.sqrt`; `random.seed(int)`, `random.randrange(n)` (one-arg).
-- go: `math.sqrt`, `math.log`; `random.seed(int)`, `random.random()`,
-  `random.randrange(n)` (one-arg; also with n = 2**63-1).
-- float: `from math import sin, cos, sqrt`.
-- raytrace: `math.sqrt`, `math.tan`, `math.pi`.
-- hexiom: `io.StringIO()` (`.getvalue()`, written to via `print(..., file=s)`).
-- others: no imports.
+| Program | Library use |
+|---|---|
+| chaos | `math.sqrt`; `random.seed(int)`, one-argument `random.randrange(n)` |
+| go | `math.sqrt`, `math.log`; `random.seed(int)`, `random.random()`, one-argument `random.randrange(n)` (also with n = 2**63-1) |
+| float | `from math import sin, cos, sqrt` |
+| raytrace | `math.sqrt`, `math.tan`, `math.pi` |
+| hexiom | `io.StringIO()`: `.getvalue()`, written to with `print(..., file=s)` |
+| others | no imports |
 
-Matching the `.expected` output of chaos and go requires a `random` that
-reproduces CPython's exactly (Mersenne Twister, `seed(int)` via
-`init_by_array`, `randrange` via `getrandbits`-based `_randbelow`,
-`random()` as 53-bit `(a*67108864+b)/2**53`).
+To match the `.expected` output of chaos and go, `random` must reproduce
+CPython's exactly: Mersenne Twister, `seed(int)` through `init_by_array`,
+`randrange` through `getrandbits`-based `_randbelow`, and `random()` as
+the 53-bit `(a*67108864+b)/2**53`.
 
-## Results
+## Measuring
 
-`examples/python` (python-loimi, tail-call release build) against both
-references, `compare.py -n 3`: 0.53x CPython 3.13.18's time and 0.20x
-MicroPython's by geometric mean; every program prints CPython's output.
-The per-program table, the optimization log and the dispatch-mode
-comparison are in `examples/python/FRICTION.md`.
-
-## Profiling notes (2026-11-04)
-
-`perf` is not available on the shared machine; the second optimization
-round (`examples/python/FRICTION.md`, "Optimizations, second round")
-used an `LD_PRELOAD` timer sampler (SIGPROF, rip plus return addresses
-found by scanning the stack), `--vm-stats` cold-block counts and
-`PYLOIMI_COUNTS=1`. Under load from other jobs, wall times of identical
-builds moved by up to ±7%; A/B decisions used CPU time (user + sys) of
-interleaved runs, which moved by about ±3%. On the set itself: 6 of the
-11 programs are dominated by instance attributes and method calls, and
-none uses dicts or strings heavily (go and hexiom aside), so dict and
-string work is barely measured here.
+- On a shared machine, wall times of identical builds moved by up to
+  ±7%. Comparisons between builds use the CPU time (user + sys) of
+  interleaved runs, which moved by about ±3%.
+- 6 of the 11 programs are dominated by instance attributes and method
+  calls. Apart from go and hexiom, none uses dicts or strings heavily, so
+  dict and string work is barely measured by this set.
+- The per-program optimization log and dispatch-mode comparison are in
+  `examples/python/FRICTION.md`.

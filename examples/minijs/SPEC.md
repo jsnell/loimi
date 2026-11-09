@@ -1,14 +1,35 @@
 # The MiniJS language
 
-MiniJS is a subset of JavaScript (ECMAScript 2020, non-module scripts). A
-valid MiniJS program is a valid JavaScript program, and it produces the
+MiniJS is a subset of JavaScript (ECMAScript 2020, non-module scripts).
+This document defines the subset, for people who write MiniJS programs or
+implement MiniJS.
+
+A valid MiniJS program is a valid JavaScript program, and it produces the
 same standard output under any conforming JavaScript engine, such as
-`node`. This document defines the subset. For anything it does not say,
-the ECMAScript specification applies.
+`node`. For anything this document does not say, the ECMAScript
+specification applies.
 
 A program that uses a feature outside the subset is not a MiniJS
 program. An implementation may reject it, or it may run it with
 different behaviour.
+
+## Running MiniJS
+
+```sh
+./target/release/loimi build examples/minijs/main.lm --release -o minijs
+./minijs program.js
+```
+
+| Command line | What it does |
+|---|---|
+| `minijs PROGRAM` | Runs the program. |
+| `minijs PROGRAM stress` | Runs it with a garbage collection at every safepoint (for testing). |
+| `minijs PROGRAM verify` | As `stress`, with a generational heap whose write barriers are checked at each collection. |
+
+| Environment variable | Effect |
+|---|---|
+| `MINIJS_DIS=1` | Prints every compiled function's bytecode. |
+| `MINIJS_STATS=1` | Prints object-shape and cache statistics to standard error at exit. |
 
 ## 1. Lexical structure
 
@@ -16,26 +37,29 @@ different behaviour.
 - **Comments** are `// ...` and `/* ... */`.
 - **Identifiers** contain letters, digits, `_` and `$`, and do not start
   with a digit.
-- **Reserved words:** `break case catch class const continue default
-  delete do else extends false finally for function if in instanceof let
-  new null return super switch this throw true try typeof undefined var
-  void while`, plus all other ECMAScript reserved words. Programs must
-  not use them as variable names. Reserved words *may* be used as
-  property names (`o.default`, `{class: 1}`).
+- **Reserved words** may not be used as variable names. They are the
+  ECMAScript reserved words, including these:
+
+  ```
+  break case catch class const continue default delete do else extends
+  false finally for function if in instanceof let new null return super
+  switch this throw true try typeof undefined var void while
+  ```
+
+  Reserved words *may* be used as property names (`o.default`,
+  `{class: 1}`).
 - **Contextual words.** `constructor`, `static`, `of`, `get` and `set`
   are ordinary identifiers outside the places where they have meaning.
-  Programs must not assign to `undefined`, `NaN` or `Infinity`.
+- Programs must not assign to `undefined`, `NaN` or `Infinity`.
 - **Numerals:**
   - decimal: `42`, `3.25`, `.5`, `5.`, `1e9`, `1e+3`, `2.5E-3`;
-  - hex: `0xff` and `0XFF`.
-
-  There are no octal, binary or BigInt literals, and no numeric
-  separators.
+  - hex: `0xff` and `0XFF`;
+  - no octal, binary or BigInt literals, and no numeric separators.
 - **Strings:**
   - delimited by `'` or `"`;
-  - escapes `\n \t \r \\ \' \" \0`, and `\xHH` below `\x80`. There
-    are no line continuations;
-  - no template literals, and no regular-expression literals.
+  - escapes `\n \t \r \\ \' \" \0`, and `\xHH` below `\x80`;
+  - no line continuations, no template literals and no
+    regular-expression literals.
 - **Strict mode.** Programs behave the same in strict and sloppy mode:
   - no assignment to undeclared variables, and no reading of undeclared
     variables, including `typeof undeclared`;
@@ -71,17 +95,20 @@ function. Arrays are objects.
 - A string is an immutable sequence of 16-bit code units. MiniJS
   programs use only ASCII characters, so in practice a string is a
   sequence of bytes.
-- `s.length`, `s[i]` (one-character string, or undefined out of range),
-  `+` concatenation, and comparisons (`< <= > >=` compare code units).
+- `s.length` is the length.
+- `s[i]` is a one-character string, or undefined out of range.
+- `+` concatenates.
+- `< <= > >=` compare code units.
 
 ### 2.3 Objects
 
 - **Properties.** Objects are collections of properties with string keys.
   Property order follows JavaScript: array-index keys (canonical
   decimal strings of integers 0 .. 2^32−2) ascending first, then the other
-  string keys in insertion order. Programs use only keys that are either
-  small non-negative integers or not numeric-looking at all. It is only observable
-  through `Object.keys` and `for ... in`.
+  string keys in insertion order. The order is only observable through
+  `Object.keys` and `for ... in`.
+- **Keys** are either small non-negative integers or not numeric-looking
+  at all. Programs use no other keys.
 - **Prototypes.** Every object has a prototype (an object, or null).
   Property reads walk the prototype chain. Property writes create or
   update an own property, since there are no setters.
@@ -172,17 +199,17 @@ function. Arrays are objects.
 
 ## 3. Expressions
 
-- **Literals, identifiers and constructors:** literals, identifiers,
-  `this`, object and array literals, function and arrow expressions,
-  and `new F(...)`.
-- **Member access:** `e.name`, `e[e]`, calls, and method calls.
+- **Primary expressions:** literals, identifiers, `this`, object and
+  array literals, function and arrow expressions, and `new F(...)`.
+- **Member access and calls:** `e.name`, `e[e]`, calls, and method
+  calls.
 - **Operators,** with JavaScript precedence and associativity:
   - unary: `! - + ~ typeof void delete`;
   - prefix and postfix `++ --` on variables and properties;
   - `**` (right-associative);
   - `* / %`, then `+ -`, then `<< >> >>>`;
-  - `< <= > >= in`. `instanceof` is out of the subset.
-  - `=== !==`, then `& ^ |`, then `&& ||`. `??` is allowed.
+  - `< <= > >= in` (`instanceof` is out of the subset);
+  - `=== !==`, then `& ^ |`, then `&& ||` and `??`;
   - `?:` (conditional);
   - assignment: `= += -= *= /= %= &= |= ^= <<= >>= >>>=`;
   - the comma operator only in `for` headers.
@@ -191,9 +218,9 @@ function. Arrays are objects.
 
 ## 4. Statements
 
-- **Declarations:** `var`, `let` and `const`, with several declarators
-  allowed (`let a = 1, b = 2;`) (with block scoping for
-  `let`/`const`), and function declarations.
+- **Declarations:** `var`, `let` and `const`, and function
+  declarations. `let` and `const` are block scoped. Several declarators
+  are allowed: `let a = 1, b = 2;`.
   - Programs must not read a `let`/`const` before its declaration (the
     temporal dead zone).
   - Programs must not use `var` in a way where hoisting changes
@@ -202,22 +229,22 @@ function. Arrays are objects.
 - **Conditionals:** `if`/`else`, and `switch` with `case`/`default` and
   fallthrough. Case values are compared with `===`.
 - **Loops:**
-  - `while`, `do ... while`, and `for (init; cond; step)`;
-  - `for (const x of array)`, also with `let` (arrays only; a loop body
-    may push to the array it iterates over, with JavaScript semantics) and `for (const k in object)`
-    (own and inherited enumerable string keys, in JavaScript order;
-    programs should iterate only over objects without inherited
-    enumerable properties);
+  - `while`, `do ... while`, and `for (init; cond; step)`.
+  - `for (const x of array)`, also with `let`. Only over arrays. The
+    loop body may push to the array it iterates over, with JavaScript
+    semantics.
+  - `for (const k in object)`: own and inherited
+    enumerable string keys, in JavaScript order. Programs should iterate
+    only over objects without inherited enumerable properties.
   - `break` and `continue`, including labels: `outer: for (...)` with
     `break outer;`.
 - **Control:** `return`, `throw`, and `try { } catch (e) { } finally { }`.
   - Programs throw `Error` objects (`new Error("msg")`, which has
     `.message`) or plain values.
-  - Built-in errors (TypeError and similar) are thrown for: calling a
+  - Built-in errors (TypeError and similar) are thrown for calling a
     non-function, reading a property of undefined or null, and calling
-    `super` wrongly. Their `.message` text is unspecified, but
-    `e instanceof TypeError` is not available. Programs may catch them,
-    but must not print their messages.
+    `super` wrongly. Programs may catch them, but must not print their
+    messages, whose text is unspecified.
 - **Uncaught exceptions.** An uncaught exception terminates the program
   with a nonzero exit status. Standard output written before it must be
   flushed. The text written to standard error is unspecified.
@@ -226,7 +253,8 @@ function. Arrays are objects.
 
 Only the following exist.
 
-**Global functions:**
+### Global functions
+
 - `console.log(...args)`: writes the arguments converted with ToString,
   separated by single spaces, followed by a newline.
   - Programs must not pass `-0`, which node prints as `-0`.
@@ -236,28 +264,37 @@ Only the following exist.
   - Printing an object or array directly is out of the subset, because
     node prints them with its own inspection format. Use `String(a)` or
     `a.join(",")` instead.
-- `String(v)` and `Number(s)`, with JavaScript's StringToNumber:
+- `String(v)` converts with ToString. `String` of functions and of
+  Error objects is out of the subset.
+- `Number(s)` converts with JavaScript's StringToNumber:
   - surrounding whitespace is ignored, and `""` gives 0;
   - an optional sign, decimal or hex numerals, and `Infinity` are
     accepted;
   - anything else gives `NaN`.
-
-  `String` of functions and of Error objects is out of the subset.
 - `parseInt(s, radix?)` and `parseFloat(s)`, for ASCII inputs.
 - `isNaN(x)` and `isFinite(x)`, for number arguments.
 - `Error`: `new Error(msg)` gives an object with `.message`.
 
-**`Math`:** `floor ceil round trunc abs sqrt sin cos tan atan atan2 exp
-log pow min max sign`, plus `Math.PI` and `Math.E`. There is no
+### `Math`
+
+| Kind | Names |
+|---|---|
+| Functions with the same result in every engine | `abs floor ceil round trunc sqrt min max sign` |
+| Functions whose result may differ in the last bit | `sin cos tan atan atan2 exp log pow` |
+| Constants | `Math.PI`, `Math.E` |
+
+Programs print the results of the second group through `toFixed`. There is no
 `Math.random`; programs implement their own generator.
 
-**`Object`:**
+### `Object`
+
 - `Object.keys(o)`: own enumerable keys, in order.
 - `Object.create(proto)`, where `proto` is an object or null.
 - `Object.getPrototypeOf(o)`.
 - `o.hasOwnProperty(k)`.
 
-**`Array`:**
+### `Array`
+
 - Creation: `new Array(n)` (n undefined elements; the only allowed form)
   and `Array.isArray(x)`.
 - Methods:
@@ -281,7 +318,10 @@ log pow min max sign`, plus `Math.PI` and `Math.E`. There is no
     no arguments.
   - `includes` uses SameValueZero, so `[NaN].includes(NaN)` is true.
 
-**`String`** (methods on string values):
+### `String`
+
+Methods on string values:
+
 - `charCodeAt(i)`, `charAt(i)`, `indexOf(sub, from?)` and
   `lastIndexOf(sub)`;
 - `slice(start?, end?)` and `substring(start, end?)`;
@@ -291,17 +331,21 @@ log pow min max sign`, plus `Math.PI` and `Math.E`. There is no
   `includes(s)`;
 - `String.fromCharCode(c...)`, for code units below 128.
 
-**Precision.** `Math` functions other than `abs floor ceil round trunc
-sqrt min max sign` may differ in the last bit between engines. Programs
-print their results through `toFixed`.
+### `Number` methods
 
-**`Number` methods:** `n.toFixed(d)` for 0 ≤ d ≤ 20 and |n| < 1e21, and
-`n.toString(radix?)` for integer n and radix 2–36.
+- `n.toFixed(d)`, for 0 ≤ d ≤ 20 and |n| < 1e21.
+- `n.toString(radix?)`, for integer n and radix 2–36.
 
-**Constants:** `NaN`, `Infinity` and `undefined`.
+### Constants
 
-The global object, `globalThis`, `Map`, `Set`, `JSON`, `Date`, `RegExp`,
-`Symbol`, typed arrays, `eval` and `Function` are out of the subset.
+`NaN`, `Infinity` and `undefined`.
+
+### Out of the subset
+
+- the global object and `globalThis`;
+- `Map`, `Set`, `JSON`, `Date`, `RegExp` and `Symbol`;
+- typed arrays;
+- `eval` and `Function`.
 
 ## 6. Memory
 

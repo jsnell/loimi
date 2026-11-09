@@ -1,15 +1,18 @@
 # std.obj inline-cache microbenchmark
 
-`ic.lm` runs a vm loop of 8 property reads per iteration (10 million
-iterations) on an object with four inline properties, with the read done
-three ways, and a loop of `MOVE`s in the same places as the baseline:
+How much a property read through `std.obj`'s inline cache costs,
+compared with a plain register move and with the slower lookups.
+
+`ic.lm` runs a vm loop of 8 property reads per iteration, 10 million
+iterations, on an object with four inline properties. It does the read
+three ways, plus a loop of `MOVE`s in the same places as the baseline:
 
 ```sh
 LOIMI_STD=. target/release/loimi run bench/obj/ic.lm --release
 ```
 
-Results (Intel i7-6700, clang 19, tail-call dispatch, 2026-11-02, other
-jobs running on the machine):
+Results on an Intel i7-6700 with clang 19, tail-call dispatch,
+2026-11-02, with other jobs running on the machine:
 
 | Read | Loop time | Cost per read over `MOVE` |
 |---|---|---|
@@ -18,9 +21,9 @@ jobs running on the machine):
 | global megamorphic cache (`get_mega`) | 480 ms | 4.9 ns |
 | uncached lookup (`get`: walks the transition chain) | 620 ms | 6.6 ns |
 
-A cache hit costs about three cycles more than a register move. The hit
-path of `GETPROP_IN` (from `tests/run/std_obj_ic.lm`, `objdump -d` of a
-`--release` build):
+A cache hit costs about three cycles more than a register move. This is
+the hit path of `GETPROP_IN`, from `objdump -d` of a `--release` build of
+`tests/run/std_obj_ic.lm`:
 
 ```
 mov    %r15d,%ecx                 ; decode the `o` register operand
@@ -48,11 +51,12 @@ movzbl %r15b,%eax
 jmp    *0x405d00(,%rax,8)
 ```
 
-The cache itself is the two loads and the compare marked `o.shape`,
-`o.shape.id` and `== cache.shape`, plus the slot load; the rest is
-operand decoding, the type test that any property read needs, and
-dispatch. The out-of-line member (`GETPROP_OUT`) adds one load
-(`o.overflow`) and the mask of the SlotRef bit. Keeping the shape id in
-the object itself (next to the shape pointer) would save one dependent
-load per hit; std.obj reads it through the shape so that objects stay one
-word smaller.
+- The cache itself is the two loads and the compare marked `o.shape`,
+  `o.shape.id` and `== cache.shape`, plus the slot load.
+- The rest is operand decoding, the type test that any property read
+  needs, and dispatch.
+- The out-of-line variant (`GETPROP_OUT`) adds one load (`o.overflow`)
+  and masks off the SlotRef bit.
+- Keeping the shape id in the object, next to the shape pointer, would
+  save one dependent load per hit. `std.obj` reads it through the shape
+  so that objects stay one word smaller.

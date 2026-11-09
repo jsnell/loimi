@@ -1,45 +1,29 @@
 # Writing a fast interpreter in Loimi
 
-This tutorial builds a small dynamically typed language, **Pip**, from an
-empty file to a bytecode interpreter with NaN-boxed values, inline
-caches, quickening, a garbage collector and a bytecode fuzzer. Every
-stage is a complete program in [`examples/tutorial/`](../../examples/tutorial),
-and every stage has tests.
+This tutorial builds a small dynamically typed language, **Pip**. It
+starts from an empty file and ends with a fast bytecode interpreter that
+has NaN-boxed values, inline caches, a garbage collector and a bytecode
+fuzzer. Every step is a complete, tested program in
+[`examples/tutorial/`](../../examples/tutorial).
 
-It is written for someone who knows C or Rust and may have read an
-interpreter or two (Lua, CPython, a Scheme), but has not written one in
-Loimi. Each chapter introduces the Loimi features the interpreter needs
-at that point and says what they replace: the macros, `Protect()` calls,
-computed gotos and hand-written disassemblers that C interpreters are
-built from.
+It is for someone who knows C or Rust and may have read the source of
+an interpreter or two (Lua, CPython, a Scheme), but has not used Loimi.
+Each chapter introduces the Loimi features the interpreter needs at
+that point, and says what they replace in a C interpreter.
 
 ## Contents
 
-1. [Loimi in ten minutes](01-basics.md): functions, structs, enums,
-   `match`, options and results, modules, `std.io`, `loimi run`.
-2. [A calculator](02-calculator.md): a lexer from `std.lex`, a Pratt
-   parser from `std.parse`, and a tree-walking evaluator.
-3. [A first vm](03-first-vm.md): `vm`, `state`, operands, a fixed
-   encoding, ops, `next`, entries, and what the compiler generates from
-   them: encoders, the disassembler and the verifier, whose
-   `Verified<Calc>` is the only code `run` accepts. Compiling to
-   bytecode with `std.bc`.
-4. [Values, slow paths and errors](04-values.md): `value ... repr
-   nanbox`, matching on `(Int, Int)`, `cold` blocks, `inline for`,
-   `raise` and `on raise`.
-5. [Variables and control flow](05-variables.md): locals in registers,
-   globals behind an inline cache (`cache`, `family`, `become`),
-   compare-and-branch with `then JMP`.
-6. [Functions and calls](06-functions.md): prototypes, frames, CALL and
-   RET, register windows, verify clauses that look at the instruction.
-7. [Heap objects and the GC](07-gc.md): `object`, `Gc<T>`, root
-   scanners, effects (`uses gc`, `sync`), and GC stress testing.
-8. [Making it fast](08-fast.md): measuring, `--dispatch`, reading the
-   generated code, constant operands, float quickening, `--vm-stats` and
-   `super`, and the checklist from Mini's performance log.
-9. [Testing an interpreter](09-testing.md): conformance tests across
-   dispatch modes and GC stress, a bytecode fuzzer with a step-budget
-   `variant`, and clean-room benchmarks.
+| Chapter | What you build | What you learn |
+|---|---|---|
+| 1. [Loimi in ten minutes](01-basics.md) | Small examples | The core language |
+| 2. [A calculator](02-calculator.md) | A lexer, a parser and a tree-walking evaluator | `std.lex` and `std.parse` |
+| 3. [A first vm](03-first-vm.md) | A bytecode compiler and vm for the calculator | The `vm` block, the generated encoders, disassembler and verifier, and `std.bc` |
+| 4. [Values, slow paths and errors](04-values.md) | Dynamically typed values and run-time errors | `value` types, `cold` blocks, `inline for`, `raise` |
+| 5. [Variables and control flow](05-variables.md) | Locals, globals, `if` and `while` | Inline caches, quickening, compare-and-branch |
+| 6. [Functions and calls](06-functions.md) | Function calls | Frames, register windows, verifying calls |
+| 7. [Heap objects and the GC](07-gc.md) | Strings and arrays | `object`, `Gc<T>`, roots, effects, GC stress testing |
+| 8. [Making it fast](08-fast.md) | A faster interpreter | Measuring, dispatch modes, reading the generated code, superinstructions |
+| 9. [Testing an interpreter](09-testing.md) | Unit tests and a bytecode fuzzer | `std.test`, variants, clean-room benchmarks |
 
 ## The language
 
@@ -60,17 +44,23 @@ while i < len(words) {
 }
 ```
 
-It has integers (32-bit, overflowing into floats), floats, booleans,
-`nil`, strings, fixed-size arrays and functions; global variables
-(`let` at the top level), local variables (`let` in a block, and
-parameters), `if`/`else`, `while`, `fn`, `return`, `print`, and two
-built-ins, `len(x)` and `array(n)`. It has no closures, no `and`/`or`,
-and no `for`; those are good exercises once you have finished.
+Pip has:
+
+- values: integers (32-bit, overflowing into floats), floats, booleans,
+  `nil`, strings, fixed-size arrays and functions
+- global variables (`let` at the top level) and local variables (`let`
+  in a block, and parameters)
+- `if`/`else`, `while`, `fn`, `return` and `print`
+- two built-in functions, `len(x)` and `array(n)`
+
+It has no closures, no `and`/`or` and no `for`. Those are good
+exercises once you have finished.
 
 ## Running the steps
 
-You need the Loimi compiler (`cargo build --release` at the top of the
-repository) and clang 19. Each step is a directory with a `main.lm`:
+You need clang 19 and the Loimi compiler, which you build by running
+`cargo build --release` at the top of the repository. Each step is a
+directory with a `main.lm`:
 
 ```sh
 ./target/release/loimi run examples/tutorial/step7/main.lm -- examples/tutorial/step7/tests/arrays.pip
@@ -78,10 +68,10 @@ repository) and clang 19. Each step is a directory with a `main.lm`:
 ./pip examples/tutorial/step9/tests/functions.pip
 ```
 
-`examples/tutorial/check.sh` builds every step (in all three dispatch
-modes for the steps that have a vm) and runs its tests; `cargo test` runs
-it, and also checks that every Loimi snippet in these chapters appears in
-the step files.
+`examples/tutorial/check.sh` builds every step and runs its tests (in
+all three dispatch modes, for the steps that have a vm). `cargo test`
+runs it too, and also checks that every Loimi snippet in these chapters
+appears in the step files.
 
 | Step | Directory | New in this step |
 |---|---|---|
@@ -97,10 +87,15 @@ the step files.
 
 ## What is not covered
 
-The language reference is [`docs/language.md`](../language.md), and
-[`docs/status.md`](../status.md) lists what is built. Some of it is left
-out here: closures in Loimi itself, embedding in C (`loimi build --lib`), threads (and heaps shared
-behind `std.gil`), the generational GC mode, resume points for
-coroutines (`Vm.Resume`), accumulator registers, cross-compiling for
-AArch64 (`--target`) and the copy-and-patch JIT (`--jit-stencils`);
-`status.md` lists them.
+These Loimi features are not used in the tutorial. The
+[language reference](../language.md) and the
+[standard library reference](../stdlib.md) describe them.
+
+- closures in Loimi code
+- embedding the interpreter in a C program (`loimi build --lib`)
+- threads, and heaps shared between threads (`std.gil`)
+- the generational GC mode
+- resume points for coroutines (`Vm.Resume`)
+- accumulator registers
+- cross-compiling for AArch64 (`--target`)
+- the copy-and-patch JIT (`--jit-stencils`)

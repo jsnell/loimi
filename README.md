@@ -1,44 +1,53 @@
 # Loimi
 
-*Loimi* is a statically typed systems
-language for **writing bytecode interpreters**. It compiles to LLVM bitcode and
-is designed around a single goal: the code you write for an interpreter's inner
-loop should compile to what an expert would write by hand in assembly, without
-you having to write assembly, macros, or `__attribute__` soup.
+Loimi is a statically typed systems language for **writing bytecode
+interpreters**. It compiles to LLVM. Its goal is that the inner loop of
+your interpreter compiles to the code an expert would write by hand in
+assembly, without you writing assembly, macros or compiler-specific
+attributes.
 
-You declare the interpreter (its state, instruction formats, value
-representation, ops, slow paths and inline caches) and the compiler
-generates the dispatch loop in the strategy you pick at build time, plus
-the tools that must agree with it: encoders, a disassembler, a bytecode
-verifier, a superinstruction peephole pass, GC tracing and even a
-copy-and-patch JIT.
+You describe the interpreter: its state, instruction formats, value
+representation, ops, slow paths and inline caches. The compiler then
+generates the dispatch loop, using the strategy you pick at build time.
+It also generates the tools that must agree with that loop:
 
-AI disclosure: All the code, and 99% of this README was written by AI. There
-was at best minimal human oversight.
+- instruction encoders and a disassembler
+- a bytecode verifier
+- a peephole pass that forms superinstructions
+- GC tracing code
+- a copy-and-patch JIT
 
-Status: working and extensively tested, but I don't expect anyone else to use this.
-(Just vibe-code your own if you like the concept).
+**AI disclosure:** All the code, and 99% of this README, was written by
+AI. There was at best minimal human oversight.
+
+**Status:** working and extensively tested, but I don't expect anyone
+else to use this. (Just vibe-code your own if you like the concept.)
 
 ## Why a new language?
 
-Every serious interpreter written in C or C++ ends up rebuilding the same
-infrastructure out of macros, compiler extensions, and convention:
+Every serious interpreter written in C or C++ ends up rebuilding the
+same machinery out of macros, compiler extensions and convention.
+Loimi makes each piece part of the language.
 
 | Problem | What people do today | What Loimi does |
 |---|---|---|
-| Fast dispatch | `switch`, computed goto (GCC extension), `musttail` + `preserve_none` (CPython 3.14), hand-written asm (LuaJIT), custom DSL (JSC's offlineasm) | `vm` declarations; dispatch strategy is a build flag (tail-call, goto, switch) over the same source |
-| Keep `pc`/`sp`/frame in registers | Hope the register allocator cooperates in one giant function | Declared `state`, pinned to registers via the calling convention |
-| Slow paths ruining hot paths | `UNLIKELY()`, manual outlining, `noinline` | `cold { }` blocks, outlined so that the hot path makes no call and keeps its registers |
-| "Save pc before anything that can error or GC" | Lua's `Protect()`/`savepc`, CPython's frame sync. Easy to forget, and forgetting causes heisenbugs | **Effects** (`sync`, `gc`, `reenter`); the compiler inserts state syncs and rejects calls that would miss one |
-| Instruction encoding | Hand-written bit shifts, plus a separate disassembler that drifts out of sync | Declared formats; encoders, decoders, emitters, disassembler and verifier are generated (`std.bc` builds code over them) |
-| Value representation | Hand-rolled NaN-boxing / pointer tagging macros | `value` types with a declared `repr`; `match` compiles to optimal bit tests, including multi-value checks |
-| Quickening and inline caches | Ad-hoc bytecode rewriting | `family` ops with `become`, typed inline `cache` words |
-| Superinstructions | Rarely done, because it's painful | `super A = X; Y;`, plus `--vm-stats`, which counts op pairs and suggests `super` declarations |
-| Untrusted bytecode | Either trust it or bounds-check everything in the hot loop | Generated verifier; verified code runs without operand bounds checks, and `#[require_verified]` makes the entries accept only verified code |
-| GC roots | Manual `PUSH_ROOT`/handle scopes, conservative stack scanning | Collection only at calls marked `uses gc`; the compiler roots traced locals and vm state there, and `--gc-check-roots` checks every root |
-| Tracing and debugger hooks | A check in every handler, or a second copy of the interpreter | Instrumentation `variant`s: alternate dispatch tables, zero cost when off |
+| Fast dispatch | `switch`, computed goto (a GCC extension), `musttail` + `preserve_none` (CPython 3.14), hand-written assembly (LuaJIT), a custom DSL (JSC's offlineasm) | `vm` declarations. The dispatch strategy (tail calls, goto or switch) is a build flag over the same source |
+| Keeping `pc`, `sp` and the frame in registers | Hope the register allocator copes with one giant function | Declared `state`, kept in registers by the calling convention |
+| Slow paths slowing down hot paths | `UNLIKELY()`, manual outlining, `noinline` | `cold { }` blocks, moved out so the hot path makes no call and keeps its registers |
+| "Save `pc` before anything that can fail or collect garbage" | Lua's `Protect()`, CPython's frame sync. Easy to forget, and forgetting causes bugs that are hard to reproduce | **Effects** (`sync`, `gc`, `reenter`). The compiler saves state where needed and rejects calls that would miss it |
+| Instruction encoding | Hand-written bit shifts, and a separate disassembler that drifts out of date | Declared formats. Encoders, decoders, disassembler and verifier are generated |
+| Value representation | Hand-written NaN-boxing or pointer-tagging macros | `value` types with a declared representation. `match` compiles to minimal bit tests, also on two values at once |
+| Quickening and inline caches | Ad-hoc bytecode rewriting | `family` ops with `become`, and typed inline `cache` words |
+| Superinstructions | Rarely done, because it's painful | `super A = X; Y;`. `--vm-stats` counts op pairs and suggests `super` declarations |
+| Untrusted bytecode | Trust it, or bounds-check everything in the hot loop | A generated verifier. Verified code runs without operand bounds checks |
+| GC roots | Manual root pushing or handle scopes, or conservative stack scanning | Collection happens only at calls marked `uses gc`, where the compiler roots locals and vm state. `--gc-check-roots` checks every root |
+| Tracing and debugger hooks | A check in every handler, or a second copy of the interpreter | Instrumentation `variant`s: alternate dispatch tables that cost nothing when off |
 
 ## A taste
+
+Part of a small register-based vm: an add with fast paths for integers
+and floats and a slow path for everything else, a compare-and-branch,
+and a return.
 
 <!-- snippet: check
 value Value repr nanbox { Num(f64) unboxed, Int(i32), Nil, Bool(bool) }
@@ -94,176 +103,155 @@ vm Mini {
 }
 ```
 
-With `--dispatch=tailcall` (the default on x86-64 and AArch64), each `op`
-becomes its own LLVM function using the `preserve_none` calling convention, and
-every `next` becomes a `musttail` call through the dispatch table. `pc`,
-`regs`, `k`, and `ctx` stay in machine registers across the whole interpreter.
-The `(Int, Int)` check compiles to one xor/or/shift/compare. The `cold` block is
-moved to its own function and reached with a tail call, so the hot path
-makes no call and needs no stack frame.
+With `--dispatch=tailcall`, the default on x86-64 and AArch64:
+
+- Each `op` becomes its own LLVM function with the `preserve_none`
+  calling convention, and each `next` becomes a `musttail` call through
+  the dispatch table.
+- `pc`, `regs`, `k` and `ctx` stay in machine registers across the
+  whole interpreter.
+- The `(Int, Int)` check compiles to one xor, or, shift and compare.
+- The `cold` block becomes a separate function reached by a tail call,
+  so the hot path makes no call and needs no stack frame.
 
 ## Example interpreters
 
-Each has its own tests, run by `cargo test`. Ratios are run time over the reference's, geometric means over
-each suite, tail-call builds; every number, for every dispatch mode and
-the JIT, is in [`docs/results.md`](docs/results.md) (made with
-`bench/run_all.py`).
+The repository has nine example interpreters, each with its own tests.
+The numbers are run time divided by the reference implementation's run
+time (lower is better), as a geometric mean over each benchmark suite,
+for tail-call builds. All results, for every dispatch mode and the JIT,
+are in [`docs/results.md`](docs/results.md).
 
-| Example | What it is | Headline |
+| Example | What it is | Performance |
 |---|---|---|
-| [`mini`](examples/mini) | A Lua 5.4 subset ([spec](examples/mini/SPEC.md)) with coroutines that switch inside the dispatch loop ([notes](examples/mini/COROUTINES.md)); also a C library ([`examples/embed`](examples/embed)) | 0.49× PUC-Lua 5.4, 0.75× LuaJIT's assembly interpreter (`-joff`), on 14 clean-room benchmarks; coroutines 0.33× PUC-Lua ([log](bench/mini/RESULTS.md)) |
-| [`minijs`](examples/minijs) | A JavaScript subset on `std.obj` shapes and inline caches | 0.48× V8's interpreter (`node --jitless`), 0.37× QuickJS |
-| [`scheme`](examples/scheme) | An R7RS-small subset with proper tail calls, flat closures and a generational heap | 43 unmodified r7rs-benchmarks programs: 0.22× Gauche, 0.38× Guile 3 without JIT, 0.80× Guile with its JIT ([notes](bench/scheme/README.md)) |
-| [`lox`](examples/lox) | Lox from *Crafting Interpreters* | All 246 tests of the book's suite; 0.42× clox |
-| [`regex`](examples/regex) | A backtracking regex engine shipped as a C library | 0.44× the PCRE2 interpreter, 0.41× Python's `re` |
+| [`mini`](examples/mini) | A Lua 5.4 subset ([spec](examples/mini/SPEC.md)) with coroutines, also usable as a C library ([`examples/embed`](examples/embed)) | 0.49× PUC-Lua 5.4 and 0.75× LuaJIT's assembly interpreter (`-joff`) on 14 clean-room benchmarks; coroutines 0.33× PUC-Lua ([log](bench/mini/RESULTS.md)) |
+| [`minijs`](examples/minijs) | A JavaScript subset with hidden classes and inline caches | 0.48× V8's interpreter (`node --jitless`), 0.37× QuickJS |
+| [`scheme`](examples/scheme) | An R7RS-small subset with proper tail calls, flat closures and a generational heap | On 43 unmodified r7rs-benchmarks programs: 0.22× Gauche, 0.38× Guile 3 without JIT, 0.80× Guile with its JIT ([notes](bench/scheme/README.md)) |
+| [`lox`](examples/lox) | Lox from *Crafting Interpreters* | Passes all 246 tests of the book's suite; 0.42× clox |
+| [`regex`](examples/regex) | A backtracking regex engine, shipped as a C library | 0.44× the PCRE2 interpreter, 0.41× Python's `re` |
 | [`stack`](examples/stack) | Stak, a Forth with statically checked stack effects | (no reference) |
-| [`wasm`](examples/wasm) | A WebAssembly interpreter (MVP plus reference types, bulk memory, multi-value, SIMD) | Every spec test file passes (SIMD's 57 included); 0.85× wasm3 on seven programs, 0.82× on 30 held-out PolyBench/C kernels |
-| [`python`](examples/python) | A Python 3 subset: classes, generators, exceptions, bigints, dicts ([spec](examples/python/SPEC.md)) | 11 pyperformance programs with CPython's output: 0.31× CPython 3.13, 0.11× MicroPython ([report](examples/python/FRICTION.md)) |
-| [`prolog`](examples/prolog) | An ISO Prolog subset on a WAM ([spec](examples/prolog/SPEC.md)) | The 30 van Roy / Aquarius programs of SWI-Prolog's bench suite: 0.47× SWI-Prolog 10 (`-O`), 0.11× Trealla ([report](examples/prolog/FRICTION.md)) |
+| [`wasm`](examples/wasm) | A WebAssembly interpreter: MVP plus reference types, bulk memory, multi-value and SIMD | Passes every spec test file (SIMD's 57 included); 0.85× wasm3 on seven programs, 0.82× on 30 held-out PolyBench/C kernels |
+| [`python`](examples/python) | A Python 3 subset with classes, generators, exceptions, bigints and dicts ([spec](examples/python/SPEC.md)) | On 11 pyperformance programs: 0.31× CPython 3.13, 0.11× MicroPython |
+| [`prolog`](examples/prolog) | An ISO Prolog subset on a WAM ([spec](examples/prolog/SPEC.md)) | On the 30 van Roy / Aquarius programs from SWI-Prolog's suite: 0.47× SWI-Prolog 10 (`-O`), 0.11× Trealla |
 
-Lox, regex, stack, wasm, python and prolog were written by agents that read only
-the docs, as usability studies; each has a `FRICTION.md` report.
+Lox, regex, stack, wasm, python and prolog were written by AI agents
+that read only the documentation, as usability studies. Each has a
+`FRICTION.md` report on what was hard.
+
 `loimi build --jit-stencils` turns the same `vm` source into a
-copy-and-patch JIT: 0.76–0.83 of the interpreter's time for Mini, MiniJS
-and Scheme ([design](docs/design/copy-and-patch.md)).
+copy-and-patch JIT. For Mini, MiniJS and Scheme it runs in 0.76–0.83 of
+the interpreter's time.
 
 ## What is in it
 
-**`vm` declarations** ([language.md §3](docs/language.md#3-the-vm-declaration), [§7](docs/language.md#7-specialization-quickening-inline-caches-superinstructions)):
-`state` pinned in registers, operand kinds with `verify` clauses,
-fixed-width formats, ops ending in control words (`next`, `jump`,
-`exit`, `raise`), vm functions (`next_pc`, `then_next_pc`), entries,
-nested entries for natives that call guest code, and resume points
-(`Vm.Resume`) for coroutines and generators. Generated from them:
-encoders, emitters, per-format readers, setters and encoders, a
-disassembler, the verifier and its `Verified<Vm>` proof type.
-Specialization: inline `cache`s, quickening with `family`/`become`,
-`then OP`, `super` instructions (with `#[forward]` register forwarding),
-accumulator registers (`#[accumulate]`), stack effects for stack VMs,
-and instrumentation `variant`s.
+**Interpreter features**
 
-**Dispatch and code generation** ([§3.7](docs/language.md#37-dispatch-strategies), [lowering.md](docs/lowering.md)):
-`--dispatch=tailcall` (`preserve_none` + `musttail`, the default),
-`goto` (one shared dispatch block copied into each handler) or `switch`
-over the same source. `cold` blocks are outlined; effects (`uses sync`,
-`gc`, `reenter`) make the compiler sync state before calls that need
-it. Handlers are kept free of stack frames (no `memcpy` formation or loop
-vectorization in them), and `-W handler_frame` reports those that still
-set one up. Targets: x86-64 and AArch64 Linux (`--target`), for the
-baseline CPU or a newer one (`--cpu=x86-64-v3`, `native`).
+- `vm` declarations: state kept in registers, operands with `verify`
+  rules, fixed-width instruction formats, ops, entry points, and resume
+  points for coroutines and generators.
+- Generated from each `vm`: encoders, a disassembler, and a verifier
+  whose `Verified<Vm>` type proves code was checked.
+- Specialization: inline caches, quickening (`family` and `become`),
+  superinstructions (`super`), accumulator registers and stack effects
+  for stack machines.
+- Instrumentation `variant`s, such as tracing or step limits, at no
+  cost when off.
+- Breakpoints patched over verified code, with `std.debug` for
+  stepping. Mini's debug build includes `mini-dap`, a Debug Adapter
+  Protocol server for editors.
 
-**Values** ([§2](docs/language.md#2-value-types-declared-representations)):
-`value` types with a declared `repr` (`nanbox`, `lowtag`, `boxed`);
-`match`, also on tuples of values, compiles to a few bit tests.
-Payloads up to 48 bits, and up to 56 `Gc` variants in a nanbox by
-sharing NaN blocks. `--explain-values` prints the chosen layout,
-`block N` pins it, and the `value_layout` warning says when adding a
-variant would change it.
+**Code generation**
 
-**GC** ([§8](docs/language.md#8-gc-integration), [stdlib/gc.md](docs/stdlib/gc.md)):
-`object` types and `Gc<T>`, tracing generated by the compiler, a
-mark-sweep collector written in Loimi (`std.gc`) with an optional
-generational mode (sticky marks, mark bitmaps and no sweep, compiler-emitted write
-barriers). Collection happens only in calls marked `uses gc`; the
-compiler roots traced locals and vm state there. Weak references,
-ephemerons, trace and free hooks. Testing aids: GC stress, a verify mode
-for write barriers, `--gc-check-roots`, and a rooting fuzzer.
+- Three dispatch strategies over the same source: `tailcall` (the
+  default), `goto` and `switch`.
+- `cold` blocks moved out of the hot path, and effects (`uses sync`,
+  `gc`, `reenter`) that make the compiler save state before calls that
+  need it.
+- Handlers kept free of stack frames; `-W handler_frame` reports those
+  that still set one up.
+- Targets: x86-64 and AArch64 Linux, for a baseline or newer CPU
+  (`--cpu=x86-64-v3`, `native`).
+- A copy-and-patch JIT built from the same source (`--jit-stencils`).
 
-**Embedding and threads** ([§10.1](docs/language.md#101-embedding-in-a-c-host-implemented)):
-`--lib`/`--shared` with `export "C"` functions and a generated C header,
-panics caught at the boundary, independent interpreter states on
-separate threads (runtime state is thread-local; `--sanitize=thread`),
-and threads sharing one heap behind a lock (`std.gil`). `--cfg NAME`
-with `#[cfg(..)]` and pointer atomics.
+**Values and memory**
 
-**Debugging guest programs** ([§9.1](docs/language.md#91-breakpoints-on-break), [design](docs/design/debugging.md)):
-generated breakpoint ops patched over verified code, at no cost when not
-debugging, with `std.debug` for stepping and breakpoints. Mini's debug
-build is debuggable from editors: a stop-callback C API and `mini-dap`,
-a Debug Adapter Protocol server (`examples/mini/dap`), with conditional
-breakpoints, break on error, pause and evaluation.
+- `value` types with a declared representation: `nanbox`, `lowtag` or
+  `boxed`. `--explain-values` prints the chosen layout.
+- `object` types and `Gc<T>`, with tracing code generated by the
+  compiler.
+- A mark-sweep collector written in Loimi (`std.gc`), with an optional
+  generational mode and compiler-generated write barriers.
+- Weak references, ephemerons, and trace and free hooks.
+- GC testing aids: stress mode, write-barrier checking,
+  `--gc-check-roots` and a rooting fuzzer.
 
-**Core language** ([§1](docs/language.md#1-core-language)): structs,
-enums, generics with static traits, `iN`/`uN` of any width, pattern
-matching (with constants as patterns), non-escaping and escaping
-closures, `defer`, `inline for`, float and wide-integer built-ins
-(`mul_wide`, `div_wide`), unaligned loads and stores, raw pointers.
+**Embedding**
 
-**Standard library** ([stdlib.md](docs/stdlib.md)): lexing (`std.lex`),
-Pratt parsing (`std.parse`), diagnostics (`std.diag`), exact number
-parsing and formatting (`std.num`), bytecode building (`std.bc`),
-hidden classes and inline caches (`std.obj`), the GC (`std.gc`,
-`std.gil`), arbitrary-precision integers (`std.bigint`), hash and
-insertion-ordered maps (`std.map`, `std.dict`), strings (`std.text`),
-collections and allocators (`std.mem`), non-local exits (`std.rt`),
-tests (`std.test`) and timing (`std.prof`).
+- Static or shared C libraries (`--lib`, `--shared`) with `export "C"`
+  functions and a generated C header. Panics are caught at the
+  boundary.
+- Independent interpreters on separate threads, or threads sharing one
+  heap behind a lock (`std.gil`).
 
-**Tooling**: `loimi test` runs `#[test]` functions; `--vm-stats` counts
-ops, op sequences (printed as suggested `super` declarations) and
-entries into cold blocks; `--sanitize=address`; a bytecode fuzzer for
-verified code (`tests/fuzz/run.sh`); `bench/run_all.py` runs every
-example against its references.
+**Core language**
+
+Structs, enums, generics with static traits, integers of any width,
+pattern matching, closures, `defer`, `inline for`, raw pointers, and
+built-ins for floats and wide integers.
+
+**Standard library**
+
+| Area | Modules |
+|---|---|
+| Front end | `std.lex` (lexing), `std.parse` (Pratt parsing), `std.diag` (error messages), `std.num` (exact number parsing and printing) |
+| Back end | `std.bc` (building bytecode), `std.obj` (hidden classes and inline caches) |
+| Memory | `std.gc`, `std.gil`, `std.mem` (collections and allocators) |
+| Data | `std.bigint`, `std.map`, `std.dict` (insertion-ordered), `std.text` |
+| Other | `std.rt` (non-local exits), `std.test`, `std.prof` (timing) |
+
+**Tools**
+
+- `loimi test` runs `#[test]` functions.
+- `--vm-stats` counts ops, common op sequences (printed as suggested
+  `super` declarations) and how often cold blocks run.
+- `--sanitize=address` and `--sanitize=thread`.
+- A bytecode fuzzer for verified code.
 
 ## Getting started
 
-Requirements: Rust (stable) and clang/LLVM 19, on x86-64 Linux (AArch64
-Linux is a cross target, below).
+You need Rust (stable) and clang/LLVM 19, on x86-64 Linux.
 
 ```sh
 cargo build --release
 ./target/release/loimi run tests/run/hello.lm          # compile and run
-./target/release/loimi build examples/mini/main.lm --release -o mini
-./mini examples/mini/tests/functions.mini              # the Lua-like example
-./target/release/loimi build examples/mini/embed.lm --lib -o libmini.a --header mini.h
-clang-19 -I. examples/embed/host.c libmini.a -lm -o host && ./host   # Mini embedded in C
-./target/release/loimi test examples/lox/lox_test.lm   # #[test] functions
 ./target/release/loimi --help                          # every build option
 ```
 
-Testing and benchmarking:
+Build and run Mini, the Lua-like example:
 
 ```sh
-LOIMI_TEST_FAST=1 cargo test --release                 # fast tier: while iterating
-cargo test --release                                   # default tier: before every merge
-cargo test --release -- --include-ignored              # heavy tier: before merging risky changes
-tests/fuzz/run.sh -t 600 vm mini                       # bytecode fuzzing under ASan
-bench/run.sh                                           # Loimi VM vs hand-written C
-bench/lua/install.sh && bench/mini/compare.py          # Mini vs PUC-Lua / LuaJIT
-bench/run_all.py --quick                               # every example vs its references
+./target/release/loimi build examples/mini/main.lm --release -o mini
+./mini examples/mini/tests/functions.mini
 ```
 
-The tests come in three tiers (`RUST_TEST_THREADS=2` on an 8-core machine):
+Build Mini as a C library and embed it in a C program:
 
-- **Fast** (`LOIMI_TEST_FAST=1`, about 2 minutes): the compiler's own
-  tests (`tests/run`, `tests/fail`, `tests/test`, IR and C-library
-  tests), Lox, Mini's scripts and conformance tests, the fuzz smoke runs
-  and the doc snippets. Tests that build the other interpreters skip,
-  saying so on stderr. Use it while iterating.
-- **Default** (about 5 minutes): every example in its dispatch modes,
-  GC modes, JIT and debugger builds, the C hosts.
-  Run it before every merge.
-- **Heavy** (`-- --include-ignored`): the `#[ignore = "heavy ..."]` tests
-  as well: AArch64 under qemu (`aarch64_qemu`, `vm_prof_stress_aarch64`),
-  the DAP session and the Mini and Python debuggers in the goto and
-  switch builds, the Mini C hosts against every library build,
-  ThreadSanitizer, two minutes of GC rooting fuzzing. Run it before
-  merging changes to code generation, dispatch, the JIT, the GC or the
-  C ABI, or anything target-specific. (ASan and TSan tests run only
-  without `ulimit -v`.)
+```sh
+./target/release/loimi build examples/mini/embed.lm --lib -o libmini.a --header mini.h
+clang-19 -I. examples/embed/host.c libmini.a -lm -o host && ./host
+```
 
-The test builds of interpreters drop the x86-64 branch padding
-(`LOIMI_BRANCH_ALIGN=0`, which is `--no-branch-align`): it takes most of
-clang's time on a large vm and only moves code. Mini's scripts and
-conformance tests and `tests/run` keep it; `LOIMI_TEST_BRANCH_ALIGN=1`
-keeps it everywhere. Builds are shared between tests within a run, and
-`LOIMI_TEST_JOBS` (default 3) bounds the builds and programs a test
-runs at once. To see where the time goes, `LOIMI_TEST_TIMES=FILE` logs
-each build, and libtest times each test:
-`RUSTC_BOOTSTRAP=1 cargo test --release --test golden -- -Z
-unstable-options --report-time NAME`.
+Run a file's `#[test]` functions:
 
-Cross-compiling for AArch64 Linux (links with `ld.lld`; tested under qemu
-user-mode, built from source with an extracted Debian sysroot, no root):
+```sh
+./target/release/loimi test examples/lox/lox_test.lm
+```
+
+### Cross-compiling for AArch64
+
+AArch64 Linux is a cross target. It links with `ld.lld` and is tested
+under qemu user mode. The install script builds qemu from source and
+extracts a Debian sysroot; it needs no root access.
 
 ```sh
 bench/cross/install.sh                                 # qemu-aarch64 + sysroot
@@ -274,25 +262,69 @@ LOIMI_RUNNER="$PWD/bench/cross/install/bin/qemu-aarch64 -L $S" \
   ./target/release/loimi run tests/run/hello.lm --target=aarch64-linux-gnu --sysroot=$S
 ```
 
-The heavy tier (`cargo test --release -- --include-ignored`) runs a subset under qemu when the toolchain is installed
-(`aarch64_qemu`); `LOIMI_TARGET`, `LOIMI_SYSROOT` and `LOIMI_RUNNER` run the
-whole suite cross-compiled (see `cross()` in `tests/golden.rs`).
-
 ## Where to read next
 
-- [`docs/tutorial/`](docs/tutorial/README.md): **start here**. Builds a
-  small language from a calculator to a fast, garbage-collected, fuzzed
-  bytecode interpreter, with working code for every step in
-  [`examples/tutorial/`](examples/tutorial).
-- [`docs/language.md`](docs/language.md): the language. The core is
-  short; most of it covers the interpreter-specific features.
-- [`docs/stdlib.md`](docs/stdlib.md): the standard library, with
-  [`stdlib/gc.md`](docs/stdlib/gc.md) and [`stdlib/obj.md`](docs/stdlib/obj.md).
-- [`docs/lowering.md`](docs/lowering.md): how each feature lowers to LLVM
-  IR, and what it costs. Everything uses stock LLVM.
-- [`docs/status.md`](docs/status.md): what is built and how it differs
-  from the design; [`CHANGELOG.md`](CHANGELOG.md): what is new.
-- [`docs/results.md`](docs/results.md): benchmark results;
-  [`docs/roadmap.md`](docs/roadmap.md): design decisions (GC, threads,
-  JIT, decoding).
-- The examples above, and their `FRICTION.md` usability reports.
+- [The tutorial](docs/tutorial/README.md): **start here**. It builds a
+  small language step by step, from a calculator to a fast,
+  garbage-collected bytecode interpreter, with working code for every
+  step.
+- [The language reference](docs/language.md): every language feature.
+  The core is short; most of it covers the interpreter features.
+- [The standard library](docs/stdlib.md).
+- [Benchmark results](docs/results.md).
+- [How features compile to LLVM IR](docs/lowering.md), and what they
+  cost. Everything uses stock LLVM.
+- [What is built](docs/status.md) and [what changed](CHANGELOG.md).
+
+## Developing Loimi
+
+This section is for people working on the compiler itself.
+
+### Running the tests
+
+The tests come in three tiers. Times are for `RUST_TEST_THREADS=2` on an
+8-core machine.
+
+| Tier | Command | Time | When to run it |
+|---|---|---|---|
+| Fast | `LOIMI_TEST_FAST=1 cargo test --release` | about 2 minutes | While iterating |
+| Default | `cargo test --release` | about 5 minutes | Before every merge |
+| Heavy | `cargo test --release -- --include-ignored` | longer | Before merging changes to code generation, dispatch, the JIT, the GC, the C ABI, or anything target-specific |
+
+- **Fast** runs the compiler's own tests (`tests/run`, `tests/fail`,
+  `tests/test`, IR and C-library tests), Lox, Mini's scripts and
+  conformance tests, the fuzz smoke runs and the doc snippets. Tests
+  that build the other interpreters are skipped, with a note on stderr.
+- **Default** adds every example in each dispatch mode, the GC modes,
+  the JIT and debugger builds, and the C hosts.
+- **Heavy** adds the tests marked `#[ignore = "heavy ..."]`: AArch64
+  under qemu, the debugger sessions in the goto and switch builds, the
+  Mini C hosts against every library build, ThreadSanitizer, and two
+  minutes of GC rooting fuzzing. ASan and TSan tests run only without
+  `ulimit -v`.
+
+To run the whole suite cross-compiled for AArch64, set `LOIMI_TARGET`,
+`LOIMI_SYSROOT` and `LOIMI_RUNNER` (see `cross()` in `tests/golden.rs`).
+
+### Test build settings
+
+| Setting | Effect |
+|---|---|
+| `LOIMI_TEST_BRANCH_ALIGN=1` | Keep x86-64 branch padding in every test build. By default, test builds of interpreters drop it (`--no-branch-align`), because it takes most of clang's time on a large vm and only moves code. Mini's scripts and conformance tests and `tests/run` always keep it. |
+| `LOIMI_TEST_JOBS=N` | How many builds and programs one test runs at once (default 3). Builds are shared between tests within a run. |
+| `LOIMI_TEST_TIMES=FILE` | Log the time of each build to `FILE`. |
+
+To time individual tests:
+
+```sh
+RUSTC_BOOTSTRAP=1 cargo test --release --test golden -- -Z unstable-options --report-time NAME
+```
+
+### Fuzzing and benchmarks
+
+```sh
+tests/fuzz/run.sh -t 600 vm mini                       # bytecode fuzzing under ASan
+bench/run.sh                                           # Loimi VM vs hand-written C
+bench/lua/install.sh && bench/mini/compare.py          # Mini vs PUC-Lua and LuaJIT
+bench/run_all.py --quick                               # every example vs its references
+```

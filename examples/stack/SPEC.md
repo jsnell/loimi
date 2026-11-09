@@ -1,87 +1,115 @@
 # Stak: a small, statically stack-checked Forth
 
-Stak is a dynamically typed, Forth-flavoured stack language. Programs are
-sequences of whitespace-separated words. Unlike Forth, every definition
-declares its stack effect, and the compiler checks stack depths statically,
-so the interpreter needs no underflow checks at run time.
+Stak is a dynamically typed, Forth-flavoured stack language. This
+document describes the language and how to run it.
 
-## Lexical
+Programs are sequences of whitespace-separated words. Unlike Forth, every
+definition declares its stack effect, and the compiler checks stack
+depths before the program runs. So the interpreter needs no underflow
+checks at run time.
+
+## Running
+
+```sh
+loimi build examples/stack/main.lm --release -o stak
+./stak FILE.stk
+examples/stack/check.sh        # every test in all dispatch modes, and with GC stress
+```
+
+| Option | What it does |
+|---|---|
+| `--disasm` | Prints the compiled bytecode before running. |
+| `--disasm-after` | Prints the bytecode after running. |
+| `--gc-stress` | Collects garbage at every safepoint (for testing). |
+
+## Lexical structure
 
 - Words are maximal runs of non-whitespace bytes.
-- `\` starts a comment to the end of the line (it must be a word of its own).
+- `\` starts a comment to the end of the line. It must be a word of its
+  own.
 - `( ... )` is a comment, except directly after `: name`, where it is the
   word's stack effect.
 - `"..."` is a string literal with C escapes (`\n`, `\t`, `\"`, `\\`).
-- A word that parses as an integer (`42`, `-7`, `0x1f`) or a float (`2.5`,
-  `-1e3`) is a literal.
+- A word that parses as an integer (`42`, `-7`, `0x1f`) or a float
+  (`2.5`, `-1e3`) is a literal.
 
 ## Values
 
-`int` (32-bit; `+ - *` that overflow give a float), `float` (f64),
-`string` (immutable), `array` (fixed length, mutable), `bool`, `nil`.
-`true`, `false`, `nil` push those values. Only `false` and `nil` are falsy.
+| Type | Notes |
+|---|---|
+| `int` | 32-bit. `+ - *` that overflow give a float. |
+| `float` | 64-bit. |
+| `string` | Immutable. |
+| `array` | Fixed length, mutable. |
+| `bool` | `true` and `false` push the two values. |
+| `nil` | `nil` pushes it. |
 
-## Definitions, locals, globals
+Only `false` and `nil` are false in conditions.
+
+## Definitions, locals and globals
 
 ```
 : name ( a b -- c )  body ;
 ```
 
-The names in the effect are documentation; the counts are checked: the
-body starts with `a b` on the stack and must leave exactly one value on
-every path, including `exit`. A word may call itself recursively by name.
-Words must be defined before use (no forward references).
+- The names in the stack effect are documentation, but the counts are
+  checked. The body starts with `a b` on the stack and must leave exactly
+  one value on every path, including `exit`.
+- A word may call itself recursively by name.
+- Words must be defined before they are used. There are no forward
+  references.
+- `{ x y }` inside a definition pops the top two values into the locals
+  `x` and `y`; `y` gets the top value. After that, `x` pushes the local's
+  value and `to x` pops a value into it.
+- `var name` at the top level declares a global, set to nil. `name`
+  pushes its value and `to name` stores into it.
 
-`{ x y }` inside a definition pops the top two values into locals `x` and
-`y` (`y` gets the top). Afterwards `x` pushes the local's value and
-`to x` pops into it. `var name` at the top level declares a global (nil);
-`name` pushes it and `to name` stores into it.
+## Control flow
 
-## Control flow (inside definitions or at the top level)
+These work inside definitions and at the top level.
 
 | Form | Effect |
 |---|---|
-| `c if A then` | runs A if c is truthy; A must be balanced |
-| `c if A else B then` | A and B must leave the same depth |
-| `begin A c until` | repeat A until c is truthy; A must push one value net |
-| `begin A c while B repeat` | the net effect of an iteration must be zero |
-| `limit start do A loop` | for i = start; i < limit; i++ (skipped if start >= limit); `i`, `j` give the inner and outer index; A must be balanced |
-| `exit` | return from the current word |
+| `c if A then` | Runs A if c is true. A must leave the stack depth unchanged. |
+| `c if A else B then` | A and B must leave the same depth. |
+| `begin A c until` | Repeats A until c is true. A must push one value net. |
+| `begin A c while B repeat` | The net effect of an iteration must be zero. |
+| `limit start do A loop` | Runs A for i = start, start+1, ... while i < limit (not at all if start >= limit). `i` and `j` push the inner and outer loop index. A must leave the depth unchanged. |
+| `exit` | Returns from the current word. |
 
 ## Built-in words
 
-| Word | Effect | |
+| Word | Effect | Notes |
 |---|---|---|
-| `dup drop swap over rot nip tuck` | standard Forth | |
+| `dup drop swap over rot nip tuck` | As in Forth | |
 | `2dup 2drop` | `( a b -- a b a b )`, `( a b -- )` | |
-| `+ - * / mod` | `( a b -- c )` | `/` on two ints truncates; `mod` is floored |
+| `+ - * / mod` | `( a b -- c )` | `/` on two ints truncates; `mod` is floored. |
 | `negate abs` | `( a -- b )` | |
-| `= <> < > <= >=` | `( a b -- bool )` | `=` compares numbers by value, strings by content |
-| `not and or` | logical, on truthiness, give bools | |
-| `print` | `( x -- )` | prints x and a newline |
-| `.` | `( x -- )` | prints x and a space |
-| `cr` | `( -- )` | prints a newline |
-| `concat` | `( a b -- s )` | both converted to text and joined |
+| `= <> < > <= >=` | `( a b -- bool )` | `=` compares numbers by value, strings by content. |
+| `not and or` | | Logical, on truthiness; give bools. |
+| `print` | `( x -- )` | Prints x and a newline. |
+| `.` | `( x -- )` | Prints x and a space. |
+| `cr` | `( -- )` | Prints a newline. |
+| `concat` | `( a b -- s )` | Converts both to text and joins them. |
 | `tostr` | `( x -- s )` | |
-| `len` | `( s|arr -- n )` | |
-| `array` | `( n -- arr )` | n nils |
-| `[ a b c ]` | `( -- arr )` | the values pushed between the brackets |
+| `len` | `( s\|arr -- n )` | |
+| `array` | `( n -- arr )` | An array of n nils. |
+| `[ a b c ]` | `( -- arr )` | An array of the values pushed between the brackets. |
 | `@` | `( arr i -- v )` | |
 | `!` | `( v arr i -- )` | |
 | `sqrt` | `( x -- f )` | |
-| `int` | `( x -- n )` | truncates a float |
+| `int` | `( x -- n )` | Truncates a float. |
 
 ## Errors
 
-Compile errors (unknown word, stack underflow, unbalanced branches, wrong
-output count) are reported with the source location and a snippet.
-Run-time errors (type errors, index out of range, division by zero, stack
-overflow) print `error: line N in WORD: message` and exit with status 1.
+**Compile errors** are reported with the source location and a snippet.
+They include:
 
-## Running
+- an unknown word;
+- stack underflow;
+- branches that leave different depths;
+- a definition that leaves the wrong number of values.
 
-```
-loimi build examples/stack/main.lm --release -o stak
-./stak FILE.stk [--disasm] [--disasm-after] [--gc-stress]
-examples/stack/check.sh        # every test in all dispatch modes, and with GC stress
-```
+**Run-time errors** print `error: line N in WORD: message` and exit with
+status 1. They include type errors, an index out of range, division by
+zero and stack overflow.

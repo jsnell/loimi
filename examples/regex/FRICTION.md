@@ -1,370 +1,120 @@
-# Friction report: a regex engine as a Loimi C library
+# A regex engine as a Loimi C library: a usability study
 
-A usability study. I built a regex engine (backtracking vm + Pike VM)
-shipped as a C library, reading only README.md, docs/, std/,
-examples/tutorial, examples/embed and tests/run + tests/fail. I did not
-read src/ or the forbidden examples, and never needed to (see item 17).
+This is a report on writing a regex engine in Loimi and shipping it as
+a C library. It is for people improving Loimi's usability, or curious
+how usable it is.
 
-**Result:** both engines agree with Python's `re` on every case tried,
-captures included: about 30,000 random patterns × subjects across seeds,
-plus 80 hand-written cases. That held in all three dispatch modes, under
-ASan, with a bytecode fuzzer and with a byte-pattern fuzzer. See SPEC.md.
+A first-time user (an AI agent) built two engines over the same
+bytecode: a backtracking vm and a Pike VM. It read only `README.md`,
+`docs/`, `std/`, `examples/tutorial`, `examples/embed`, `tests/run` and
+`tests/fail`; it did not read the compiler's source. What the engine
+accepts is in `SPEC.md`.
 
-## Language and std follow-up
+Both engines agree with Python's `re` on every case tried, captures
+included: about 30,000 random pattern and subject pairs, plus 80
+hand-written cases. That held in all three dispatch modes, under
+AddressSanitizer, and under a bytecode fuzzer and a pattern fuzzer.
 
-This report is kept as written. Since then, for the language and std
-items:
+## Summary
 
-| # | Status |
-|---|---|
-| 5 | Fixed: generated `Vm.Op` (one variant per op, no supers, a family as its generic op; discriminant = opcode) and `Vm.op_of(w) -> Vm.Op` (`language.md` §3.3). `pike.lm` now dispatches with two exhaustive `match`es, so a new op is a compile error there. |
-| 6 | Fixed: `~x` is bitwise not on integers (an error on `bool`, pointing at `!`); `!x` on integers still works, and both are documented. language.md §1.2 has an operator table with precedence. `++`, `--`, `**`, `?:`, `===` and unary `+` get a hint saying what to write. |
-| 7 | Fixed: in vm code `jump (expr)`, `exit (..)`, `raise (..)`, `fail (..)` take a parenthesized operand; `next (`/`redo (` are errors saying they take none; outside vm code the unknown-name error says it is a control word. |
-| 8 | Fixed: an empty `Vec` (`Vec.new()`, `with_capacity(0)`, after `free()`) allocates nothing; `mem.release`/`mem.grow` accept its sentinel pointer. stdlib.md documents the pattern for optional resources (`Vec` or `?*T`, never `alloc(1)` dummies). `lib.lm` no longer frees its placeholder vectors. |
-| 10 | Fixed: `a ?? b` with `b: ?T` is `?T` (`b` still evaluated only on None; chains). No `or`/`or_else` methods: `??` is the lazy form. |
-| 11 | `var r = Ok(..)`: still needs an annotation (inference stays local), but the error now says how to write it. `in` stays reserved (`for x in`); the error says it is a reserved word and suggests `in_`. Added `mem.find_byte`/`rfind_byte`/`find_bytes`/`compare_bytes`/`equal_bytes` (libc `memchr`/`memrchr`/`memmem`/`memcmp`) and `HashMap.clear()`; `text.find` uses `memchr`. `lib.lm` uses `mem.find_byte` instead of its own `extern memchr`. |
+- **The language part went smoothly.** About 1,000 lines of new Loimi
+  built after three one-line fixes, and the first run gave correct
+  matches. The whole job took about 47 minutes.
+- **The friction was in the embedding path**: a panic in the library
+  killed the C host, and AddressSanitizer and `--vm-stats` didn't work
+  for libraries. The generated C header was minimal.
+- **The engine is fast.** The backtracker beats Python's `re` and the
+  PCRE2 interpreter on most benchmarks, and is within about 2× of
+  PCRE2's JIT.
+- **Almost every issue has been fixed** since the study.
 
-## Embedding and tooling follow-up
+## Issues
 
-For the library and tooling items:
+Most important first.
 
-| # | Status |
-|---|---|
-| 1 | Fixed: `#[catch_panic(v)]` on an `export "C"` function turns a panic below it on the thread (bounds check, `unwrap`, overflow and division checks, `trap()` in libraries, `rt.panic`, `mem.alloc` out of memory, a generated `op_of` on a bad word) into the return value `v`; `rt.panic_message()` gives the message. `rt.catch_panic(f, data)` does the same inside Loimi; `mem.try_alloc` returns `?*T`. Without a catch a panic still aborts. What is safe afterwards (frames abandoned, shadow stack and vm depths restored, objects being modified are poisoned) is in `language.md` §10.1. `lib.lm` uses it: `rx_compile` returns NULL and `rx_exec` -2 on an internal error, with `rx_internal_error()`. Cost 1-2 ns per call; 5-8% on the benchmarks with a match every 25 ns. Since: a panic unwinding through nested vm runs and host callbacks restores `Vm.depth` and the shadow stack (tested); an `rt.panic` message is copied (up to 512 bytes), so it may be built at run time; Mini's `mini_dostring`/`mini_call` return `MiniStatus_Internal` and poison only that state (`examples/embed/host.c`). |
-| 2 | Fixed: `--sanitize=address` works with `--lib` and `--shared`; the host links the ASan runtime (`gcc -fsanitize=address host.c librx.a`), documented in §10.1. `check.sh --asan` uses it. |
-| 3 | Fixed: `--lib --vm-stats` archives the stats runtime; the report prints when the host exits. Several such libraries link into one host (the runtime's symbols are weak and hash-named). |
-| 4 | Fixed: `export "C" const RX_SEARCH: u32 = 1;` → `#define RX_SEARCH 1u`; `///` comments are copied (functions, constants, structs, enums); `#[c_const(pat, buf)]` makes parameters `const void *`; `#[c_name("rx_regex")]` (or `--header-prefix`) names opaque types. `host.c` has no `#define`s or casts left. |
-| 9 | Fixed: the suggestions are one list with no two overlapping each other or an existing super; overlapping candidates follow, commented out, naming what they overlap. |
+| # | Issue | State |
+|---|---|---|
+| 1 | A panic in library code (bounds check, `unwrap`, out of memory) aborted the C host. | Fixed. `#[catch_panic(v)]` on an `export "C"` function turns a panic into the return value `v`; `rt.panic_message()` gives the message. `mem.try_alloc` returns `?*T`. Costs 1–2 ns per call. |
+| 2 | `--sanitize=address` refused `--lib` and `--shared`. | Fixed. The host links the ASan runtime: `gcc -fsanitize=address host.c librx.a`. |
+| 3 | `--vm-stats` failed for a library build. | Fixed. The report prints when the host exits. |
+| 4 | The generated header had no constants, no doc comments, no `const` pointers, and no way to choose a C name for opaque types. | Fixed: `export "C" const`, `///` comments copied, `#[c_const(..)]`, `#[c_name(..)]` (or `--header-prefix`). |
+| 5 | No generated op enum, so the Pike VM dispatched with an if-chain that silently ignored new ops. | Fixed. `Vm.Op` and `Vm.op_of(w)`; the Pike VM now uses exhaustive `match`es. |
+| 6 | `!x` was bitwise not on integers, undocumented; `~x` was a parse error. | Fixed. `~x` is bitwise not; language.md has an operator table. |
+| 7 | `jump (expr)` was parsed as a call to a function named `jump`. | Fixed. Control words take a parenthesized operand. |
+| 8 | `Vec.new()` allocated and `*T` can't be null, so placeholder values leaked when overwritten. | Fixed. An empty `Vec` allocates nothing; stdlib.md shows the pattern for optional resources. |
+| 9 | `--vm-stats` suggested super instructions that overlap each other. | Fixed. Overlapping candidates are listed separately, commented out. |
+| 10 | `a ?? b` was a type error when `b` is itself an option. | Fixed. `a ?? b` with `b: ?T` gives `?T`. |
+| 11 | Small items: `var r = Ok(..)` needs a type annotation; `in` is reserved; no `memchr`/`memcmp` on raw pointers; no `HashMap.clear()`. | Mostly fixed. Better error messages for the first two; `mem.find_byte`, `mem.compare_bytes` and friends, and `HashMap.clear()` were added. Inference stays local. |
+| 12 | The docs had no short example of a C API with an opaque handle, an error string and an output array, and none of returning memory the C side must free. | Open as of the study. language.md's embedding section was enough to write the API. |
 
-## Summary: top items
+## What worked well
 
-| # | Item | Area | Fix kind |
-|---|---|---|---|
-| 1 | A panic in library code (bounds check, `unwrap`, OOM) aborts the C host | embedding | runtime + doc |
-| 2 | `--sanitize=address` refuses `--lib`/`--shared` | embedding/tooling | tooling + doc |
-| 3 | `--vm-stats --lib` fails (clang `-o` error; missing `loimi_stats_seq_report`) | tooling bug | bug |
-| 4 | Header: no constants, no doc comments, `void *` without const, no C name prefix for opaque types | embedding | header generator |
-| 5 | No generated op enum or decoder for host tools: a second engine over the same bytecode is an if-chain that silently ignores new ops | vm | std/generated API |
-| 6 | `!x` is bitwise NOT on integers, but that isn't documented; `~x` gives a parse error with no hint | language/docs | doc + diagnostic |
-| 7 | `jump (expr)` is parsed as a call to a function named `jump` | diagnostics | parser/diagnostic |
-| 8 | `*T` can't be null and `Vec.new()` allocates, so a struct needs placeholder allocations, which leak when overwritten | std/language | std |
-| 9 | `--vm-stats` suggests supers that overlap each other, so its own suggestions set off `super_overlap` warnings | tooling | tooling |
-| 10 | `a ?? b` with `b: ?T` is a type error: there is no `or_else` for options | language | std/language |
+- **Declaring the vm paid for itself.** Encoders, the disassembler, the
+  verifier and `optimize` came for free. `Verified<Rx>` made "only
+  verified code runs" a type-level fact. The bytecode fuzzer (about 80
+  lines) ran 20,000 mutated programs under AddressSanitizer cleanly.
+- **The generated code is good.** The CLASS handler is 17 instructions,
+  with no spills.
+- **`-> never` vm functions** (`backtrack`, `grow_stack`) were exactly
+  right for a backtracking matcher: one shared copy, called from every
+  op's failure path.
+- **`std.bc`** labels and fixups kept the compiler short.
+- **Super instructions** took two minutes from `--vm-stats` to
+  `optimize`.
+- **A per-match step limit** took 15 lines as an instrumentation
+  variant, and costs nothing when off.
+- **The embedding path**: no initialization call, a clean symbol table,
+  no clashes between two Loimi libraries, and threads are safe.
+- **The library needed no GC.** The vm, the verifier, `std.bc` and the
+  embedding path all work without it.
+- **Builds are fast**: 0.9 s for the release library.
 
-Details follow, in priority order. Times are this agent's wall-clock
-time. A human would take longer on each, though in the same proportions.
+## Benchmarks
 
----
+4 MiB of generated text. Each benchmark counts the non-overlapping
+matches, calling the library from C. Best of 3, on an i7-6700, with
+Python 3.13.5 and PCRE2 10.46 through its C API.
 
-### 1. A panic inside the library kills the host process (embedding, high)
+| benchmark | pattern | rx backtrack | rx Pike VM | Python `re` | PCRE2 | PCRE2 JIT |
+|---|---|---:|---:|---:|---:|---:|
+| literal | `Sherlock Holmes` | 3.1 ms | 15.3 ms | 2.4 ms | 2.6 ms | 0.8 ms |
+| literal-alt | `Sherlock\|Watson\|Holmes\|1887` | 7.9 ms | 74 ms | 36 ms | 17.7 ms | 9.4 ms |
+| class | `[a-z]+ing\|\d{3,}` | 57 ms | 327 ms | 149 ms | 220 ms | 17.0 ms |
+| words | `\w+` | 17.4 ms | 185 ms | 153 ms | 53 ms | 24.4 ms |
+| capture | `(\w+)\s+(\w+)` | 15.8 ms | 309 ms | 106 ms | 49 ms | 17.0 ms |
+| alt-heavy | `(?:fox\|dog\|cat\|bird\|lazy)\s(?:over\|jumps\|end)` | 22.8 ms | 135 ms | 31 ms | 48.6 ms | 11.7 ms |
+| dot-star | `x9.*end` | 9.7 ms | 88 ms | 7.9 ms | 21.4 ms | 4.2 ms |
+| pathological | `(a*)*b` on a²² | 0.0 ms¹ | 0.0 ms | 417 ms | 0.0 ms¹ | 0.0 ms¹ |
+| patho-alt | `(a\|aa)+$` on a²⁸b | 42 ms | 0.0 ms | 119 ms | 152 ms | 11.3 ms |
 
-- **Trying to:** decide what a C caller sees if library code hits a
-  bounds check, `unwrap()` on None, `trap()`, or `mem.alloc` running out
-  of memory.
-- **What happened:** a test library `export "C" fn other_oob(i: u64) -> u8 { a[..][i] }`
-  called with `i = 9` printed `other.lm:16:5: index out of bounds` on
-  stderr and the host died with SIGABRT (exit 134). `std.rt.protect`
-  catches only `rt.throw()`, not panics. `mem.alloc` "aborts when out
-  of memory" (stdlib.md).
-- **Expected:** a library can turn a failure inside one call into an
-  error return, as `rt.protect` already does for `throw`. At the least,
-  §10.1 should say plainly that panics abort the host.
-- **Cost:** about 5 min to establish. In the regex library I designed
-  around it: every slice index is guarded or is in verified handlers,
-  and the backtrack stack has an explicit limit with an error return
-  (`backtrack limit exceeded`) instead of growing until `mem.alloc` aborts.
-- **Suggested fix:** let `rt.protect` also catch panics (it already uses
-  setjmp/longjmp and restores the shadow stack), or add
-  `#[catch_panics(ret = -1)]` on `export "C"` functions, or a
-  `loimi_set_panic_hook`. Add `mem.try_alloc -> ?*T`. Document the
-  current behavior in language.md §10.1.
+¹ The input has no `b`, so a required-byte check rejects it before
+matching. With `(a*)*[b]`, which hides the required byte, the
+backtracker takes 138 ms and Python 418 ms.
 
-### 2. ASan for a library: `--sanitize=address builds executables only` (embedding/tooling, high)
+- The backtracker beats Python's `re` and the PCRE2 interpreter except
+  on `literal` and `dot-star`, where it is within 30% of Python.
+- It is within about 2× of PCRE2's JIT, and ahead of it on `words` and
+  `literal-alt`.
+- The Pike VM is a plain loop with no fast paths: 5–20× slower, but
+  linear, so it handles the pathological cases.
+- `goto` and `switch` dispatch are 0–10% slower than `tailcall`, except
+  on `patho-alt`, where `switch` is 30–60% slower.
+- The step limit costs 3–15% when set.
 
-- **Trying to:** run the C test host against the library under ASan.
-- **What happened:** `loimi build lib.lm --lib --sanitize=address` gave
-  `--sanitize=address builds executables only`. Workaround:
-  `loimi build --lib --emit-llvm -o rx.ll`, then
-  `clang-19 -fsanitize=address -c rx.ll` (with the
-  `-Wno-override-module` warning), then link with **gcc**:
-  `clang-19 -fsanitize=address` failed with
-  `cannot find /usr/lib/llvm-19/lib/clang/19/lib/x86_64-pc-linux-gnu/libclang_rt.asan_static.a`,
-  since only gcc's libasan is installed. The docs don't say which ASan
-  runtime Loimi's own `--sanitize` uses.
-- **Expected:** `--lib --sanitize=address` gives an instrumented archive,
-  and the docs show how to link it.
-- **Cost:** about 6 min. It found real leaks in my code (item 8).
-- **Suggested fix:** allow `--sanitize=address` with `--lib`/`--shared`.
-  Document the link line (`gcc -fsanitize=address host.c librx.a`), and
-  document that `--emit-llvm` with `--lib` gives IR you can instrument
-  yourself.
+## Size and time
 
-### 3. `--vm-stats` doesn't work for a library (tooling bug, high for this use)
-
-- **Trying to:** profile op pairs while the real C host runs the
-  benchmarks.
-- **What happened:** `loimi build lib.lm --release --lib --vm-stats -o librx_stats.a`
-  gave `clang-19: error: cannot specify -o when generating multiple output files`
-  and `error: clang-19 failed on generated IR (kept at /tmp/loimi-2073955/lib.ll)`.
-  With `--emit-llvm` the IR linked into the host failed with
-  `undefined reference to 'loimi_stats_seq_report'`.
-- **Expected:** a stats build of the library prints at exit (atexit), or
-  exports a `loimi_vm_stats_report()` for the host to call.
-- **Cost:** about 8 min, including writing `stats.lm`, a Loimi
-  executable that repeats the C benchmark so that `--vm-stats` can run.
-  That is a second copy of the benchmark to keep in sync.
-- **Suggested fix:** fix the clang invocation for `--lib --vm-stats` and
-  link the stats runtime into library builds.
-
-### 4. The generated header is minimal (embedding, medium)
-
-- **Trying to:** give C callers a usable `rx.h`.
-- **What happened:**
-  - **No constants.** `rx_exec` takes flags. A payload-free enum reaches
-    the header only if an export's signature uses it, so `host.c` has
-    its own `#define RX_SEARCH 1u` / `RX_PIKE 2u`, which can drift from
-    `lib.lm`.
-  - **No documentation.** The `///` comments on exports (ownership,
-    return codes, lifetimes) are not copied into the header.
-  - **No const.** `*u8` becomes `void *`, so C callers holding
-    `const char *` need casts (`rx_compile((void *)pat, n)`). The Mini
-    host does the same.
-  - **No C name prefix.** The opaque type's C name is the Loimi struct
-    name: `typedef struct Regex Regex;` can collide with a host's own
-    `Regex`. I would have to rename the Loimi struct to `rx_regex` to
-    get a C-style name.
-- **Expected:** `export "C" const RX_SEARCH: u32 = 1;`, doc comments in
-  the header, a way to mark read-only pointer parameters (`*const u8` →
-  `const void *`), and `#[c_name("rx_regex")]` on structs.
-- **Cost:** about 3 min. Low cost, but every library will hit it.
-- **What worked well:** `str` ↔ `loimi_str`, `[]u8` → `loimi_str`,
-  `?*T` → nullable `T *`, `bool`, and `int64_t *` for the spans
-  out-parameter all mapped as expected. The archive exports exactly the
-  8 `rx_*` symbols. A second Loimi library linked into the same host
-  caused no symbol clashes. 8 threads, each with its own regex, ran
-  correctly. `--shared` exports only `rx_*`.
-
-### 5. No typed decoder for host tools over a vm's bytecode (vm, medium)
-
-- **Trying to:** write the Pike VM, a second interpreter over the same
-  bytecode. Handlers can only express the backtracking semantics, so
-  the Pike VM is host code.
-- **What happened:** the generated readers make it possible
-  (`Rx.opcode(w)`, `Rx.A_a(w)`, `Rx.AJ_a(w)`, `Rx.label(w) -> ?i64`),
-  but the dispatch is an if-chain over `Rx.OP_*` constants. When I
-  later added `UNMARK` and `NOPROG` to the vm, the Pike VM's final
-  `else` (consuming ops) took them silently, and only the differential
-  tests caught it. `Rx.label(w)` returns an option even for an op whose
-  format always has a label, so there is a `trap()` on None.
-- **Expected:** a generated `Rx.Op` enum (or `Rx.decode(w) -> Rx.Insn`
-  with typed operands) that a `match` can be exhaustive over. Then
-  adding an op breaks host tools at compile time.
-- **Cost:** about 4 min of debugging, plus the risk.
-- **Suggested fix:** generate `enum Vm.Op { CHAR, ANY, .. }` and
-  `Vm.op_of(w) -> ?Vm.Op` (None for invalid or super opcodes, which a
-  tool can map with `base_op`).
-
-### 6. Bitwise NOT is `!`, which isn't documented; `~` is a parse error (language/docs, medium)
-
-- **Trying to:** invert a 256-bit class set (`w = ~w`).
-- **What happened:** `error: expected expression, found '~'`. The
-  language reference has no operator table. I used
-  `w ^ 0xFFFFFFFFFFFFFFFF`. Later, testing by hand, I found that `!x`
-  on a `u64` is bitwise NOT (`!5 as i64` prints `-6`), which no
-  document says.
-- **Cost:** 2 min (more for someone who doesn't think to try `!`).
-- **Suggested fix:** add an operator table to language.md §1.2 (and say
-  that `!` is bitwise on integers). On `~`, say "use `!x` for bitwise
-  not".
-
-### 7. `jump (expr)` is parsed as a call (diagnostics, medium)
-
-- **Trying to:** resume a backtrack record: `jump (t as *u32)`.
-- **What happened:** `error: unknown name 'jump'`, pointing at `jump`.
-- **Expected:** control words take any expression, or the message says
-  that `jump (...)` reads as a function call and suggests binding the
-  target first.
-- **Cost:** 1 min. I wrote `let resume = t as *u32; jump resume`.
-  `exit (..)`, `raise (..)` and `fail (..)` probably behave the same
-  way; I didn't check.
-
-### 8. Non-null pointers and allocating `Vec.new()` make placeholder state leak (std, medium)
-
-- **Trying to:** create the `Regex` object before compiling, so that
-  `rx_compile` can always return one, carrying an error if compilation
-  failed.
-- **What happened:** every `*T` field needs a value (no null; `..zero`
-  is not allowed for pointers or for `Vec`), and `mem.Vec.new()`
-  allocates one element. So `empty_regex()` allocates placeholders, and
-  assigning the real vectors over them leaked. LeakSanitizer reported
-  `57 byte(s) leaked in 9 allocation(s)` in `rx_compile`. The fix was
-  `free()` before each overwrite, plus a hack in `rx_free` to tell a
-  placeholder `marks` pointer from a real one.
-- **Expected:** `Vec.new()` doesn't allocate (as in Rust), so an empty
-  `Vec` is free to create and to drop, or `..zero` works for `Vec`.
-- **Cost:** about 5 min after ASan pointed at it.
-- **Suggested fix (std):** make `Vec.new()` start with `cap: 0`, using a
-  static sentinel pointer, and have `free()` skip it. Alternatively,
-  document the pattern for objects with optional resources (use `?*T`).
-
-### 9. `--vm-stats` suggestions overlap each other (tooling, low)
-
-- **What happened:** I pasted five of its suggestions (`SAVE_SPLIT_CPLUS_LIT`,
-  `CPLUS_SAVE`, `SAVE_CPLUS`, `SAVE_MATCH`, `SPLIT_LIT`) and got three
-  `warning[super_overlap]`s, for example
-  ``superinstruction `CPLUS_SAVE` overlaps `SAVE_SPLIT_CPLUS_LIT` ... `CPLUS_SAVE` cannot run there``.
-  The warnings themselves are excellent: they name the sequence and say
-  which super `optimize` keeps.
-- **Expected:** the suggested set is overlap-free, or it marks which
-  suggestions conflict.
-- **Cost:** 2 min.
-
-### 10. `??` takes only a plain default (language, low)
-
-- `required(t, b) ?? required(t, a)` failed with
-  `mismatched types: expected 'u8', found '?u8'`. I wrote
-  `if let Some(x) = .. { Some(x) } else { .. }`. An `o.or(p)` /
-  `or_else` for options, or `??` accepting `?T` on the right, would fix
-  it. 1 min.
-
-### 11. Smaller items (low)
-
-- `var res = Ok(false);` → `cannot infer the type of 'Ok'`. This is
-  documented ("inference is local"), but `var` followed by an
-  assignment is a common pattern. Annotating fixed it.
-- `in` is a keyword: `state { .., in: *u8 }` →
-  `expected identifier, found 'in'`. A note ("`in` is reserved") would
-  help.
-- std gaps I filled with `extern "C"` or by hand: `memchr`/`memcmp` on
-  raw pointers (`text.find` covers only `str`), and `HashMap.clear()`
-  (I stored a generation number as the value instead).
-- The generated encoder `Rx.CHAR(c: u32)` for a 24-bit field accepts
-  300 and masks it. The verifier then rejects it with a precise message
-  (``operand `c` (byte) fails `it < 256` ``), so this was fine.
-- An operand of struct type (`cls = ctx.classes[it]`) reads as a value.
-  Calling a method on it works, and passing it to a `*Set` parameter
-  needs `&s`. Again fine: the error said `expected '*Set', found 'Set'`.
-
-### 12. Docs coverage of the C path (finding, low)
-
-- The Loimi half of the embedding example, `examples/mini/embed.lm`,
-  lives in a directory this study excluded. `examples/embed/` has only
-  the C side, and `tests/embed/api.lm` isn't linked from the docs.
-  **I didn't need any of them:** language.md §10.1 (the type table, the
-  `str` register rule, TLS and PIC, "no initialization call") was
-  enough to write the API first time. What I missed was a 20-line
-  "opaque handle + error string + out-array" example in the docs
-  themselves, plus a statement of what happens on panic (item 1).
-- No `.lm` ↔ C example shows returning memory the C side must free. I
-  avoided the question: strings returned by the library live in the
-  `Regex` until the next call.
-
-## GC interaction
-
-None. The library uses only `std.mem`, never `std.gc`, so there are no
-roots, barriers or effects to manage, and nothing about the GC is
-visible in the C API. That the vm, the verifier, std.bc and the
-embedding path all work without the GC is a plus. A regex engine
-doesn't need it.
-
-## Numbers
-
-**Lines of code** (`wc -l`, comments included):
-
-| file | lines | |
-|---|---:|---|
-| syntax.lm | 310 | parser |
-| compile.lm | 285 | compiler, first-byte set, required byte |
-| vm.lm | 307 | the Rx vm (17 ops, 4 supers, 1 variant, 2 entries) |
-| pike.lm | 217 | Pike VM |
-| lib.lm | 250 | C API |
-| fuzz.lm, verify_test.lm, stats.lm | 197 | bytecode fuzzer, verifier test, stats driver |
-| host.c | 343 | C host: demo, tests, fuzz, benchmarks (with PCRE2) |
-| tests/gen.py, tests/compare.py, bench.py, check.sh, dispatch.sh | 277 | |
-
-That is 1,369 lines of Loimi for the engine and its API, and 2,186 in
-total.
-
-**Time per phase** (agent wall-clock, from the commit log):
+1,369 lines of Loimi for the engine and its C API (2,186 lines in all,
+with the C host and test scripts). The largest files are `syntax.lm`
+(310, the parser), `vm.lm` (307) and `compile.lm` (285).
 
 | phase | time |
 |---|---|
-| reading the docs (README, language.md, tutorial ch. 3, stdlib.md, std/bc.lm, examples/embed) | 6 min |
-| parser, vm, compiler, Pike VM, C API, host (first build after 3 compile errors) | 8 min |
-| differential tests vs Python, first benchmarks | 5 min |
-| ASan path, `--vm-stats` path, CSTAR/CPLUS, supers | 6 min |
-| matching sre's empty-iteration rules exactly (backtracker and Pike VM) | 5 min |
-| verifier test, bytecode fuzzer, step-limit variant, dispatch modes, `--shared`, threads | 7 min |
-| SPEC.md, this report | 10 min |
+| reading the docs | 6 min |
+| parser, vm, compiler, Pike VM, C API, host | 8 min |
+| differential tests against Python, first benchmarks | 5 min |
+| AddressSanitizer and `--vm-stats` for the library, super instructions | 6 min |
+| matching Python's rules for empty loop iterations | 5 min |
+| verifier test, fuzzer, step limit, dispatch modes, threads | 7 min |
+| `SPEC.md` and this report | 10 min |
 
-Most of the debugging time went into regex semantics (sre's rules for
-empty loop iterations, Pike VM deduplication), not into Loimi.
-
-**Benchmarks.** 4 MiB of generated text (the same generator in `host.c`
-and `bench.py`). Each benchmark counts the non-overlapping matches from
-C through the library (`rx_exec` in a loop). Best of 3. i7-6700, Python
-3.13.5, PCRE2 10.46 through its C API (interpreter and JIT). `grep -P`
-was not used, since the PCRE2 library times the same engine without
-grep's output.
-
-| benchmark | pattern | matches | rx backtrack | rx Pike VM | Python `re` | PCRE2 | PCRE2 JIT |
-|---|---|---:|---:|---:|---:|---:|---:|
-| literal | `Sherlock Holmes` | 1,635 | 3.1 ms | 15.3 ms | 2.4 ms | 2.6 ms | 0.8 ms |
-| literal-alt | `Sherlock\|Watson\|Holmes\|1887` | 145,514 | 7.9 ms | 74 ms | 36 ms | 17.7 ms | 9.4 ms |
-| class | `[a-z]+ing\|\d{3,}` | 36,133 | 57 ms | 327 ms | 149 ms | 220 ms | 17.0 ms |
-| words | `\w+` | 729,317 | 17.4 ms | 185 ms | 153 ms | 53 ms | 24.4 ms |
-| capture | `(\w+)\s+(\w+)` | 364,658 | 15.8 ms | 309 ms | 106 ms | 49 ms | 17.0 ms |
-| alt-heavy | `(?:fox\|dog\|cat\|bird\|lazy)\s(?:over\|jumps\|end)` | 16,335 | 22.8 ms | 135 ms | 31 ms | 48.6 ms | 11.7 ms |
-| dot-star | `x9.*end` | 8,495 | 9.7 ms | 88 ms | 7.9 ms | 21.4 ms | 4.2 ms |
-| pathological | `(a*)*b` on a²² | 0 | 0.0 ms¹ (138 ms²) | 0.0 ms | 417 ms | 0.0 ms¹ | 0.0 ms¹ |
-| patho-alt | `(a\|aa)+$` on a²⁸b | 0 | 42 ms | 0.0 ms | 119 ms | 152 ms | 11.3 ms |
-
-¹ The required-byte check (`b` never occurs) rejects the input before
-matching, as in PCRE. ² `(a*)*[b]` hides the required byte, so the
-backtracker does the exponential work. Python takes 418 ms on the same
-input.
-
-The backtracker beats Python's `re` and the PCRE2 interpreter on every
-benchmark except `literal` and `dot-star`, where it is within 30% of
-Python. It is within about 2× of PCRE2's JIT, and ahead of it on
-`words` and `literal-alt`. The Pike VM is a plain host-code loop with
-no fast paths: it is linear but 5-20× slower, and fixes the
-pathological cases. The three dispatch modes give the same results.
-`goto` and `switch` are 0-10% slower than `tailcall`, except on
-`patho-alt`, where `switch` is 30-60% slower across runs (`dispatch.sh`). A step limit
-(`rx_set_step_limit`, the `budget` variant) costs 3-15% when set and
-nothing when not.
-
-## What I liked
-
-- **It compiled almost first time.** About 1,000 lines of new Loimi built
-  after three one-line fixes (`in`, `~`, `jump (..)`), and the first run
-  gave correct matches. Diagnostics point at the right token, with
-  carets.
-- **Declaring the vm paid for itself.** Encoders, the disassembler
-  (`rx_disasm` is three lines), `Rx.verify` and `Rx.optimize` were free.
-  The verifier's messages are precise: ``word 1 (LOOP): operand `m`
-  (mark) fails `(it as u32) < lim.nmarks` ``. `Verified<Rx>`,
-  `#[require_verified]` and `Rx.placeholder()` made "only verified code
-  runs" a type-level fact with no ceremony. The bytecode fuzzer (about
-  80 lines) ran 20,000 mutated programs under ASan cleanly.
-- **The code is good.** The CLASS handler is 17 instructions: bounds
-  test, bit test, `pc` advance, the next dispatch load, and an indirect
-  jump. There are no spills, and the fail path is a direct `jae` to the
-  shared `backtrack` function.
-- **`-> never` vm functions** (`backtrack`, `class_star`, `grow_stack`)
-  were exactly right for a backtracking matcher. Each is one shared
-  copy, called from every op's failure path, that can `jump` to a saved
-  pc, `exit`, `fail` or `redo`.
-- **`std.bc`** labels and fixups made the compiler short: the
-  alternation, star and repeat layouts are a few lines each.
-- **`--vm-stats` → `super` → `Rx.optimize`** took two minutes, and the
-  `super_overlap` lint explained exactly what each conflict meant.
-- **Instrumentation variants:** a per-match step limit that costs nothing
-  when off, added in 15 lines.
-- **The embedding path:** no initialization call, a clean symbol table,
-  `str` as `loimi_str`, both `--lib` and `--shared` work, there are no
-  clashes between two Loimi libraries, and threads are safe. The
-  documented rules (str argument registers, TLS models) matched what I
-  saw.
-- **Builds are fast:** 0.9 s for the release library.
+Most debugging time went into regex semantics, not into Loimi.
