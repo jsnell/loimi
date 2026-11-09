@@ -22,6 +22,7 @@ mod parser;
 mod redocheck;
 mod rtgen;
 mod safety;
+mod splitir;
 mod tir;
 mod tirwalk;
 mod tracegen;
@@ -688,6 +689,97 @@ fn build_stencils(ir: &mut String, jit: &JitParts, clang: &str, cpu_flag: &[Stri
 /// recordings, counted) or `--traces=PROF` (traces of the profiled
 /// loops): append the generated functions and their table to `ir`.
 /// `LOIMI_TRACE_REPORT=1` lists what was generated.
+/// How many parts to split a module of `ir` into: about one per 20k
+/// lines, at most one per core (`LOIMI_SPLIT=N` overrides; 1 or 0 turns
+/// splitting off).
+fn split_count(ir: &str) -> usize {
+    if let Some(n) = std::env::var("LOIMI_SPLIT").ok().and_then(|v| v.parse().ok()) {
+        return n;
+    }
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get()).min(8);
+    (ir.len() / 1_000_000).min(cores)
+}
+
+/// Compiles the parts of a split module in parallel: their objects and,
+/// with `asm`, their assembly (compiled to assembly, then assembled, so
+/// the lint reads the code that is linked).
+fn compile_parts(clang: &str, cflags: &[String], parts: &[String], dir: &Path, stem: &str, asm: bool) -> Result<(Vec<PathBuf>, Option<String>), String> {
+    let run = |args: Vec<(PathBuf, PathBuf, &str)>| -> Result<(), String> {
+        let mut kids = Vec::new();
+        for (src, out, lang) in &args {
+            let c = Command::new(clang)
+                .args(cflags)
+                .arg(if out.extension().is_some_and(|e| e == "s") { "-S" } else { "-c" })
+                .args(["-x", lang])
+                .arg(src)
+                .arg("-o")
+                .arg(out)
+                .spawn()
+                .map_err(|e| format!("cannot run {}: {}", clang, e))?;
+            kids.push((c, src));
+        }
+        let t0 = std::time::Instant::now();
+        let report = std::env::var_os("LOIMI_SPLIT_REPORT").is_some();
+        // (in the order they finish, for the report)
+        while !kids.is_empty() {
+            let mut k = 0;
+            while k < kids.len() {
+                let done = kids[k].0.try_wait().map_err(|e| e.to_string())?;
+                let Some(st) = done else {
+                    k += 1;
+                    continue;
+                };
+                let (_, src) = kids.swap_remove(k);
+                if !st.success() {
+                    return Err(format!("{} failed on {}", clang, src.display()));
+                }
+                if report {
+                    let kb = std::fs::metadata(src).map_or(0, |m| m.len() / 1024);
+                    eprintln!("split: {} ({} KiB) done at {:.2} s", src.display(), kb, t0.elapsed().as_secs_f64());
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        Ok(())
+    };
+    let mut lls = Vec::new();
+    for (k, p) in parts.iter().enumerate() {
+        let ll = dir.join(format!("{}.part{}.ll", stem, k));
+        std::fs::write(&ll, p).map_err(|e| format!("cannot write {}: {}", ll.display(), e))?;
+        lls.push(ll);
+    }
+    let objs: Vec<PathBuf> = lls.iter().map(|l| l.with_extension("o")).collect();
+    if !asm {
+        run(lls.iter().zip(&objs).map(|(l, o)| (l.clone(), o.clone(), "ir")).collect())?;
+        return Ok((objs, None));
+    }
+    let ss: Vec<PathBuf> = lls.iter().map(|l| l.with_extension("s")).collect();
+    run(lls.iter().zip(&ss).map(|(l, s)| (l.clone(), s.clone(), "ir")).collect())?;
+    run(ss.iter().zip(&objs).map(|(s, o)| (s.clone(), o.clone(), "assembler")).collect())?;
+    let mut text = String::new();
+    for s in &ss {
+        text.push_str(&std::fs::read_to_string(s).map_err(|e| format!("cannot read {}: {}", s.display(), e))?);
+    }
+    Ok((objs, Some(text)))
+}
+
+/// One relocatable object from a split module's objects, with the
+/// symbols the parts shared (hidden) made local, so a static library
+/// exports what a whole module would.
+fn merge_objects(objs: &[PathBuf], out: &Path) -> Result<(), String> {
+    let ld = std::env::var("LOIMI_LD").unwrap_or_else(|_| "ld.lld".into());
+    let ok = Command::new(&ld).arg("-r").arg("-o").arg(out).args(objs).status().is_ok_and(|s| s.success());
+    if !ok {
+        return Err(format!("{} -r failed", ld));
+    }
+    let objcopy = std::env::var("LOIMI_OBJCOPY").unwrap_or_else(|_| "llvm-objcopy".into());
+    let ok = Command::new(&objcopy).arg("--localize-hidden").arg(out).status().is_ok_and(|s| s.success());
+    if !ok {
+        return Err(format!("{} --localize-hidden failed", objcopy));
+    }
+    Ok(())
+}
+
 fn add_traces(ir: &mut String, jit: &JitParts, opts: &Opts) -> Result<(), String> {
     let read = |p: &PathBuf| std::fs::read_to_string(p).map_err(|e| format!("cannot read {}: {}", p.display(), e));
     let vm = tracegen::VmInfo {
@@ -1134,6 +1226,24 @@ fn compiler_main() -> ExitCode {
     // `--cpu`: for every clang run below (the program, the C runtimes,
     // the assembly of -W handler_frame).
     cross.extend(cpu_flag.iter().cloned());
+    // Flags for compiling the IR, shared by a split build's parts.
+    let mut cflags: Vec<String> = vec![if opts.release { "-O3" } else { "-O1" }.into(), "-Wno-override-module".into()];
+    cflags.extend(cross.iter().cloned());
+    cflags.push(if opts.kind == OutKind::Exe { "-fno-pic" } else { "-fPIC" }.into());
+    if let Some(n) = opts.align_functions {
+        cflags.push("-mllvm".into());
+        cflags.push(format!("-align-all-functions={}", n.trailing_zeros()));
+    }
+    for a in &llvm_args {
+        cflags.push("-mllvm".into());
+        cflags.push(a.to_string());
+    }
+    if opts.sanitize_address {
+        cflags.extend(["-fsanitize=address", "-fsanitize-address-use-after-return=never", "-fno-omit-frame-pointer"].map(String::from));
+    }
+    if opts.sanitize_thread {
+        cflags.extend(["-fsanitize=thread", "-fno-omit-frame-pointer"].map(String::from));
+    }
     let mut cmd = Command::new(&clang);
     cmd.arg(if opts.release { "-O3" } else { "-O1" }).arg("-Wno-override-module").args(&cross);
     // The object goes into the archive.
@@ -1195,7 +1305,39 @@ fn compiler_main() -> ExitCode {
     if san.is_some() && (san_lib.is_some() || opts.kind != OutKind::Exe) {
         cmd.arg("-fno-sanitize-link-runtime");
     }
-    cmd.arg("-x").arg("ir").arg(&ll);
+    // A large module is split and its parts compiled in parallel
+    // (splitir.rs); ELF only (a static library's shared symbols are made
+    // local with an ELF relocatable link).
+    let elf = opts.target.as_ref().map_or(cfg!(target_os = "linux"), |t| t.triple.contains("linux"));
+    let lint = !frame_sites.sites.is_empty();
+    let t0 = std::time::Instant::now();
+    let parts = if elf { splitir::split(&ir, split_count(&ir)) } else { None };
+    if std::env::var_os("LOIMI_SPLIT_REPORT").is_some() {
+        eprintln!("split: {} KiB into {} parts in {:.2} s", ir.len() / 1024, parts.as_ref().map_or(1, |p| p.len()), t0.elapsed().as_secs_f64());
+    }
+    let split = parts.is_some();
+    let mut lint_asm = None;
+    if let Some(parts) = parts {
+        let (objs, asm) = match compile_parts(&clang, &cflags, &parts, &tmpdir, &stem, lint) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("error: {} (IR kept at {})", e, ll.display());
+                return ExitCode::from(1);
+            }
+        };
+        lint_asm = asm;
+        if opts.kind == OutKind::Static {
+            if let Err(e) = merge_objects(&objs, &tmpdir.join(format!("{}.o", stem))) {
+                eprintln!("error: {}", e);
+                return ExitCode::from(1);
+            }
+        } else {
+            // The `-mllvm` flags were for the IR, now compiled.
+            cmd.arg("-Wno-unused-command-line-argument").arg("-x").arg("none").args(&objs);
+        }
+    } else {
+        cmd.arg("-x").arg("ir").arg(&ll);
+    }
     // C runtime sources. A static library compiles each to its own
     // object (`-c` takes one input per `-o`), all archived together.
     let mut extra_objs = Vec::new();
@@ -1238,7 +1380,8 @@ fn compiler_main() -> ExitCode {
     if opts.vm_prof && opts.kind != OutKind::Static {
         cmd.arg("-Wl,-z,now");
     }
-    let status = cmd.status();
+    // A split static library's object is already built.
+    let status = if split && opts.kind == OutKind::Static { Ok(std::process::ExitStatus::default()) } else { cmd.status() };
     match status {
         Ok(s) if s.success() => {}
         Ok(_) => {
@@ -1251,7 +1394,17 @@ fn compiler_main() -> ExitCode {
         }
     }
     // Lint `handler_frame`: the same IR to assembly, with the same options.
-    if !frame_sites.sites.is_empty() {
+    if let Some(text) = lint_asm {
+        let arch = opts.target.as_ref().map_or(codegen::Arch::host(), |t| t.arch);
+        let ws = framelint::check(&text, arch, &frame_sites.sites, &frame_sites.panics);
+        for w in &ws {
+            eprint!("{}", sm.render_as(if opts.deny_warnings { "error" } else { "warning" }, w));
+        }
+        if opts.deny_warnings && !ws.is_empty() {
+            eprintln!("error: {} warning(s) treated as errors (-W error)", ws.len());
+            return ExitCode::from(1);
+        }
+    } else if lint {
         let s = tmpdir.join(format!("{}.s", stem));
         let mut asm = Command::new(&clang);
         asm.arg(if opts.release { "-O3" } else { "-O1" }).arg("-Wno-override-module").args(&cross);

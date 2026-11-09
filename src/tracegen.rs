@@ -67,7 +67,6 @@
 //! stencils push and pop the vm's frames as they do in the JIT, so exits
 //! inside an inlined frame need no reconstruction.
 
-use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 
@@ -585,7 +584,8 @@ struct Module<'a> {
     stencil_decls: HashMap<&'a str, &'a str>,
     program_syms: HashSet<&'a str>,
     types: HashSet<&'a str>,
-    ro: RefCell<HashMap<String, bool>>,
+    /// `readonly`'s answers (shared by the threads that generate regions).
+    ro: std::sync::Mutex<HashMap<String, bool>>,
     /// The handlers' state register types (from a stencil's signature).
     sig: Vec<String>,
     ret: String,
@@ -599,7 +599,7 @@ impl<'a> Module<'a> {
             stencil_decls: HashMap::new(),
             program_syms: HashSet::new(),
             types: HashSet::new(),
-            ro: RefCell::new(HashMap::new()),
+            ro: std::sync::Mutex::new(HashMap::new()),
             sig: Vec::new(),
             ret: "void".into(),
         };
@@ -655,15 +655,24 @@ impl<'a> Module<'a> {
 
     /// Whether `name` stores nothing outside its own locals and calls
     /// only such functions: it cannot change the register file.
+    /// (A function that reaches a cycle of calls is not, whichever is
+    /// asked first: `visiting` holds the calls being looked at.)
     fn readonly(&self, name: &str) -> bool {
+        self.readonly_in(name, &mut Vec::new())
+    }
+
+    fn readonly_in(&self, name: &str, visiting: &mut Vec<String>) -> bool {
         if let Some(i) = name.strip_prefix("llvm.") {
             return !effectful_intrinsic(i);
         }
-        if let Some(&r) = self.ro.borrow().get(name) {
+        if let Some(&r) = self.ro.lock().unwrap().get(name) {
             return r;
         }
-        self.ro.borrow_mut().insert(name.to_string(), false);
+        if visiting.iter().any(|v| v == name) {
+            return false;
+        }
         let Some(body) = self.bodies.get(name) else { return false };
+        visiting.push(name.to_string());
         let mut locals: HashSet<&str> = HashSet::new();
         let mut ok = true;
         for line in body {
@@ -697,7 +706,7 @@ impl<'a> Module<'a> {
                 } else if c.musttail || !c.global {
                     false
                 } else {
-                    self.readonly(c.callee)
+                    self.readonly_in(c.callee, visiting)
                 };
                 if !fine {
                     ok = false;
@@ -705,7 +714,8 @@ impl<'a> Module<'a> {
                 }
             }
         }
-        self.ro.borrow_mut().insert(name.to_string(), ok);
+        visiting.pop();
+        self.ro.lock().unwrap().insert(name.to_string(), ok);
         ok
     }
 }
@@ -3038,6 +3048,38 @@ struct GenFn {
     lines: usize,
 }
 
+impl GenFn {
+    /// A function known only by its size (one over the budget).
+    fn sized(lines: usize) -> GenFn {
+        GenFn { ir: String::new(), blockmap: Vec::new(), edges: Vec::new(), exits: Vec::new(), sites: Vec::new(), kchk: Vec::new(), nr: 0, nguards: 0, neffect: 0, nwrites: 0, inlined_writes: 0, guard_info: Vec::new(), lines }
+    }
+}
+
+/// `f` over `xs` on every core, results in order.
+fn par_map<T: Sync, R: Send>(xs: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let n = std::thread::available_parallelism().map_or(1, |n| n.get()).min(xs.len().max(1));
+    let mut out: Vec<(usize, R)> = std::thread::scope(|s| {
+        let ws: Vec<_> = (0..n)
+            .map(|_| {
+                s.spawn(|| {
+                    let mut got = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if i >= xs.len() {
+                            break got;
+                        }
+                        got.push((i, f(&xs[i])));
+                    }
+                })
+            })
+            .collect();
+        ws.into_iter().flat_map(|w| w.join().unwrap()).collect()
+    });
+    out.sort_by_key(|p| p.0);
+    out.into_iter().map(|p| p.1).collect()
+}
+
 /// A frame of a path: its code, the frame that called it and the call
 /// (a step of the parent).
 #[derive(Clone, Copy)]
@@ -3407,16 +3449,45 @@ pub fn regions(ir: &str, stencils: &str, vm: &VmInfo, codes: &[Code], opts: &Opt
             }
         }
     }
+    // Generated in parallel twice: first under provisional names, for
+    // their sizes (which decide what fits the budget, in order), then the
+    // regions kept under their names (which number the entries so far).
+    let make = |(code, _, h, order, _): &(&Code, BTreeMap<usize, usize>, usize, Vec<usize>, &str), name: &str, index: usize| {
+        let nodes: Vec<Node> = order.iter().map(|&pc| Node::new(0, pc)).collect();
+        generate_fn(&m, vm, &[PathFrame { code, parent: None, call: None }], *h, &nodes, Kind::Region, name, index, Shape::default(), None, opts)
+    };
+    let sized = par_map(&todo, |t| make(t, "r", 0).map(|g| g.lines));
+    let mut keep = Vec::new();
+    {
+        let (mut lines, mut entries) = ([0usize; 2], 0);
+        for (t, r) in todo.iter().zip(&sized) {
+            let k = (t.4 == "entry") as usize;
+            match r {
+                Ok(n) if lines[k] + n > opts.max_total || (k == 1 && *n > opts.inline_lines) => keep.push(None),
+                Ok(n) => {
+                    lines[k] += n;
+                    keep.push(Some(entries));
+                    entries += t.3.len();
+                }
+                Err(_) => keep.push(None),
+            }
+        }
+    }
+    let kept: Vec<(usize, usize)> = keep.iter().enumerate().filter_map(|(i, e)| e.map(|e| (i, e))).collect();
+    let mut made: HashMap<usize, Result<GenFn, String>> = par_map(&kept, |&(i, e)| (i, make(&todo[i], &format!("r{}", e), e))).into_iter().collect();
     {
         // (entry regions have a budget of their own, and each one a smaller
         // size: what is worth inlining is small)
         let mut lines = [0usize; 2];
-        for (code, lp, h, order, what) in todo {
+        for (i, (code, lp, h, order, what)) in todo.into_iter().enumerate() {
             let name = format!("r{}", out.entries.len());
-            let index = out.entries.len();
-            let nodes: Vec<Node> = order.iter().map(|&pc| Node::new(0, pc)).collect();
             let k = (what == "entry") as usize;
-            match generate_fn(&m, vm, &[PathFrame { code, parent: None, call: None }], h, &nodes, Kind::Region, &name, index, Shape::default(), None, opts) {
+            let r = match (made.remove(&i), &sized[i]) {
+                (Some(r), _) => r,
+                (None, Ok(n)) => Ok(GenFn::sized(*n)),
+                (None, Err(e)) => Err(e.clone()),
+            };
+            match r {
                 Ok(g) if lines[k] + g.lines > opts.max_total => {
                     let _ = writeln!(report, "no region for code {:016x} {} {}: the {} regions so far have {} lines of IR (LOIMI_TRACE_MAXTOTAL={})", code.hash, what, h, what, lines[k], opts.max_total);
                 }

@@ -13,6 +13,17 @@ implementation; `git log` has the details.
   half of a large vm's build (Mini 20 s of 28). `--release` still pads.
 - Mini drops its value accumulator (0.99-1.00 over its suite, 27% of
   its IR). A Mini build: 28 s before, 9 s now.
+- Large modules compile in parallel: the IR is split into up to one part
+  per core (handlers in contiguous runs, so the hot layout is kept;
+  small helpers copied into each part that calls them, so they still
+  inline; globals defined once and copied `available_externally`).
+  Mini: 10 s to 4 s (development), 22 s to 6.5 s (`--release`); run
+  time unchanged (0.999 geomean over its benchmarks). `LOIMI_SPLIT=N`
+  sets the part count (`1` compiles whole); `LOIMI_SPLIT_REPORT=1`
+  times the parts. With `-W handler_frame`, the parts' assembly is
+  linted and assembled, not compiled a second time.
+- Trace-region generation (`--trace-regions`) runs on every core: a
+  profiling build of Mini, 57 s to 23 s.
 
 ### `vm` declarations and dispatch
 
