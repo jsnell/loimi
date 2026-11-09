@@ -21,7 +21,9 @@ It also generates the tools that must agree with that loop:
 AI. There was at best minimal human oversight.
 
 **Status:** working and extensively tested, but I don't expect anyone
-else to use this. (Just vibe-code your own if you like the concept.)
+else to use this. (Just vibe-code your own if you like the concept.) Any
+part of the language or implementation could change without notice, or
+this repository might never be updated again. 
 
 ## Why a new language?
 
